@@ -262,7 +262,22 @@ where
         if self.client && self.direction == Direction::Decode {
             let mut me = self.as_mut();
 
+            // If we previously decoded trailers (which can arrive in the same HTTP
+            // data frame as the final message), ensure we yield them on a subsequent
+            // poll once all message bytes have been emitted.
+            let this = me.as_mut().project();
+            if this.decoded.is_empty() {
+                if let Some(trailers) = this.trailers.take() {
+                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                }
+            }
+
             loop {
+                // Track whether the underlying HTTP body is complete for this poll.
+                // This is used to avoid busy loops when we have an incomplete gRPC
+                // frame buffered but can no longer read more bytes.
+                let mut eof = false;
+
                 match ready!(me.as_mut().poll_decode(cx)) {
                     Some(Ok(incoming_buf)) if incoming_buf.is_data() => {
                         me.as_mut()
@@ -283,7 +298,10 @@ where
                         continue;
                     }
                     Some(Ok(_)) => unreachable!("unexpected frame type"),
-                    None => {} // No more data to decode, time to look for trailers
+                    None => {
+                        // No more data to decode, time to look for trailers / remaining messages
+                        eof = true;
+                    }
                     Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                 };
 
@@ -295,11 +313,27 @@ where
                     FindTrailers::Trailer(len) => {
                         // Extract up to len of where the trailers are at
                         let msg_buf = buf.copy_to_bytes(len);
-                        match decode_trailers_frame(buf.split().freeze()) {
-                            Ok(Some(trailers)) => {
-                                me.as_mut().project().trailers.replace(trailers);
+
+                        // Only attempt to decode the trailers once the full trailers frame
+                        // is buffered. Otherwise, keep the bytes in `decoded` for the next poll.
+                        match grpc_web_frame_total_len(&buf[..]) {
+                            Some(total_len) if buf.len() >= total_len => {
+                                let trailers_bytes = buf.split_to(total_len).freeze();
+                                match decode_trailers_frame(trailers_bytes) {
+                                    Ok(Some(trailers)) => {
+                                        me.as_mut().project().trailers.replace(trailers);
+                                    }
+                                    Err(e) => return Poll::Ready(Some(Err(e))),
+                                    Ok(None) => {}
+                                }
                             }
-                            Err(e) => return Poll::Ready(Some(Err(e))),
+                            // We cannot make forward progress: the trailers frame is only
+                            // partially buffered, and the underlying HTTP body has ended.
+                            _ if eof && !msg_buf.has_remaining() => {
+                                return Poll::Ready(Some(Err(data_loss(
+                                    "incomplete grpc-web trailers frame",
+                                ))))
+                            }
                             _ => {}
                         }
 
@@ -308,14 +342,41 @@ where
                         } else if let Some(trailers) = me.as_mut().project().trailers.take() {
                             Poll::Ready(Some(Ok(Frame::trailers(trailers))))
                         } else {
+                            // If we haven't yet buffered the full trailers frame, request more
+                            // bytes from the underlying body.
+                            if !eof {
+                                continue;
+                            }
                             Poll::Ready(None)
                         }
                     }
-                    FindTrailers::IncompleteBuf => continue,
-                    FindTrailers::Done(len) => Poll::Ready(match len {
-                        0 => None,
-                        _ => Some(Ok(Frame::data(buf.split_to(len).freeze()))),
-                    }),
+                    FindTrailers::IncompleteBuf => {
+                        if eof {
+                            Poll::Ready(Some(Err(data_loss("incomplete grpc-web message frame"))))
+                        } else {
+                            continue;
+                        }
+                    }
+                    FindTrailers::Done(len) => {
+                        // If we have no more message bytes buffered, but we did decode trailers
+                        // on a previous poll, yield them now.
+                        if len == 0 {
+                            if let Some(trailers) = me.as_mut().project().trailers.take() {
+                                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                            }
+
+                            // Not enough bytes to form a complete gRPC frame yet.
+                            // If we can still read from the underlying body, continue polling
+                            // for more bytes.
+                            if !eof {
+                                continue;
+                            }
+
+                            Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(Ok(Frame::data(buf.split_to(len).freeze()))))
+                        }
+                    }
                 };
             }
         }
@@ -374,6 +435,10 @@ impl Encoding {
 
 fn internal_error(e: impl std::fmt::Display) -> Status {
     Status::internal(format!("tonic-web: {e}"))
+}
+
+fn data_loss(e: impl std::fmt::Display) -> Status {
+    Status::data_loss(format!("tonic-web: {e}"))
 }
 
 // Key-value pairs encoded as a HTTP/1 headers block (without the terminating newline)
@@ -461,6 +526,23 @@ fn make_trailers_frame(trailers: HeaderMap) -> Bytes {
     frame.freeze()
 }
 
+/// Return the total length (header + payload) of the first grpc-web frame in `buf`.
+///
+/// This is used to avoid consuming (and potentially partially parsing) frames when
+/// the underlying HTTP body has not yielded enough bytes yet.
+#[inline]
+fn grpc_web_frame_total_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < FRAME_HEADER_SIZE {
+        return None;
+    }
+
+    // Bytes 1..=4 are the big-endian payload length.
+    let payload_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    // Saturating: on 32-bit targets a payload length near `u32::MAX` would overflow,
+    // and a frame that large can never be fully buffered anyway.
+    Some(FRAME_HEADER_SIZE.saturating_add(payload_len))
+}
+
 /// Search some buffer for grpc-web trailers headers and return
 /// its location in the original buf. If `None` is returned we did
 /// not find a trailers in this buffer either because its incomplete
@@ -511,9 +593,75 @@ enum FindTrailers {
 
 #[cfg(test)]
 mod tests {
+    use http_body_util::BodyExt;
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tonic::Code;
 
     use super::*;
+
+    /// A body that yields each of `chunks` as its own data frame, so tests can
+    /// control how grpc-web frames are split across HTTP data frames.
+    ///
+    /// Once the chunks run out it ends the stream, unless it was built with
+    /// [`ChunkedBody::stalled`], in which case it stays pending forever.
+    struct ChunkedBody {
+        chunks: VecDeque<Bytes>,
+        end_of_stream: bool,
+    }
+
+    impl ChunkedBody {
+        fn new(chunks: impl IntoIterator<Item = Bytes>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                end_of_stream: true,
+            }
+        }
+
+        /// A body that never signals end-of-stream, modelling a transport that has
+        /// delivered every byte but has not yet reported that the body is complete.
+        fn stalled(chunks: impl IntoIterator<Item = Bytes>) -> Self {
+            Self {
+                end_of_stream: false,
+                ..Self::new(chunks)
+            }
+        }
+    }
+
+    impl Body for ChunkedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            match self.chunks.pop_front() {
+                Some(chunk) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
+                None if self.end_of_stream => Poll::Ready(None),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Poll `call` exactly once, so tests can assert that a frame is available
+    /// without the poll being retried on their behalf.
+    async fn poll_once<B>(call: &mut GrpcWebCall<B>) -> Poll<Option<Result<Frame<Bytes>, Status>>>
+    where
+        B: Body + Unpin,
+        B::Error: fmt::Display,
+    {
+        let mut polled = None;
+        std::future::poll_fn(|cx| {
+            polled = Some(Pin::new(&mut *call).poll_frame(cx));
+            Poll::Ready(())
+        })
+        .await;
+
+        polled.unwrap()
+    }
 
     #[test]
     fn encoding_constructors() {
@@ -705,5 +853,106 @@ mod tests {
             map.get("grpc-message").unwrap(),
             "error: something: went wrong"
         );
+    }
+
+    const MESSAGE_FRAME: &[u8] = b"\0\0\0\0\x13\n\x11first ok response";
+    const TRAILERS_FRAME: &[u8] =
+        b"\x80\0\0\0Agrpc-status:10\r\ngrpc-message:error%20after%20partial%20response\r\n";
+
+    async fn assert_message_then_trailers(mut call: GrpcWebCall<ChunkedBody>) {
+        let message = call
+            .frame()
+            .await
+            .expect("expected a message frame")
+            .unwrap()
+            .into_data()
+            .expect("expected a data frame");
+        assert_eq!(message, Bytes::from_static(MESSAGE_FRAME));
+
+        let trailers = call
+            .frame()
+            .await
+            .expect("expected a trailers frame")
+            .unwrap()
+            .into_trailers()
+            .expect("expected a trailers frame");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "10");
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "error%20after%20partial%20response"
+        );
+
+        assert!(call.frame().await.is_none(), "expected end of stream");
+    }
+
+    #[tokio::test]
+    async fn client_response_yields_trailers_after_final_message_in_same_chunk() {
+        let chunk = Bytes::from([MESSAGE_FRAME, TRAILERS_FRAME].concat());
+
+        assert_message_then_trailers(GrpcWebCall::client_response(ChunkedBody::new([chunk]))).await;
+    }
+
+    #[tokio::test]
+    async fn client_response_yields_trailers_split_across_chunks() {
+        // The trailers frame is only partially buffered when the final message is
+        // emitted, so it has to be held back until the rest of it arrives.
+        let (head, tail) = TRAILERS_FRAME.split_at(20);
+
+        assert_message_then_trailers(GrpcWebCall::client_response(ChunkedBody::new([
+            Bytes::from([MESSAGE_FRAME, head].concat()),
+            Bytes::from_static(tail),
+        ])))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_response_yields_trailers_before_end_of_body() {
+        // The trailers frame is the logical end of the RPC, so once it has been
+        // decoded it must be yielded without waiting for the transport to report
+        // end-of-stream.
+        let chunk = Bytes::from([MESSAGE_FRAME, TRAILERS_FRAME].concat());
+        let mut call = GrpcWebCall::client_response(ChunkedBody::stalled([chunk]));
+
+        match poll_once(&mut call).await {
+            Poll::Ready(Some(Ok(frame))) if frame.is_data() => {}
+            other => panic!("expected a message frame, got {other:?}"),
+        }
+
+        match poll_once(&mut call).await {
+            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {}
+            other => panic!("expected a trailers frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_response_errors_on_truncated_trailers_frame() {
+        let mut call = GrpcWebCall::client_response(ChunkedBody::new([
+            Bytes::from_static(MESSAGE_FRAME),
+            Bytes::from_static(&TRAILERS_FRAME[..20]),
+        ]));
+
+        assert!(call.frame().await.unwrap().unwrap().is_data());
+
+        let err = call
+            .frame()
+            .await
+            .expect("expected an error frame")
+            .unwrap_err();
+        assert_eq!(err.code(), Code::DataLoss);
+    }
+
+    #[tokio::test]
+    async fn client_response_errors_on_truncated_message_frame() {
+        // The frame header promises 19 bytes, but the body ends after 5 of them.
+        let mut call = GrpcWebCall::client_response(ChunkedBody::new([Bytes::from_static(
+            b"\0\0\0\0\x13\n\x11fir",
+        )]));
+
+        let err = call
+            .frame()
+            .await
+            .expect("expected an error frame")
+            .unwrap_err();
+        assert_eq!(err.code(), Code::DataLoss);
     }
 }

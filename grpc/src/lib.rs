@@ -33,6 +33,7 @@
 
 pub mod attributes;
 pub mod client;
+pub(crate) mod codec;
 pub mod core;
 pub mod credentials;
 pub mod inmemory;

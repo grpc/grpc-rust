@@ -667,7 +667,7 @@ impl IdlePicker {
 
 impl Picker for IdlePicker {
     fn pick(&self, _: &RequestHeaders) -> PickResult {
-        if !self.triggered_work.swap(true, Ordering::SeqCst) {
+        if !self.triggered_work.swap(true, Ordering::Relaxed) {
             self.work_scheduler.schedule_work();
         }
         PickResult::Queue

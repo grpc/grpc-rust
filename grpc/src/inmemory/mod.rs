@@ -392,9 +392,20 @@ pub struct InMemoryResolverBuilder {}
 impl ResolverBuilder for InMemoryResolverBuilder {
     fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
         let path = target.path().strip_prefix('/').unwrap_or(target.path());
-        let ids: Vec<String> = path.split(',').map(|s| s.to_string()).collect();
+        let (lb_policy, rest) = if let Some(stripped) = path.strip_prefix("leastrequest/") {
+            (
+                crate::client::service_config::LbPolicyType::LeastRequest,
+                stripped,
+            )
+        } else {
+            (
+                crate::client::service_config::LbPolicyType::RoundRobin,
+                path,
+            )
+        };
+        let ids: Vec<String> = rest.split(',').map(|s| s.to_string()).collect();
         options.work_scheduler.schedule_work();
-        Box::new(InMemoryResolver { ids })
+        Box::new(InMemoryResolver { ids, lb_policy })
     }
 
     fn scheme(&self) -> &str {
@@ -408,6 +419,7 @@ impl ResolverBuilder for InMemoryResolverBuilder {
 
 struct InMemoryResolver {
     ids: Vec<String>,
+    lb_policy: crate::client::service_config::LbPolicyType,
 }
 
 impl Resolver for InMemoryResolver {
@@ -430,9 +442,7 @@ impl Resolver for InMemoryResolver {
         let _ = channel_controller.update(ResolverUpdate {
             endpoints: Ok(endpoints),
             service_config: Ok(Some(ServiceConfig {
-                load_balancing_policy: Some(
-                    crate::client::service_config::LbPolicyType::RoundRobin,
-                ),
+                load_balancing_policy: Some(self.lb_policy.clone()),
             })),
             ..Default::default()
         });
@@ -492,5 +502,97 @@ mod tests {
             }
             _ => panic!("expected trailers with error, got {:?}", item),
         }
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_least_request_load_balancing() {
+        reg(); // Register transport and resolver
+        crate::client::load_balancing::least_request::reg(); // Register least request policy
+
+        let backend1 = InMemoryListener::new();
+        let backend2 = InMemoryListener::new();
+
+        let b1_id = backend1.id();
+        let b2_id = backend2.id();
+
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel(10);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(10);
+
+        let b1 = backend1.clone();
+        let handle1 = tokio::spawn(async move {
+            if let Some(call) = b1.accept().await {
+                tx1.send(()).await.unwrap();
+                // Keep the connection/stream open until the test is done
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                drop(call);
+            }
+        });
+
+        let b2 = backend2.clone();
+        let handle2 = tokio::spawn(async move {
+            if let Some(call) = b2.accept().await {
+                tx2.send(()).await.unwrap();
+                // Keep the connection/stream open until the test is done
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                drop(call);
+            }
+        });
+
+        // Construct target URI using the newly supported prefix
+        let target = format!("inmemory:///leastrequest/{},{}", b1_id, b2_id);
+
+        let channel = crate::client::Channel::new(
+            &target,
+            crate::credentials::LocalChannelCredentials::new_arc(),
+            crate::client::ChannelOptions::default(),
+        );
+
+        // Make first invoke to establish an active request on whichever backend is ready first
+        let (_send1, _recv1) = channel
+            .invoke(
+                crate::core::RequestHeaders::new().with_method_name("/test/method"),
+                crate::client::CallOptions::default(),
+            )
+            .await;
+
+        // Loop and retry the second invoke until the other backend is ready and picked.
+        // Since the first backend is kept active (1 active request), the Least Request policy
+        // will immediately pick Backend 2 once it becomes ready (0 active requests).
+        let mut b1_called = false;
+        let mut b2_called = false;
+
+        for _ in 0..50 {
+            // Check which backends have been called so far
+            if rx1.try_recv().is_ok() {
+                b1_called = true;
+            }
+            if rx2.try_recv().is_ok() {
+                b2_called = true;
+            }
+
+            if b1_called && b2_called {
+                break;
+            }
+
+            // Make a short-lived invoke. If it goes to the same backend, it will be dropped immediately,
+            // returning its active request count back to 1.
+            let invoke_future = channel.invoke(
+                crate::core::RequestHeaders::new().with_method_name("/test/method"),
+                crate::client::CallOptions::default(),
+            );
+            if let Ok((_send_tmp, _recv_tmp)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), invoke_future).await
+            {
+                // Successfully made call
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(b1_called, "Backend 1 was not called");
+        assert!(b2_called, "Backend 2 was not called");
+
+        handle1.abort();
+        handle2.abort();
     }
 }

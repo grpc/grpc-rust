@@ -56,6 +56,7 @@ use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
+use crate::client::load_balancing::least_request;
 use crate::client::load_balancing::pick_first;
 use crate::client::load_balancing::round_robin;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -174,6 +175,7 @@ impl Channel {
     {
         pick_first::reg();
         round_robin::reg();
+        least_request::reg();
         dns::reg();
         #[cfg(unix)]
         name_resolution::unix::reg();
@@ -389,11 +391,20 @@ impl Invoke for Arc<ActiveChannel> {
                     "channel has been closed",
                 ));
             };
-            let result = &state.picker.pick(&headers);
+            let result = state.picker.pick(&headers);
             match result {
-                PickResult::Pick(pr) => {
+                PickResult::Pick(mut pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
-                        return sc.dyn_invoke(headers, options.clone()).await;
+                        let (tx, rx) = sc.dyn_invoke(headers, options.clone()).await;
+                        let rx = if let Some(on_complete) = pr.on_complete.take() {
+                            Box::new(CallbackRecvStream {
+                                delegate: rx,
+                                on_complete: Some(on_complete),
+                            }) as Box<dyn DynRecvStream>
+                        } else {
+                            rx
+                        };
+                        return (tx, rx);
                     } else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"
@@ -404,7 +415,7 @@ impl Invoke for Arc<ActiveChannel> {
                     // Continue and retry the RPC with the next picker.
                 }
                 PickResult::Fail(status) => {
-                    return FailingRecvStream::new_stream_pair(status.clone());
+                    return FailingRecvStream::new_stream_pair(status);
                 }
                 PickResult::Drop(status) => {
                     todo!("dropped pick: {:?}", status);
@@ -417,6 +428,39 @@ impl Invoke for Arc<ActiveChannel> {
 impl Drop for ActiveChannel {
     fn drop(&mut self) {
         self.abort_handle.abort();
+    }
+}
+
+struct CallbackRecvStream {
+    delegate: Box<dyn DynRecvStream>,
+    on_complete: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+#[tonic::async_trait]
+impl DynRecvStream for CallbackRecvStream {
+    async fn dyn_recv(
+        &mut self,
+        msg: &mut dyn crate::core::RecvMessage,
+    ) -> crate::client::ResponseStreamItem {
+        let item = self.delegate.dyn_recv(msg).await;
+        if matches!(
+            item,
+            crate::client::ResponseStreamItem::Trailers(_)
+                | crate::client::ResponseStreamItem::StreamClosed
+        ) {
+            if let Some(cb) = self.on_complete.take() {
+                cb();
+            }
+        }
+        item
+    }
+}
+
+impl Drop for CallbackRecvStream {
+    fn drop(&mut self) {
+        if let Some(cb) = self.on_complete.take() {
+            cb();
+        }
     }
 }
 
@@ -474,13 +518,22 @@ impl ResolverChannelController {
 
 impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
-        let json_config = if let Ok(Some(service_config)) = update.service_config.as_ref()
-            && service_config
+        let json_config = if let Ok(Some(service_config)) = update.service_config.as_ref() {
+            if service_config
                 .load_balancing_policy
                 .as_ref()
                 .is_some_and(|p| *p == LbPolicyType::RoundRobin)
-        {
-            json!([{round_robin::POLICY_NAME: {}}])
+            {
+                json!([{round_robin::POLICY_NAME: {}}])
+            } else if service_config
+                .load_balancing_policy
+                .as_ref()
+                .is_some_and(|p| *p == LbPolicyType::LeastRequest)
+            {
+                json!([{least_request::POLICY_NAME: {}}])
+            } else {
+                json!([{pick_first::POLICY_NAME: {"shuffleAddressList": true, "unknown_field": false}}])
+            }
         } else {
             json!([{pick_first::POLICY_NAME: {"shuffleAddressList": true, "unknown_field": false}}])
         };

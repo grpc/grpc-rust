@@ -991,7 +991,6 @@ mod test {
 
         // Should NOT have any more events (no Connect, no UpdatePicker),
         // because it stuck to the original selected subchannel.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "unexpected event");
 
         assert_eq!(
@@ -1161,7 +1160,6 @@ mod test {
         assert_eq!(sc2.address().address.to_string(), "addr2");
 
         // Verify no 3rd subchannel was created.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         while let Ok(event) = rx.try_recv() {
             if let TestEvent::NewSubchannel(_) = event {
                 panic!("Duplicate subchannel created");
@@ -1288,7 +1286,6 @@ mod test {
 
         // We should NOT reconnect to addr1 during the first pass.
         // Wait a bit to ensure no event is sent.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "unexpected event");
 
         // Now fail addr2 to complete first pass.
@@ -1378,7 +1375,6 @@ mod test {
         );
 
         // Expect NO events yet because first pass is still active.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "unexpected event during first pass");
 
         // Fail addr2 to exhaust the first pass.
@@ -1473,7 +1469,6 @@ mod test {
         // abort the attempt or force TransientFailure immediately if the load
         // balancer still has valid addresses.
         // Expect NO events to be emitted (no UpdatePicker/RequestResolution).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             rx.try_recv().is_err(),
             "Unexpected event after resolver error"
@@ -1518,7 +1513,6 @@ mod test {
         );
 
         // Verify policy does NOT enter TransientFailure yet.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "unexpected premature event");
 
         // 3. Simulate addr1 failing. Pass is now fully exhausted.
@@ -1609,7 +1603,6 @@ mod test {
         let idle_picker = state.picker;
 
         // At this point, there should be no more events, as we are waiting for an RPC.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "unexpected event");
 
         // 4. Simulate an RPC (pick) happening.

@@ -29,6 +29,8 @@ use crate::server::Handle;
 use crate::server::RecvStream;
 use crate::server::SendStream;
 
+pub mod compression;
+
 /// A trait which allows intercepting an incoming RPC call to a [`Handle`] implementation.
 #[trait_variant::make(Send)]
 pub trait Intercept: Sync + 'static {

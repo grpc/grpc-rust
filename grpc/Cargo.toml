@@ -1,11 +1,17 @@
 [package]
 name = "grpc"
 version = "0.9.0-alpha.1"
-edition = "2024"
 authors = ["gRPC Authors"]
 license = "MIT"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = """
+The official Rust implementation of gRPC: a high performance, open source, universal RPC framework.
+"""
+keywords = ["rpc", "grpc", "async", "protobuf", "proto"]
+categories = ["web-programming", "network-programming", "asynchronous"]
 rust-version = { workspace = true }
-publish = false
+edition = "2024"
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [

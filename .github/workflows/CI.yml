@@ -53,8 +53,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p protoc-cache
-          # Find where cmake built the binaries.
-          find target/ -name "protoc" -o -name "protoc.exe" -o -name "protoc-gen-rust-grpc" -o -name "protoc-gen-rust-grpc.exe" | while read -r file; do
+          # Find where cmake built the binaries and any companion DLLs.
+          find target/ -name "protoc" -o -name "protoc.exe" -o -name "protoc-gen-rust-grpc" -o -name "protoc-gen-rust-grpc.exe" -o -name "*.dll" | while read -r file; do
             # Verify it's in the build output directory to avoid copying source or unrelated files.
             if [[ "$file" == *"/out/bin/"* ]] || [[ "$file" == *"/out/build/bin/"* ]]; then
               cp "$file" protoc-cache/

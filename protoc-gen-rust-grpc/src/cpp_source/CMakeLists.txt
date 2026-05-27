@@ -64,6 +64,9 @@ set(CMAKE_PREFIX_PATH "" CACHE STRING "" FORCE)
 
 FetchContent_MakeAvailable(absl)
 
+# Prevent protobuf from using a local version of abseil
+set(protobuf_ABSL_PROVIDER "package" CACHE STRING "Use external Abseil" FORCE)
+
 # Download and configure protobuf
 fetch_protobuf(${PROTOBUF_VERSION})
 

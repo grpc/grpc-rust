@@ -27,7 +27,7 @@ use tower::discover::{Change, Discover};
 
 use crate::client::endpoint::{Connector, EndpointAddress};
 use crate::client::loadbalance::channel_state::{
-    EjectionConfig, IdleChannel, OutlierChannelState, ReadyChannel, UnejectedChannel,
+    EjectionConfig, IdleChannel, ReadyChannel, UnejectedChannel,
 };
 use crate::client::loadbalance::errors::LbError;
 use crate::client::loadbalance::keyed_futures::KeyedFutures;
@@ -70,8 +70,10 @@ impl<Resp> Future for LbFuture<Resp> {
 pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     discovery: D,
     connector: Arc<C>,
-    /// In-flight connection attempts.
-    connecting: KeyedFutures<EndpointAddress, C::Service>,
+    /// In-flight connection attempts. Resolves directly to a
+    /// [`ReadyChannel`] with outlier state already attached (looked
+    /// up in [`Self::outlier`]'s registry when present).
+    connecting: KeyedFutures<EndpointAddress, ReadyChannel<C::Service>>,
     /// Ready-to-serve channels.
     ready: IndexMap<EndpointAddress, ReadyChannel<C::Service>>,
     /// Currently-ejected channels. Each entry is an
@@ -124,6 +126,13 @@ where
         })
     }
 
+    /// The `Arc<OutlierStatsRegistry>` that fresh `ReadyChannel`s
+    /// should attach state from. `None` when outlier detection is
+    /// disabled.
+    fn registry(&self) -> Option<Arc<OutlierStatsRegistry>> {
+        self.outlier.as_ref().map(|o| o.registry().clone())
+    }
+
     /// Purge all state for `addr`, including the outlier-detection
     /// registry entry. Called on `Change::Remove`.
     fn purge_endpoint(&mut self, addr: &EndpointAddress) {
@@ -159,7 +168,7 @@ where
                 Some(Ok(Change::Insert(addr, idle))) => {
                     tracing::trace!("discovery: insert {addr}");
                     self.reset_active_slots(&addr);
-                    let connecting = idle.connect(self.connector.clone());
+                    let connecting = idle.connect(self.connector.clone(), self.registry());
                     let _ = self.connecting.add(addr, connecting);
                 }
                 Some(Ok(Change::Remove(addr))) => {
@@ -170,21 +179,18 @@ where
         }
     }
 
-    /// Drain completed connection futures. If the outlier state for
-    /// a re-discovered endpoint is still ejected, the new channel is
-    /// re-ejected for the *remaining* duration; if the deadline has
-    /// already passed, it is un-ejected and routed to `ready`.
+    /// Drain completed connection futures. Each yields a fully-formed
+    /// `ReadyChannel` with outlier state already attached. If the
+    /// preserved outlier state for a re-discovered endpoint is still
+    /// ejected, the new channel is re-ejected for the *remaining*
+    /// duration; if the deadline has already passed, it is un-ejected
+    /// and routed to `ready`.
     fn poll_connecting(&mut self, cx: &mut Context<'_>) {
-        while let Poll::Ready(Some((addr, svc))) = self.connecting.poll_next(cx) {
-            let state = match self.outlier.as_ref() {
-                Some(o) => o.registry().add_channel(addr.clone()),
-                None => Arc::new(OutlierChannelState::new(addr.clone())),
-            };
-            let ready = ReadyChannel::new(addr.clone(), svc, state.clone());
-            let remaining = self
-                .outlier
-                .as_ref()
-                .and_then(|o| o.registry().remaining_ejection(&state, Instant::now()));
+        while let Poll::Ready(Some((addr, ready))) = self.connecting.poll_next(cx) {
+            let remaining = self.outlier.as_ref().and_then(|o| {
+                o.registry()
+                    .remaining_ejection(ready.outlier(), Instant::now())
+            });
             self.place_after_connect(addr, ready, remaining);
         }
     }
@@ -215,6 +221,7 @@ where
                         needs_reconnect: false,
                     },
                     self.connector.clone(),
+                    self.registry(),
                 );
                 tracing::debug!("outlier detection: re-eject {addr} for {d:?}");
                 let _ = self.ejected.add(addr, ejected);
@@ -250,6 +257,7 @@ where
                             needs_reconnect: false,
                         },
                         self.connector.clone(),
+                        Some(registry.clone()),
                     );
                     tracing::debug!("outlier detection: eject {addr} for {d:?}");
                     let _ = self.ejected.add(addr, ejected);
@@ -283,12 +291,12 @@ where
                 }
                 // `needs_reconnect = false` for A50; this arm is
                 // reserved for future policies.
-                UnejectedChannel::Connecting(future) => {
+                UnejectedChannel::Connecting(connecting) => {
                     if let Some(o) = self.outlier.as_ref() {
                         let state = o.registry().add_channel(addr.clone());
                         o.registry().note_uneject(&state);
                     }
-                    let _ = self.connecting.add(addr, future);
+                    let _ = self.connecting.add(addr, connecting);
                 }
             }
         }

@@ -132,25 +132,6 @@ where
         self.outlier.registry().clone()
     }
 
-    /// Purge all state for `addr`, including the outlier-detection
-    /// registry entry. Called on `Change::Remove`.
-    fn purge_endpoint(&mut self, addr: &EndpointAddress) {
-        let _ = self.connecting.cancel(addr);
-        self.ready.swap_remove(addr);
-        let _ = self.ejected.cancel(addr);
-        self.outlier.registry().remove_channel(addr);
-    }
-
-    /// Clear stale connecting/ready/ejected slots for `addr` but
-    /// preserve the outlier-detection registry entry. Called on
-    /// `Change::Insert` so transient discovery flaps don't lose
-    /// counters or ejection state, matching grpc-go and Envoy.
-    fn reset_active_slots(&mut self, addr: &EndpointAddress) {
-        let _ = self.connecting.cancel(addr);
-        self.ready.swap_remove(addr);
-        let _ = self.ejected.cancel(addr);
-    }
-
     /// Drain pending discovery events. Resolves to an error
     /// ([`LbError::DiscoverClosed`] or [`LbError::DiscoverError`])
     /// or stays pending — there is no success outcome.
@@ -164,13 +145,22 @@ where
                 Some(Err(e)) => return Poll::Ready(LbError::DiscoverError(e.into())),
                 Some(Ok(Change::Insert(addr, idle))) => {
                     tracing::trace!("discovery: insert {addr}");
-                    self.reset_active_slots(&addr);
+                    let _ = self.connecting.cancel(&addr);
+                    self.ready.swap_remove(&addr);
+                    let _ = self.ejected.cancel(&addr);
+                    // Note: the outlier-detection registry entry is
+                    // intentionally preserved across re-insert so a
+                    // transient discovery flap keeps its counters and
+                    // ejection state (matching grpc-go and Envoy).
                     let connecting = idle.connect(self.connector.clone(), self.registry());
                     let _ = self.connecting.add(addr, connecting);
                 }
                 Some(Ok(Change::Remove(addr))) => {
                     tracing::trace!("discovery: remove {addr}");
-                    self.purge_endpoint(&addr);
+                    let _ = self.connecting.cancel(&addr);
+                    self.ready.swap_remove(&addr);
+                    let _ = self.ejected.cancel(&addr);
+                    self.outlier.registry().remove_channel(&addr);
                 }
             }
         }

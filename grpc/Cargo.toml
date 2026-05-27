@@ -1,6 +1,6 @@
 [package]
 name = "grpc"
-version = "0.9.0-alpha.2"
+version = "0.9.0"
 authors = ["gRPC Authors"]
 license = "MIT"
 homepage = "https://grpc.io"

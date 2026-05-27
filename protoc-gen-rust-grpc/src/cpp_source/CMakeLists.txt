@@ -19,6 +19,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(MINGW)
     add_compile_options("-Wa,-mbig-obj")
+    add_compile_definitions(_WIN32_WINNT=0x0601)
 elseif(MSVC)
     add_compile_options("/bigobj")
 endif()
@@ -35,9 +36,6 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # Include modules
 include(FetchContent)
 include(FetchProtobuf)
-
-# Download and configure protobuf
-fetch_protobuf(${PROTOBUF_VERSION})
 
 # Download and configure abseil
 # Abseil version that's compatible with protobuf
@@ -65,6 +63,9 @@ set(absl_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/absl-build" CACHE PATH "" FORCE)
 set(CMAKE_PREFIX_PATH "" CACHE STRING "" FORCE)
 
 FetchContent_MakeAvailable(absl)
+
+# Download and configure protobuf
+fetch_protobuf(${PROTOBUF_VERSION})
 
 # Add the protoc-gen-rust-grpc executable and installation rules
 if(BUILD_PLUGIN)

@@ -205,7 +205,6 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - uses: hecrj/setup-rust-action@v2
-    - uses: taiki-e/install-action@protoc
     - uses: taiki-e/install-action@cargo-hack
     - uses: taiki-e/install-action@cargo-nextest
     - uses: actions/cache@v4

@@ -16,6 +16,7 @@ edition = "2024"
 prettyplease = "0.2.35"
 protobuf-codegen = { version = "4.34.0-release" }
 syn = "2.0.104"
+which = "8.0"
 protoc-gen-rust-grpc = { version = "0.9.0-alpha.2", path = "../protoc-gen-rust-grpc", optional = true }
 
 [features]

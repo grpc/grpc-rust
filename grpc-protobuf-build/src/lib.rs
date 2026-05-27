@@ -34,6 +34,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use syn::parse_file;
 
@@ -106,6 +107,27 @@ impl From<&Dependency> for protobuf_codegen::Dependency {
             proto_import_paths: val.proto_import_paths.clone(),
             proto_files: val.proto_files.clone(),
         }
+    }
+}
+
+fn check_runnable(binary: &Path) -> Result<(), String> {
+    let out = Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Binary '{}' failed to execute: {e}", binary.display()))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Err(format!(
+            "Binary '{}' is not runnable. Status: {}. Stdout: {}. Stderr: {}",
+            binary.display(),
+            out.status,
+            stdout.trim(),
+            stderr.trim()
+        ))
     }
 }
 
@@ -222,19 +244,14 @@ impl CodeGen {
         self
     }
 
-    fn find_in_path(binary_name: &str) -> Option<PathBuf> {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for path in std::env::split_paths(&paths) {
-                let candidate = path.join(binary_name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
+    fn resolve_binaries(&self) -> Result<(PathBuf, PathBuf), String> {
+        let (protoc, plugin) = self.resolve_binaries_impl()?;
+        check_runnable(&protoc)?;
+        check_runnable(&plugin)?;
+        Ok((protoc, plugin))
     }
 
-    fn resolve_binaries(&self) -> Result<(PathBuf, PathBuf), String> {
+    fn resolve_binaries_impl(&self) -> Result<(PathBuf, PathBuf), String> {
         // 1. Explicit configuration
         if let Some((protoc, plugin)) = &self.prebuilt_binaries {
             return Ok((protoc.clone(), plugin.clone()));
@@ -246,7 +263,8 @@ impl CodeGen {
             let compiled_protoc = PathBuf::from(protoc_gen_rust_grpc::protoc());
             let compiled_plugin = PathBuf::from(protoc_gen_rust_grpc::protoc_gen_rust_grpc());
             if compiled_protoc.exists() && compiled_plugin.exists() {
-                // The files may not exist if a build setting instructed
+                // The files may not exist if a build setting instructed protoc-gen-rust-grpc to
+                // skip the C++ build (DOCS_RS / our CI setting).
                 return Ok((compiled_protoc, compiled_plugin));
             }
         }
@@ -273,9 +291,9 @@ impl CodeGen {
         }
 
         // 4. Discovery from PATH
-        if let (Some(protoc), Some(plugin)) = (
-            Self::find_in_path(protoc_filename),
-            Self::find_in_path(plugin_filename),
+        if let (Ok(protoc), Ok(plugin)) = (
+            which::which(protoc_filename),
+            which::which(plugin_filename),
         ) {
             return Ok((protoc, plugin));
         }
@@ -313,7 +331,7 @@ Please do one of the following:
         };
 
         // Generate the service code.
-        let mut cmd = std::process::Command::new(&protoc);
+        let mut cmd = Command::new(&protoc);
         cmd.arg(format!(
             "--plugin=protoc-gen-rust-grpc={}",
             plugin.display()

@@ -41,10 +41,11 @@ fn main() {
         .compile_protos(&["proto/helloworld/helloworld.proto"], &["proto"])
         .unwrap();
 
+    println!("cargo:rerun-if-env-changed=GRPC_RUST_REGENERATE_PROTO");
     let grpc_helloworld = env::var_os("CARGO_FEATURE_GRPC_HELLOWORLD").is_some();
     let grpc_routeguide = env::var_os("CARGO_FEATURE_GRPC_ROUTEGUIDE").is_some();
 
-    if grpc_helloworld || grpc_routeguide {
+    if (grpc_helloworld || grpc_routeguide) && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some() {
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
         grpc_protobuf_build::CodeGen::new()

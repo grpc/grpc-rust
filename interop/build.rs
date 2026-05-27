@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     let proto = "proto/grpc/testing/test.proto";
 
     tonic_prost_build::compile_protos(proto).unwrap();
@@ -7,7 +8,4 @@ fn main() {
         .inputs(["test.proto", "empty.proto", "messages.proto"])
         .compile()
         .unwrap();
-
-    // prevent needing to rebuild if files (or deps) haven't changed
-    println!("cargo:rerun-if-changed={proto}");
 }

@@ -1,7 +1,8 @@
 # protoc-gen-rust-grpc
 
 A protoc plugin that generates Rust gRPC service code for use with the [`grpc`
-crate](https://crates.io/crates/grpc).
+crate](https://crates.io/crates/grpc).  This crate is generally not needed
+directly; instead most users will use `grpc-protobuf-build`
 
 > NOTE: This version is a preview and not recommended for any production
 > use.  All APIs are unstable.  Proceed at your own risk.
@@ -15,6 +16,20 @@ The archive's checksum is verified before compiling.
 A `build.rs` script will ensure the `protoc` and `protoc-gen-rust-grpc` binaries
 are compiled, and the functions `protoc` and `protoc_gen_rust_grpc` can be used
 to find their locations.
+
+### Skipping C++ Compilation
+
+If you want to bypass the C++ compilation step in your application, set the
+following environment variable:
+
+```bash
+export PROTOC_GEN_RUST_GRPC_NO_BUILD=1
+```
+
+When set, the C++ build is skipped, and no binaries will be present in the
+output directory.  This will cause `grpc-protobuf-build` to fall back to the
+`GRPC_RUST_PROTOC_DIR` environment variable, and then your `PATH` to find the
+protoc plugin.
 
 ## Building binaries manually
 

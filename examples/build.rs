@@ -1,6 +1,7 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     tonic_prost_build::configure()
         .compile_protos(&["proto/routeguide/route_guide.proto"], &["proto"])
         .unwrap();

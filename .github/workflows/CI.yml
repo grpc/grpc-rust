@@ -14,7 +14,9 @@ permissions:
   contents: read
 
 env:
-  GRPC_RUST_SKIP_CPP_BUILD: 1
+  # By default, skip building the plugin and rely on caching to put it in the
+  # system's PATH.
+  PROTOC_GEN_RUST_GRPC_NO_BUILD: 1
 
 jobs:
   rustfmt:
@@ -32,8 +34,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macOS-latest, windows-latest]
     env:
-      # By default we skip building this plugin; this is the only rule that needs to actually build it.
-      GRPC_RUST_SKIP_CPP_BUILD: ""
+      # By default we skip building this plugin; this is the only rule that
+      # needs to actually build it.
+      PROTOC_GEN_RUST_GRPC_NO_BUILD: ""
     steps:
       - uses: actions/checkout@v6
       - uses: actions/cache@v4

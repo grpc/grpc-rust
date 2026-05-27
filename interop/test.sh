@@ -38,11 +38,7 @@ esac
 
 ARG="${1:-""}"
 
-# Skip building in github actions as the workflow already builds it (to
-# make sure the cache works).
-if [ -z "${GITHUB_ACTIONS:-}" ]; then
-  (cd interop && cargo build --bins)
-fi
+(cd interop && cargo build --bins)
 
 SERVER="interop/bin/server_${OS}_amd64${EXT}"
 

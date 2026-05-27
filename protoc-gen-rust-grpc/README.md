@@ -2,7 +2,9 @@
 
 A protoc plugin that generates Rust gRPC service code for use with the [`grpc`
 crate](https://crates.io/crates/grpc).  This crate is generally not needed
-directly; instead most users will use `grpc-protobuf-build`
+directly; instead most users will use
+[`grpc-protobuf-build`](https://crates.io/crates/grpc-protobuf-build), which
+depends on this crate.
 
 > NOTE: This version is a preview and not recommended for any production
 > use.  All APIs are unstable.  Proceed at your own risk.

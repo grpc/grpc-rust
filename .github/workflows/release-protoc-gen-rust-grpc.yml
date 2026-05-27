@@ -3,12 +3,6 @@ name: Release protoc-gen-rust-grpc
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Simulated Release Tag'
-        required: false
-        default: 'protoc-gen-rust-grpc-v0.9.0-test'
 
 permissions:
   contents: write
@@ -16,7 +10,7 @@ permissions:
 jobs:
   publish-protoc-gen-rust-grpc:
     name: Build and attach protoc-gen-rust-grpc binaries
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'protoc-gen-rust-grpc')
+    if: startsWith(github.event.release.tag_name, 'protoc-gen-rust-grpc')
     runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
@@ -54,15 +48,15 @@ jobs:
           - runs_on: macos-latest
             target: osx-x86_64
             binary_name: protoc-gen-rust-grpc
-            cmake_flags: '-DCMAKE_OSX_ARCHITECTURES=x86_64'
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=x86_64"
           - runs_on: macos-latest
             target: osx-aarch_64
             binary_name: protoc-gen-rust-grpc
-            cmake_flags: '-DCMAKE_OSX_ARCHITECTURES=arm64'
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=arm64"
           - runs_on: macos-latest
             target: osx-universal_binary
             binary_name: protoc-gen-rust-grpc
-            cmake_flags: '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"'
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
 
           # --- Windows Builds ---
           - runs_on: windows-latest
@@ -94,13 +88,13 @@ jobs:
       - name: Configure CMake
         shell: bash
         run: |
-          # Extract version from release tag or workflow dispatch input
-          TAG_NAME="${{ github.event.release.tag_name || github.event.inputs.tag_name }}"
-          VERSION_FROM_TAG="${TAG_NAME##*protoc-gen-rust-grpc-v}"
+          # Extract version from release tag (e.g. protoc-gen-rust-grpc-v0.9.0 -> 0.9.0)
+          VERSION_FROM_TAG="${{ github.event.release.tag_name }}"
+          VERSION_FROM_TAG="${VERSION_FROM_TAG##*protoc-gen-rust-grpc-v}"
 
           echo "Building version: $VERSION_FROM_TAG"
 
-          # Export clean version and target for subsequent steps
+          # Export clean version and asset filename for subsequent steps
           echo "VERSION_FROM_TAG=${VERSION_FROM_TAG}" >> $GITHUB_ENV
           echo "ASSET_FILENAME=protoc-gen-rust-grpc-${VERSION_FROM_TAG}-${{ matrix.target }}.zip" >> $GITHUB_ENV
 
@@ -133,7 +127,6 @@ jobs:
       - name: Upload asset to Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag_name }}
           files: ${{ env.ASSET_FILENAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

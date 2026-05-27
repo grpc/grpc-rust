@@ -5,13 +5,14 @@ fn main() {
     }
 
     // If CI/prebuilt environment tells us to skip the C++ build, do so immediately.
-    if let Ok(val) = std::env::var("GRPC_RUST_SKIP_CPP_BUILD") {
-        if !val.is_empty() && val != "0" {
-            println!(
-                "cargo:warning=GRPC_RUST_SKIP_CPP_BUILD is set, skipping C++ protobuf plugin build."
-            );
-            return;
-        }
+    if let Ok(val) = std::env::var("GRPC_RUST_SKIP_CPP_BUILD")
+        && !val.is_empty()
+        && val != "0"
+    {
+        println!(
+            "cargo:warning=GRPC_RUST_SKIP_CPP_BUILD is set, skipping C++ protobuf plugin build."
+        );
+        return;
     }
 
     // Avoid rebuilding if the C++ source files (and this file) didn't change.

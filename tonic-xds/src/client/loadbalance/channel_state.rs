@@ -272,16 +272,15 @@ impl IdleChannel {
 
 /// A channel that is in the process of connecting.
 ///
-/// `impl Future<Output = ReadyChannel<S>>` — resolves to a fully-formed
-/// `ReadyChannel` whose outlier state is looked up from `registry`
-/// via `add_channel` at resolve time. Cancellation is handled
-/// externally via [`KeyedFutures::cancel`].
+/// `impl Future<Output = ReadyChannel<S>>` — the connector's
+/// service-future is wrapped at construction time into an async
+/// block that looks up the per-channel outlier state from `registry`
+/// (via `add_channel`) and produces a fully-formed `ReadyChannel`.
+/// Cancellation is handled externally via [`KeyedFutures::cancel`].
 ///
 /// [`KeyedFutures::cancel`]: crate::client::loadbalance::keyed_futures::KeyedFutures::cancel
 pub(crate) struct ConnectingChannel<S> {
-    addr: EndpointAddress,
-    registry: Arc<OutlierStatsRegistry>,
-    inner: Pin<Box<dyn Future<Output = S> + Send>>,
+    inner: Pin<Box<dyn Future<Output = ReadyChannel<S>> + Send>>,
 }
 
 impl<S: Send + 'static> ConnectingChannel<S> {
@@ -291,9 +290,11 @@ impl<S: Send + 'static> ConnectingChannel<S> {
         registry: Arc<OutlierStatsRegistry>,
     ) -> Self {
         Self {
-            addr,
-            registry,
-            inner: fut,
+            inner: Box::pin(async move {
+                let svc = fut.await;
+                let outlier = registry.add_channel(addr.clone());
+                ReadyChannel::new(addr, svc, outlier)
+            }),
         }
     }
 }
@@ -302,10 +303,7 @@ impl<S: Send + 'static> Future for ConnectingChannel<S> {
     type Output = ReadyChannel<S>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let svc = std::task::ready!(this.inner.as_mut().poll(cx));
-        let outlier = this.registry.add_channel(this.addr.clone());
-        Poll::Ready(ReadyChannel::new(this.addr.clone(), svc, outlier))
+        self.get_mut().inner.as_mut().poll(cx)
     }
 }
 

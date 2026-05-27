@@ -910,6 +910,11 @@ mod tests {
             let _ = lb.call("hello").await;
         }
 
+        // Per A50 the sweep decides ejection; drive it synchronously.
+        // (The spawned actor would also fire it on tick; calling it
+        // here avoids depending on actor timing under #[tokio::test].)
+        registry.run_housekeeping();
+
         // poll_ready drains the eject mpsc and transitions 8084 into
         // `self.ejected` via `ReadyChannel::eject`.
         let _ = poll_ready_now(&mut lb);
@@ -1030,6 +1035,7 @@ mod tests {
         for _ in 0..100 {
             let _ = lb.call("hello").await;
         }
+        registry.run_housekeeping();
         let _ = poll_ready_now(&mut lb);
         let state_8084 = registry.add_channel(addr(8084));
         assert!(
@@ -1096,6 +1102,7 @@ mod tests {
         for _ in 0..100 {
             let _ = lb.call("hello").await;
         }
+        registry.run_housekeeping();
         let _ = poll_ready_now(&mut lb);
         assert!(
             lb.ejected.contains_key(&addr(8084)),

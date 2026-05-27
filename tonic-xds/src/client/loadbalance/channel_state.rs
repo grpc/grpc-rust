@@ -26,7 +26,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -82,10 +82,6 @@ impl EndpointCounters {
 pub(crate) struct OutlierChannelState {
     addr: EndpointAddress,
     counters: EndpointCounters,
-    /// `true` while this channel is counted in the registry's
-    /// `qualifying_count` (i.e. has hit `request_volume` in the
-    /// current interval).
-    is_qualifying: AtomicBool,
     /// Bumped on each ejection; decremented (saturating) on each
     /// healthy interval.
     ejection_multiplier: AtomicU32,
@@ -101,7 +97,6 @@ impl OutlierChannelState {
         Self {
             addr,
             counters: EndpointCounters::default(),
-            is_qualifying: AtomicBool::new(false),
             ejection_multiplier: AtomicU32::new(0),
             ejected_at_nanos: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -132,18 +127,6 @@ impl OutlierChannelState {
     /// Read and zero the counters. Returns `(success, failure)`.
     pub(crate) fn snapshot_and_reset(&self) -> (u64, u64) {
         self.counters.snapshot_and_reset()
-    }
-
-    /// Set `is_qualifying` to `true`. Returns `true` if this call
-    /// performed the false → true transition (so the caller can bump
-    /// the registry counter exactly once per crossing).
-    pub(crate) fn mark_qualifying(&self) -> bool {
-        !self.is_qualifying.swap(true, Ordering::AcqRel)
-    }
-
-    /// Clear `is_qualifying`. Returns the previous value.
-    pub(crate) fn clear_qualifying(&self) -> bool {
-        self.is_qualifying.swap(false, Ordering::AcqRel)
     }
 
     /// Atomically mark this channel as ejected starting at `now`.

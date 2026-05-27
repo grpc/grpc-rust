@@ -47,11 +47,10 @@ use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 /// balancer ([`Self::note_uneject`], [`Self::remaining_ejection`]).
 pub(crate) struct OutlierStatsRegistry {
     channels: DashMap<EndpointAddress, Arc<OutlierChannelState>>,
-    /// Channels with `total >= request_volume` in the active
-    /// interval. Drives the `minimum_hosts` gate.
-    qualifying_count: AtomicU64,
     /// Channels currently ejected. Drives the
-    /// `max_ejection_percent` cap.
+    /// `max_ejection_percent` cap. Bumped by the sweep on each
+    /// ejection; decremented by [`Self::note_uneject`] and
+    /// [`Self::remove_channel`].
     ejected_count: AtomicU64,
     /// Shared config, hot-swappable. Readers `.load()` per call;
     /// future xDS integration `.store()`s new configs on cluster
@@ -72,7 +71,6 @@ impl OutlierStatsRegistry {
         let (eject_tx, eject_rx) = mpsc::unbounded_channel();
         let registry = Arc::new(Self {
             channels: DashMap::new(),
-            qualifying_count: AtomicU64::new(0),
             ejected_count: AtomicU64::new(0),
             config,
             eject_tx,
@@ -89,16 +87,13 @@ impl OutlierStatsRegistry {
             .clone()
     }
 
-    /// Drop the state for `addr`, decrementing cluster-wide counters
-    /// (`qualifying_count`, `ejected_count`) if it was contributing.
+    /// Drop the state for `addr`, decrementing `ejected_count` if
+    /// the removed channel was contributing to it.
     pub(crate) fn remove_channel(&self, addr: &EndpointAddress) {
-        if let Some((_, state)) = self.channels.remove(addr) {
-            if state.clear_qualifying() {
-                self.qualifying_count.fetch_sub(1, Ordering::Relaxed);
-            }
-            if state.is_ejected() {
-                self.ejected_count.fetch_sub(1, Ordering::Relaxed);
-            }
+        if let Some((_, state)) = self.channels.remove(addr)
+            && state.is_ejected()
+        {
+            self.ejected_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -107,58 +102,14 @@ impl OutlierStatsRegistry {
         self.channels.len()
     }
 
-    /// Per-RPC entry point. Records the outcome and, if all gates
-    /// pass, transitions the channel to ejected and dispatches the
-    /// address on the eject mpsc.
+    /// Per-RPC entry point. Records the outcome on the channel's
+    /// counter. Ejection decisions are deferred to the next sweep
+    /// (gRFC A50 §6) — see [`Self::run_housekeeping`].
     pub(crate) fn record_outcome(&self, state: &OutlierChannelState, success: bool) {
         if success {
             state.record_success();
         } else {
             state.record_failure();
-        }
-
-        let config = self.config.load();
-        let Some(fp) = config.failure_percentage.as_ref() else {
-            return;
-        };
-
-        let (s, f) = state.counters();
-        let total = s + f;
-        let request_volume = u64::from(fp.request_volume);
-
-        // Bump `qualifying_count` exactly once per channel per
-        // interval so the `minimum_hosts` gate is a single atomic load.
-        if total >= request_volume && state.mark_qualifying() {
-            self.qualifying_count.fetch_add(1, Ordering::Relaxed);
-        }
-
-        if state.is_ejected() {
-            return;
-        }
-        if total < request_volume {
-            return;
-        }
-        if self.qualifying_count.load(Ordering::Relaxed) < u64::from(fp.minimum_hosts) {
-            return;
-        }
-        if self.ejected_count.load(Ordering::Relaxed) >= self.max_ejections(&config) {
-            return;
-        }
-
-        // failure_pct = 100 * failure / total. A50 uses strict ">".
-        let failure_pct = 100 * f / total;
-        if failure_pct <= u64::from(fp.threshold.get()) {
-            return;
-        }
-        if !roll(fp.enforcing_failure_percentage.get()) {
-            return;
-        }
-
-        if state.try_eject(Instant::now()) {
-            self.ejected_count.fetch_add(1, Ordering::Relaxed);
-            // Send failure (LB receiver dropped during shutdown) is
-            // ignored; the registry will be torn down momentarily.
-            let _ = self.eject_tx.send(state.addr().clone());
         }
     }
 
@@ -197,16 +148,69 @@ impl OutlierStatsRegistry {
         Some(target.checked_sub(elapsed).unwrap_or_default())
     }
 
-    /// Interval-boundary housekeeping. Resets counters and
-    /// decrements multipliers for non-ejected channels. Does not
-    /// un-eject — that is driven by each `EjectedChannel`'s timer.
+    /// One interval-boundary sweep (gRFC A50 §6). Order matters:
+    ///
+    /// 1. Snapshot every channel's counters for one consistent pass.
+    /// 2. Run the failure-percentage algorithm against the snapshot:
+    ///    apply `minimum_hosts` to the qualifying population, then
+    ///    `max_ejection_percent`, then per-channel threshold and the
+    ///    enforcement roll. Dispatch eject signals through the mpsc.
+    /// 3. Reset counters and decrement multipliers for non-ejected
+    ///    channels.
+    ///
+    /// Un-ejection is *not* driven from here — each `EjectedChannel`
+    /// owns its own `Sleep` timer.
     pub(crate) fn run_housekeeping(&self) {
-        for entry in self.channels.iter() {
-            let state = entry.value();
-            state.snapshot_and_reset();
-            if state.clear_qualifying() {
-                self.qualifying_count.fetch_sub(1, Ordering::Relaxed);
+        let config = self.config.load();
+        let snapshots: Vec<(Arc<OutlierChannelState>, u64, u64)> = self
+            .channels
+            .iter()
+            .map(|e| {
+                let state = e.value().clone();
+                let (s, f) = state.counters();
+                (state, s, f)
+            })
+            .collect();
+
+        if let Some(fp) = config.failure_percentage.as_ref() {
+            let request_volume = u64::from(fp.request_volume);
+            let qualifying = snapshots
+                .iter()
+                .filter(|(_, s, f)| s + f >= request_volume)
+                .count() as u64;
+            if qualifying >= u64::from(fp.minimum_hosts) {
+                let max_ejections = self.max_ejections(&config);
+                let now = Instant::now();
+                let threshold = u64::from(fp.threshold.get());
+                let enforcing = fp.enforcing_failure_percentage.get();
+                for (state, s, f) in &snapshots {
+                    let total = s + f;
+                    if total < request_volume || state.is_ejected() {
+                        continue;
+                    }
+                    if self.ejected_count.load(Ordering::Relaxed) >= max_ejections {
+                        break;
+                    }
+                    // failure_pct = 100 * failure / total. A50 uses strict ">".
+                    let failure_pct = 100 * f / total;
+                    if failure_pct <= threshold {
+                        continue;
+                    }
+                    if !roll(enforcing) {
+                        continue;
+                    }
+                    if state.try_eject(now) {
+                        self.ejected_count.fetch_add(1, Ordering::Relaxed);
+                        // Send failure (LB receiver dropped during
+                        // shutdown) is ignored.
+                        let _ = self.eject_tx.send(state.addr().clone());
+                    }
+                }
             }
+        }
+
+        for (state, _, _) in &snapshots {
+            state.snapshot_and_reset();
             if !state.is_ejected() {
                 state.decrement_multiplier();
             }
@@ -371,10 +375,10 @@ mod tests {
         }
     }
 
-    // ----- record_outcome: failure-percentage detection -----
+    // ----- run_housekeeping: failure-percentage detection -----
 
     #[test]
-    fn ejects_above_threshold_inline() {
+    fn ejects_above_threshold_at_sweep() {
         let registry = make_registry_only(fp_config(50, 10, 3));
         let bad = registry.add_channel(addr(8084));
         for port in 8080..=8083 {
@@ -382,6 +386,9 @@ mod tests {
             drive(&registry, &s, 100, 0);
         }
         drive(&registry, &bad, 10, 90);
+        // Per A50 the algorithm runs at the interval sweep, not per RPC.
+        assert!(!bad.is_ejected());
+        registry.run_housekeeping();
         assert!(bad.is_ejected());
         assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 1);
     }
@@ -396,6 +403,7 @@ mod tests {
             drive(&registry, &s, 70, 30);
             all.push(s);
         }
+        registry.run_housekeeping();
         for s in &all {
             assert!(!s.is_ejected());
         }
@@ -411,6 +419,7 @@ mod tests {
             drive(&registry, &s, 50, 50);
             all.push(s);
         }
+        registry.run_housekeeping();
         for s in &all {
             assert!(!s.is_ejected());
         }
@@ -426,6 +435,7 @@ mod tests {
             drive(&registry, &s, 0, 100);
             all.push(s);
         }
+        registry.run_housekeeping();
         for s in &all {
             assert!(!s.is_ejected());
         }
@@ -440,6 +450,7 @@ mod tests {
             let s = registry.add_channel(addr(port));
             drive(&registry, &s, 200, 0);
         }
+        registry.run_housekeeping();
         assert!(!bad.is_ejected());
     }
 
@@ -458,6 +469,7 @@ mod tests {
             drive(&registry, &s, 0, 100);
             all.push(s);
         }
+        registry.run_housekeeping();
         for s in &all {
             assert!(!s.is_ejected());
         }
@@ -474,10 +486,11 @@ mod tests {
             let s = registry.add_channel(addr(port));
             all.push(s);
         }
-        // Drive all hosts to bad state in parallel pseudo-order.
+        // Drive all hosts to bad state.
         for s in &all {
             drive(&registry, s, 0, 100);
         }
+        registry.run_housekeeping();
 
         let ejected = all.iter().filter(|s| s.is_ejected()).count();
         // 5 hosts × 20% = 1 max ejection.
@@ -485,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_channel_decrements_counters() {
+    fn remove_channel_decrements_ejected_count() {
         let registry = make_registry_only(fp_config(50, 10, 3));
         let mut all = vec![];
         for port in 8080..=8083 {
@@ -495,15 +508,12 @@ mod tests {
         }
         let bad = registry.add_channel(addr(8084));
         drive(&registry, &bad, 0, 100);
+        registry.run_housekeeping();
         assert!(bad.is_ejected());
         assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 1);
-        // Each healthy host crossed request_volume; bad too. So
-        // qualifying_count = 5.
-        assert_eq!(registry.qualifying_count.load(Ordering::Relaxed), 5);
 
         registry.remove_channel(&addr(8084));
         assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 0);
-        assert_eq!(registry.qualifying_count.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -515,6 +525,7 @@ mod tests {
             drive(&registry, &s, 100, 0);
         }
         drive(&registry, &bad, 10, 90);
+        registry.run_housekeeping();
 
         // Eject dispatched exactly once via the mpsc.
         assert_eq!(rx.try_recv(), Ok(addr(8084)));
@@ -527,16 +538,14 @@ mod tests {
     // ----- Housekeeping -----
 
     #[test]
-    fn housekeeping_resets_counters_and_qualifying() {
+    fn housekeeping_resets_counters() {
         let registry = make_registry_only(fp_config(50, 10, 3));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
             drive(&registry, &s, 100, 0);
         }
-        assert_eq!(registry.qualifying_count.load(Ordering::Relaxed), 4);
 
         registry.run_housekeeping();
-        assert_eq!(registry.qualifying_count.load(Ordering::Relaxed), 0);
         for port in 8080..=8083 {
             let s = registry.channels.get(&addr(port)).unwrap();
             assert_eq!(s.counters(), (0, 0));

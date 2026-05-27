@@ -22,7 +22,7 @@
  *
  */
 
-//! Protobuf integration for the [`grpc` crate](grpc).
+//! Protobuf integration for the [`grpc`](grpc) crate.
 //!
 //! These types are generally created by the generated code produced by
 //! [`protoc-gen-rust-grpc`](https://docs.rs/protoc-gen-rust-grpc).  See our

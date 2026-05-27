@@ -4,9 +4,13 @@
 //! manages the connection lifecycle via the channel state machine,
 //! and routes requests to ready endpoints via a [`ChannelPicker`].
 //!
-//! Outlier detection (gRFC A50) is integrated via an optional
-//! [`OutlierDetector`]. Eject requests arrive on an mpsc channel from
-//! the data path; the LB consumes the matching [`ReadyChannel`] via
+//! Outlier detection (gRFC A50) is integrated via [`OutlierDetector`],
+//! which is always present. The actor inside is conditionally spawned
+//! based on the [`OutlierDetectionConfig`] passed at construction —
+//! `OutlierDetectionConfig::default()` is the disabled config, in
+//! which case `record_outcome` short-circuits and no eject signals
+//! ever fire. Eject requests arrive on an mpsc channel from the data
+//! path; the LB consumes the matching [`ReadyChannel`] via
 //! [`ReadyChannel::eject`] and tracks the resulting
 //! [`EjectedChannel`] in [`Self::ejected`]. When the timer fires, the
 //! resolved [`UnejectedChannel`] is routed back into `ready` or
@@ -25,16 +29,17 @@ use indexmap::IndexMap;
 use tower::Service;
 use tower::discover::{Change, Discover};
 
+use arc_swap::ArcSwap;
+
 use crate::client::endpoint::{Connector, EndpointAddress};
 use crate::client::loadbalance::channel_state::{
     EjectionConfig, IdleChannel, ReadyChannel, UnejectedChannel,
 };
 use crate::client::loadbalance::errors::LbError;
 use crate::client::loadbalance::keyed_futures::KeyedFutures;
-use crate::client::loadbalance::outlier_detection::{
-    OutlierDetector, OutlierStatsRegistry, RegistryAlreadyWired,
-};
+use crate::client::loadbalance::outlier_detection::{OutlierDetector, OutlierStatsRegistry};
 use crate::client::loadbalance::pickers::ChannelPicker;
+use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 
 /// Future returned by [`LoadBalancer::call`]. Either resolves
 /// immediately with an [`LbError`] or drives the selected channel.
@@ -71,8 +76,7 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     discovery: D,
     connector: Arc<C>,
     /// In-flight connection attempts. Resolves directly to a
-    /// [`ReadyChannel`] with outlier state already attached (looked
-    /// up in [`Self::outlier`]'s registry when present).
+    /// [`ReadyChannel`] with outlier state already attached.
     connecting: KeyedFutures<EndpointAddress, ReadyChannel<C::Service>>,
     /// Ready-to-serve channels.
     ready: IndexMap<EndpointAddress, ReadyChannel<C::Service>>,
@@ -80,8 +84,12 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// [`EjectedChannel`] whose `Sleep` fires when the ejection
     /// window expires.
     ejected: KeyedFutures<EndpointAddress, UnejectedChannel<C::Service>>,
-    /// `None` disables outlier detection.
-    outlier: Option<OutlierDetector>,
+    /// Per-LB outlier-detection plumbing. Always present; the
+    /// housekeeping actor inside is conditionally spawned based on
+    /// whether the config had an algorithm enabled at construction.
+    /// When disabled, the data path's `record_outcome` short-circuits
+    /// and nothing reads from `eject_rx`.
+    outlier: OutlierDetector,
     picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
 }
 
@@ -92,30 +100,22 @@ where
     C: Connector + Send + Sync + 'static,
     C::Service: Clone + Send + 'static,
 {
-    /// Create a load balancer with no outlier detection.
+    /// Construct a load balancer driven by `config`. Wrapping the
+    /// config in `ArcSwap` lets future xDS subscription updates
+    /// reconfigure detection without rebuilding the LB; until that
+    /// wiring lands, the value is effectively read-once at
+    /// construction. `OutlierDetectionConfig::default()` is the
+    /// disabled config — both algorithms `None` ⇒ no actor, no
+    /// ejection.
     pub(crate) fn new(
         discovery: D,
         connector: Arc<C>,
         picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
+        config: Arc<ArcSwap<OutlierDetectionConfig>>,
     ) -> Self {
-        // Infallible: `with_outlier(.., None)` never wires a registry.
-        Self::with_outlier(discovery, connector, picker, None)
-            .expect("with_outlier(.., None) is infallible")
-    }
-
-    /// Create a load balancer, optionally enabling outlier detection.
-    /// When `outlier` is `Some`, the registry's housekeeping actor is
-    /// spawned and bound to this LB. Returns
-    /// [`RegistryAlreadyWired`] if the registry already drives
-    /// another LB.
-    pub(crate) fn with_outlier(
-        discovery: D,
-        connector: Arc<C>,
-        picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
-        outlier: Option<Arc<OutlierStatsRegistry>>,
-    ) -> Result<Self, RegistryAlreadyWired> {
-        let outlier = outlier.map(OutlierDetector::new).transpose()?;
-        Ok(Self {
+        let (registry, eject_rx) = OutlierStatsRegistry::new(config);
+        let outlier = OutlierDetector::new(registry, eject_rx);
+        Self {
             discovery,
             connector,
             connecting: KeyedFutures::new(),
@@ -123,14 +123,13 @@ where
             ejected: KeyedFutures::new(),
             outlier,
             picker,
-        })
+        }
     }
 
-    /// The `Arc<OutlierStatsRegistry>` that fresh `ReadyChannel`s
-    /// should attach state from. `None` when outlier detection is
-    /// disabled.
-    fn registry(&self) -> Option<Arc<OutlierStatsRegistry>> {
-        self.outlier.as_ref().map(|o| o.registry().clone())
+    /// Shared `Arc<OutlierStatsRegistry>` for attaching per-channel
+    /// state when a [`ReadyChannel`] is born.
+    fn registry(&self) -> Arc<OutlierStatsRegistry> {
+        self.outlier.registry().clone()
     }
 
     /// Purge all state for `addr`, including the outlier-detection
@@ -139,9 +138,7 @@ where
         let _ = self.connecting.cancel(addr);
         self.ready.swap_remove(addr);
         let _ = self.ejected.cancel(addr);
-        if let Some(o) = self.outlier.as_ref() {
-            o.registry().remove_channel(addr);
-        }
+        self.outlier.registry().remove_channel(addr);
     }
 
     /// Clear stale connecting/ready/ejected slots for `addr` but
@@ -187,10 +184,10 @@ where
     /// and routed to `ready`.
     fn poll_connecting(&mut self, cx: &mut Context<'_>) {
         while let Poll::Ready(Some((addr, ready))) = self.connecting.poll_next(cx) {
-            let remaining = self.outlier.as_ref().and_then(|o| {
-                o.registry()
-                    .remaining_ejection(ready.outlier(), Instant::now())
-            });
+            let remaining = self
+                .outlier
+                .registry()
+                .remaining_ejection(ready.outlier(), Instant::now());
             self.place_after_connect(addr, ready, remaining);
         }
     }
@@ -209,9 +206,7 @@ where
                 self.ready.insert(addr, ready);
             }
             Some(d) if d.is_zero() => {
-                if let Some(o) = self.outlier.as_ref() {
-                    o.registry().note_uneject(ready.outlier());
-                }
+                self.outlier.registry().note_uneject(ready.outlier());
                 self.ready.insert(addr, ready);
             }
             Some(d) => {
@@ -235,14 +230,11 @@ where
     /// `record_outcome`.
     fn poll_eject_requests(&mut self, cx: &mut Context<'_>) {
         loop {
-            let Some(o) = self.outlier.as_mut() else {
-                return;
-            };
-            let addr = match o.poll_eject_request(cx) {
+            let addr = match self.outlier.poll_eject_request(cx) {
                 Poll::Ready(Some(a)) => a,
                 _ => return,
             };
-            let registry = o.registry().clone();
+            let registry = self.outlier.registry().clone();
             // Channel may have been removed by discovery in the
             // meantime; if so, nothing to eject.
             let Some(ch) = self.ready.swap_remove(&addr) else {
@@ -257,7 +249,7 @@ where
                             needs_reconnect: false,
                         },
                         self.connector.clone(),
-                        Some(registry.clone()),
+                        registry.clone(),
                     );
                     tracing::debug!("outlier detection: eject {addr} for {d:?}");
                     let _ = self.ejected.add(addr, ejected);
@@ -281,21 +273,18 @@ where
     /// reattached) or `connecting`.
     fn poll_unejection(&mut self, cx: &mut Context<'_>) {
         while let Poll::Ready(Some((addr, unejected))) = self.ejected.poll_next(cx) {
+            let registry = self.outlier.registry();
             match unejected {
                 UnejectedChannel::Ready(ready) => {
-                    if let Some(o) = self.outlier.as_ref() {
-                        o.registry().note_uneject(ready.outlier());
-                    }
+                    registry.note_uneject(ready.outlier());
                     tracing::debug!("outlier detection: uneject {addr}");
                     self.ready.insert(addr, ready);
                 }
                 // `needs_reconnect = false` for A50; this arm is
                 // reserved for future policies.
                 UnejectedChannel::Connecting(connecting) => {
-                    if let Some(o) = self.outlier.as_ref() {
-                        let state = o.registry().add_channel(addr.clone());
-                        o.registry().note_uneject(&state);
-                    }
+                    let state = registry.add_channel(addr.clone());
+                    registry.note_uneject(&state);
                     let _ = self.connecting.add(addr, connecting);
                 }
             }
@@ -358,15 +347,13 @@ where
         // can take ownership without holding the picker borrow.
         let mut svc = picked.clone();
         let outlier_state = picked.outlier().clone();
-        let registry = self.outlier.as_ref().map(|o| o.registry().clone());
+        let registry = self.outlier.registry().clone();
         LbFuture::Pending(Box::pin(async move {
             tower::ServiceExt::ready(&mut svc)
                 .await
                 .map_err(|e| LbError::LbChannelPollReadyError(e.into()))?;
             let result = svc.call(req).await;
-            if let Some(registry) = registry.as_ref() {
-                registry.record_outcome(&outlier_state, result.is_ok());
-            }
+            registry.record_outcome(&outlier_state, result.is_ok());
             result.map_err(|e| LbError::LbChannelCallError(e.into()))
         }))
     }
@@ -519,7 +506,8 @@ mod tests {
         let connector = Arc::new(MockConnector::new());
         let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
             Arc::new(P2cPicker);
-        let lb = LoadBalancer::new(discover, connector.clone(), picker);
+        let config = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
+        let lb = LoadBalancer::new(discover, connector.clone(), picker, config);
         (lb, connector)
     }
 
@@ -875,7 +863,9 @@ mod tests {
         }
     }
 
-    /// Build an LB with outlier detection enabled.
+    /// Build an LB with outlier detection enabled. The returned
+    /// registry is the same `Arc` the LB owns; tests use it to
+    /// inspect ejected_count and the like.
     fn make_lb_with_outlier(
         discover: MockDiscover,
         config: OutlierDetectionConfig,
@@ -883,10 +873,9 @@ mod tests {
         let connector = Arc::new(MockConnector::new());
         let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
             Arc::new(P2cPicker);
-        let registry = OutlierStatsRegistry::new(config);
-        let lb =
-            LoadBalancer::with_outlier(discover, connector.clone(), picker, Some(registry.clone()))
-                .expect("registry not yet wired");
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let lb = LoadBalancer::new(discover, connector.clone(), picker, config);
+        let registry = lb.outlier.registry().clone();
         (lb, connector, registry)
     }
 
@@ -1144,33 +1133,5 @@ mod tests {
             "8084 must be back in ready after un-ejection"
         );
         assert!(!registry.add_channel(addr(8084)).is_ejected());
-    }
-
-    /// Sharing one `OutlierStatsRegistry` across two `LoadBalancer`s is
-    /// not supported — the eject-signal receiver is one-shot. The
-    /// second `with_outlier` call must return an error rather than
-    /// panic.
-    #[tokio::test]
-    async fn test_outlier_registry_cannot_be_wired_twice() {
-        let (_tx1, discover1) = new_discover();
-        let (_tx2, discover2) = new_discover();
-        let connector = Arc::new(MockConnector::new());
-        let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
-            Arc::new(P2cPicker);
-        let registry = OutlierStatsRegistry::new(fp_config(50, 5, 3));
-
-        // First wiring succeeds.
-        LoadBalancer::with_outlier(
-            discover1,
-            connector.clone(),
-            picker.clone(),
-            Some(registry.clone()),
-        )
-        .expect("first wire");
-
-        // Second wiring of the same registry must error, not panic.
-        let result =
-            LoadBalancer::with_outlier(discover2, connector, picker, Some(registry.clone()));
-        assert!(result.is_err());
     }
 }

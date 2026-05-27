@@ -93,6 +93,23 @@ impl OutlierDetectionConfig {
     }
 }
 
+impl Default for OutlierDetectionConfig {
+    /// Disabled by default: both ejection algorithms are `None`, so
+    /// [`Self::is_enabled`] returns `false`. The remaining fields use
+    /// A50's documented defaults — they're inert until an algorithm
+    /// is enabled via config update.
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(10),
+            base_ejection_time: Duration::from_secs(30),
+            max_ejection_time: Duration::from_secs(300),
+            max_ejection_percent: Percentage(10),
+            success_rate: None,
+            failure_percentage: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

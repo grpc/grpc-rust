@@ -28,11 +28,11 @@
 //! [`UnejectedChannel`]: crate::client::loadbalance::channel_state::UnejectedChannel
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
@@ -40,12 +40,6 @@ use crate::client::endpoint::EndpointAddress;
 use crate::client::loadbalance::channel_state::OutlierChannelState;
 use crate::common::async_util::AbortOnDrop;
 use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
-
-/// Returned when an [`OutlierStatsRegistry`] is handed to a second
-/// load balancer. The eject-signal receiver is one-shot.
-#[derive(Debug, thiserror::Error)]
-#[error("OutlierStatsRegistry is already wired to a LoadBalancer")]
-pub(crate) struct RegistryAlreadyWired;
 
 /// Shared outlier-detection state, owned by `Arc` and accessed
 /// concurrently by the data path ([`Self::record_outcome`]), the
@@ -59,38 +53,31 @@ pub(crate) struct OutlierStatsRegistry {
     /// Channels currently ejected. Drives the
     /// `max_ejection_percent` cap.
     ejected_count: AtomicU64,
-    config: OutlierDetectionConfig,
-    /// Sender half of the eject signal. The receiver is owned by the
-    /// LB's [`OutlierDetector`].
+    /// Shared config, hot-swappable. Readers `.load()` per call;
+    /// future xDS integration `.store()`s new configs on cluster
+    /// updates. `interval` changes also require an actor restart —
+    /// see [`spawn_actor`].
+    config: Arc<ArcSwap<OutlierDetectionConfig>>,
+    /// Sender half of the eject signal. The receiver is paired
+    /// off and handed to the LB at construction (see [`Self::new`]).
     eject_tx: mpsc::UnboundedSender<EndpointAddress>,
-    /// Receiver moved out exactly once by [`Self::take_eject_rx`].
-    eject_rx: Mutex<Option<mpsc::UnboundedReceiver<EndpointAddress>>>,
 }
 
 impl OutlierStatsRegistry {
-    pub(crate) fn new(config: OutlierDetectionConfig) -> Arc<Self> {
+    /// Construct the registry and the paired eject-signal receiver.
+    /// The LB owns the receiver; the registry owns the sender.
+    pub(crate) fn new(
+        config: Arc<ArcSwap<OutlierDetectionConfig>>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<EndpointAddress>) {
         let (eject_tx, eject_rx) = mpsc::unbounded_channel();
-        Arc::new(Self {
+        let registry = Arc::new(Self {
             channels: DashMap::new(),
             qualifying_count: AtomicU64::new(0),
             ejected_count: AtomicU64::new(0),
             config,
             eject_tx,
-            eject_rx: Mutex::new(Some(eject_rx)),
-        })
-    }
-
-    /// Take the eject-signal receiver. Returns
-    /// [`RegistryAlreadyWired`] on a second call — a registry can
-    /// drive at most one load balancer.
-    fn take_eject_rx(
-        &self,
-    ) -> Result<mpsc::UnboundedReceiver<EndpointAddress>, RegistryAlreadyWired> {
-        self.eject_rx
-            .lock()
-            .expect("eject_rx mutex poisoned")
-            .take()
-            .ok_or(RegistryAlreadyWired)
+        });
+        (registry, eject_rx)
     }
 
     /// Get or create the state for `addr`. Idempotent — existing
@@ -130,7 +117,8 @@ impl OutlierStatsRegistry {
             state.record_failure();
         }
 
-        let Some(fp) = self.config.failure_percentage.as_ref() else {
+        let config = self.config.load();
+        let Some(fp) = config.failure_percentage.as_ref() else {
             return;
         };
 
@@ -153,7 +141,7 @@ impl OutlierStatsRegistry {
         if self.qualifying_count.load(Ordering::Relaxed) < u64::from(fp.minimum_hosts) {
             return;
         }
-        if self.ejected_count.load(Ordering::Relaxed) >= self.max_ejections() {
+        if self.ejected_count.load(Ordering::Relaxed) >= self.max_ejections(&config) {
             return;
         }
 
@@ -199,12 +187,9 @@ impl OutlierStatsRegistry {
     ) -> Option<Duration> {
         let elapsed = state.ejected_duration(now)?;
         let multiplier = state.ejection_multiplier();
-        let cap = self
-            .config
-            .base_ejection_time
-            .max(self.config.max_ejection_time);
-        let target = self
-            .config
+        let config = self.config.load();
+        let cap = config.base_ejection_time.max(config.max_ejection_time);
+        let target = config
             .base_ejection_time
             .checked_mul(multiplier)
             .unwrap_or(cap)
@@ -229,16 +214,20 @@ impl OutlierStatsRegistry {
     }
 
     /// Resolve `max_ejection_percent` against the current channel count.
-    fn max_ejections(&self) -> u64 {
-        self.channels.len() as u64 * u64::from(self.config.max_ejection_percent.get()) / 100
+    fn max_ejections(&self, config: &OutlierDetectionConfig) -> u64 {
+        self.channels.len() as u64 * u64::from(config.max_ejection_percent.get()) / 100
     }
 }
 
 /// Spawn the housekeeping actor. Ticks every `config.interval` and
 /// calls [`OutlierStatsRegistry::run_housekeeping`]. Dropping the
 /// returned [`AbortOnDrop`] stops the task.
+///
+/// The `interval` is captured at spawn time; live updates require an
+/// actor restart, which the xDS-integration layer will own. Other
+/// config fields are re-read from the ArcSwap on each tick.
 pub(crate) fn spawn_actor(registry: Arc<OutlierStatsRegistry>) -> AbortOnDrop {
-    let interval = registry.config.interval;
+    let interval = registry.config.load().interval;
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -251,27 +240,36 @@ pub(crate) fn spawn_actor(registry: Arc<OutlierStatsRegistry>) -> AbortOnDrop {
 }
 
 /// Per-LB outlier-detection plumbing: shared registry, eject-signal
-/// receiver, and the housekeeping actor handle (aborted on drop). The
-/// LB holds this as `Option<OutlierDetector>`.
+/// receiver, and (when enabled) the housekeeping actor handle
+/// (aborted on drop). The LB always owns one of these; the actor is
+/// conditional on the config being enabled at construction.
 pub(crate) struct OutlierDetector {
     registry: Arc<OutlierStatsRegistry>,
     eject_rx: mpsc::UnboundedReceiver<EndpointAddress>,
-    _actor: AbortOnDrop,
+    /// `None` while config is disabled — `record_outcome` short-
+    /// circuits and the data path never sends through `eject_tx`, so
+    /// nothing reads or writes outlier state.
+    _actor: Option<AbortOnDrop>,
 }
 
 impl OutlierDetector {
-    /// Take ownership of the registry's eject-signal receiver and
-    /// spawn the housekeeping actor. Returns
-    /// [`RegistryAlreadyWired`] if the registry is already wired to
-    /// another LB.
-    pub(crate) fn new(registry: Arc<OutlierStatsRegistry>) -> Result<Self, RegistryAlreadyWired> {
-        let eject_rx = registry.take_eject_rx()?;
-        let _actor = spawn_actor(registry.clone());
-        Ok(Self {
+    /// Pair the registry with the eject-signal receiver and (if the
+    /// config currently has an algorithm enabled) spawn the
+    /// housekeeping actor.
+    pub(crate) fn new(
+        registry: Arc<OutlierStatsRegistry>,
+        eject_rx: mpsc::UnboundedReceiver<EndpointAddress>,
+    ) -> Self {
+        let _actor = registry
+            .config
+            .load()
+            .is_enabled()
+            .then(|| spawn_actor(registry.clone()));
+        Self {
             registry,
             eject_rx,
             _actor,
-        })
+        }
     }
 
     /// Shared registry handle.
@@ -314,6 +312,22 @@ mod tests {
 
     fn pct(v: u32) -> Percentage {
         Percentage::new(v).unwrap()
+    }
+
+    /// Build a registry whose config will never be swapped — these
+    /// tests exercise algorithm correctness, not config live-update.
+    fn make_registry(
+        config: OutlierDetectionConfig,
+    ) -> (
+        Arc<OutlierStatsRegistry>,
+        mpsc::UnboundedReceiver<EndpointAddress>,
+    ) {
+        OutlierStatsRegistry::new(Arc::new(ArcSwap::from_pointee(config)))
+    }
+
+    /// Convenience wrapper for tests that don't observe ejections.
+    fn make_registry_only(config: OutlierDetectionConfig) -> Arc<OutlierStatsRegistry> {
+        make_registry(config).0
     }
 
     fn base_config() -> OutlierDetectionConfig {
@@ -361,7 +375,7 @@ mod tests {
 
     #[test]
     fn ejects_above_threshold_inline() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 3));
+        let registry = make_registry_only(fp_config(50, 10, 3));
         let bad = registry.add_channel(addr(8084));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
@@ -374,7 +388,7 @@ mod tests {
 
     #[test]
     fn skips_below_threshold() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 3));
+        let registry = make_registry_only(fp_config(50, 10, 3));
         let mut all = vec![];
         for port in 8080..=8084 {
             let s = registry.add_channel(addr(port));
@@ -390,7 +404,7 @@ mod tests {
     #[test]
     fn at_threshold_does_not_eject() {
         // A50 specifies a strict "greater than" comparison.
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 3));
+        let registry = make_registry_only(fp_config(50, 10, 3));
         let mut all = vec![];
         for port in 8080..=8084 {
             let s = registry.add_channel(addr(port));
@@ -404,7 +418,7 @@ mod tests {
 
     #[test]
     fn minimum_hosts_gates_ejection() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 5));
+        let registry = make_registry_only(fp_config(50, 10, 5));
         // Only 2 hosts have request_volume ≥ 10; minimum_hosts is 5 ⇒ skip.
         let mut all = vec![];
         for port in 8080..=8081 {
@@ -419,7 +433,7 @@ mod tests {
 
     #[test]
     fn request_volume_filters_low_traffic() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 100, 3));
+        let registry = make_registry_only(fp_config(50, 100, 3));
         let bad = registry.add_channel(addr(8080));
         drive(&registry, &bad, 0, 5);
         for port in 8081..=8084 {
@@ -437,7 +451,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .enforcing_failure_percentage = pct(0);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let mut all = vec![];
         for port in 8080..=8084 {
             let s = registry.add_channel(addr(port));
@@ -453,7 +467,7 @@ mod tests {
     fn max_ejection_percent_caps_concurrent_ejections() {
         let mut config = fp_config(50, 10, 3);
         config.max_ejection_percent = pct(20);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
 
         let mut all = vec![];
         for port in 8080..=8084 {
@@ -472,7 +486,7 @@ mod tests {
 
     #[test]
     fn remove_channel_decrements_counters() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 3));
+        let registry = make_registry_only(fp_config(50, 10, 3));
         let mut all = vec![];
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
@@ -494,8 +508,7 @@ mod tests {
 
     #[test]
     fn ejection_dispatches_address_through_mpsc() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 3));
-        let mut rx = registry.take_eject_rx().expect("receiver available");
+        let (registry, mut rx) = make_registry(fp_config(50, 10, 3));
         let bad = registry.add_channel(addr(8084));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
@@ -515,7 +528,7 @@ mod tests {
 
     #[test]
     fn housekeeping_resets_counters_and_qualifying() {
-        let registry = OutlierStatsRegistry::new(fp_config(50, 10, 3));
+        let registry = make_registry_only(fp_config(50, 10, 3));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
             drive(&registry, &s, 100, 0);
@@ -532,7 +545,7 @@ mod tests {
 
     #[test]
     fn housekeeping_decrements_multiplier_on_healthy_interval() {
-        let registry = OutlierStatsRegistry::new(base_config());
+        let registry = make_registry_only(base_config());
         let s = registry.add_channel(addr(8080));
         // Force multiplier to 3 directly (no traffic, no eject).
         s.set_ejection_multiplier(3);
@@ -543,7 +556,7 @@ mod tests {
 
     #[test]
     fn housekeeping_leaves_ejected_multipliers_alone() {
-        let registry = OutlierStatsRegistry::new(base_config());
+        let registry = make_registry_only(base_config());
         let s = registry.add_channel(addr(8080));
         s.try_eject(Instant::now());
         s.set_ejection_multiplier(3);
@@ -562,7 +575,7 @@ mod tests {
         let mut config = fp_config(50, 10, 3);
         config.base_ejection_time = Duration::from_secs(10);
         config.max_ejection_time = Duration::from_secs(60);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let s = registry.add_channel(addr(8080));
         let t0 = Instant::now();
         s.try_eject(t0);
@@ -576,7 +589,7 @@ mod tests {
         let mut config = fp_config(50, 10, 3);
         config.base_ejection_time = Duration::from_secs(10);
         config.max_ejection_time = Duration::from_secs(15);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let s = registry.add_channel(addr(8080));
         let t0 = Instant::now();
         s.try_eject(t0);
@@ -590,7 +603,7 @@ mod tests {
         let mut config = fp_config(50, 10, 3);
         config.base_ejection_time = Duration::from_secs(30);
         config.max_ejection_time = Duration::from_secs(60);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let s = registry.add_channel(addr(8080));
         let t0 = Instant::now();
         s.try_eject(t0);
@@ -606,7 +619,7 @@ mod tests {
         let mut config = fp_config(50, 10, 3);
         config.base_ejection_time = Duration::from_secs(10);
         config.max_ejection_time = Duration::from_secs(60);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let s = registry.add_channel(addr(8080));
         let t0 = Instant::now();
         s.try_eject(t0);
@@ -619,14 +632,14 @@ mod tests {
 
     #[test]
     fn remaining_ejection_none_when_not_ejected() {
-        let registry = OutlierStatsRegistry::new(base_config());
+        let registry = make_registry_only(base_config());
         let s = registry.add_channel(addr(8080));
         assert!(registry.remaining_ejection(&s, Instant::now()).is_none());
     }
 
     #[test]
     fn note_uneject_clears_state_and_decrements_counter() {
-        let registry = OutlierStatsRegistry::new(base_config());
+        let registry = make_registry_only(base_config());
         let s = registry.add_channel(addr(8080));
         s.try_eject(Instant::now()); // bumps multiplier 0 → 1
         registry.ejected_count.fetch_add(1, Ordering::Relaxed);
@@ -653,7 +666,7 @@ mod tests {
         let mut config = fp_config(50, 10, 3);
         config.base_ejection_time = Duration::from_secs(10);
         config.max_ejection_time = Duration::from_secs(300);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let s = registry.add_channel(addr(8080));
 
         let t0 = Instant::now();
@@ -687,7 +700,7 @@ mod tests {
     async fn dropping_abort_stops_actor() {
         let mut config = base_config();
         config.interval = Duration::from_millis(50);
-        let registry = OutlierStatsRegistry::new(config);
+        let registry = make_registry_only(config);
         let s = registry.add_channel(addr(8080));
         s.set_ejection_multiplier(5);
 

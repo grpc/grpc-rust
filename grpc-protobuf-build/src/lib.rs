@@ -291,10 +291,9 @@ impl CodeGen {
         }
 
         // 4. Discovery from PATH
-        if let (Ok(protoc), Ok(plugin)) = (
-            which::which(protoc_filename),
-            which::which(plugin_filename),
-        ) {
+        if let (Ok(protoc), Ok(plugin)) =
+            (which::which(protoc_filename), which::which(plugin_filename))
+        {
             return Ok((protoc, plugin));
         }
 

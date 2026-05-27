@@ -40,7 +40,7 @@ ARG="${1:-""}"
 
 if [ "$OS" = "windows" ]; then
   # Remove Git Bash / MSYS2 bin directories from PATH to avoid dynamic library conflicts (0xc0000139)
-  CLEAN_PATH=$(echo "$PATH" | tr ';' '\n' | grep -v -E "/usr/bin|/bin|/mingw" | tr '\n' ';')
+  CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -E "/usr/bin|/bin|/mingw" | tr '\n' ':')
   PATH="$CLEAN_PATH" cargo build --manifest-path interop/Cargo.toml --bins
 else
   (cd interop && cargo build --bins)

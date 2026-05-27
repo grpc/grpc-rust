@@ -217,9 +217,15 @@ impl OutlierStatsRegistry {
         }
     }
 
-    /// Resolve `max_ejection_percent` against the current channel count.
+    /// Resolve `max_ejection_percent` against the current channel
+    /// count. A50 mandates "at least one address regardless of the
+    /// value" — without this floor the default 10% × small clusters
+    /// (e.g. 5 endpoints) rounds to zero and silently disables
+    /// ejection. An empty pool genuinely has nothing to eject.
     fn max_ejections(&self, config: &OutlierDetectionConfig) -> u64 {
-        self.channels.len() as u64 * u64::from(config.max_ejection_percent.get()) / 100
+        let len = self.channels.len() as u64;
+        let cap = len * u64::from(config.max_ejection_percent.get()) / 100;
+        if len > 0 { cap.max(1) } else { 0 }
     }
 }
 
@@ -494,6 +500,29 @@ mod tests {
 
         let ejected = all.iter().filter(|s| s.is_ejected()).count();
         // 5 hosts × 20% = 1 max ejection.
+        assert_eq!(ejected, 1);
+    }
+
+    /// A50 §"max_ejection_percent": at least one address may be
+    /// ejected regardless of the percentage. 5 hosts × 10% = 0
+    /// arithmetically; the floor still allows 1.
+    #[test]
+    fn max_ejection_percent_permits_at_least_one_ejection() {
+        let mut config = fp_config(50, 10, 3);
+        config.max_ejection_percent = pct(10);
+        let registry = make_registry_only(config);
+
+        let mut all = vec![];
+        for port in 8080..=8084 {
+            let s = registry.add_channel(addr(port));
+            all.push(s);
+        }
+        for s in &all {
+            drive(&registry, s, 0, 100);
+        }
+        registry.run_housekeeping();
+
+        let ejected = all.iter().filter(|s| s.is_ejected()).count();
         assert_eq!(ejected, 1);
     }
 

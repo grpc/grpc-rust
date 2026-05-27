@@ -207,6 +207,7 @@ jobs:
     - uses: hecrj/setup-rust-action@v2
     - uses: taiki-e/install-action@cargo-hack
     - uses: taiki-e/install-action@cargo-nextest
+    - uses: taiki-e/install-action@protoc
     - uses: actions/cache@v4
       with:
         path: protoc-cache

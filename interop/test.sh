@@ -38,7 +38,11 @@ esac
 
 ARG="${1:-""}"
 
-(cd interop && cargo build --bins)
+if [ "$OS" = "windows" ]; then
+  powershell.exe -Command "cargo build --manifest-path interop/Cargo.toml --bins"
+else
+  (cd interop && cargo build --bins)
+fi
 
 SERVER="interop/bin/server_${OS}_amd64${EXT}"
 

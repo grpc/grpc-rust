@@ -259,7 +259,6 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
-    - run: cargo build -p interop
     - name: Run interop tests
       run: ./interop/test.sh
       shell: bash

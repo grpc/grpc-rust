@@ -3,7 +3,8 @@
 //! [`OutlierDetectionConfig`] is the input to the outlier-detection
 //! algorithm. The two sub-configs gate which ejection algorithms run.
 //! The `child_policy` field from A50 is not modeled — `tonic-xds`
-//! currently runs P2C as its only load balancer.
+//! currently runs P2C as its only load balancer; revisit when
+//! more land.
 //!
 //! [gRFC A50]: https://github.com/grpc/proposal/blob/master/A50-xds-outlier-detection.md
 

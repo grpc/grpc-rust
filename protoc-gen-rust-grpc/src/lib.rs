@@ -27,12 +27,16 @@
 //! [`protoc`]: https://protobuf.dev/installation/
 //! [`gRPC-Rust`]: https://crates.io/crates/grpc
 
+use std::path::PathBuf;
+
 fn bin_file(file: &str) -> String {
+    let mut path = PathBuf::from(bin()).join(file);
     if cfg!(target_os = "windows") {
-        format!("{}/{file}.exe", bin())
-    } else {
-        format!("{}/{file}", bin())
+        path.set_extension("exe");
     }
+    path.to_str()
+        .expect("Path contains invalid UTF-8")
+        .to_owned()
 }
 
 /// The full path to the `protoc` executable.
@@ -48,5 +52,10 @@ pub fn protoc_gen_rust_grpc() -> String {
 /// The path to the `bin` directory containing the C++ binaries this package
 /// builds.
 pub fn bin() -> String {
-    format!("{}/build/bin", env!("OUT_DIR"))
+    PathBuf::from(env!("OUT_DIR"))
+        .join("build")
+        .join("bin")
+        .to_str()
+        .expect("Path contains invalid UTF-8")
+        .to_owned()
 }

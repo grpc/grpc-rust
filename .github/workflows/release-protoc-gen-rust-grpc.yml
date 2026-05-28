@@ -103,7 +103,7 @@ jobs:
             -DBUILD_PROTOC=OFF \
             -DBUILD_PLUGIN=ON \
             -DRUST_GRPC_VERSION="$VERSION_FROM_TAG" \
-            ${{ matrix.cmake_flags }}
+            "${{ matrix.cmake_flags }}"
 
       - name: Build
         shell: bash

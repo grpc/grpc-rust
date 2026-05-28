@@ -51,8 +51,11 @@ $ cargo run --bin grpc-helloworld-client
 
 ### Server
 
+The `grpc` crate currently does not support servers; run the Tonic helloworld
+server instead:
+
 ```bash
-$ cargo run --bin grpc-helloworld-server
+$ cargo run --bin helloworld-server
 ```
 
 ## RouteGuide
@@ -65,8 +68,11 @@ $ cargo run --bin grpc-routeguide-client
 
 ### Server
 
+The `grpc` crate currently does not support servers; run the Tonic routeguide
+server instead:
+
 ```bash
-$ cargo run --bin grpc-routeguide-server
+$ cargo run --bin routeguide-server
 ```
 
 ## Helloworld

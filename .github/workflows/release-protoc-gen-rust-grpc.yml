@@ -3,6 +3,10 @@ name: Release protoc-gen-rust-grpc
 on:
   release:
     types: [published]
+  pull_request:
+    paths:
+      - '.github/workflows/release-protoc-gen-rust-grpc.yml'
+      - 'protoc-gen-rust-grpc/src/cpp_source/**'
 
 permissions:
   contents: write
@@ -10,7 +14,9 @@ permissions:
 jobs:
   publish-protoc-gen-rust-grpc:
     name: Build and attach protoc-gen-rust-grpc binaries
-    if: startsWith(github.event.release.tag_name, 'protoc-gen-rust-grpc')
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'protoc-gen-rust-grpc'))
     runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
@@ -56,7 +62,7 @@ jobs:
           - runs_on: macos-latest
             target: osx-universal_binary
             binary_name: protoc-gen-rust-grpc
-            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES='arm64;x86_64'"
 
           # --- Windows Builds ---
           - runs_on: windows-latest
@@ -90,7 +96,11 @@ jobs:
         run: |
           # Extract version from release tag (e.g. protoc-gen-rust-grpc-v0.9.0 -> 0.9.0)
           VERSION_FROM_TAG="${{ github.event.release.tag_name }}"
-          VERSION_FROM_TAG="${VERSION_FROM_TAG##*protoc-gen-rust-grpc-v}"
+          if [ -z "$VERSION_FROM_TAG" ]; then
+            VERSION_FROM_TAG="test-version"
+          else
+            VERSION_FROM_TAG="${VERSION_FROM_TAG##*protoc-gen-rust-grpc-v}"
+          fi
 
           echo "Building version: $VERSION_FROM_TAG"
 
@@ -125,6 +135,7 @@ jobs:
           7z a ${{ env.ASSET_FILENAME }} bin/
 
       - name: Upload asset to Release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET_FILENAME }}

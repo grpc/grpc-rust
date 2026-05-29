@@ -281,6 +281,7 @@ where
                 UnejectedChannel::Connecting(connecting) => {
                     let state = registry.add_channel(addr.clone());
                     registry.note_uneject(&state);
+                    tracing::debug!("outlier detection: uneject {addr} via reconnect");
                     let _ = self.connecting.add(addr, connecting);
                 }
             }

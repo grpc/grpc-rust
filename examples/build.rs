@@ -58,10 +58,16 @@ fn main() {
     let grpc_routeguide = env::var_os("CARGO_FEATURE_GRPC_ROUTEGUIDE").is_some();
 
     if (grpc_helloworld || grpc_routeguide) && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some() {
-        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+
+        let generated_dir = manifest_dir.join("generated");
+        if generated_dir.exists() {
+            std::fs::remove_dir_all(&generated_dir)
+                .expect("All files in generated/ directory should be deletable");
+        }
 
         grpc_protobuf_build::CodeGen::new()
-            .output_dir(manifest_dir.join("src/grpc-helloworld/generated"))
+            .output_dir(generated_dir.join("helloworld"))
             .input("helloworld.proto")
             .include(manifest_dir.join("proto/helloworld"))
             .client_only()
@@ -69,7 +75,7 @@ fn main() {
             .unwrap();
 
         grpc_protobuf_build::CodeGen::new()
-            .output_dir(manifest_dir.join("src/grpc-routeguide/generated"))
+            .output_dir(generated_dir.join("routeguide"))
             .input("route_guide.proto")
             .include(manifest_dir.join("proto/routeguide"))
             .client_only()

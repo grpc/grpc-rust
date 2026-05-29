@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn quiet_sweep_does_not_rebroadcast_snapshot() {
-        let (registry, mut rx) = make_registry(fp_config(50, 10, 3));
+        let (registry, rx) = make_registry(fp_config(50, 10, 3));
         for port in 8080..=8084 {
             registry.add_channel(addr(port));
         }

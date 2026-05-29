@@ -219,25 +219,28 @@ where
         }
     }
 
-    /// Drain eject requests from the outlier detector's mpsc and
-    /// move each named `ReadyChannel` into [`Self::ejected`]. The
-    /// per-channel ejection flag has already been set by
-    /// `record_outcome`.
+    /// Drain ejected-set snapshots broadcast by the sweep and reconcile
+    /// against [`Self::ready`] / [`Self::ejected`]. For any address the
+    /// sweep marked ejected that we still have in `ready`, move it into
+    /// `ejected` (or un-eject immediately if its deadline already
+    /// passed). Addresses that left the snapshot are echoes of our own
+    /// uneject path — the EjectedChannel timers in `self.ejected` drive
+    /// that side; we don't act on removals here.
     fn poll_eject_requests(&mut self, cx: &mut Context<'_>) {
-        loop {
-            let addr = match self.outlier.poll_eject_request(cx) {
-                Poll::Ready(Some(a)) => a,
-                _ => return,
-            };
-            let registry = self.outlier.registry().clone();
-            // Channel may have been removed by discovery in the
-            // meantime; if so, nothing to eject.
-            let Some(ch) = self.ready.swap_remove(&addr) else {
-                tracing::debug!("outlier detection: eject signal for {addr}, but no longer in ready set; skipping");
+        let snapshot = match self.outlier.poll_ejected_snapshot(cx) {
+            Poll::Ready(Some(s)) => s,
+            _ => return,
+        };
+        let registry = self.outlier.registry().clone();
+        let now = Instant::now();
+        for addr in snapshot.iter() {
+            // Only act on addresses we currently treat as ready; skip
+            // anything already in `ejected` / `connecting` or unknown.
+            let Some(ch) = self.ready.swap_remove(addr) else {
                 continue;
             };
             let state = ch.outlier().clone();
-            match registry.remaining_ejection(&state, Instant::now()) {
+            match registry.remaining_ejection(&state, now) {
                 Some(d) if !d.is_zero() => {
                     let ejected = ch.eject(
                         EjectionConfig {
@@ -248,16 +251,16 @@ where
                         registry.clone(),
                     );
                     tracing::debug!("outlier detection: eject {addr} for {d:?}");
-                    let _ = self.ejected.add(addr, ejected);
+                    let _ = self.ejected.add(addr.clone(), ejected);
                 }
                 Some(_) => {
                     // Deadline already past — un-eject.
                     registry.note_uneject(&state);
-                    self.ready.insert(addr, ch);
+                    self.ready.insert(addr.clone(), ch);
                 }
                 None => {
-                    // No longer ejected (raced with un-eject).
-                    self.ready.insert(addr, ch);
+                    // No longer ejected (raced with our own uneject).
+                    self.ready.insert(addr.clone(), ch);
                 }
             }
         }

@@ -3,20 +3,22 @@
 //! Work is split across three sites:
 //!
 //! - **Data path** ([`OutlierStatsRegistry::record_outcome`]): runs
-//!   inline per RPC. Updates per-channel counters, applies the
-//!   failure-percentage gate, and on transition to ejected sends the
-//!   address through an mpsc channel.
-//! - **Load balancer**: drains the eject mpsc in `poll_ready`,
-//!   consumes the matching [`ReadyChannel`] via
-//!   [`ReadyChannel::eject`], and tracks the resulting
-//!   [`EjectedChannel`] in a `KeyedFutures`. Each ejected channel's
-//!   sleep fires at `base × multiplier` (capped by
+//!   inline per RPC. Updates per-channel counters only; ejection
+//!   decisions are deferred to the sweep.
+//! - **Load balancer**: drains the ejected-set snapshot broadcast by
+//!   the sweep on a `watch` channel, consumes the matching
+//!   [`ReadyChannel`] via [`ReadyChannel::eject`], and tracks the
+//!   resulting [`EjectedChannel`] in a `KeyedFutures`. Each ejected
+//!   channel's sleep fires at `base × multiplier` (capped by
 //!   `max_ejection_time`); the LB then routes the resolved
 //!   [`UnejectedChannel`] back into the ready set.
 //! - **Housekeeping actor** ([`spawn_actor`]): on each
-//!   `config.interval` tick, resets counters and decrements
-//!   multipliers for non-ejected channels. The actor never ejects or
-//!   un-ejects.
+//!   `config.interval` tick, runs the failure-percentage algorithm
+//!   over a snapshot of counters, ejects qualifying channels, resets
+//!   counters, and decrements multipliers for non-ejected channels.
+//!   When the ejected-set membership changes, broadcasts a fresh
+//!   snapshot on the `watch` channel; quiet ticks skip the broadcast
+//!   via an O(1) version compare.
 //!
 //! Only the failure-percentage algorithm is implemented; success-rate
 //! (cross-endpoint mean/stdev) is left to a follow-up.
@@ -27,6 +29,8 @@
 //! [`EjectedChannel`]: crate::client::loadbalance::channel_state::EjectedChannel
 //! [`UnejectedChannel`]: crate::client::loadbalance::channel_state::UnejectedChannel
 
+use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -34,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use crate::client::endpoint::EndpointAddress;
 use crate::client::loadbalance::channel_state::OutlierChannelState;
@@ -52,30 +56,45 @@ pub(crate) struct OutlierStatsRegistry {
     /// ejection; decremented by [`Self::note_uneject`] and
     /// [`Self::remove_channel`].
     ejected_count: AtomicU64,
+    /// Monotonic counter bumped every time the ejected-channel set's
+    /// membership changes (sweep ejects, LB unejects, removed entry
+    /// was ejected). Lets the sweep skip recomputing+broadcasting the
+    /// snapshot on quiet ticks via an O(1) compare against
+    /// [`Self::last_broadcast_version`].
+    ejected_set_version: AtomicU64,
+    /// The version that was last broadcast on
+    /// [`Self::ejected_snapshot_tx`]. Single-writer (the sweep), so
+    /// `Relaxed` is enough.
+    last_broadcast_version: AtomicU64,
     /// Shared config, hot-swappable. Readers `.load()` per call;
     /// future xDS integration `.store()`s new configs on cluster
     /// updates. `interval` changes also require an actor restart —
     /// see [`spawn_actor`].
     config: Arc<ArcSwap<OutlierDetectionConfig>>,
-    /// Sender half of the eject signal. The receiver is paired
-    /// off and handed to the LB at construction (see [`Self::new`]).
-    eject_tx: mpsc::UnboundedSender<EndpointAddress>,
+    /// Broadcasts the snapshot of currently-ejected addresses at the
+    /// end of each sweep that mutated the set. The LB's
+    /// [`OutlierDetector`] holds the matching `watch::Receiver` and
+    /// diffs against its own `ejected` map. Wrapped in `Arc` so each
+    /// receiver clone is cheap regardless of cluster size.
+    ejected_snapshot_tx: watch::Sender<Arc<HashSet<EndpointAddress>>>,
 }
 
 impl OutlierStatsRegistry {
-    /// Construct the registry and the paired eject-signal receiver.
+    /// Construct the registry and the paired snapshot receiver.
     /// The LB owns the receiver; the registry owns the sender.
     pub(crate) fn new(
         config: Arc<ArcSwap<OutlierDetectionConfig>>,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<EndpointAddress>) {
-        let (eject_tx, eject_rx) = mpsc::unbounded_channel();
+    ) -> (Arc<Self>, watch::Receiver<Arc<HashSet<EndpointAddress>>>) {
+        let (tx, rx) = watch::channel(Arc::new(HashSet::new()));
         let registry = Arc::new(Self {
             channels: DashMap::new(),
             ejected_count: AtomicU64::new(0),
+            ejected_set_version: AtomicU64::new(0),
+            last_broadcast_version: AtomicU64::new(0),
             config,
-            eject_tx,
+            ejected_snapshot_tx: tx,
         });
-        (registry, eject_rx)
+        (registry, rx)
     }
 
     /// Get or create the state for `addr`. Idempotent — existing
@@ -94,6 +113,7 @@ impl OutlierStatsRegistry {
             && state.is_ejected()
         {
             self.ejected_count.fetch_sub(1, Ordering::Relaxed);
+            self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -120,6 +140,7 @@ impl OutlierStatsRegistry {
     pub(crate) fn note_uneject(&self, state: &OutlierChannelState) -> bool {
         if state.try_uneject() {
             self.ejected_count.fetch_sub(1, Ordering::Relaxed);
+            self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
             state.decrement_multiplier();
             true
         } else {
@@ -154,9 +175,14 @@ impl OutlierStatsRegistry {
     /// 2. Run the failure-percentage algorithm against the snapshot:
     ///    apply `minimum_hosts` to the qualifying population, then
     ///    `max_ejection_percent`, then per-channel threshold and the
-    ///    enforcement roll. Dispatch eject signals through the mpsc.
+    ///    enforcement roll.
     /// 3. Reset counters and decrement multipliers for non-ejected
     ///    channels.
+    /// 4. If the ejected-set version changed (sweep ejected at least
+    ///    one channel, or the LB unejected between ticks), rebuild
+    ///    the snapshot of ejected addresses and broadcast it on the
+    ///    `watch` channel. Quiet ticks skip the rebuild via an O(1)
+    ///    version compare.
     ///
     /// Un-ejection is *not* driven from here — each `EjectedChannel`
     /// owns its own `Sleep` timer.
@@ -201,9 +227,7 @@ impl OutlierStatsRegistry {
                     }
                     if state.try_eject(now) {
                         self.ejected_count.fetch_add(1, Ordering::Relaxed);
-                        // Send failure (LB receiver dropped during
-                        // shutdown) is ignored.
-                        let _ = self.eject_tx.send(state.addr().clone());
+                        self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -214,6 +238,24 @@ impl OutlierStatsRegistry {
             if !state.is_ejected() {
                 state.decrement_multiplier();
             }
+        }
+
+        // Broadcast the ejected-set snapshot, but only if something
+        // changed since the last broadcast. Single writer (this task),
+        // so `Relaxed` on `last_broadcast_version` is sound.
+        let current = self.ejected_set_version.load(Ordering::Relaxed);
+        if current != self.last_broadcast_version.load(Ordering::Relaxed) {
+            let snapshot: HashSet<EndpointAddress> = self
+                .channels
+                .iter()
+                .filter(|e| e.value().is_ejected())
+                .map(|e| e.key().clone())
+                .collect();
+            // Send failure (no receivers) is fine — the LB is being
+            // torn down.
+            let _ = self.ejected_snapshot_tx.send(Arc::new(snapshot));
+            self.last_broadcast_version
+                .store(current, Ordering::Relaxed);
         }
     }
 
@@ -249,26 +291,30 @@ pub(crate) fn spawn_actor(registry: Arc<OutlierStatsRegistry>) -> AbortOnDrop {
     AbortOnDrop(task)
 }
 
-/// Per-LB outlier-detection plumbing: shared registry, eject-signal
+/// Per-LB outlier-detection plumbing: shared registry, snapshot
 /// receiver, and (when enabled) the housekeeping actor handle
 /// (aborted on drop). The LB always owns one of these; the actor is
 /// conditional on the config being enabled at construction.
 pub(crate) struct OutlierDetector {
     registry: Arc<OutlierStatsRegistry>,
-    eject_rx: mpsc::UnboundedReceiver<EndpointAddress>,
+    /// Stream of ejected-address snapshots, broadcast by the sweep
+    /// whenever its set changes. `WatchStream::poll_next` yields the
+    /// current value on first poll, then yields the new value on each
+    /// subsequent change.
+    ejected_snapshot_stream: tokio_stream::wrappers::WatchStream<Arc<HashSet<EndpointAddress>>>,
     /// `None` while config is disabled — `record_outcome` short-
-    /// circuits and the data path never sends through `eject_tx`, so
-    /// nothing reads or writes outlier state.
+    /// circuits and the sweep doesn't run, so nothing ever writes
+    /// to the snapshot channel.
     _actor: Option<AbortOnDrop>,
 }
 
 impl OutlierDetector {
-    /// Pair the registry with the eject-signal receiver and (if the
+    /// Pair the registry with the snapshot receiver and (if the
     /// config currently has an algorithm enabled) spawn the
     /// housekeeping actor.
     pub(crate) fn new(
         registry: Arc<OutlierStatsRegistry>,
-        eject_rx: mpsc::UnboundedReceiver<EndpointAddress>,
+        ejected_snapshot_rx: watch::Receiver<Arc<HashSet<EndpointAddress>>>,
     ) -> Self {
         let _actor = registry
             .config
@@ -277,7 +323,7 @@ impl OutlierDetector {
             .then(|| spawn_actor(registry.clone()));
         Self {
             registry,
-            eject_rx,
+            ejected_snapshot_stream: tokio_stream::wrappers::WatchStream::new(ejected_snapshot_rx),
             _actor,
         }
     }
@@ -287,12 +333,16 @@ impl OutlierDetector {
         &self.registry
     }
 
-    /// Poll for the next address the data path has decided to eject.
-    pub(crate) fn poll_eject_request(
+    /// Poll for the next ejected-set snapshot. `Poll::Ready(Some(_))`
+    /// when the sweep broadcasts a new set (or on the first poll, with
+    /// the initial empty set). `Poll::Ready(None)` when the sender has
+    /// been dropped — i.e. the registry is being torn down.
+    pub(crate) fn poll_ejected_snapshot(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<EndpointAddress>> {
-        self.eject_rx.poll_recv(cx)
+    ) -> Poll<Option<Arc<HashSet<EndpointAddress>>>> {
+        use futures_util::Stream;
+        Pin::new(&mut self.ejected_snapshot_stream).poll_next(cx)
     }
 }
 
@@ -330,7 +380,7 @@ mod tests {
         config: OutlierDetectionConfig,
     ) -> (
         Arc<OutlierStatsRegistry>,
-        mpsc::UnboundedReceiver<EndpointAddress>,
+        watch::Receiver<Arc<HashSet<EndpointAddress>>>,
     ) {
         OutlierStatsRegistry::new(Arc::new(ArcSwap::from_pointee(config)))
     }
@@ -546,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn ejection_dispatches_address_through_mpsc() {
+    fn ejection_broadcasts_via_snapshot_watch() {
         let (registry, mut rx) = make_registry(fp_config(50, 10, 3));
         let bad = registry.add_channel(addr(8084));
         for port in 8080..=8083 {
@@ -556,12 +606,25 @@ mod tests {
         drive(&registry, &bad, 10, 90);
         registry.run_housekeeping();
 
-        // Eject dispatched exactly once via the mpsc.
-        assert_eq!(rx.try_recv(), Ok(addr(8084)));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        // The snapshot contains exactly the ejected address.
+        rx.mark_changed();
+        let snapshot = rx.borrow_and_update().clone();
+        assert!(snapshot.contains(&addr(8084)));
+        assert_eq!(snapshot.len(), 1);
+    }
+
+    #[test]
+    fn quiet_sweep_does_not_rebroadcast_snapshot() {
+        let (registry, mut rx) = make_registry(fp_config(50, 10, 3));
+        for port in 8080..=8084 {
+            registry.add_channel(addr(port));
+        }
+        // First sweep with no qualifying traffic ⇒ no eject ⇒ no broadcast.
+        registry.run_housekeeping();
+        assert!(
+            !rx.has_changed().unwrap(),
+            "expected no broadcast on a sweep with no ejection-set changes"
+        );
     }
 
     // ----- Housekeeping -----

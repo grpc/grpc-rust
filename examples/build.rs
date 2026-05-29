@@ -51,7 +51,8 @@ fn main() {
 
         let generated_dir = manifest_dir.join("generated");
         if generated_dir.exists() {
-            std::fs::remove_dir_all(&generated_dir).unwrap();
+            std::fs::remove_dir_all(&generated_dir)
+                .expect("All files in generated/ directory should be deletable");
         }
 
         grpc_protobuf_build::CodeGen::new()

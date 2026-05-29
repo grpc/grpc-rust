@@ -50,6 +50,5 @@ pub fn protoc_gen_rust_grpc() -> PathBuf {
 /// The path to the `bin` directory containing the C++ binaries this package
 /// builds.
 pub fn bin() -> PathBuf {
-    PathBuf::from(env!("OUT_DIR"))
-        .join("bin")
+    PathBuf::from(env!("OUT_DIR")).join("bin")
 }

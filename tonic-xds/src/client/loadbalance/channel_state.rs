@@ -210,10 +210,7 @@ pub(crate) enum UnejectedChannel<S> {
     /// Cooldown elapsed; the original connection is reused with its
     /// outlier state reattached.
     Ready(ReadyChannel<S>),
-    /// A fresh connection has been started. The LB looks the
-    /// existing outlier state back up via the registry to call
-    /// `note_uneject` — `add_channel` is idempotent, so no Arc needs
-    /// to ride along on the variant.
+    /// A fresh connection has been started.
     Connecting(ConnectingChannel<S>),
 }
 

@@ -233,6 +233,7 @@ where
             // Channel may have been removed by discovery in the
             // meantime; if so, nothing to eject.
             let Some(ch) = self.ready.swap_remove(&addr) else {
+                tracing::debug!("outlier detection: eject signal for {addr}, but no longer in ready set; skipping");
                 continue;
             };
             let state = ch.outlier().clone();

@@ -29,32 +29,27 @@
 
 use std::path::PathBuf;
 
-fn bin_file(file: &str) -> String {
-    let mut path = PathBuf::from(bin()).join(file);
+fn bin_file(file: &str) -> PathBuf {
+    let mut path = bin().join(file);
     if cfg!(target_os = "windows") {
         path.set_extension("exe");
     }
-    path.to_str()
-        .expect("Path contains invalid UTF-8")
-        .to_owned()
+    path
 }
 
 /// The full path to the `protoc` executable.
-pub fn protoc() -> String {
+pub fn protoc() -> PathBuf {
     bin_file("protoc")
 }
 
 /// The full path to the gRPC `protoc` plugin, `protoc-gen-rust-grpc`.
-pub fn protoc_gen_rust_grpc() -> String {
+pub fn protoc_gen_rust_grpc() -> PathBuf {
     bin_file("protoc-gen-rust-grpc")
 }
 
 /// The path to the `bin` directory containing the C++ binaries this package
 /// builds.
-pub fn bin() -> String {
+pub fn bin() -> PathBuf {
     PathBuf::from(env!("OUT_DIR"))
         .join("bin")
-        .to_str()
-        .expect("Path contains invalid UTF-8")
-        .to_owned()
 }

@@ -37,7 +37,8 @@ downloaded from [our releases].
 Alternatively, you can also set the `grpc-protobuf-build/build-plugin` feature
 flag when building via `cargo` using the `--features` flag.  In this case you
 will need a compatible C++ compiler and CMake as described in the
-`protoc-gen-rust-grpc` crate.
+`protoc-gen-rust-grpc` crate. When using this approach, you can also set the
+`protoc-gen-rust-grpc` feature to use the same protoc for the prost examples.
 
 [our releases]: https://github.com/grpc/grpc-rust/releases
 

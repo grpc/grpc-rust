@@ -126,6 +126,11 @@ if(BUILD_PROTOC)
     install(PROGRAMS ${CMAKE_BINARY_DIR}/bin/${PROTOC_OUTPUT_NAME}
         DESTINATION bin
     )
+
+    install(DIRECTORY ${protobuf_SOURCE_DIR}/src/google/protobuf/
+        DESTINATION include/google/protobuf
+        FILES_MATCHING PATTERN "*.proto"
+    )
 endif()
 
 # Print summary

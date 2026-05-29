@@ -2,6 +2,13 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Optionally use protoc-gen-rust-grpc's protoc for prost
+    #[cfg(feature = "protoc-gen-rust-grpc")]
+    unsafe {
+        env::set_var("PROTOC", protoc_gen_rust_grpc::protoc());
+    }
+
     tonic_prost_build::configure()
         .compile_protos(&["proto/routeguide/route_guide.proto"], &["proto"])
         .unwrap();

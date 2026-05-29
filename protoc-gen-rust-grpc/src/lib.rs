@@ -53,7 +53,6 @@ pub fn protoc_gen_rust_grpc() -> String {
 /// builds.
 pub fn bin() -> String {
     PathBuf::from(env!("OUT_DIR"))
-        .join("build")
         .join("bin")
         .to_str()
         .expect("Path contains invalid UTF-8")

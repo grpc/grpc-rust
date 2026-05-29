@@ -71,8 +71,8 @@ impl EndpointCounters {
 }
 
 /// Per-channel outlier-detection state, shared via `Arc` between the
-/// data path (per-RPC outcome recording + threshold-based ejection),
-/// the housekeeping actor, and the load balancer.
+/// data path (per-RPC outcome recording + threshold-based ejection)
+/// and the housekeeping actor.
 ///
 /// Ejection state is encoded in [`Self::ejected_at_nanos`]: zero means
 /// not ejected, non-zero is the nanos-since-epoch of the ejection's

@@ -8,10 +8,11 @@
 //! which is always present. The actor inside is conditionally spawned
 //! based on the [`OutlierDetectionConfig`] passed at construction —
 //! `OutlierDetectionConfig::default()` is the disabled config, in
-//! which case `record_outcome` short-circuits and no eject signals
-//! ever fire. Eject requests arrive on an mpsc channel from the data
-//! path; the LB consumes the matching [`ReadyChannel`] via
-//! [`ReadyChannel::eject`] and tracks the resulting
+//! which case the sweep never runs and no ejections fire. When
+//! enabled, the sweep broadcasts the current ejected-address set on a
+//! `watch` channel each time the set changes; the LB consumes the
+//! latest snapshot, consumes the matching [`ReadyChannel`] via
+//! [`ReadyChannel::eject`], and tracks the resulting
 //! [`EjectedChannel`] in [`Self::ejected`]. When the timer fires, the
 //! resolved [`UnejectedChannel`] is routed back into `ready` or
 //! `connecting`.

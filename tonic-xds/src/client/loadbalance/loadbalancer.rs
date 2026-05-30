@@ -17,8 +17,9 @@
 //! `connecting`.
 //!
 //! TODO: wire dynamic outlier-detection config updates from xDS
-//! (`ArcSwap::store` on the config + actor restart on `interval`
-//! changes + A50 §7 disable transition handling). To land in a
+//! (`ArcSwap::store` on the config + A50 §7 disable transition
+//! handling). The actor will pick up new configs by reading the
+//! `ArcSwap` on each tick — no restart needed. To land in a
 //! follow-up PR.
 //!
 //! [`EjectedChannel`]: crate::client::loadbalance::channel_state::EjectedChannel

@@ -35,4 +35,5 @@ pub enum LbPolicyType {
     #[default]
     PickFirst,
     RoundRobin,
+    LeastRequest,
 }

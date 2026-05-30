@@ -251,6 +251,11 @@ impl OutlierStatsRegistry {
                 .filter(|e| e.value().is_ejected())
                 .map(|e| e.key().clone())
                 .collect();
+            tracing::debug!(
+                version = current,
+                ejected = snapshot.len(),
+                "outlier detection: broadcasting ejected-set snapshot {snapshot:?}",
+            );
             // Send failure (no receivers) is fine — the LB is being
             // torn down.
             let _ = self.ejected_snapshot_tx.send(Arc::new(snapshot));

@@ -116,6 +116,17 @@ impl OutlierChannelState {
         self.counters.record_failure();
     }
 
+    /// Per-RPC entry point. Bumps the success or failure counter
+    /// depending on the RPC's outcome. Ejection decisions are deferred
+    /// to the next sweep (gRFC A50 §6).
+    pub(crate) fn record_outcome(&self, success: bool) {
+        if success {
+            self.record_success();
+        } else {
+            self.record_failure();
+        }
+    }
+
     /// Returns `(success, failure)` without resetting. The two reads
     /// are not atomic together; bias is bounded by in-flight RPCs.
     pub(crate) fn counters(&self) -> (u64, u64) {
@@ -315,6 +326,14 @@ impl<S> ReadyChannel<S> {
     /// Per-channel outlier-detection state. Cloned cheaply via `Arc`.
     pub(crate) fn outlier(&self) -> &Arc<OutlierChannelState> {
         &self.outlier
+    }
+
+    /// Record the outcome of an RPC handled by this channel on the
+    /// attached outlier-detection state. The data path calls this on
+    /// every completed RPC; ejection decisions happen at the next
+    /// sweep (gRFC A50 §6).
+    pub(crate) fn record_outcome(&self, success: bool) {
+        self.outlier.record_outcome(success);
     }
 
     /// Eject this channel. Consumes self; the outlier state is moved

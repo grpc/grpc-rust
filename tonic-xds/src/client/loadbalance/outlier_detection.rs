@@ -2,9 +2,9 @@
 //!
 //! Work is split across three sites:
 //!
-//! - **Data path** ([`OutlierStatsRegistry::record_outcome`]): runs
-//!   inline per RPC. Updates per-channel counters only; ejection
-//!   decisions are deferred to the sweep.
+//! - **Data path** ([`ReadyChannel::record_outcome`]): runs inline per
+//!   RPC. Updates per-channel counters only; ejection decisions are
+//!   deferred to the sweep.
 //! - **Load balancer**: drains the ejected-set snapshot broadcast by
 //!   the sweep on a `watch` channel, consumes the matching
 //!   [`ReadyChannel`] via [`ReadyChannel::eject`], and tracks the
@@ -45,9 +45,8 @@ use crate::client::loadbalance::channel_state::OutlierChannelState;
 use crate::common::async_util::AbortOnDrop;
 use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 
-/// Shared outlier-detection state, owned by `Arc` and accessed
-/// concurrently by the data path ([`Self::record_outcome`]), the
-/// housekeeping actor ([`Self::run_housekeeping`]), and the load
+/// Shared outlier-detection state, owned by `Arc` and accessed by
+/// the housekeeping actor ([`Self::run_housekeeping`]) and the load
 /// balancer ([`Self::note_uneject`], [`Self::remaining_ejection`]).
 pub(crate) struct OutlierStatsRegistry {
     channels: DashMap<EndpointAddress, Arc<OutlierChannelState>>,
@@ -120,17 +119,6 @@ impl OutlierStatsRegistry {
     /// Number of registered channels.
     pub(crate) fn len(&self) -> usize {
         self.channels.len()
-    }
-
-    /// Per-RPC entry point. Records the outcome on the channel's
-    /// counter. Ejection decisions are deferred to the next sweep
-    /// (gRFC A50 §6) — see [`Self::run_housekeeping`].
-    pub(crate) fn record_outcome(&self, state: &OutlierChannelState, success: bool) {
-        if success {
-            state.record_success();
-        } else {
-            state.record_failure();
-        }
     }
 
     /// Clear the ejection: flip the state, decrement
@@ -428,17 +416,12 @@ mod tests {
     }
 
     /// Drive `n` outcomes through `record_outcome` for one channel.
-    fn drive(
-        registry: &OutlierStatsRegistry,
-        state: &OutlierChannelState,
-        successes: u64,
-        failures: u64,
-    ) {
+    fn drive(state: &OutlierChannelState, successes: u64, failures: u64) {
         for _ in 0..successes {
-            registry.record_outcome(state, true);
+            state.record_outcome(true);
         }
         for _ in 0..failures {
-            registry.record_outcome(state, false);
+            state.record_outcome(false);
         }
     }
 
@@ -450,9 +433,9 @@ mod tests {
         let bad = registry.add_channel(addr(8084));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 100, 0);
+            drive(&s, 100, 0);
         }
-        drive(&registry, &bad, 10, 90);
+        drive(&bad, 10, 90);
         // Per A50 the algorithm runs at the interval sweep, not per RPC.
         assert!(!bad.is_ejected());
         registry.run_housekeeping();
@@ -467,7 +450,7 @@ mod tests {
         for port in 8080..=8084 {
             let s = registry.add_channel(addr(port));
             // 30% failure → below 50% threshold.
-            drive(&registry, &s, 70, 30);
+            drive(&s, 70, 30);
             all.push(s);
         }
         registry.run_housekeeping();
@@ -483,7 +466,7 @@ mod tests {
         let mut all = vec![];
         for port in 8080..=8084 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 50, 50);
+            drive(&s, 50, 50);
             all.push(s);
         }
         registry.run_housekeeping();
@@ -499,7 +482,7 @@ mod tests {
         let mut all = vec![];
         for port in 8080..=8081 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 0, 100);
+            drive(&s, 0, 100);
             all.push(s);
         }
         registry.run_housekeeping();
@@ -512,10 +495,10 @@ mod tests {
     fn request_volume_filters_low_traffic() {
         let registry = make_registry_only(fp_config(50, 100, 3));
         let bad = registry.add_channel(addr(8080));
-        drive(&registry, &bad, 0, 5);
+        drive(&bad, 0, 5);
         for port in 8081..=8084 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 200, 0);
+            drive(&s, 200, 0);
         }
         registry.run_housekeeping();
         assert!(!bad.is_ejected());
@@ -533,7 +516,7 @@ mod tests {
         let mut all = vec![];
         for port in 8080..=8084 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 0, 100);
+            drive(&s, 0, 100);
             all.push(s);
         }
         registry.run_housekeeping();
@@ -555,7 +538,7 @@ mod tests {
         }
         // Drive all hosts to bad state.
         for s in &all {
-            drive(&registry, s, 0, 100);
+            drive(s, 0, 100);
         }
         registry.run_housekeeping();
 
@@ -579,7 +562,7 @@ mod tests {
             all.push(s);
         }
         for s in &all {
-            drive(&registry, s, 0, 100);
+            drive(s, 0, 100);
         }
         registry.run_housekeeping();
 
@@ -593,11 +576,11 @@ mod tests {
         let mut all = vec![];
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 100, 0);
+            drive(&s, 100, 0);
             all.push(s);
         }
         let bad = registry.add_channel(addr(8084));
-        drive(&registry, &bad, 0, 100);
+        drive(&bad, 0, 100);
         registry.run_housekeeping();
         assert!(bad.is_ejected());
         assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 1);
@@ -612,9 +595,9 @@ mod tests {
         let bad = registry.add_channel(addr(8084));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 100, 0);
+            drive(&s, 100, 0);
         }
-        drive(&registry, &bad, 10, 90);
+        drive(&bad, 10, 90);
         registry.run_housekeeping();
 
         // The snapshot contains exactly the ejected address.
@@ -645,7 +628,7 @@ mod tests {
         let registry = make_registry_only(fp_config(50, 10, 3));
         for port in 8080..=8083 {
             let s = registry.add_channel(addr(port));
-            drive(&registry, &s, 100, 0);
+            drive(&s, 100, 0);
         }
 
         registry.run_housekeeping();

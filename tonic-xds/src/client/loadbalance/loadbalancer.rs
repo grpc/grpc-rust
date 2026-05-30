@@ -348,14 +348,13 @@ where
         // Cheap clones (all Arc-shared internals) so the async block
         // can take ownership without holding the picker borrow.
         let mut svc = picked.clone();
-        let outlier_state = picked.outlier().clone();
-        let registry = self.outlier.registry().clone();
+        let recorder = picked.clone();
         LbFuture::Pending(Box::pin(async move {
             tower::ServiceExt::ready(&mut svc)
                 .await
                 .map_err(|e| LbError::LbChannelPollReadyError(e.into()))?;
             let result = svc.call(req).await;
-            registry.record_outcome(&outlier_state, result.is_ok());
+            recorder.record_outcome(result.is_ok());
             result.map_err(|e| LbError::LbChannelCallError(e.into()))
         }))
     }

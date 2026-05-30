@@ -188,6 +188,12 @@ impl OutlierStatsRegistry {
     /// owns its own `Sleep` timer.
     pub(crate) fn run_housekeeping(&self) {
         let config = self.config.load();
+        tracing::debug!(
+            channels = self.channels.len(),
+            ejected = self.ejected_count.load(Ordering::Relaxed),
+            "outlier detection: sweep tick with config {:?}",
+            **config,
+        );
         let snapshots: Vec<(Arc<OutlierChannelState>, u64, u64)> = self
             .channels
             .iter()

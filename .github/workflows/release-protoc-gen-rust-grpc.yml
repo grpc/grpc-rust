@@ -1,5 +1,23 @@
 name: Release protoc-gen-rust-grpc
 
+# Workflow explanation:
+#
+# This workflow consists of four steps:
+#
+# 1. detect-changes: determines if plugin files were modified (for PR testing)
+#    or if it's running as the result of a plugin release.  Passes that
+#    determination to the following steps as detect-changes.outputs.should_run.
+#
+# 2. build-plugin: (if should_run) builds the plugin for every platform.
+#    Uploads built artifacts if releasing.
+#
+# 3. publish-plugin: (if build-plugin && releasing) publishes plugin artifacts
+#    from above.
+#
+# 4. build-status: (PRs only) passes if the plugin either built correctly OR if
+#    the build was skipped.  Runs even when should_run is false.  This is
+#    required to be passing for branch protection rules.
+
 on:
   release:
     types: [published]
@@ -9,6 +27,8 @@ permissions:
   contents: write
 
 jobs:
+  # Determines whether the plugin needs to be built (i.e. a plugin release is
+  # happening or a PR changed this file or a source file of the plugin).
   detect-changes:
     name: Detect changes
     runs-on: ubuntu-latest
@@ -47,8 +67,9 @@ jobs:
             echo "should_run=$FILTER_SHOULD_RUN" >> "$GITHUB_OUTPUT"
           fi
 
-  publish-protoc-gen-rust-grpc:
-    name: Build and attach protoc-gen-rust-grpc binaries
+  # Matrix-builds the plugin for Linux, macOS, and Windows targets, saving them as run artifacts.
+  build-plugin:
+    name: Build plugin binaries
     needs: detect-changes
     if: needs.detect-changes.outputs.should_run == 'true'
     runs-on: ${{ matrix.runs_on }}
@@ -168,10 +189,67 @@ jobs:
           cp build/bin/Release/${{ matrix.binary_name }} bin/ || cp build/bin/${{ matrix.binary_name }} bin/
           7z a ${{ env.ASSET_FILENAME }} bin/
 
-      - name: Upload asset to Release
+      - name: Upload build artifact
         if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_FILENAME }}
+          path: ${{ env.ASSET_FILENAME }}
+          retention-days: 1
+
+  # Downloads all built matrix artifacts and publishes them to the Github release.
+  publish-plugin:
+    name: Publish plugin binaries
+    needs: [detect-changes, build-plugin]
+    if: needs.detect-changes.outputs.should_run == 'true' && github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+
+      - name: Flatten artifacts directory
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -name "*.zip" -exec cp {} release_assets/ \;
+          echo "Release assets to upload:"
+          ls -la release_assets/
+
+      - name: Upload assets to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET_FILENAME }}
+          files: release_assets/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Required status check for PR presubmits (branch protection).
+  build-status:
+    name: plugin build status
+    needs: [detect-changes, build-plugin]
+    # `always()` is needed to prevent this from skipping if a "needs" dependency
+    # didn't run.
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check build status
+        run: |
+          DETECT_RESULT="${{ needs.detect-changes.result }}"
+          BUILD_RESULT="${{ needs.build-plugin.result }}"
+
+          echo "Detect changes result: $DETECT_RESULT"
+          echo "Build result: $BUILD_RESULT"
+
+          if [ "$DETECT_RESULT" != "success" ]; then
+            echo "Detect changes job failed."
+            exit 1
+          fi
+
+          if [ "$BUILD_RESULT" = "success" ] || [ "$BUILD_RESULT" = "skipped" ]; then
+            echo "All checks passed."
+            exit 0
+          else
+            echo "Build job failed or was cancelled."
+            exit 1
+          fi

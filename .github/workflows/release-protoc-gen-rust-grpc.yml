@@ -4,19 +4,53 @@ on:
   release:
     types: [published]
   pull_request:
-    paths:
-      - '.github/workflows/release-protoc-gen-rust-grpc.yml'
-      - 'protoc-gen-rust-grpc/src/cpp_source/**'
 
 permissions:
   contents: write
 
 jobs:
+  detect-changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.determine.outputs.should_run }}
+    steps:
+      - name: Checkout repository
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v6
+
+      - name: Check for path changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            should_run:
+              - '.github/workflows/release-protoc-gen-rust-grpc.yml'
+              - 'protoc-gen-rust-grpc/src/cpp_source/**'
+
+      - name: Determine if workflow should run
+        id: determine
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          FILTER_SHOULD_RUN: ${{ steps.filter.outputs.should_run }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            if [[ "$TAG_NAME" == protoc-gen-rust-grpc* ]]; then
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "should_run=$FILTER_SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          fi
+
   publish-protoc-gen-rust-grpc:
     name: Build and attach protoc-gen-rust-grpc binaries
-    if: |
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'protoc-gen-rust-grpc'))
+    needs: detect-changes
+    if: needs.detect-changes.outputs.should_run == 'true'
     runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false

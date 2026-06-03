@@ -277,6 +277,10 @@ impl Subchannel for InternalSubchannel {
         self.address.clone()
     }
 
+    fn get_attribute_dyn(&self, _id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     fn connect(&self) {
         begin_connecting_if_idle(self.data.clone());
     }

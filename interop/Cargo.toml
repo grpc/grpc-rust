@@ -38,4 +38,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [build-dependencies]
 tonic-prost-build = {path = "../tonic-prost-build"}
-grpc-protobuf-build = {path = "../grpc-protobuf-build"}
+grpc-protobuf-build = {path = "../grpc-protobuf-build", default-features = false}

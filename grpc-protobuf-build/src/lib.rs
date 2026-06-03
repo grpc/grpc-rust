@@ -22,24 +22,21 @@
  *
  */
 
+/// Library providing build integration for the gRPC protobuf compiler.
+///
+/// ## Usage Information
+///
+/// Please see [our website] for everything you should need to get started using
+/// gRPC!
+///
+/// [our website]: https://grpc.io/docs/languages/rust
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use syn::parse_file;
-
-pub fn protoc() -> String {
-    format!("{}/bin/protoc", env!("OUT_DIR"))
-}
-
-pub fn protoc_gen_rust_grpc() -> String {
-    format!("{}/bin/protoc-gen-rust-grpc", env!("OUT_DIR"))
-}
-
-pub fn bin() -> String {
-    format!("{}/bin", env!("OUT_DIR"))
-}
 
 /// Details about a crate containing proto files with symbols referenced in
 /// the file being compiled currently.
@@ -113,6 +110,27 @@ impl From<&Dependency> for protobuf_codegen::Dependency {
     }
 }
 
+fn check_runnable(binary: &Path) -> Result<(), String> {
+    let out = Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Binary '{}' failed to execute: {e}", binary.display()))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Err(format!(
+            "Binary '{}' is not runnable. Status: {}. Stdout: {}. Stderr: {}",
+            binary.display(),
+            out.status,
+            stdout.trim(),
+            stderr.trim()
+        ))
+    }
+}
+
 /// Service generator builder.
 #[derive(Debug, Clone)]
 pub struct CodeGen {
@@ -125,6 +143,7 @@ pub struct CodeGen {
     generate_message_code: bool,
     should_format_code: bool,
     client_only: bool,
+    prebuilt_binaries: Option<(PathBuf, PathBuf)>,
 }
 
 impl CodeGen {
@@ -140,11 +159,22 @@ impl CodeGen {
             generate_message_code: true,
             should_format_code: true,
             client_only: false,
+            prebuilt_binaries: None,
         }
     }
 
     pub fn client_only(&mut self) -> &mut Self {
         self.client_only = true;
+        self
+    }
+
+    /// Sets explicit paths to the `protoc` and `protoc-gen-rust-grpc` plugin binaries.
+    pub fn prebuilt_binaries(
+        &mut self,
+        protoc: impl Into<PathBuf>,
+        plugin: impl Into<PathBuf>,
+    ) -> &mut Self {
+        self.prebuilt_binaries = Some((protoc.into(), plugin.into()));
         self
     }
 
@@ -214,10 +244,78 @@ impl CodeGen {
         self
     }
 
+    fn resolve_binaries(&self) -> Result<(PathBuf, PathBuf), String> {
+        let (protoc, plugin) = self.resolve_binaries_impl()?;
+        check_runnable(&protoc)?;
+        check_runnable(&plugin)?;
+        Ok((protoc, plugin))
+    }
+
+    fn resolve_binaries_impl(&self) -> Result<(PathBuf, PathBuf), String> {
+        // 1. Explicit configuration
+        if let Some((protoc, plugin)) = &self.prebuilt_binaries {
+            return Ok((protoc.clone(), plugin.clone()));
+        }
+
+        // 2. Compiled via protoc-gen-rust-grpc (build-plugin feature)
+        #[cfg(feature = "build-plugin")]
+        {
+            let compiled_protoc = protoc_gen_rust_grpc::protoc();
+            let compiled_plugin = protoc_gen_rust_grpc::protoc_gen_rust_grpc();
+            if compiled_protoc.exists() && compiled_plugin.exists() {
+                // The files may not exist if a build setting instructed protoc-gen-rust-grpc to
+                // skip the C++ build (DOCS_RS / our CI setting).
+                return Ok((compiled_protoc, compiled_plugin));
+            }
+        }
+
+        let protoc_filename = if cfg!(windows) {
+            "protoc.exe"
+        } else {
+            "protoc"
+        };
+        let plugin_filename = if cfg!(windows) {
+            "protoc-gen-rust-grpc.exe"
+        } else {
+            "protoc-gen-rust-grpc"
+        };
+
+        // 3. Prebuilt binaries environment variable
+        if let Ok(dir) = std::env::var("GRPC_RUST_PROTOC_DIR") {
+            let path_dir = Path::new(&dir);
+            let protoc = path_dir.join(protoc_filename);
+            let plugin = path_dir.join(plugin_filename);
+            if protoc.exists() && plugin.exists() {
+                return Ok((protoc, plugin));
+            }
+        }
+
+        // 4. Discovery from PATH
+        if let (Ok(protoc), Ok(plugin)) =
+            (which::which(protoc_filename), which::which(plugin_filename))
+        {
+            return Ok((protoc, plugin));
+        }
+
+        Err(
+            "Could not locate the protoc and/or protoc-gen-rust-grpc plugin binaries.
+Please do one of the following:
+  1. Enable the \"build-plugin\" feature to compile from source.
+  2. Set the \"GRPC_RUST_PROTOC_DIR\" environment variable to a path
+     containing both binaries.
+  3. Ensure both binaries are in your system PATH.
+  4. Supply paths via CodeGen::prebuilt_binaries() method in build.rs."
+                .to_string(),
+        )
+    }
+
     pub fn compile(&self) -> Result<(), String> {
+        let (protoc, plugin) = self.resolve_binaries()?;
+
         // Generate the message code.
         if self.generate_message_code {
             protobuf_codegen::CodeGen::new()
+                .protoc_path(&protoc)
                 .inputs(self.inputs.clone())
                 .output_dir(self.output_dir.clone())
                 .includes(self.includes.iter())
@@ -232,7 +330,11 @@ impl CodeGen {
         };
 
         // Generate the service code.
-        let mut cmd = std::process::Command::new("protoc");
+        let mut cmd = Command::new(&protoc);
+        cmd.arg(format!(
+            "--plugin=protoc-gen-rust-grpc={}",
+            plugin.display()
+        ));
         if self.client_only {
             cmd.arg("--rust-grpc_opt=client_only=true");
         }
@@ -285,6 +387,11 @@ impl CodeGen {
         if self.should_format_code {
             self.format_code();
         }
+
+        if crate_mapping_path.exists() {
+            let _ = fs::remove_file(&crate_mapping_path);
+        }
+
         Ok(())
     }
 

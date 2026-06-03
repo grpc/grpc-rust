@@ -1,9 +1,18 @@
 # Examples
 
-Set of examples that show off the features provided by `tonic`.
+Set of examples that show off the features provided by `tonic` and `grpc`.
 
-In order to build these examples, you must have the `protoc` Protocol Buffers compiler
-installed, along with the Protocol Buffers resource files.
+In order to build these examples, you must have the `protoc` Protocol Buffers
+compiler.  You need to have installed either:
+
+ * the `protoc` binary, made available in your PATH. This is the default.
+
+ * A compatible C++ compiler and CMake as described in the
+   [`protoc-gen-rust-grpc` crate](../protoc-gen-rust-grpc/README.md).  Choose
+   this option by passing `--features protoc-gen-rust-grpc` to `cargo`.
+
+If you choose to install protobuf, here are the steps for a variety of operating
+systems.
 
 Ubuntu:
 
@@ -24,6 +33,57 @@ Assuming [Homebrew](https://brew.sh/) is already installed. (If not, see instruc
 
 ```zsh
 brew install protobuf
+```
+
+# `grpc` crate examples
+
+For the examples related to the `grpc` crate, the generated code is checked into
+the repo to allow building without `protoc`.  To rebuild the generated code you
+must set `GRPC_RUST_REGENERATE_PROTO=1` in your environment.  This requires that
+you have installed either:
+
+ * the `protoc` and `protoc-gen-rust-grpc` binaries, made available in your
+   PATH.  See above for `protoc`.  `protoc-gen-rust-grpc` can be downloaded from
+   [our releases].
+
+ * A compatible C++ compiler and CMake as described in the
+   [`protoc-gen-rust-grpc` crate](../protoc-gen-rust-grpc/README.md).  Choose
+   this option by passing `--features grpc-protobuf-build/build-plugin` to `cargo`.
+
+[our releases]: https://github.com/grpc/grpc-rust/releases
+
+## Helloworld
+
+### Client
+
+```bash
+$ cargo run --bin grpc-helloworld-client
+```
+
+### Server
+
+The `grpc` crate currently does not support servers; run the Tonic helloworld
+server instead:
+
+```bash
+$ cargo run --bin helloworld-server
+```
+
+## RouteGuide
+
+### Client
+
+```bash
+$ cargo run --bin grpc-routeguide-client
+```
+
+### Server
+
+The `grpc` crate currently does not support servers; run the Tonic routeguide
+server instead:
+
+```bash
+$ cargo run --bin routeguide-server
 ```
 
 ## Helloworld

@@ -3,8 +3,7 @@ use protobuf::proto;
 #[allow(unused)]
 mod generated {
     pub mod routeguide {
-        include!("generated/generated.rs"); // Contains messages
-        include!("generated/route_guide_grpc.pb.rs"); // Contains grpc stubs
+        grpc::include_generated_proto!("generated/routeguide", "route_guide");
     }
 }
 

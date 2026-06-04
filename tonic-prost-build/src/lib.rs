@@ -85,6 +85,7 @@ pub fn configure() -> Builder {
         use_arc_self: false,
         generate_default_stubs: false,
         codec_path: "tonic_prost::ProstCodec".to_string(),
+        tonic_path: None,
         skip_debug: HashSet::default(),
     }
 }
@@ -328,6 +329,7 @@ struct ServiceGenerator {
     proto_path: String,
     compile_well_known_types: bool,
     codec_path: String,
+    tonic_path: Option<String>,
     disable_comments: HashSet<String>,
 }
 
@@ -345,6 +347,7 @@ impl ServiceGenerator {
         proto_path: String,
         compile_well_known_types: bool,
         codec_path: String,
+        tonic_path: Option<String>,
         disable_comments: HashSet<String>,
     ) -> Self {
         ServiceGenerator {
@@ -358,6 +361,7 @@ impl ServiceGenerator {
             proto_path,
             compile_well_known_types,
             codec_path,
+            tonic_path,
             disable_comments,
         }
     }
@@ -375,6 +379,10 @@ impl prost_build::ServiceGenerator for ServiceGenerator {
             .disable_comments(self.disable_comments.clone())
             .use_arc_self(self.use_arc_self)
             .generate_default_stubs(self.generate_default_stubs);
+
+        if let Some(p) = &self.tonic_path {
+            builder.tonic_path(p);
+        }
 
         let mut tokens = TokenStream::new();
 
@@ -425,6 +433,7 @@ pub struct Builder {
     use_arc_self: bool,
     generate_default_stubs: bool,
     codec_path: String,
+    tonic_path: Option<String>,
     skip_debug: HashSet<String>,
 }
 
@@ -700,6 +709,15 @@ impl Builder {
         self
     }
 
+    /// Set the path to the `tonic` crate for generated code.
+    ///
+    /// Useful for crates that re-export `tonic` under a different path (e.g.
+    /// `my_lib::tonic`). When unset, the default of `::tonic` is used.
+    pub fn tonic_path(mut self, path: impl AsRef<str>) -> Self {
+        self.tonic_path = Some(path.as_ref().to_string());
+        self
+    }
+
     /// Configure the code generator not to strip the `Debug` implementation for the request and
     /// response types from the generated code.
     ///
@@ -829,7 +847,8 @@ impl Builder {
                 self.generate_default_stubs,
                 self.proto_path,
                 self.compile_well_known_types,
-                self.codec_path.clone(),
+                self.codec_path,
+                self.tonic_path,
                 self.disable_comments,
             );
 
@@ -931,7 +950,8 @@ impl Builder {
                 self.generate_default_stubs,
                 self.proto_path,
                 self.compile_well_known_types,
-                self.codec_path.clone(),
+                self.codec_path,
+                self.tonic_path,
                 self.disable_comments,
             );
 
@@ -956,7 +976,8 @@ impl Builder {
             self.generate_default_stubs,
             self.proto_path,
             self.compile_well_known_types,
-            self.codec_path.clone(),
+            self.codec_path,
+            self.tonic_path,
             self.disable_comments,
         ))
     }

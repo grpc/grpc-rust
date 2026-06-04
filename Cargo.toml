@@ -30,6 +30,8 @@ members = [
   "tests/web",
   "tests/default_stubs",
   "tests/deprecated_methods",
+  "tests/tonic_path/wrapper",
+  "tests/tonic_path/my_application",
 ]
 resolver = "2"
 

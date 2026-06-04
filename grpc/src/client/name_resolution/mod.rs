@@ -323,7 +323,12 @@ impl Hash for Address {
 impl Display for Address {
     #[allow(clippy::to_string_in_format_args)]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.network_type, self.address.to_string())
+        write!(
+            f,
+            "{}:{}",
+            self.network_type,
+            String::from_utf8_lossy(&self.address)
+        )
     }
 }
 
@@ -379,13 +384,15 @@ impl NopResolver {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
     use super::Target;
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
     use crate::client::name_resolution::Address;
-    use std::collections::HashMap;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     #[test]
     pub fn parse_target() {

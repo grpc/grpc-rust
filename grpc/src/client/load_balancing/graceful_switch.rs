@@ -451,12 +451,10 @@ mod test {
         let PickResult::Pick(pick) = pick else {
             panic!("unexpected pick result: {:?}", pick);
         };
-        let received_address = &pick.subchannel.address().address.to_string();
-        // It's good practice to create the expected value once.
-        let expected_address = name.to_string();
+        let received_address = &pick.subchannel.address().address;
 
         // Check for inequality and panic with a detailed message if they don't match.
-        assert_eq!(received_address, &expected_address);
+        assert_eq!(received_address, name);
     }
 
     fn move_subchannel_to_state(
@@ -655,7 +653,7 @@ mod test {
             .resolver_update(update.clone(), Some(&parsed_config2), &mut *tcc)
             .unwrap();
         let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        assert_eq!(&*subchannel.address().address, "127.0.0.1:1234");
+        assert_eq!(subchannel.address().address, "127.0.0.1:1234");
         assert_channel_empty(&mut rx_events);
     }
 

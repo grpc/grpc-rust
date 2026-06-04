@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::byte_str::ByteStr;
 use crate::client::DynInvoke;
 use crate::client::Invoke;
 use crate::credentials::client::ClientHandshakeInfo;
@@ -71,7 +72,7 @@ pub(crate) trait Transport: Sync {
 
     async fn connect(
         &self,
-        address: String,
+        address: ByteStr,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
@@ -89,7 +90,7 @@ pub(crate) trait Transport: Sync {
 pub(crate) trait DynTransport: Send + Sync {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: ByteStr,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
@@ -107,7 +108,7 @@ pub(crate) trait DynTransport: Send + Sync {
 impl<T: Transport> DynTransport for T {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: ByteStr,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,

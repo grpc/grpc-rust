@@ -39,6 +39,7 @@ use tonic::async_trait;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
@@ -243,7 +244,7 @@ pub(crate) struct InternalSubchannel {
 }
 
 struct InternalSubchannelData {
-    address: String,
+    address: ByteStr,
     state: InternalSubchannelState,
     work_queue: WorkQueueTx,
     on_drop: Arc<Notify>,
@@ -310,7 +311,7 @@ impl InternalSubchannel {
         work_queue: WorkQueueTx,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
-        let address_string = address.address.to_string();
+        let address_string = address.address.clone();
         let this = Arc::new_cyclic(|weak_self| Self {
             address,
             on_drop: on_drop.clone(),

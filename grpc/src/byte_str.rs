@@ -21,28 +21,24 @@
  * IN THE SOFTWARE.
  *
  */
-
-use core::str;
 use std::ops::Deref;
 
 use bytes::Bytes;
 
 /// A cheaply cloneable and sliceable chunk of contiguous memory.
+///
+/// The bytes held by `ByteStr` are arbitrary and may not be valid UTF-8.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ByteStr {
-    // Invariant: bytes contains valid UTF-8
     bytes: Bytes,
 }
 
 impl Deref for ByteStr {
-    type Target = str;
+    type Target = [u8];
 
     #[inline]
-    fn deref(&self) -> &str {
-        let b: &[u8] = self.bytes.as_ref();
-        // The invariant of `bytes` is that it contains valid UTF-8 allows us
-        // to unwrap.
-        str::from_utf8(b).unwrap()
+    fn deref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -53,5 +49,52 @@ impl From<String> for ByteStr {
             // Invariant: src is a String so contains valid UTF-8.
             bytes: Bytes::from(src),
         }
+    }
+}
+
+impl<'a> TryFrom<&'a ByteStr> for &'a str {
+    type Error = std::str::Utf8Error;
+
+    #[inline]
+    fn try_from(value: &'a ByteStr) -> Result<Self, Self::Error> {
+        std::str::from_utf8(value)
+    }
+}
+
+impl TryFrom<ByteStr> for String {
+    type Error = std::str::Utf8Error;
+
+    #[inline]
+    fn try_from(value: ByteStr) -> Result<Self, Self::Error> {
+        let s = std::str::from_utf8(&value)?;
+        Ok(s.to_owned())
+    }
+}
+
+impl PartialEq<str> for ByteStr {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.bytes == other.as_bytes()
+    }
+}
+
+impl<'a> PartialEq<&'a str> for ByteStr {
+    #[inline]
+    fn eq(&self, other: &&'a str) -> bool {
+        self.bytes == other.as_bytes()
+    }
+}
+
+impl PartialEq<ByteStr> for str {
+    #[inline]
+    fn eq(&self, other: &ByteStr) -> bool {
+        self.as_bytes() == other.bytes
+    }
+}
+
+impl<'a> PartialEq<ByteStr> for &'a str {
+    #[inline]
+    fn eq(&self, other: &ByteStr) -> bool {
+        self.as_bytes() == other.bytes
     }
 }

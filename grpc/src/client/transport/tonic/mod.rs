@@ -23,8 +23,10 @@
  */
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -70,6 +72,7 @@ use tower_service::Service as TowerService;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::RecvStream;
@@ -363,7 +366,7 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: String,
+        address: ByteStr,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
@@ -405,8 +408,11 @@ impl Transport for TransportBuilder {
 
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
+                let addr_str: &str = (&address)
+                    .try_into()
+                    .map_err(|err| format!("address contains non-utf8 symbols: {err}"))?;
                 let addr: SocketAddr =
-                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(addr_str).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -415,9 +421,10 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => {
-                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
-            }
+            NetworkType::Unix => runtime.unix_stream(
+                PathBuf::from(OsStr::from_bytes(&address)),
+                UnixSocketOptions::default(),
+            ),
         };
         let transport = if let Some(deadline) = opts.connect_deadline {
             let timeout = deadline.saturating_duration_since(Instant::now());

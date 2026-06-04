@@ -157,7 +157,7 @@ pub(crate) async fn tonic_transport_rpc() {
     };
     let (conn, _sec_info, mut disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            addr.to_string().into(),
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -674,7 +674,7 @@ async fn tonic_transport_invalid_base64_headers() {
     };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            addr.to_string().into(),
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -749,7 +749,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
     };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            addr.to_string().into(),
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,

@@ -316,6 +316,16 @@ mod unix_tests {
 
     #[tokio::test]
     async fn unix_absolute_path() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let socket_path = dir.path().join("absolute.sock");
+        let target = format!("unix://{}", socket_path.to_str().unwrap());
+
+        run_unix_test(&socket_path, &target).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn unix_absolute_path_non_utf8() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 

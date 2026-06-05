@@ -318,7 +318,7 @@ fn parse_endpoint_and_authority(target: &Target) -> Result<ParseResult, String> 
     let endpoint = endpoint.strip_prefix(b"/").unwrap_or(endpoint);
     let host_port = (&endpoint)
         .try_into()
-        .map_err(|err| format!("target hostname contains invalid utf8 symbols: {err}"))?;
+        .map_err(|err| format!("target hostname contains invalid UTF-8 symbols: {err}"))?;
     let parse_result = parse_host_port(host_port, DEFAULT_PORT)
         .map_err(|err| format!("Failed to parse target {target}: {err}"))?;
     let endpoint = parse_result.ok_or("Received empty endpoint host.".to_string())?;

@@ -323,7 +323,6 @@ impl Hash for Address {
 }
 
 impl Display for Address {
-    #[allow(clippy::to_string_in_format_args)]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,

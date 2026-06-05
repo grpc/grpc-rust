@@ -410,7 +410,7 @@ impl Transport for TransportBuilder {
             NetworkType::Tcp => {
                 let addr_str: &str = (&address)
                     .try_into()
-                    .map_err(|err| format!("address contains non-utf8 symbols: {err}"))?;
+                    .map_err(|err| format!("address contains non-UTF-8 symbols: {err}"))?;
                 let addr: SocketAddr =
                     SocketAddr::from_str(addr_str).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(

@@ -23,10 +23,8 @@
  */
 
 use std::error::Error;
-use std::ffi::OsStr;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -421,10 +419,27 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => runtime.unix_stream(
-                PathBuf::from(OsStr::from_bytes(&address)),
-                UnixSocketOptions::default(),
-            ),
+            NetworkType::Unix => {
+                #[cfg(unix)]
+                {
+                    use std::ffi::OsStr;
+                    use std::os::unix::ffi::OsStrExt;
+                    runtime.unix_stream(
+                        PathBuf::from(OsStr::from_bytes(&address)),
+                        UnixSocketOptions::default(),
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    match std::str::from_utf8(&address) {
+                        Ok(valid_str) => runtime
+                            .unix_stream(PathBuf::from(valid_str), UnixSocketOptions::default()),
+                        Err(_) => Box::pin(async move {
+                            Err("socket path contains non-UTF-8 characters".to_string())
+                        }),
+                    }
+                }
+            }
         };
         let transport = if let Some(deadline) = opts.connect_deadline {
             let timeout = deadline.saturating_duration_since(Instant::now());

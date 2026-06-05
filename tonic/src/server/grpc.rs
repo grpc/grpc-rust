@@ -10,8 +10,8 @@ use crate::{
     server::{ClientStreamingService, ServerStreamingService, StreamingService, UnaryService},
 };
 use http_body::Body as HttpBody;
-use std::{fmt, pin::pin};
-use tokio_stream::{Stream, StreamExt};
+use std::fmt;
+use tokio_stream::Stream;
 
 macro_rules! t {
     ($result:expr) => {
@@ -373,15 +373,15 @@ where
 
         let (parts, body) = request.into_parts();
 
-        let mut stream = pin!(Streaming::new_request(
+        let mut stream = Streaming::new_request(
             self.codec.decoder(),
             body,
             request_compression_encoding,
             self.max_decoding_message_size,
-        ));
+        );
 
         let message = stream
-            .try_next()
+            .message()
             .await?
             .ok_or_else(|| Status::internal("Missing request message."))?;
 
@@ -411,6 +411,7 @@ where
                 encoding,
                 self.max_decoding_message_size,
             )
+            .boxed()
         });
 
         Ok(Request::from_http(request))

@@ -42,18 +42,24 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
 #[derive(Debug)]
 pub struct JsonDecoder<U>(PhantomData<U>);
 
-impl<U: serde::de::DeserializeOwned> Decoder for JsonDecoder<U> {
+impl<U: serde::de::DeserializeOwned + Send> Decoder for JsonDecoder<U> {
     type Item = U;
     type Error = Status;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    type DecodeFuture<'a>
+        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
+    where
+        Self: 'a;
+
+    fn decode<'a>(&'a mut self, buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
         if !buf.has_remaining() {
-            return Ok(None);
+            return std::future::ready(Ok(None));
         }
 
-        let item: Self::Item =
-            serde_json::from_reader(buf.reader()).map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Some(item))
+        let item = serde_json::from_reader(buf.reader())
+            .map(Some)
+            .map_err(|e| Status::internal(e.to_string()));
+        std::future::ready(item)
     }
 }
 

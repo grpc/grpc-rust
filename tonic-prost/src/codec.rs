@@ -136,12 +136,17 @@ impl<U: Message + Default> Decoder for ProstDecoder<U> {
     type Item = U;
     type Error = Status;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    type DecodeFuture<'a>
+        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
+    where
+        Self: 'a;
+
+    fn decode<'a>(&'a mut self, buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
         let item = Message::decode(buf)
             .map(Option::Some)
-            .map_err(from_decode_error)?;
+            .map_err(from_decode_error);
 
-        Ok(item)
+        std::future::ready(item)
     }
 
     fn buffer_settings(&self) -> BufferSettings {
@@ -197,6 +202,33 @@ mod tests {
             i += 1;
         }
         assert_eq!(i, 1);
+    }
+
+    #[tokio::test]
+    async fn decode_waits_for_async_decoder() {
+        let decoder = PendingDecoder::default();
+
+        let msg = vec![0u8; LEN];
+
+        let mut buf = BytesMut::new();
+
+        buf.reserve(msg.len() + HEADER_SIZE);
+        buf.put_u8(0);
+        buf.put_u32(msg.len() as u32);
+
+        buf.put(&msg[..]);
+
+        let body = body::MockBody::new(&buf[..], 10005, 0);
+
+        let mut stream = Streaming::new_request(decoder, body, None, None);
+
+        let output_msg = stream
+            .message()
+            .await
+            .expect("decode succeeds")
+            .expect("message is present");
+        assert_eq!(output_msg.len(), msg.len());
+        assert!(stream.message().await.expect("stream ends").is_none());
     }
 
     #[tokio::test]
@@ -444,14 +476,65 @@ mod tests {
         type Item = Vec<u8>;
         type Error = Status;
 
-        fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        type DecodeFuture<'a>
+            = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
+        where
+            Self: 'a;
+
+        fn decode<'a>(&'a mut self, mut buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
             let out = Vec::from(buf.chunk());
             buf.advance(LEN);
-            Ok(Some(out))
+            std::future::ready(Ok(Some(out)))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
             Default::default()
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct PendingDecoder {}
+
+    impl Decoder for PendingDecoder {
+        type Item = Vec<u8>;
+        type Error = Status;
+
+        type DecodeFuture<'a>
+            = PendingDecode<'a>
+        where
+            Self: 'a;
+
+        fn decode<'a>(&'a mut self, buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
+            PendingDecode {
+                buf: Some(buf),
+                yielded: false,
+            }
+        }
+
+        fn buffer_settings(&self) -> BufferSettings {
+            Default::default()
+        }
+    }
+
+    struct PendingDecode<'a> {
+        buf: Option<DecodeBuf<'a>>,
+        yielded: bool,
+    }
+
+    impl Future for PendingDecode<'_> {
+        type Output = Result<Option<Vec<u8>>, Status>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let mut buf = self.buf.take().expect("buffer available");
+            let out = Vec::from(buf.chunk());
+            buf.advance(LEN);
+            Poll::Ready(Ok(Some(out)))
         }
     }
 

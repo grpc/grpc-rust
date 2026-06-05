@@ -103,10 +103,15 @@ impl Decoder for MockDecoder {
     type Item = Vec<u8>;
     type Error = Status;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    type DecodeFuture<'a>
+        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
+    where
+        Self: 'a;
+
+    fn decode<'a>(&'a mut self, mut buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
         let out = Vec::from(buf.chunk());
         buf.advance(self.message_size);
-        Ok(Some(out))
+        std::future::ready(Ok(Some(out)))
     }
 }
 

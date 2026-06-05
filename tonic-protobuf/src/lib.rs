@@ -121,11 +121,16 @@ impl<U: Message + Default> Decoder for ProtoDecoder<U> {
     type Item = U;
     type Error = Status;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    type DecodeFuture<'a>
+        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
+    where
+        Self: 'a;
+
+    fn decode<'a>(&'a mut self, mut buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
         let slice = buf.chunk();
-        let item = U::parse(slice).map_err(from_decode_error)?;
+        let item = U::parse(slice).map_err(from_decode_error);
         buf.advance(slice.len());
-        Ok(Some(item))
+        std::future::ready(item.map(Some))
     }
 }
 

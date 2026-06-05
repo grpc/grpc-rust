@@ -329,6 +329,7 @@ impl<T> Grpc<T> {
         T: GrpcService<Body>,
         T::ResponseBody: HttpBody + Send + 'static,
         <T::ResponseBody as HttpBody>::Error: Into<crate::BoxError>,
+        M2: Send + 'static,
     {
         let encoding = CompressionEncoding::from_encoding_header(
             response.headers(),
@@ -349,19 +350,16 @@ impl<T> Grpc<T> {
         } else {
             true
         };
-
         let response = response.map(|body| {
-            if expect_additional_trailers {
-                Streaming::new_response(
-                    decoder,
-                    body,
-                    status_code,
-                    encoding,
-                    self.config.max_decoding_message_size,
-                )
-            } else {
-                Streaming::new_empty(decoder, body)
-            }
+            Streaming::new_response_or_empty(
+                decoder,
+                body,
+                status_code,
+                expect_additional_trailers,
+                encoding,
+                self.config.max_decoding_message_size,
+            )
+            .boxed()
         });
 
         Ok(Response::from_http(response))

@@ -151,12 +151,17 @@ pub trait Decoder {
     /// The type of unrecoverable frame decoding errors.
     type Error: From<io::Error>;
 
+    /// The future returned by [`Decoder::decode`].
+    type DecodeFuture<'a>: Future<Output = Result<Option<Self::Item>, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
     /// Decode a message from the buffer.
     ///
     /// The buffer will contain exactly the bytes of a full message. There
     /// is no need to get the length from the bytes, gRPC framing is handled
     /// for you.
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error>;
+    fn decode<'a>(&'a mut self, src: DecodeBuf<'a>) -> Self::DecodeFuture<'a>;
 
     /// Controls how tonic creates and expands decode buffers.
     fn buffer_settings(&self) -> BufferSettings {

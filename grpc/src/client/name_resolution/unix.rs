@@ -23,7 +23,6 @@
  */
 
 use crate::attributes::Attributes;
-use crate::byte_str::ByteStr;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::NopResolver;
 use crate::client::name_resolution::ResolverBuilder;
@@ -59,7 +58,7 @@ impl ResolverBuilder for Builder {
     }
 
     fn default_authority(&self, target: &Target) -> String {
-        "localhost".to_owned()
+        "localhost".into()
     }
 }
 
@@ -76,10 +75,9 @@ fn parse_target(target: &Target) -> Result<Address, String> {
     if !host_port.is_empty() {
         return Err(format!("invalid (non-empty) authority: {host_port}"));
     }
-    let addr_string = target.path().to_owned();
     Ok(Address {
         network_type: UNIX_NETWORK_TYPE,
-        address: ByteStr::from(addr_string),
+        address: target.path(),
         attributes: Attributes::new(),
     })
 }
@@ -87,6 +85,7 @@ fn parse_target(target: &Target) -> Result<Address, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::byte_str::ByteStr;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverOptions;
     use crate::client::name_resolution::test_utils::TestChannelController;

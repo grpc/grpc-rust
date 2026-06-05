@@ -316,9 +316,15 @@ mod unix_tests {
 
     #[tokio::test]
     async fn unix_absolute_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
         let dir = tempdir().expect("failed to create temp dir");
-        let socket_path = dir.path().join("absolute.sock");
-        let target = format!("unix://{}", socket_path.to_str().unwrap());
+        let mut socket_path_bytes = dir.path().as_os_str().as_bytes().to_vec();
+        // Use an invalid UTF-8 byte sequence to ensure it is handled correctly.
+        socket_path_bytes.extend_from_slice(b"/absolute\xff.sock");
+        let socket_path = PathBuf::from(OsStr::from_bytes(&socket_path_bytes));
+        let target = format!("unix://{}/absolute%FF.sock", dir.path().to_str().unwrap());
 
         run_unix_test(&socket_path, &target).await;
     }

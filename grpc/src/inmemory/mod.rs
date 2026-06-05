@@ -392,8 +392,11 @@ pub struct InMemoryResolverBuilder {}
 
 impl ResolverBuilder for InMemoryResolverBuilder {
     fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
-        let path = target.path().strip_prefix('/').unwrap_or(target.path());
-        let ids: Vec<String> = path.split(',').map(|s| s.to_string()).collect();
+        let path = target.path().strip_prefix(b"/").unwrap_or(target.path());
+        let ids: Vec<ByteStr> = path
+            .split(|&b| b == b',')
+            .map(|chunk| chunk.iter().copied().collect())
+            .collect();
         options.work_scheduler.schedule_work();
         Box::new(InMemoryResolver { ids })
     }
@@ -408,7 +411,7 @@ impl ResolverBuilder for InMemoryResolverBuilder {
 }
 
 struct InMemoryResolver {
-    ids: Vec<String>,
+    ids: Vec<ByteStr>,
 }
 
 impl Resolver for InMemoryResolver {
@@ -421,7 +424,7 @@ impl Resolver for InMemoryResolver {
             .map(|id| Endpoint {
                 addresses: vec![Address {
                     network_type: "inmemory",
-                    address: crate::byte_str::ByteStr::from(id.clone()),
+                    address: id.clone(),
                     ..Default::default()
                 }],
                 ..Default::default()

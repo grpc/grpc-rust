@@ -33,6 +33,20 @@ pub struct ByteStr {
     bytes: Bytes,
 }
 
+impl ByteStr {
+    /// Strips a prefix, returning a new zero-copy ByteStr.
+    #[inline]
+    pub(crate) fn strip_prefix(&self, prefix: &[u8]) -> Option<ByteStr> {
+        if self.starts_with(prefix) {
+            Some(ByteStr {
+                bytes: self.bytes.slice(prefix.len()..),
+            })
+        } else {
+            None
+        }
+    }
+}
+
 impl Deref for ByteStr {
     type Target = [u8];
 
@@ -46,7 +60,6 @@ impl From<String> for ByteStr {
     #[inline]
     fn from(src: String) -> ByteStr {
         ByteStr {
-            // Invariant: src is a String so contains valid UTF-8.
             bytes: Bytes::from(src),
         }
     }
@@ -92,9 +105,27 @@ impl PartialEq<ByteStr> for str {
     }
 }
 
-impl<'a> PartialEq<ByteStr> for &'a str {
+impl PartialEq<ByteStr> for &str {
     #[inline]
     fn eq(&self, other: &ByteStr) -> bool {
         self.as_bytes() == other.bytes
+    }
+}
+
+impl FromIterator<u8> for ByteStr {
+    #[inline]
+    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
+        ByteStr {
+            bytes: Bytes::from_iter(iter),
+        }
+    }
+}
+
+impl From<&'static str> for ByteStr {
+    #[inline]
+    fn from(src: &'static str) -> ByteStr {
+        ByteStr {
+            bytes: Bytes::from_static(src.as_bytes()),
+        }
     }
 }

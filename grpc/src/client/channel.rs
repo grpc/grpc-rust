@@ -614,8 +614,8 @@ impl<T: Clone> WatcherIter<T> {
     }
 }
 
-/// Parses the host and port from a URL-encoded string. When the input can not
-/// be parsed as (host, port) pair, it returns the entire input as the host.
+/// Parses the host and port from a string. When the input can not be parsed
+/// as (host, port) pair, it returns the entire input as the host.
 fn parse_authority(host_and_port: &str) -> Authority {
     // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
     if let Some(stripped) = host_and_port.strip_prefix('[')

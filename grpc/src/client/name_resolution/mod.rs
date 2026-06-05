@@ -34,6 +34,7 @@ use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::attributes::Attributes;
@@ -123,9 +124,9 @@ impl Target {
         }
     }
 
-    /// Retrieves endpoint from `Url.path()`.
-    pub fn path(&self) -> &str {
-        self.url.path()
+    /// Retrieves the percent-decoded endpoint from `Url.path()`.
+    pub fn path(&self) -> ByteStr {
+        percent_decode_str(self.url.path()).collect()
     }
 }
 
@@ -136,7 +137,7 @@ impl Display for Target {
             "{}://{}{}",
             self.scheme(),
             self.authority_host_port(),
-            self.path()
+            String::from_utf8_lossy(&self.path())
         )
     }
 }
@@ -163,7 +164,8 @@ pub(crate) trait ResolverBuilder: Send + Sync {
     /// with the leading prefix removed.
     fn default_authority(&self, target: &Target) -> String {
         let path = target.path();
-        path.strip_prefix("/").unwrap_or(path).to_string()
+        let path = path.strip_prefix(b"/").unwrap_or(path);
+        String::from_utf8_lossy(&path).into()
     }
 
     /// Returns a bool indicating whether the input uri is valid to create a
@@ -403,7 +405,7 @@ mod test {
             want_host: &'static str,
             want_port: Option<u16>,
             want_host_port: &'static str,
-            want_path: &'static str,
+            want_path: &'static [u8],
             want_str: &'static str,
         }
         let test_cases = vec![
@@ -413,7 +415,7 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: "/grpc.io",
+                want_path: b"/grpc.io",
                 want_str: "dns:///grpc.io",
             },
             TestCase {
@@ -422,7 +424,7 @@ mod test {
                 want_host_port: "8.8.8.8:53",
                 want_host: "8.8.8.8",
                 want_port: Some(53),
-                want_path: "/grpc.io/docs",
+                want_path: b"/grpc.io/docs",
                 want_str: "dns://8.8.8.8:53/grpc.io/docs",
             },
             TestCase {
@@ -431,7 +433,7 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: "path/to/file",
+                want_path: b"path/to/file",
                 want_str: "unix://path/to/file",
             },
             TestCase {
@@ -440,8 +442,26 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: "/run/containerd/containerd.sock",
+                want_path: b"/run/containerd/containerd.sock",
                 want_str: "unix:///run/containerd/containerd.sock",
+            },
+            TestCase {
+                input: "dns:///foo%20bar",
+                want_scheme: "dns",
+                want_host_port: "",
+                want_host: "",
+                want_port: None,
+                want_path: b"/foo bar",
+                want_str: "dns:///foo bar",
+            },
+            TestCase {
+                input: "dns:///foo%FFbar",
+                want_scheme: "dns",
+                want_host_port: "",
+                want_host: "",
+                want_port: None,
+                want_path: b"/foo\xffbar",
+                want_str: "dns:///foo\u{FFFD}bar",
             },
         ];
 
@@ -451,7 +471,7 @@ mod test {
             assert_eq!(target.authority_host(), tc.want_host);
             assert_eq!(target.authority_port(), tc.want_port);
             assert_eq!(target.authority_host_port(), tc.want_host_port);
-            assert_eq!(target.path(), tc.want_path);
+            assert_eq!(&*target.path(), tc.want_path);
             assert_eq!(&target.to_string(), tc.want_str);
         }
     }

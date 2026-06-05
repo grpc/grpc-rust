@@ -82,14 +82,25 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+    type EncodeFuture<'a>
+        = std::future::Ready<Result<(), Self::Error>>
+    where
+        Self: 'a;
+
+    fn encode<'a>(
+        &'a mut self,
+        item: Self::Item,
+        mut buf: EncodeBuf<'a>,
+    ) -> Self::EncodeFuture<'a> {
         // The protobuf library doesn't support serializing into a user-provided
         // buffer. Instead, it allocates its own buffer, resulting in an extra
         // copy and allocation.
         // TODO: #2345 - Find a way to avoid this extra copy.
-        let serialized = item.serialize().map_err(from_decode_error)?;
-        buf.put_slice(serialized.as_slice());
-        Ok(())
+        let result = item
+            .serialize()
+            .map_err(from_decode_error)
+            .map(|serialized| buf.put_slice(serialized.as_slice()));
+        std::future::ready(result)
     }
 }
 

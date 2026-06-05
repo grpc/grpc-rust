@@ -27,8 +27,15 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string()))
+    type EncodeFuture<'a>
+        = std::future::Ready<Result<(), Self::Error>>
+    where
+        Self: 'a;
+
+    fn encode<'a>(&'a mut self, item: Self::Item, buf: EncodeBuf<'a>) -> Self::EncodeFuture<'a> {
+        std::future::ready(
+            serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string())),
+        )
     }
 }
 

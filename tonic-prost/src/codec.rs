@@ -94,11 +94,20 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        item.encode(buf)
+    type EncodeFuture<'a>
+        = std::future::Ready<Result<(), Self::Error>>
+    where
+        Self: 'a;
+
+    fn encode<'a>(
+        &'a mut self,
+        item: Self::Item,
+        mut buf: EncodeBuf<'a>,
+    ) -> Self::EncodeFuture<'a> {
+        item.encode(&mut buf)
             .expect("Message only errors if not enough space");
 
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     fn buffer_settings(&self) -> BufferSettings {
@@ -152,7 +161,11 @@ mod tests {
     use bytes::{Buf, BufMut, BytesMut};
     use http_body::Body;
     use http_body_util::BodyExt as _;
-    use std::pin::pin;
+    use std::{
+        future::Future,
+        pin::{Pin, pin},
+        task::{Context, Poll},
+    };
     use tonic::codec::SingleMessageCompressionOverride;
     use tonic::codec::{EncodeBody, HEADER_SIZE, Streaming};
 
@@ -239,6 +252,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encode_waits_for_async_encoder() {
+        let encoder = PendingEncoder::default();
+        let msg = Vec::from(&[7u8; 32][..]);
+
+        let messages = std::iter::once(Ok::<_, Status>(msg.clone()));
+        let source = tokio_stream::iter(messages);
+
+        let mut body = pin!(EncodeBody::new_server(
+            encoder,
+            source,
+            None,
+            SingleMessageCompressionOverride::default(),
+            None,
+        ));
+
+        let frame = body
+            .frame()
+            .await
+            .expect("at least one frame")
+            .expect("no error polling frame");
+        let data = frame.into_data().expect("got data frame");
+
+        assert_eq!(data[0], 0);
+        assert_eq!(
+            u32::from_be_bytes(data[1..HEADER_SIZE].try_into().unwrap()) as usize,
+            msg.len()
+        );
+        assert_eq!(&data[HEADER_SIZE..], &msg[..]);
+
+        let frame = body
+            .frame()
+            .await
+            .expect("trailers frame")
+            .expect("no error polling trailers");
+        assert_eq!(
+            frame
+                .into_trailers()
+                .expect("got trailers")
+                .get(Status::GRPC_STATUS)
+                .expect("grpc-status header"),
+            "0"
+        );
+        assert!(body.is_end_stream());
+    }
+
+    #[tokio::test]
     async fn encode_max_message_size_exceeded() {
         let encoder = MockEncoder::default();
 
@@ -313,13 +372,68 @@ mod tests {
         type Item = Vec<u8>;
         type Error = Status;
 
-        fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        type EncodeFuture<'a>
+            = std::future::Ready<Result<(), Self::Error>>
+        where
+            Self: 'a;
+
+        fn encode<'a>(
+            &'a mut self,
+            item: Self::Item,
+            mut buf: EncodeBuf<'a>,
+        ) -> Self::EncodeFuture<'a> {
             buf.put(&item[..]);
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
             Default::default()
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct PendingEncoder {}
+
+    impl Encoder for PendingEncoder {
+        type Item = Vec<u8>;
+        type Error = Status;
+
+        type EncodeFuture<'a>
+            = PendingEncode<'a>
+        where
+            Self: 'a;
+
+        fn encode<'a>(
+            &'a mut self,
+            item: Self::Item,
+            buf: EncodeBuf<'a>,
+        ) -> Self::EncodeFuture<'a> {
+            PendingEncode {
+                item: Some(item),
+                buf,
+                yielded: false,
+            }
+        }
+    }
+    struct PendingEncode<'a> {
+        item: Option<Vec<u8>>,
+        buf: EncodeBuf<'a>,
+        yielded: bool,
+    }
+
+    impl Future for PendingEncode<'_> {
+        type Output = Result<(), Status>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let item = self.item.take().expect("item available");
+            self.buf.put(&item[..]);
+            Poll::Ready(Ok(()))
         }
     }
 

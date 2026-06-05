@@ -7,7 +7,7 @@ pub(crate) mod compression;
 mod decode;
 mod encode;
 use crate::Status;
-use std::io;
+use std::{future::Future, io};
 
 pub use self::buffer::{DecodeBuf, EncodeBuf};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
@@ -129,8 +129,13 @@ pub trait Encoder {
     /// The type of unrecoverable frame encoding errors.
     type Error: From<io::Error>;
 
+    /// The future returned by [`Encoder::encode`].
+    type EncodeFuture<'a>: Future<Output = Result<(), Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
     /// Encodes a message into the provided buffer.
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error>;
+    fn encode<'a>(&'a mut self, item: Self::Item, dst: EncodeBuf<'a>) -> Self::EncodeFuture<'a>;
 
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {

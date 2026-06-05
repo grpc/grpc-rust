@@ -41,6 +41,7 @@ use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first;
@@ -208,8 +209,8 @@ impl LbPolicy for RoundRobinPolicy {
         self.update_picker(channel_controller);
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.child_manager.work(channel_controller);
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        self.child_manager.work(data, channel_controller);
         self.update_picker(channel_controller);
     }
 

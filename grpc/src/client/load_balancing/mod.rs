@@ -111,7 +111,7 @@ pub(crate) trait LbPolicy: Send + Sync + Debug + 'static {
 
     /// Called by the channel in response to a call from the LB policy to the
     /// WorkScheduler's request_work method.
-    fn work(&mut self, channel_controller: &mut dyn ChannelController);
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController);
 
     /// Called by the channel when an LbPolicy goes idle and the channel
     /// wants it to start connecting to subchannels again.
@@ -128,6 +128,46 @@ pub(crate) struct LbPolicyOptions {
     pub runtime: GrpcRuntime,
 }
 
+/// A trait to add `Debug` to an `Any` for [`WorkData`] to allow debugging data
+/// to be printed more readily.  Blanket implemented on all types that are Any +
+/// Send + Debug.  `dyn WorkDataTrait` also implements downcast methods like
+/// [`Any`] for convenience.
+pub(crate) trait WorkDataTrait: Any + Send + Debug {}
+
+impl<T: Any + Send + Debug> WorkDataTrait for T {}
+
+impl dyn WorkDataTrait {
+    /// Like [`Box<dyn Any>::downcast`] but for this wrapper trait.
+    pub(crate) fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
+        // If we directly call downcast then we can't return `Self` anymore
+        // (only a Box<dyn Any + Send>), so we first have to check `is` and only
+        // downcast when we know it will succeed.
+        if (&*self as &(dyn Any + Send)).is::<T>() {
+            Ok((self as Box<dyn Any + Send>).downcast().unwrap())
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Like
+    /// [`downcast_ref`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_ref)
+    /// implemented on [`dyn Any`](Any), but for this wrapper trait.
+    pub(crate) fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        (self as &(dyn Any + Send)).downcast_ref::<T>()
+    }
+
+    /// Like
+    /// [`downcast_mut`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_mut)
+    /// implemented on [`dyn Any`](Any), but for this wrapper trait.
+    pub(crate) fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
+        (self as &mut (dyn Any + Send)).downcast_mut::<T>()
+    }
+}
+
+/// A dynamic payload passed between [`WorkScheduler::schedule_work`] and its
+/// associated policy's [`work`](LbPolicy::work) method.
+pub(crate) type WorkData = Box<dyn WorkDataTrait>;
+
 /// Used to asynchronously request a call into the LbPolicy's work method if
 /// the LbPolicy needs to provide an update without waiting for an update
 /// from the channel first.
@@ -135,7 +175,7 @@ pub(crate) trait WorkScheduler: Send + Sync + Debug {
     // Schedules a call into the LbPolicy's work method.  If there is already a
     // pending work call that has not yet started, this may not schedule another
     // call.
-    fn schedule_work(&self);
+    fn schedule_work(&self, data: Option<WorkData>);
 }
 
 /// Abstract representation of the configuration for any LB policy, stored as
@@ -412,8 +452,8 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
         (**self).subchannel_update(subchannel, state, channel_controller);
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        (**self).work(channel_controller);
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        (**self).work(data, channel_controller);
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {

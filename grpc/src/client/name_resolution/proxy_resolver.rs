@@ -1,0 +1,641 @@
+/*
+ *
+ * Copyright 2026 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+use std::fmt::Debug;
+use std::sync::Arc;
+use std::sync::LazyLock;
+
+use http::HeaderValue;
+use hyper_util::client::proxy::matcher::Matcher;
+use url::Url;
+
+use super::ResolverOptions;
+use super::Target;
+use crate::client::name_resolution::Address;
+use crate::client::name_resolution::ChannelController;
+use crate::client::name_resolution::NopResolver;
+use crate::client::name_resolution::Resolver;
+use crate::client::name_resolution::ResolverBuilder;
+use crate::client::name_resolution::ResolverUpdate;
+use crate::client::name_resolution::dns;
+use crate::client::service_config::ServiceConfig;
+
+static MATCHER: LazyLock<Option<Matcher>> = LazyLock::new(build_matcher);
+
+fn build_matcher() -> Option<Matcher> {
+    // Avoid using a proxy in a Common Gateway Interface (CGI) environment.
+    if std::env::var_os("REQUEST_METHOD").is_some() {
+        return None;
+    }
+
+    let https_proxy = get_first_env(&["HTTPS_PROXY", "https_proxy"]);
+    if https_proxy.is_empty() {
+        return None;
+    }
+
+    let builder = Matcher::builder();
+    // Only read NO_PROXY and HTTPS_PROXY. This avoids reading ALL_PROXY,
+    // which is not read by gRPC Go and C++.
+    Some(
+        builder
+            .no(get_first_env(&["NO_PROXY", "no_proxy"]))
+            .https(https_proxy)
+            .build(),
+    )
+}
+
+/// A resolver builder that wraps another `ResolverBuilder` and applies proxy
+/// configuration.
+///
+/// This builder checks if the target URI should be proxied based on environment
+/// variables (like `HTTPS_PROXY`, `NO_PROXY`). If a proxy is needed, it creates
+/// a resolver that resolves the proxy address and injects proxy options into
+/// the resolved addresses.
+pub(crate) struct Builder {
+    child_builder: Arc<dyn ResolverBuilder>,
+}
+
+impl ResolverBuilder for Builder {
+    fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
+        match self.new_resolver(target, options, MATCHER.as_ref()) {
+            Ok(resolver) => resolver,
+            Err((err, options)) => NopResolver::new_with_err(err, options),
+        }
+    }
+
+    fn scheme(&self) -> &str {
+        self.child_builder.scheme()
+    }
+
+    fn is_valid_uri(&self, uri: &Target) -> bool {
+        self.child_builder.is_valid_uri(uri)
+    }
+
+    fn default_authority(&self, target: &Target) -> String {
+        self.child_builder.default_authority(target)
+    }
+}
+
+impl Builder {
+    /// Creates a new `Builder` that wraps the given `child_builder`.
+    pub(crate) fn new(child_builder: Arc<dyn ResolverBuilder>) -> Self {
+        Self { child_builder }
+    }
+
+    fn new_resolver(
+        &self,
+        target: &Target,
+        options: ResolverOptions,
+        matcher: Option<&Matcher>,
+    ) -> Result<Box<dyn Resolver>, (String, ResolverOptions)> {
+        // If HTTPS_PROXY is unset, avoid parsing the target as a DNS hostname.
+        let Some(matcher) = matcher else {
+            return Ok(self.child_builder.build(target, options));
+        };
+        let path = target.path();
+        let path = path.strip_prefix(b"/").unwrap_or(path);
+
+        // Attempt to convert the path to a UTF-8 string, then parse it as a
+        // URL host.
+        let url_obj = match (&path)
+            .try_into()
+            .map_err(|err| format!("non-UTF-8 symbol in target host: {err}"))
+            .and_then(|target_host: &str| {
+                Url::parse(&format!("https://{target_host}"))
+                    .map_err(|err| format!("invalid target host in URL: {err}"))
+            }) {
+            Ok(url) => url,
+            Err(err) => {
+                return Err((err, options));
+            }
+        };
+
+        // Extract host and port, adding the 443 default.
+        let host = url_obj.host_str().unwrap_or("");
+        let port = url_obj.port().unwrap_or(443);
+        let explicit_authority = format!("{host}:{port}");
+
+        // Safely build `http::Uri` with the explicit authority (guaranteed ASCII/Punycode).
+        let uri = match http::Uri::builder()
+            .scheme("https")
+            .authority(explicit_authority.as_str())
+            .path_and_query("/")
+            .build()
+        {
+            Ok(uri) => uri,
+            Err(err) => {
+                // This should not error since the url crate parsed the host.
+                return Err((
+                    format!("failed to parse target authority: {}", err),
+                    options,
+                ));
+            }
+        };
+
+        let Some(intercept) = matcher.intercept(&uri) else {
+            return Ok(self.child_builder.build(target, options));
+        };
+
+        let mut proxy_authorization_header = intercept.basic_auth().cloned();
+        if let Some(ref mut header) = proxy_authorization_header {
+            header.set_sensitive(true);
+        }
+
+        let proxy_options = ProxyOptions {
+            proxy_authorization_header,
+            connect_addr: explicit_authority,
+        };
+
+        let Some(proxy_host) = intercept.uri().authority() else {
+            return Err((
+                format!("proxy URI missing authority: {}", intercept.uri()),
+                options,
+            ));
+        };
+
+        // `proxy_host` must be a valid URL authority. Because the `url` crate
+        // implements the WHATWG standard, it leaves `[]` unescaped in the path.
+        // Therefore, we don't need to explicitly percent-decode the host string.
+        let target_str = format!("dns:///{}", proxy_host);
+        let proxy_target: Target = match target_str.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                return Err((
+                    format!("failed to parse proxy target {target_str}: {e}"),
+                    options,
+                ));
+            }
+        };
+
+        let child = dns::Builder {}.build(&proxy_target, options);
+
+        Ok(Box::new(HttpsProxyResolver {
+            child,
+            proxy_options: Arc::new(proxy_options),
+        }))
+    }
+}
+
+struct HttpsProxyResolver {
+    child: Box<dyn Resolver>,
+    proxy_options: Arc<ProxyOptions>,
+}
+
+/// Options for establishing an HTTP CONNECT proxy tunnel.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub(crate) struct ProxyOptions {
+    proxy_authorization_header: Option<HeaderValue>,
+    connect_addr: String,
+}
+
+impl ProxyOptions {
+    /// Returns the value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn proxy_authorization_header(&self) -> Option<&http::HeaderValue> {
+        self.proxy_authorization_header.as_ref()
+    }
+
+    /// Returns the address of the proxy server to connect to (host:port).
+    /// This is Punycode-encoded, i.e., it's a valid URL host:port.
+    pub(crate) fn target_authority(&self) -> &str {
+        &self.connect_addr
+    }
+}
+
+impl Resolver for HttpsProxyResolver {
+    fn resolve_now(&mut self) {
+        self.child.resolve_now();
+    }
+
+    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+        let mut interceptor = InterceptingController {
+            inner: channel_controller,
+            proxy_options: &self.proxy_options,
+        };
+        self.child.work(&mut interceptor);
+    }
+}
+
+struct InterceptingController<'a> {
+    inner: &'a mut dyn ChannelController,
+    proxy_options: &'a Arc<ProxyOptions>,
+}
+
+impl<'a> ChannelController for InterceptingController<'a> {
+    fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
+        if let Ok(endpoints) = &mut update.endpoints {
+            for endpoint in endpoints {
+                for address in &mut endpoint.addresses {
+                    address.attributes = address.attributes.add(self.proxy_options.clone());
+                }
+            }
+        }
+        self.inner.update(update)
+    }
+
+    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
+        self.inner.parse_service_config(config)
+    }
+}
+
+/// Extracts `ProxyOptions` from the given `Address` attributes, if present.
+pub(crate) fn proxy_options_for_addr(addr: &Address) -> Option<&ProxyOptions> {
+    addr.attributes
+        .get::<Arc<ProxyOptions>>()
+        .map(AsRef::as_ref)
+}
+
+fn get_first_env(names: &[&str]) -> String {
+    for name in names {
+        if let Ok(val) = std::env::var(name) {
+            return val;
+        }
+    }
+
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::net::IpAddr;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::attributes::Attributes;
+    use crate::byte_str::ByteStr;
+    use crate::client::name_resolution::Address;
+    use crate::client::name_resolution::test_utils::TestChannelController;
+    use crate::client::name_resolution::test_utils::TestWorkScheduler;
+    use crate::rt;
+    use crate::rt::GrpcEndpoint;
+    use crate::rt::GrpcRuntime;
+    use crate::rt::Runtime;
+    use crate::rt::Sleep;
+    use crate::rt::TaskHandle;
+    use crate::rt::TcpOptions;
+    use crate::rt::tokio::TokioRuntime;
+
+    const DIRECT_ADDRESS: &str = "1.2.3.4:5678";
+
+    #[derive(Clone, Debug)]
+    struct FakeDns {
+        lookup_result: Result<Vec<IpAddr>, String>,
+    }
+
+    #[tonic::async_trait]
+    impl rt::DnsResolver for FakeDns {
+        async fn lookup_host_name(&self, _: &str) -> Result<Vec<IpAddr>, String> {
+            self.lookup_result.clone()
+        }
+
+        async fn lookup_txt(&self, _: &str) -> Result<Vec<String>, String> {
+            Err("unimplemented".to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeRuntime {
+        inner: TokioRuntime,
+        dns: FakeDns,
+    }
+
+    impl Runtime for FakeRuntime {
+        fn spawn(
+            &self,
+            task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> Box<dyn TaskHandle> {
+            self.inner.spawn(task)
+        }
+
+        fn get_dns_resolver(
+            &self,
+            _: rt::ResolverOptions,
+        ) -> Result<Box<dyn rt::DnsResolver>, String> {
+            Ok(Box::new(self.dns.clone()))
+        }
+
+        fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn Sleep>> {
+            self.inner.sleep(duration)
+        }
+
+        fn tcp_stream(
+            &self,
+            target: std::net::SocketAddr,
+            opts: TcpOptions,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
+            self.inner.tcp_stream(target, opts)
+        }
+    }
+
+    struct MockResolverBuilder {
+        scheme: &'static str,
+    }
+
+    impl ResolverBuilder for MockResolverBuilder {
+        fn build(&self, _target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
+            let addr = Address {
+                network_type: "tcp",
+                address: ByteStr::from(DIRECT_ADDRESS.to_string()),
+                attributes: Attributes::new(),
+            };
+            NopResolver::new_with_addr(addr, options)
+        }
+
+        fn scheme(&self) -> &str {
+            self.scheme
+        }
+
+        fn is_valid_uri(&self, _uri: &Target) -> bool {
+            true
+        }
+    }
+
+    async fn run_resolver_and_get_addresses(
+        target_uri: &str,
+        dns_ips: Vec<IpAddr>,
+        matcher: Option<&Matcher>,
+    ) -> Vec<Address> {
+        let child_builder = Arc::new(MockResolverBuilder { scheme: "dns" });
+        let builder = Builder::new(child_builder);
+
+        let target: Target = target_uri.parse().unwrap();
+        let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
+        let runtime = FakeRuntime {
+            inner: TokioRuntime::default(),
+            dns: FakeDns {
+                lookup_result: Ok(dns_ips),
+            },
+        };
+        let options = ResolverOptions {
+            authority: target.authority_host_port(),
+            runtime: GrpcRuntime::new(runtime),
+            work_scheduler,
+        };
+
+        let mut resolver = match builder.new_resolver(&target, options, matcher) {
+            Ok(resolver) => resolver,
+            Err((err, _)) => panic!("failed to build resolver: {err}"),
+        };
+
+        work_rx.recv().await.unwrap();
+
+        let (mut channel_controller, mut update_rx) = TestChannelController::new_pair();
+        resolver.work(&mut channel_controller);
+
+        let update = update_rx.recv().await.unwrap();
+        let endpoints = update.endpoints.unwrap();
+
+        let mut addresses = Vec::new();
+        for endpoint in endpoints {
+            for address in endpoint.addresses {
+                addresses.push(address);
+            }
+        }
+        addresses
+    }
+
+    #[tokio::test]
+    async fn test_proxy_matched() {
+        let matcher = Matcher::builder()
+            .https("http://user:password@proxy.example.com:8080")
+            .build();
+
+        let dns_ips = vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
+        let addresses =
+            run_resolver_and_get_addresses("dns:///target.example.com", dns_ips, Some(&matcher))
+                .await;
+
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+        assert_eq!(addresses[1].address, "[::1]:8080");
+
+        let mut expected_header = HeaderValue::from_static("Basic dXNlcjpwYXNzd29yZA==");
+        expected_header.set_sensitive(true);
+        let expected_proxy_opts = ProxyOptions {
+            proxy_authorization_header: Some(expected_header),
+            connect_addr: "target.example.com:443".to_string(),
+        };
+
+        for address in &addresses {
+            let proxy_opts = proxy_options_for_addr(address).expect("ProxyOptions not found");
+            assert_eq!(proxy_opts, &expected_proxy_opts);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_non_matched() {
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .no("target.example.com")
+            .build();
+
+        let addresses = run_resolver_and_get_addresses(
+            "dns:///target.example.com",
+            vec!["127.0.0.1".parse().unwrap()],
+            Some(&matcher),
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_punycode_encoding() {
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .build();
+
+        let addresses = run_resolver_and_get_addresses(
+            "dns:///täst.example.com",
+            vec!["127.0.0.1".parse().unwrap()],
+            Some(&matcher),
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        assert_eq!(
+            proxy_opts,
+            &ProxyOptions {
+                proxy_authorization_header: None,
+                connect_addr: "xn--tst-qla.example.com:443".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_unix_path_with_proxy_errors() {
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .build();
+
+        // The path has a space in the first segment of the path, which makes it
+        // an invalid hostname.
+        let target_uri = "unix:///var%20/run/grpc.sock";
+
+        let child_builder = Arc::new(MockResolverBuilder { scheme: "unix" });
+        let builder = Builder::new(child_builder);
+
+        let target: Target = target_uri.parse().unwrap();
+        let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
+        let runtime = FakeRuntime {
+            inner: TokioRuntime::default(),
+            dns: FakeDns {
+                lookup_result: Ok(vec!["127.0.0.1".parse().unwrap()]),
+            },
+        };
+        let options = ResolverOptions {
+            authority: target.authority_host_port(),
+            runtime: GrpcRuntime::new(runtime),
+            work_scheduler,
+        };
+
+        let mut resolver = match builder.new_resolver(&target, options, Some(&matcher)) {
+            Ok(resolver) => resolver,
+            Err((err, options)) => NopResolver::new_with_err(err, options),
+        };
+
+        work_rx.recv().await.unwrap();
+
+        let (mut channel_controller, mut update_rx) = TestChannelController::new_pair();
+        resolver.work(&mut channel_controller);
+
+        let update = update_rx.recv().await.unwrap();
+        let err = update.endpoints.unwrap_err();
+        assert!(err.contains("invalid target host in URL"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_unix_path_without_proxy_works() {
+        // When matcher is None, it should bypass URL parsing and succeed,
+        // returning the child resolver's addresses.
+        let addresses = run_resolver_and_get_addresses(
+            "unix:///var%20/run/grpc.sock",
+            vec!["127.0.0.1".parse().unwrap()],
+            None,
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_matcher_behavior_configured_manually() {
+        let dns_ips = || vec!["127.0.0.1".parse().unwrap()];
+
+        // Case 1: http proxy is set, but destination is HTTPS.
+        // It should NOT be matched.
+        let matcher = Matcher::builder()
+            .http("http://proxy.example.com:8080")
+            .build();
+        let addresses =
+            run_resolver_and_get_addresses("dns:///target.example.com", dns_ips(), Some(&matcher))
+                .await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert!(
+            proxy_options_for_addr(&addresses[0]).is_none(),
+            "HTTP proxy should not match HTTPS destinations"
+        );
+
+        // Case 2: https proxy is set, destination is HTTPS.
+        // It should be matched.
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .build();
+        let addresses =
+            run_resolver_and_get_addresses("dns:///target.example.com", dns_ips(), Some(&matcher))
+                .await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+        assert!(
+            proxy_options_for_addr(&addresses[0]).is_some(),
+            "HTTPS proxy should match HTTPS destinations"
+        );
+
+        // Case 3: https proxy and no proxy are configured.
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .no("target.example.com")
+            .build();
+
+        // Target A: target.example.com (matched by no_proxy) -> should bypass proxy
+        let addresses =
+            run_resolver_and_get_addresses("dns:///target.example.com", dns_ips(), Some(&matcher))
+                .await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+
+        // Target B: other.example.com (NOT matched by no_proxy) -> should proxy
+        let addresses =
+            run_resolver_and_get_addresses("dns:///other.example.com", dns_ips(), Some(&matcher))
+                .await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+        assert!(proxy_options_for_addr(&addresses[0]).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_no_matcher_returns_child_resolver() {
+        let addresses = run_resolver_and_get_addresses(
+            "unix:///invalid/but/doesnt/matter/since/no/matcher",
+            vec!["127.0.0.1".parse().unwrap()],
+            None,
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ipv6_address() {
+        let matcher = Matcher::builder().https("http://[::1]:8080").build();
+
+        let addresses = run_resolver_and_get_addresses(
+            "dns:///target.example.com",
+            vec!["127.0.0.1".parse().unwrap()],
+            Some(&matcher),
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, "[::1]:8080");
+
+        let expected_proxy_opts = ProxyOptions {
+            proxy_authorization_header: None,
+            connect_addr: "target.example.com:443".to_string(),
+        };
+
+        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        assert_eq!(proxy_opts, &expected_proxy_opts);
+    }
+}

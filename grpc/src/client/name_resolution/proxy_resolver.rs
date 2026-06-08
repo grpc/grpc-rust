@@ -40,6 +40,7 @@ use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::dns;
 use crate::client::service_config::ServiceConfig;
+use crate::credentials::common::Authority;
 
 static MATCHER: LazyLock<Option<Matcher>> = LazyLock::new(build_matcher);
 
@@ -126,6 +127,7 @@ impl Builder {
             .try_into()
             .map_err(|err| format!("non-UTF-8 symbol in target host: {err}"))
             .and_then(|target_host: &str| {
+                let target_host = authority_with_default_port(target_host, 443);
                 Url::parse(&format!("https://{target_host}"))
                     .map_err(|err| format!("invalid target host in URL: {err}"))
             }) {
@@ -135,12 +137,14 @@ impl Builder {
             }
         };
 
-        // Extract host and port, adding the 443 default.
+        // The URL omits the default port for the scheme (443 for HTTPS), so we
+        // must explicitly add it.
         let host = url_obj.host_str().unwrap_or("");
         let port = url_obj.port().unwrap_or(443);
         let explicit_authority = format!("{host}:{port}");
 
-        // Safely build `http::Uri` with the explicit authority (guaranteed ASCII/Punycode).
+        // Safely build `http::Uri` with the explicit authority (guaranteed
+        // ASCII/Punycode).
         let uri = match http::Uri::builder()
             .scheme("https")
             .authority(explicit_authority.as_str())
@@ -277,6 +281,14 @@ fn get_first_env(names: &[&str]) -> String {
     }
 
     String::new()
+}
+
+fn authority_with_default_port(host_port: &str, default_port: u16) -> String {
+    let mut authority = Authority::from_host_port_str(host_port);
+    if authority.port().is_none() {
+        authority.set_port(Some(default_port));
+    }
+    authority.host_port_string()
 }
 
 #[cfg(test)]
@@ -636,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_ipv6_address() {
+    async fn ipv6_proxy_address() {
         let matcher = Matcher::builder().https("http://[::1]:8080").build();
 
         let addresses = run_resolver_and_get_addresses(
@@ -652,6 +664,31 @@ mod tests {
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
             connect_addr: "target.example.com:443".to_string(),
+        };
+
+        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        assert_eq!(proxy_opts, &expected_proxy_opts);
+    }
+
+    #[tokio::test]
+    async fn ipv6_target_address() {
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .build();
+
+        let addresses = run_resolver_and_get_addresses(
+            "dns:///::1",
+            vec!["127.0.0.1".parse().unwrap()],
+            Some(&matcher),
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+
+        let expected_proxy_opts = ProxyOptions {
+            proxy_authorization_header: None,
+            connect_addr: "[::1]:443".to_string(),
         };
 
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");

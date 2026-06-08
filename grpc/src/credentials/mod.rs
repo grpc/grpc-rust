@@ -190,6 +190,10 @@ pub(crate) mod common {
             self.port
         }
 
+        pub fn set_port(&mut self, port: Option<u16>) {
+            self.port = port;
+        }
+
         pub fn host_port_string(&self) -> String {
             let host_str = &self.host;
             match self.port() {

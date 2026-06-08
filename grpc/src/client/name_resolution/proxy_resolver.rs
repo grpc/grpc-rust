@@ -109,6 +109,10 @@ impl Builder {
         options: ResolverOptions,
         matcher: Option<&Matcher>,
     ) -> Result<Box<dyn Resolver>, (String, ResolverOptions)> {
+        // Skip proxy lookup for known non-TCP schemes.
+        if matches!(target.scheme(), "unix" | "unix-abstract") {
+            return Ok(self.child_builder.build(target, options));
+        }
         // If HTTPS_PROXY is unset, avoid parsing the target as a DNS hostname.
         let Some(matcher) = matcher else {
             return Ok(self.child_builder.build(target, options));
@@ -417,7 +421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_matched() {
+    async fn proxy_matched() {
         let matcher = Matcher::builder()
             .https("http://user:password@proxy.example.com:8080")
             .build();
@@ -445,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_non_matched() {
+    async fn proxy_non_matched() {
         let matcher = Matcher::builder()
             .https("http://proxy.example.com:8080")
             .no("target.example.com")
@@ -464,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_punycode_encoding() {
+    async fn punycode_encoding() {
         let matcher = Matcher::builder()
             .https("http://proxy.example.com:8080")
             .build();
@@ -488,16 +492,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_unix_path_with_proxy_errors() {
+    async fn invalid_custom_scheme_path_with_proxy_errors() {
         let matcher = Matcher::builder()
             .https("http://proxy.example.com:8080")
             .build();
 
         // The path has a space in the first segment of the path, which makes it
         // an invalid hostname.
-        let target_uri = "unix:///var%20/run/grpc.sock";
+        let target_uri = "custom:///var%20/run/grpc.sock";
 
-        let child_builder = Arc::new(MockResolverBuilder { scheme: "unix" });
+        let child_builder = Arc::new(MockResolverBuilder { scheme: "custom" });
         let builder = Builder::new(child_builder);
 
         let target: Target = target_uri.parse().unwrap();
@@ -530,13 +534,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_unix_path_without_proxy_works() {
-        // When matcher is None, it should bypass URL parsing and succeed,
-        // returning the child resolver's addresses.
+    async fn invalid_unix_path_works() {
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .build();
+
+        // Proxy lookup for unix targets should be skipped.
         let addresses = run_resolver_and_get_addresses(
             "unix:///var%20/run/grpc.sock",
             vec!["127.0.0.1".parse().unwrap()],
-            None,
+            Some(&matcher),
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+
+        // Check for abstract-unix scheme.
+        let addresses = run_resolver_and_get_addresses(
+            "unix-abstract:grpc.sock",
+            vec!["127.0.0.1".parse().unwrap()],
+            Some(&matcher),
         )
         .await;
 
@@ -546,7 +565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matcher_behavior_configured_manually() {
+    async fn matcher_behavior_configured_manually() {
         let dns_ips = || vec!["127.0.0.1".parse().unwrap()];
 
         // Case 1: http proxy is set, but destination is HTTPS.
@@ -603,7 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_matcher_returns_child_resolver() {
+    async fn no_matcher_returns_child_resolver() {
         let addresses = run_resolver_and_get_addresses(
             "unix:///invalid/but/doesnt/matter/since/no/matcher",
             vec!["127.0.0.1".parse().unwrap()],
@@ -617,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_ipv6_address() {
+    async fn proxy_ipv6_address() {
         let matcher = Matcher::builder().https("http://[::1]:8080").build();
 
         let addresses = run_resolver_and_get_addresses(

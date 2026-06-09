@@ -70,7 +70,6 @@ use tower_service::Service as TowerService;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::RecvStream;
@@ -364,7 +363,7 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: ByteStr,
+        address: String,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
@@ -406,11 +405,8 @@ impl Transport for TransportBuilder {
 
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
-                let addr_str: &str = (&address)
-                    .try_into()
-                    .map_err(|err| format!("address contains non-UTF-8 symbols: {err}"))?;
                 let addr: SocketAddr =
-                    SocketAddr::from_str(addr_str).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -420,25 +416,7 @@ impl Transport for TransportBuilder {
                 )
             }
             NetworkType::Unix => {
-                #[cfg(unix)]
-                {
-                    use std::ffi::OsStr;
-                    use std::os::unix::ffi::OsStrExt;
-                    runtime.unix_stream(
-                        PathBuf::from(OsStr::from_bytes(&address)),
-                        UnixSocketOptions::default(),
-                    )
-                }
-                #[cfg(not(unix))]
-                {
-                    match std::str::from_utf8(&address) {
-                        Ok(valid_str) => runtime
-                            .unix_stream(PathBuf::from(valid_str), UnixSocketOptions::default()),
-                        Err(_) => Box::pin(async move {
-                            Err("socket path contains non-UTF-8 characters".to_string())
-                        }),
-                    }
-                }
+                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
             }
         };
         let transport = if let Some(deadline) = opts.connect_deadline {

@@ -1018,11 +1018,11 @@ mod test {
         let all_subchannels = verify_subchannel_creation(&mut rx_events, 2);
         let subchannel_one = all_subchannels
             .iter()
-            .find(|sc| sc.address().address == "subchannel_one")
+            .find(|sc| sc.address().address == "subchannel_one".to_string().into())
             .unwrap();
         let subchannel_two = all_subchannels
             .iter()
-            .find(|sc| sc.address().address == "subchannel_two")
+            .find(|sc| sc.address().address == "subchannel_two".to_string().into())
             .unwrap();
 
         move_subchannel_to_state(
@@ -1081,11 +1081,11 @@ mod test {
         let new_subchannels = verify_subchannel_creation(&mut rx_events, 2);
         let new_sc = new_subchannels
             .iter()
-            .find(|sc| sc.address().address == "new")
+            .find(|sc| sc.address().address == "new".to_string().into())
             .unwrap();
         let old_sc = new_subchannels
             .iter()
-            .find(|sc| sc.address().address == "subchannel_two")
+            .find(|sc| sc.address().address == "subchannel_two".to_string().into())
             .unwrap();
 
         move_subchannel_to_state(

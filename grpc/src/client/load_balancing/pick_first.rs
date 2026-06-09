@@ -425,7 +425,7 @@ impl PickFirstPolicy {
         // Partition by family (Basic IPv6 detection via colon).
         let (ipv6, ipv4): (Vec<Address>, Vec<Address>) = tcp_addresses
             .into_iter()
-            .partition(|addr| addr.address.contains(&b':'));
+            .partition(|addr| addr.address.contains(':'));
 
         // Interleave the two lists so ipv6 and ipv4 addresses are alternated.
         let mut interleaved = Vec::with_capacity(ipv6.len() + ipv4.len() + unknown.len());
@@ -738,9 +738,9 @@ mod test {
     use std::time::Duration;
 
     use super::*;
-    use crate::client::load_balancing::test_utils::TestChannelController;
-    use crate::client::load_balancing::test_utils::TestEvent;
-    use crate::client::load_balancing::test_utils::TestWorkScheduler;
+    use crate::client::load_balancing::test_utils::{
+        TestChannelController, TestEvent, TestWorkScheduler,
+    };
 
     const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 
@@ -928,7 +928,7 @@ mod test {
         let res = state.picker.pick(&RequestHeaders::default());
         match res {
             PickResult::Pick(pick) => {
-                assert_eq!(pick.subchannel.address().address, "addr1")
+                assert_eq!(pick.subchannel.address().address.to_string(), "addr1")
             }
             other => panic!("unexpected pick result {:?}", other),
         }
@@ -942,7 +942,7 @@ mod test {
 
         // Should connect to addr2.
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr2");
+        assert_eq!(addr.address.to_string(), "addr2");
 
         // Simulate addr2 succeeding.
         let sc2 = policy.subchannels[1].clone();
@@ -986,16 +986,25 @@ mod test {
 
         // Should create new subchannel for addr2 (was cleared by cleanup).
         let sc2 = expect_new_subchannel(&rx);
-        assert_eq!(sc2.address().address, "addr2");
+        assert_eq!(sc2.address().address.to_string(), "addr2");
         // Should create new subchannel for addr3 (was not in previous list).
         let sc3 = expect_new_subchannel(&rx);
-        assert_eq!(sc3.address().address, "addr3");
+        assert_eq!(sc3.address().address.to_string(), "addr3");
 
         // Should NOT have any more events (no Connect, no UpdatePicker),
         // because it stuck to the original selected subchannel.
         assert!(rx.try_recv().is_err(), "unexpected event");
 
-        assert_eq!(policy.selected.as_ref().unwrap().address().address, "addr1");
+        assert_eq!(
+            policy
+                .selected
+                .as_ref()
+                .unwrap()
+                .address()
+                .address
+                .to_string(),
+            "addr1"
+        );
     }
 
     // If all addresses fail during a connection pass, the LB should update to
@@ -1079,7 +1088,7 @@ mod test {
         let mut resulting_addrs = Vec::with_capacity(NUM_ADDRS);
         for _ in 0..NUM_ADDRS {
             let sc = expect_new_subchannel(&rx);
-            resulting_addrs.push(sc.address().address);
+            resulting_addrs.push(sc.address().address.to_string());
         }
 
         // Mock shuffler reverses endpoints: [EP3, EP2, EP1]
@@ -1148,9 +1157,9 @@ mod test {
 
         // Should only create subchannels for addr1 and addr2 (2 unique addrs).
         let sc1 = expect_new_subchannel(&rx);
-        assert_eq!(sc1.address().address, "addr1");
+        assert_eq!(sc1.address().address.to_string(), "addr1");
         let sc2 = expect_new_subchannel(&rx);
-        assert_eq!(sc2.address().address, "addr2");
+        assert_eq!(sc2.address().address.to_string(), "addr2");
 
         // Verify no 3rd subchannel was created.
         while let Ok(event) = rx.try_recv() {
@@ -1217,7 +1226,7 @@ mod test {
 
         // Expect Connect event for addr2 due to timer expiration.
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr2");
+        assert_eq!(addr.address.to_string(), "addr2");
     }
 
     // If all addresses fail during a connection pass, the LB should enter
@@ -1250,7 +1259,7 @@ mod test {
 
         // Should automatically call connect() again.
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr1");
+        assert_eq!(addr.address.to_string(), "addr1");
     }
 
     // If the LB is in steady state, and a new address becomes ready, it should
@@ -1265,7 +1274,7 @@ mod test {
 
         // Should failover to addr2: expect Connect(addr2).
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr2");
+        assert_eq!(addr.address.to_string(), "addr2");
 
         // While addr2 is connecting, simulate addr1 going IDLE (backoff over).
         policy.subchannel_update(
@@ -1300,7 +1309,7 @@ mod test {
         );
         expect_request_resolution(&rx);
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr1");
+        assert_eq!(addr.address.to_string(), "addr1");
 
         // Confirm LB is in steady state.
         assert!(policy.steady_state.is_some());
@@ -1317,7 +1326,7 @@ mod test {
 
         // Now it should automatically call connect() again.
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr1");
+        assert_eq!(addr.address.to_string(), "addr1");
 
         // Simulate addr1 successfully connecting and becoming READY.
         policy.subchannel_update(
@@ -1335,7 +1344,7 @@ mod test {
         let res = state.picker.pick(&RequestHeaders::default());
         match res {
             PickResult::Pick(pick) => {
-                assert_eq!(pick.subchannel.address().address, "addr1");
+                assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
             }
             other => panic!("unexpected pick result {:?}", other),
         }
@@ -1354,7 +1363,7 @@ mod test {
 
         // Expect Connect(addr2).
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr2");
+        assert_eq!(addr.address.to_string(), "addr2");
 
         // Simulate addr1 backing off and transitioning to IDLE early
         // (while addr2 is still connecting).
@@ -1393,7 +1402,7 @@ mod test {
         // Expect an immediate Connect(addr1) event triggered by the exhaustion
         // loop sweeping up the early IDLE subchannel.
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr1");
+        assert_eq!(addr.address.to_string(), "addr1");
     }
 
     // This test is meant to validate that if a new address with different
@@ -1492,7 +1501,7 @@ mod test {
         policy.work(None, controller.as_mut());
 
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr2");
+        assert_eq!(addr.address.to_string(), "addr2");
 
         // 2. Simulate addr2 failing first while addr1 is still in flight.
         let sc2 = policy.subchannels[1].clone();
@@ -1574,7 +1583,7 @@ mod test {
         let res = state.picker.pick(&RequestHeaders::default());
         let sc1 = match res {
             PickResult::Pick(pick) => {
-                assert_eq!(pick.subchannel.address().address, "addr1");
+                assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
                 pick.subchannel
             }
             other => panic!("unexpected pick result {:?}", other),
@@ -1610,7 +1619,7 @@ mod test {
 
         // 7. Verify that the policy initiates a reconnection to addr1.
         let addr = expect_connect(&rx);
-        assert_eq!(addr.address, "addr1");
+        assert_eq!(addr.address.to_string(), "addr1");
 
         // And the picker goes to Connecting.
         let state = expect_picker_update(&rx);

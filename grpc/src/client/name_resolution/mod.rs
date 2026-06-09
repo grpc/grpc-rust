@@ -68,22 +68,19 @@ pub(crate) use registry::global_registry;
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
     url: Url,
+    decoded_path: String,
 }
 
 impl FromStr for Target {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.parse::<Url>() {
-            Ok(url) => Ok(Target { url }),
-            Err(err) => Err(err.to_string()),
-        }
-    }
-}
-
-impl From<url::Url> for Target {
-    fn from(url: url::Url) -> Self {
-        Target { url }
+        let url = s.parse::<Url>().map_err(|err| err.to_string())?;
+        let decoded_path = percent_decode_str(url.path())
+            .decode_utf8()
+            .map_err(|err| format!("invalid UTF-8 character in target path: {err}"))?
+            .into_owned();
+        Ok(Target { url, decoded_path })
     }
 }
 
@@ -125,8 +122,8 @@ impl Target {
     }
 
     /// Retrieves the percent-decoded endpoint from `Url.path()`.
-    pub fn path(&self) -> ByteStr {
-        percent_decode_str(self.url.path()).collect()
+    pub fn path(&self) -> &str {
+        &self.decoded_path
     }
 }
 
@@ -137,7 +134,7 @@ impl Display for Target {
             "{}://{}{}",
             self.scheme(),
             self.authority_host_port(),
-            String::from_utf8_lossy(&self.path())
+            self.decoded_path
         )
     }
 }
@@ -164,8 +161,7 @@ pub(crate) trait ResolverBuilder: Send + Sync {
     /// with the leading prefix removed.
     fn default_authority(&self, target: &Target) -> String {
         let path = target.path();
-        let path = path.strip_prefix(b"/").unwrap_or(path);
-        String::from_utf8_lossy(&path).into()
+        path.strip_prefix("/").unwrap_or(path).to_string()
     }
 
     /// Returns a bool indicating whether the input uri is valid to create a
@@ -323,13 +319,9 @@ impl Hash for Address {
 }
 
 impl Display for Address {
+    #[allow(clippy::to_string_in_format_args)]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}:{}",
-            self.network_type,
-            String::from_utf8_lossy(&self.address)
-        )
+        write!(f, "{}:{}", self.network_type, self.address.to_string())
     }
 }
 
@@ -404,7 +396,7 @@ mod test {
             want_host: &'static str,
             want_port: Option<u16>,
             want_host_port: &'static str,
-            want_path: &'static [u8],
+            want_path: &'static str,
             want_str: &'static str,
         }
         let test_cases = vec![
@@ -414,7 +406,7 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: b"/grpc.io",
+                want_path: "/grpc.io",
                 want_str: "dns:///grpc.io",
             },
             TestCase {
@@ -423,7 +415,7 @@ mod test {
                 want_host_port: "8.8.8.8:53",
                 want_host: "8.8.8.8",
                 want_port: Some(53),
-                want_path: b"/grpc.io/docs",
+                want_path: "/grpc.io/docs",
                 want_str: "dns://8.8.8.8:53/grpc.io/docs",
             },
             TestCase {
@@ -432,7 +424,7 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: b"path/to/file",
+                want_path: "path/to/file",
                 want_str: "unix://path/to/file",
             },
             TestCase {
@@ -441,7 +433,7 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: b"/run/containerd/containerd.sock",
+                want_path: "/run/containerd/containerd.sock",
                 want_str: "unix:///run/containerd/containerd.sock",
             },
             TestCase {
@@ -450,17 +442,8 @@ mod test {
                 want_host_port: "",
                 want_host: "",
                 want_port: None,
-                want_path: b"/foo bar",
+                want_path: "/foo bar",
                 want_str: "dns:///foo bar",
-            },
-            TestCase {
-                input: "dns:///foo%FFbar",
-                want_scheme: "dns",
-                want_host_port: "",
-                want_host: "",
-                want_port: None,
-                want_path: b"/foo\xffbar",
-                want_str: "dns:///foo\u{FFFD}bar",
             },
         ];
 
@@ -470,9 +453,21 @@ mod test {
             assert_eq!(target.authority_host(), tc.want_host);
             assert_eq!(target.authority_port(), tc.want_port);
             assert_eq!(target.authority_host_port(), tc.want_host_port);
-            assert_eq!(&*target.path(), tc.want_path);
+            assert_eq!(target.path(), tc.want_path);
             assert_eq!(&target.to_string(), tc.want_str);
         }
+    }
+
+    #[test]
+    fn parse_target_invalid_utf8() {
+        let input = "dns:///foo%FFbar";
+        let target: Result<Target, _> = input.parse();
+        assert!(target.is_err());
+        assert!(
+            target
+                .unwrap_err()
+                .contains("invalid UTF-8 character in target path")
+        );
     }
 
     // This test ensures that the Address struct correctly maintains its

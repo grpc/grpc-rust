@@ -38,7 +38,6 @@ use tokio::sync::oneshot;
 use crate::StatusCodeError;
 use crate::StatusError;
 use crate::attributes::Attributes;
-use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::DynRecvStream as ClientDynRecvStream;
 use crate::client::DynSendStream as ClientDynSendStream;
@@ -79,7 +78,7 @@ use crate::server::ResponseStreamItem as ServerResponseStreamItem;
 use crate::server::SendOptions as ServerSendOptions;
 use crate::server::SendStream as ServerSendStream;
 
-static LISTENERS: LazyLock<Mutex<HashMap<ByteStr, mpsc::Sender<InMemoryServerCall>>>> =
+static LISTENERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<InMemoryServerCall>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -107,7 +106,7 @@ pub struct InMemoryListener {
 }
 
 struct InMemoryListenerInner {
-    id: ByteStr,
+    id: String,
     r: TokioMutex<mpsc::Receiver<InMemoryServerCall>>,
     close_notify: Arc<Notify>,
     drop_notify: Arc<Notify>,
@@ -127,7 +126,7 @@ impl Default for InMemoryListener {
 
 impl InMemoryListener {
     pub fn new() -> Self {
-        let id: ByteStr = NEXT_ID.fetch_add(1, Ordering::Relaxed).to_string().into();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed).to_string();
         let (s, r) = mpsc::channel(1);
         let mut listeners = LISTENERS.lock().unwrap();
         listeners.insert(id.clone(), s);
@@ -141,7 +140,7 @@ impl InMemoryListener {
         }
     }
 
-    pub fn id(&self) -> ByteStr {
+    pub fn id(&self) -> String {
         self.inner.id.clone()
     }
 
@@ -344,7 +343,7 @@ impl Transport for InMemoryTransport {
 
     async fn connect(
         &self,
-        target: ByteStr,
+        target: String,
         _runtime: GrpcRuntime,
         _security_opts: &SecurityOpts,
         _options: &TransportOptions,
@@ -359,7 +358,7 @@ impl Transport for InMemoryTransport {
         let listeners = LISTENERS.lock().unwrap();
         let s = listeners
             .get(&target)
-            .ok_or_else(|| format!("no listener for target: {:?}", target))?;
+            .ok_or_else(|| format!("no listener for target: {}", target))?;
 
         let (closed_tx, closed_rx) = oneshot::channel();
         let conn = InMemoryConnection {
@@ -392,11 +391,8 @@ pub struct InMemoryResolverBuilder {}
 
 impl ResolverBuilder for InMemoryResolverBuilder {
     fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
-        let path = target.path().strip_prefix(b"/").unwrap_or(target.path());
-        let ids: Vec<ByteStr> = path
-            .split(|&b| b == b',')
-            .map(|chunk| chunk.iter().copied().collect())
-            .collect();
+        let path = target.path().strip_prefix('/').unwrap_or(target.path());
+        let ids: Vec<String> = path.split(',').map(|s| s.to_string()).collect();
         options.work_scheduler.schedule_work();
         Box::new(InMemoryResolver { ids })
     }
@@ -411,7 +407,7 @@ impl ResolverBuilder for InMemoryResolverBuilder {
 }
 
 struct InMemoryResolver {
-    ids: Vec<ByteStr>,
+    ids: Vec<String>,
 }
 
 impl Resolver for InMemoryResolver {
@@ -424,7 +420,7 @@ impl Resolver for InMemoryResolver {
             .map(|id| Endpoint {
                 addresses: vec![Address {
                     network_type: "inmemory",
-                    address: id.clone(),
+                    address: crate::byte_str::ByteStr::from(id.clone()),
                     ..Default::default()
                 }],
                 ..Default::default()

@@ -157,7 +157,7 @@ pub(crate) async fn tonic_transport_rpc() {
     };
     let (conn, _sec_info, mut disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string().into(),
+            addr.to_string(),
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -319,22 +319,6 @@ mod unix_tests {
         let dir = tempdir().expect("failed to create temp dir");
         let socket_path = dir.path().join("absolute.sock");
         let target = format!("unix://{}", socket_path.to_str().unwrap());
-
-        run_unix_test(&socket_path, &target).await;
-    }
-
-    #[tokio::test]
-    #[cfg(target_os = "linux")]
-    async fn unix_absolute_path_non_utf8() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let dir = tempdir().expect("failed to create temp dir");
-        let mut socket_path_bytes = dir.path().as_os_str().as_bytes().to_vec();
-        // Use an invalid UTF-8 byte sequence to ensure it is handled correctly.
-        socket_path_bytes.extend_from_slice(b"/absolute\xff.sock");
-        let socket_path = PathBuf::from(OsStr::from_bytes(&socket_path_bytes));
-        let target = format!("unix://{}/absolute%FF.sock", dir.path().to_str().unwrap());
 
         run_unix_test(&socket_path, &target).await;
     }
@@ -690,7 +674,7 @@ async fn tonic_transport_invalid_base64_headers() {
     };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string().into(),
+            addr.to_string(),
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -765,7 +749,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
     };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string().into(),
+            addr.to_string(),
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,

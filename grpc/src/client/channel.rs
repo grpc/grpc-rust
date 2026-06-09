@@ -36,7 +36,6 @@ use std::vec;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -248,10 +247,9 @@ impl PersistentChannel {
         options: ChannelOptions,
         credentials: Arc<dyn DynChannelCredentials>,
     ) -> Self {
-        // TODO(arjan-bal): Return errors here instead of panicking.
-        let target = Url::from_str(&target.into()).unwrap();
+        // TODO(nathanielford): Return errors here instead of panicking.
+        let target = Target::from_str(&target.into()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        let target = name_resolution::Target::from(target);
         let authority = options
             .channel_authority
             .clone()

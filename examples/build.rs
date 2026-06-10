@@ -57,11 +57,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GRPC_RUST_REGENERATE_PROTO");
     let grpc_helloworld = env::var_os("CARGO_FEATURE_GRPC_HELLOWORLD").is_some();
     let grpc_routeguide = env::var_os("CARGO_FEATURE_GRPC_ROUTEGUIDE").is_some();
-    let grpc_gcp = env::var_os("CARGO_FEATURE_GRPC_GCP").is_some();
 
-    if (grpc_helloworld || grpc_routeguide || grpc_gcp)
-        && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some()
-    {
+    if (grpc_helloworld || grpc_routeguide) && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some() {
         let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
 
         let generated_dir = manifest_dir.join("generated");
@@ -85,9 +82,11 @@ fn main() {
             .client_only()
             .compile()
             .unwrap();
+    }
 
+    if env::var_os("CARGO_FEATURE_GRPC_GCP").is_some() {
+        let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
         grpc_protobuf_build::CodeGen::new()
-            .output_dir(generated_dir.join("gcp"))
             .include(manifest_dir.join("proto/googleapis"))
             .inputs([
                 "google/pubsub/v1/pubsub.proto",

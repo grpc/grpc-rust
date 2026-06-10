@@ -4,6 +4,14 @@ This example demonstrates how to fetch a list of topics using Google's gRPC
 Protocol Buffers specification. The request is secured using an OAuth token and
 TLS.
 
+You must have the following binaries in your `PATH` or use the 
+`--features grpc-protobuf-build/build-plugin` flag to build the binaries:
+
+1.  `protoc`: The [Protocol Buffers compiler] and the well-known `.proto` files
+    bundled with it.
+1.  `protoc-gen-rust-grpc`: The `protoc` plugin to generate service code.
+    ([View instruction](https://github.com/hyperium/tonic/tree/master/protoc-gen-rust-grpc))
+
 Ensure your environment has [Application Default Credentials] configured.
 You can do this by setting the `GOOGLE_APPLICATION_CREDENTIALS` environment
 variable, or by running the `gcloud auth application-default login` command.

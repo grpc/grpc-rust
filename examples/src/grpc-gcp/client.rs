@@ -1,7 +1,7 @@
 #[allow(unused)]
 mod generated {
     pub mod api {
-        grpc::include_generated_proto!("generated/gcp/google/pubsub/v1", "pubsub");
+        grpc::include_proto!("google/pubsub/v1", "pubsub");
     }
 }
 

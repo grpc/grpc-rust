@@ -338,4 +338,4 @@ protobuf-well-known-types = { version = "4.34.0-release", optional = true }
 tonic-prost-build = { path = "../tonic-prost-build" }
 grpc-protobuf-build = { path = "../grpc-protobuf-build", default-features = false }
 protoc-gen-rust-grpc = { path = "../protoc-gen-rust-grpc", optional = true }
-protobuf-well-known-types = { version = "4.34.0-release", optional = true }
+protobuf-well-known-types = { version = "4.34.0-release" }

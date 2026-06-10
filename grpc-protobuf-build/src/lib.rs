@@ -110,6 +110,16 @@ impl From<&Dependency> for protobuf_codegen::Dependency {
     }
 }
 
+impl From<protobuf_codegen::Dependency> for Dependency {
+    fn from(val: protobuf_codegen::Dependency) -> Self {
+        Dependency {
+            crate_name: val.crate_name,
+            proto_import_paths: val.proto_import_paths,
+            proto_files: val.proto_files,
+        }
+    }
+}
+
 fn check_runnable(binary: &Path) -> Result<(), String> {
     let out = Command::new(binary)
         .arg("--version")

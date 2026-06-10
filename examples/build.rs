@@ -1,4 +1,5 @@
-use std::{env, path::PathBuf};
+use std::env;
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -56,8 +57,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GRPC_RUST_REGENERATE_PROTO");
     let grpc_helloworld = env::var_os("CARGO_FEATURE_GRPC_HELLOWORLD").is_some();
     let grpc_routeguide = env::var_os("CARGO_FEATURE_GRPC_ROUTEGUIDE").is_some();
+    let grpc_gcp = env::var_os("CARGO_FEATURE_GRPC_GCP").is_some();
 
-    if (grpc_helloworld || grpc_routeguide) && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some() {
+    if (grpc_helloworld || grpc_routeguide || grpc_gcp)
+        && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some()
+    {
         let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
 
         let generated_dir = manifest_dir.join("generated");
@@ -78,6 +82,29 @@ fn main() {
             .output_dir(generated_dir.join("routeguide"))
             .input("route_guide.proto")
             .include(manifest_dir.join("proto/routeguide"))
+            .client_only()
+            .compile()
+            .unwrap();
+
+        grpc_protobuf_build::CodeGen::new()
+            .output_dir(generated_dir.join("gcp"))
+            .include(manifest_dir.join("proto/googleapis"))
+            .inputs([
+                "google/pubsub/v1/pubsub.proto",
+                "google/pubsub/v1/schema.proto",
+                "google/api/annotations.proto",
+                "google/api/resource.proto",
+                "google/api/http.proto",
+                "google/api/field_behavior.proto",
+                "google/api/client.proto",
+                "google/protobuf/descriptor.proto", // bundled with protoc.
+            ])
+            .dependencies(
+                protobuf_well_known_types::get_dependency("protobuf_well_known_types")
+                    .into_iter()
+                    .map(|d| d.into())
+                    .collect(),
+            )
             .client_only()
             .compile()
             .unwrap();

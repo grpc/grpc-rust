@@ -26,7 +26,6 @@
 
 use core::panic;
 use std::error::Error;
-use std::mem;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -54,6 +53,7 @@ use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::pick_first;
@@ -344,15 +344,10 @@ impl ActiveChannel {
                         resolver.work(&mut resolver_channel_controller)
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
-                    WorkQueueItem::ScheduleLbPolicy => {
-                        *resolver_channel_controller
-                            .lb_work_scheduler
-                            .pending
-                            .lock()
-                            .unwrap() = false;
+                    WorkQueueItem::ScheduleLbPolicy(data) => {
                         resolver_channel_controller
                             .lb_policy
-                            .work(&mut resolver_channel_controller.lb_channel_controller);
+                            .work(data, &mut resolver_channel_controller.lb_channel_controller);
                     }
                     WorkQueueItem::SubchannelStateUpdate { subchannel, state } => {
                         resolver_channel_controller.lb_policy.subchannel_update(
@@ -447,10 +442,7 @@ impl ResolverChannelController {
         lb_watcher: Arc<Watcher<LbState>>,
         security_opts: SecurityOpts,
     ) -> Self {
-        let lb_work_scheduler = Arc::new(LbWorkScheduler {
-            pending: Mutex::default(),
-            wqtx: wqtx.clone(),
-        });
+        let lb_work_scheduler = Arc::new(LbWorkScheduler { wqtx: wqtx.clone() });
         let lb_channel_controller = LbChannelController {
             lb_work_scheduler: lb_work_scheduler.clone(),
             transport_registry: GLOBAL_TRANSPORT_REGISTRY.clone(),
@@ -538,23 +530,18 @@ impl load_balancing::ChannelController for LbChannelController {
 
 #[derive(Debug)]
 struct LbWorkScheduler {
-    pending: Mutex<bool>,
     wqtx: WorkQueueTx,
 }
 
 impl WorkScheduler for LbWorkScheduler {
-    fn schedule_work(&self) {
-        if mem::replace(&mut *self.pending.lock().unwrap(), true) {
-            // Already had a pending call scheduled.
-            return;
-        }
-        _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy);
+    fn schedule_work(&self, data: Option<WorkData>) {
+        _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy(data));
     }
 }
 
 pub(super) enum WorkQueueItem {
     // Call the LB policy to do work.
-    ScheduleLbPolicy,
+    ScheduleLbPolicy(Option<WorkData>),
     // Provide the subchannel state update to the LB policy.
     SubchannelStateUpdate {
         subchannel: Arc<dyn Subchannel>,

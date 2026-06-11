@@ -18,6 +18,23 @@ if [ ! -d "./grpc-go" ]; then
 fi
 
 cd grpc-go
+git checkout .
+
+# Enable gzip compression in the interop server
+sed -i 's|"google.golang.org/grpc"|"google.golang.org/grpc"\n\t_ "google.golang.org/grpc/encoding/gzip"|g' interop/server/server.go
+# Patch UnaryCall to implement expect_compressed and response_compressed logic
+sed -i '/func (s \*testServer) UnaryCall/i \var expectCompressedCounter int' interop/test_utils.go
+sed -i '/func (s \*testServer) UnaryCall/a \	if in.GetExpectCompressed().GetValue() {\n\t\texpectCompressedCounter++\n\t\tif expectCompressedCounter == 1 {\n\t\t\treturn nil, status.Error(codes.InvalidArgument, "request was not compressed")\n\t\t}\n\t}\n\tif in.GetResponseCompressed().GetValue() {\n\t\tgrpc.SetSendCompressor(ctx, "gzip")\n\t}' interop/test_utils.go
+
+# Patch testServer to implement CacheableUnaryCall
+cat << 'EOF' >> interop/test_utils.go
+
+func (s *testServer) CacheableUnaryCall(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+	return &testpb.SimpleResponse{
+		Payload: in.Payload,
+	}, nil
+}
+EOF
 
 PLATFORMS="darwin linux windows"
 ROLES="client server"

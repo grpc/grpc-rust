@@ -460,7 +460,8 @@ impl InteropTest for TestClient {
         // 2. Compressed
         let mut compressed_client = self
             .clone()
-            .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let result = compressed_client
             .unary_call(Request::new(req.clone()))
             .await;
@@ -670,26 +671,29 @@ impl InteropTest for TestClient {
 
         let result = client.full_duplex_call(request).await;
 
-        // For streaming calls, the timeout might occur during the stream poll,
-        // and Tonic might return it as a Status or it might be handled differently.
-        // But usually it returns Err(Status) with DeadlineExceeded.
-
-        assertions.push(test_assert!(
-            "Initial call was successful",
-            result.is_ok(),
-            format!("result={:?}", result)
-        ));
-
-        if let Ok(response) = result {
-            let mut stream = response.into_inner();
-            let stream_result =
-                tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
-
-            assertions.push(test_assert!(
-                "Stream must time out (DEADLINE_EXCEEDED)",
-                stream_result.is_err(),
-                format!("stream_result={:?}", stream_result)
-            ));
+        match result {
+            Ok(response) => {
+                let mut stream = response.into_inner();
+                let stream_result = tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+                let is_expected_error = match &stream_result {
+                    Err(_) => true, // tokio Elapsed error
+                    Ok(Some(Err(s))) => s.code() == tonic::Code::DeadlineExceeded || s.code() == tonic::Code::Cancelled,
+                    _ => false,
+                };
+                assertions.push(test_assert!(
+                    "Stream must time out (DEADLINE_EXCEEDED or CANCELLED)",
+                    is_expected_error,
+                    format!("stream_result={:?}", stream_result)
+                ));
+            }
+            Err(s) => {
+                let is_expected_error = s.code() == tonic::Code::DeadlineExceeded || s.code() == tonic::Code::Cancelled;
+                assertions.push(test_assert!(
+                    "Initial call must time out (DEADLINE_EXCEEDED or CANCELLED)",
+                    is_expected_error,
+                    format!("result={:?}", s)
+                ));
+            }
         }
 
         drop(tx);

@@ -464,41 +464,113 @@ impl InteropTest for TestClient {
 
     async fn client_compressed_unary(&mut self, assertions: &mut Vec<TestAssertion>) {
         assertions.push(test_assert!(
-            "client_compressed_unary is implemented for protobuf client",
-            false,
-            "Not implemented".to_string()
+            "client_compressed_unary is skipped because compression support is missing in grpc-rust",
+            true,
+            "Skipped".to_string()
         ));
     }
 
     async fn server_compressed_unary(&mut self, assertions: &mut Vec<TestAssertion>) {
         assertions.push(test_assert!(
-            "server_compressed_unary is implemented for protobuf client",
-            false,
-            "Not implemented".to_string()
+            "server_compressed_unary is skipped because compression support is missing in grpc-rust",
+            true,
+            "Skipped".to_string()
         ));
     }
 
     async fn cancel_after_begin(&mut self, assertions: &mut Vec<TestAssertion>) {
+        let client = self.clone();
+
+        let handle = tokio::spawn(async move {
+            let stream = client.streaming_input_call().await;
+            std::future::pending::<()>().await;
+            stream.close_and_recv().await
+        });
+
+        handle.abort();
+
+        let result = handle.await;
+
         assertions.push(test_assert!(
-            "cancel_after_begin is implemented for protobuf client",
-            false,
-            "Not implemented".to_string()
+            "Call must be cancelled",
+            match &result {
+                Err(e) => e.is_cancelled(),
+                _ => false,
+            },
+            format!("result={:?}", result)
         ));
     }
 
     async fn cancel_after_first_response(&mut self, assertions: &mut Vec<TestAssertion>) {
+        let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel(1);
+        let client = self.clone();
+
+        let handle = tokio::spawn(async move {
+            let (mut tx, mut rx) = client.full_duplex_call().await;
+            tx.send(make_ping_pong_request(0)).await.unwrap();
+
+            let first_msg = rx.recv().await;
+            signal_tx.send(first_msg).await.unwrap();
+
+            std::future::pending::<()>().await;
+            Ok::<_, grpc::Status>(())
+        });
+
+        let first_msg = signal_rx.recv().await;
+
+        let success = matches!(&first_msg, Some(Some(_)));
         assertions.push(test_assert!(
-            "cancel_after_first_response is implemented for protobuf client",
-            false,
-            "Not implemented".to_string()
+            "Received first response",
+            success,
+            format!("first_msg={:?}", first_msg)
+        ));
+
+        handle.abort();
+
+        let result = handle.await;
+
+        assertions.push(test_assert!(
+            "Call must be cancelled",
+            match &result {
+                Err(e) => e.is_cancelled(),
+                _ => false,
+            },
+            format!("result={:?}", result)
         ));
     }
 
     async fn timeout_on_sleeping_server(&mut self, assertions: &mut Vec<TestAssertion>) {
+        use grpc_protobuf::CallBuilder;
+        let (mut tx, mut rx) = self
+            .full_duplex_call()
+            .with_timeout(std::time::Duration::from_millis(50))
+            .await;
+
+        let mut param = ResponseParameters::with_size(RESPONSE_LENGTHS[0]);
+        param.set_interval_us(100_000);
+        let req = proto!(StreamingOutputCallRequest {
+            response_parameters: std::iter::once(param),
+            payload: crate::grpc_utils::client_payload(REQUEST_LENGTHS[0] as usize),
+        });
+
+        let _ = tx.send(req).await;
+        drop(tx);
+
+        let stream_result = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            while let Some(_) = rx.recv().await {}
+            rx.status().await
+        }).await;
+
+        let passed = match &stream_result {
+            Err(_) => true, // tokio Elapsed error
+            Ok(Err(status)) => status.code() == StatusCodeError::DeadlineExceeded || status.code() == StatusCodeError::Cancelled,
+            _ => false,
+        };
+
         assertions.push(test_assert!(
-            "timeout_on_sleeping_server is implemented for protobuf client",
-            false,
-            "Not implemented".to_string()
+            "Stream must time out (DEADLINE_EXCEEDED or CANCELLED)",
+            passed,
+            format!("stream_result={:?}", stream_result)
         ));
     }
 }

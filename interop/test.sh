@@ -3,9 +3,9 @@
 set -eu
 set -o pipefail
 
-# the go client does not support passing an argument with multiple test cases
-# so we loop over this array calling the binary each time around
-TEST_CASES=(
+# the go client does not support compression test cases
+# so we maintain two separate arrays
+RUST_TEST_CASES=(
   "empty_unary"
   "large_unary"
   "client_streaming"
@@ -17,12 +17,39 @@ TEST_CASES=(
   "custom_metadata"
   "unimplemented_method"
   "unimplemented_service"
+  "cacheable_unary"
+  "client_compressed_unary"
+  "server_compressed_unary"
+  "cancel_after_begin"
+  "cancel_after_first_response"
+  "timeout_on_sleeping_server"
+)
+
+GO_TEST_CASES=(
+  "empty_unary"
+  "large_unary"
+  "client_streaming"
+  "server_streaming"
+  "ping_pong"
+  "empty_stream"
+  "status_code_and_message"
+  "special_status_message"
+  "custom_metadata"
+  "unimplemented_method"
+  "unimplemented_service"
+  "cacheable_unary"
+  "cancel_after_begin"
+  "cancel_after_first_response"
+  "timeout_on_sleeping_server"
 )
 
 # join all test cases in one comma separated string (dropping the first one)
 # so we can call the rust client only once, reducing the noise
-JOINED_TEST_CASES=$(printf ",%s" "${TEST_CASES[@]}")
-JOINED_TEST_CASES="${JOINED_TEST_CASES:1}"
+JOINED_RUST_TEST_CASES=$(printf ",%s" "${RUST_TEST_CASES[@]}")
+JOINED_RUST_TEST_CASES="${JOINED_RUST_TEST_CASES:1}"
+
+JOINED_GO_TEST_CASES=$(printf ",%s" "${GO_TEST_CASES[@]}")
+JOINED_GO_TEST_CASES="${JOINED_GO_TEST_CASES:1}"
 
 set -x
 
@@ -64,10 +91,10 @@ trap cleanup EXIT
 sleep 3
 
 TARGET_DIR="$(cargo metadata --format-version 1 | jq -r '.target_directory')"
-"${TARGET_DIR}/debug/client" --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
+"${TARGET_DIR}/debug/client" --codec=prost --test_case="${JOINED_RUST_TEST_CASES}" "${ARG}"
 
 # Test a grpc rust client against a Go server.
-"${TARGET_DIR}/debug/client" --codec=protobuf --test_case="${JOINED_TEST_CASES}" ${ARG}
+"${TARGET_DIR}/debug/client" --codec=protobuf --test_case="${JOINED_RUST_TEST_CASES}" ${ARG}
 
 echo ":; killing test server"; kill "${SERVER_PID}";
 echo "Waiting for test server to exit..."
@@ -85,7 +112,16 @@ for CODEC in "${CODECS[@]}"; do
 
     sleep 3
 
-    "${TARGET_DIR}/debug/client" --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
+    if [ "${CODEC}" = "protobuf" ]; then
+        CLIENT_TEST_CASES="$JOINED_GO_TEST_CASES"
+    else
+        CLIENT_TEST_CASES="$JOINED_RUST_TEST_CASES"
+    fi
+
+    "${TARGET_DIR}/debug/client" --codec=prost --test_case="${CLIENT_TEST_CASES}" "${ARG}"
+
+    # Test the protobuf (grpc-rust) client against the test server
+    "${TARGET_DIR}/debug/client" --codec=protobuf --test_case="${CLIENT_TEST_CASES}" "${ARG}"
 
     # Run client test cases
     if [ -n "${ARG:-}" ]; then
@@ -99,7 +135,7 @@ for CODEC in "${CODECS[@]}"; do
       TLS_ARRAY=()
     fi
 
-    for CASE in "${TEST_CASES[@]}"; do
+    for CASE in "${GO_TEST_CASES[@]}"; do
       flags=( "-test_case=${CASE}" )
       # Avoid unbound variable errors on MacOS with bash version < 4.4.
       # See: https://stackoverflow.com/a/61551944

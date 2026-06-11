@@ -674,10 +674,14 @@ impl InteropTest for TestClient {
         match result {
             Ok(response) => {
                 let mut stream = response.into_inner();
-                let stream_result = tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+                let stream_result =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
                 let is_expected_error = match &stream_result {
                     Err(_) => true, // tokio Elapsed error
-                    Ok(Some(Err(s))) => s.code() == tonic::Code::DeadlineExceeded || s.code() == tonic::Code::Cancelled,
+                    Ok(Some(Err(s))) => {
+                        s.code() == tonic::Code::DeadlineExceeded
+                            || s.code() == tonic::Code::Cancelled
+                    }
                     _ => false,
                 };
                 assertions.push(test_assert!(
@@ -687,7 +691,8 @@ impl InteropTest for TestClient {
                 ));
             }
             Err(s) => {
-                let is_expected_error = s.code() == tonic::Code::DeadlineExceeded || s.code() == tonic::Code::Cancelled;
+                let is_expected_error =
+                    s.code() == tonic::Code::DeadlineExceeded || s.code() == tonic::Code::Cancelled;
                 assertions.push(test_assert!(
                     "Initial call must time out (DEADLINE_EXCEEDED or CANCELLED)",
                     is_expected_error,

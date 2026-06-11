@@ -559,11 +559,15 @@ impl InteropTest for TestClient {
         let stream_result = tokio::time::timeout(std::time::Duration::from_millis(50), async {
             while let Some(_) = rx.recv().await {}
             rx.status().await
-        }).await;
+        })
+        .await;
 
         let passed = match &stream_result {
             Err(_) => true, // tokio Elapsed error
-            Ok(Err(status)) => status.code() == StatusCodeError::DeadlineExceeded || status.code() == StatusCodeError::Cancelled,
+            Ok(Err(status)) => {
+                status.code() == StatusCodeError::DeadlineExceeded
+                    || status.code() == StatusCodeError::Cancelled
+            }
             _ => false,
         };
 

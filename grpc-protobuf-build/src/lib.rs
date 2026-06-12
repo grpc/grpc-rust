@@ -260,11 +260,11 @@ impl CodeGen {
         // 2. Compiled via protoc-gen-rust-grpc (build-plugin feature)
         #[cfg(feature = "build-plugin")]
         {
-            let compiled_protoc = protoc_gen_rust_grpc::protoc();
-            let compiled_plugin = protoc_gen_rust_grpc::protoc_gen_rust_grpc();
-            if compiled_protoc.exists() && compiled_plugin.exists() {
-                // The files may not exist if a build setting instructed protoc-gen-rust-grpc to
-                // skip the C++ build (DOCS_RS / our CI setting).
+            // protoc_gen_rust_grpc may fail if a build setting instructed it to skip the C++ build
+            if let (Ok(compiled_protoc), Ok(compiled_plugin)) = (
+                protoc_gen_rust_grpc::protoc(),
+                protoc_gen_rust_grpc::protoc_gen_rust_grpc(),
+            ) {
                 return Ok((compiled_protoc, compiled_plugin));
             }
         }

@@ -129,7 +129,13 @@ if(BUILD_PROTOC)
 
     install(DIRECTORY ${protobuf_SOURCE_DIR}/src/google/protobuf/
         DESTINATION include/google/protobuf
-        FILES_MATCHING PATTERN "*.proto"
+        FILES_MATCHING
+        PATTERN "*.proto"
+        PATTERN "*test*.proto" EXCLUDE
+        PATTERN "*unittest*.proto" EXCLUDE
+        PATTERN "compiler/cpp/*" EXCLUDE
+        PATTERN "compiler/java/*" EXCLUDE
+        PATTERN "compiler/ruby/*" EXCLUDE
     )
 endif()
 

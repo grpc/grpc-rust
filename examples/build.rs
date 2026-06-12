@@ -7,9 +7,9 @@ fn main() {
     // build when PROTOC_GEN_RUST_GRPC_NO_BUILD=1 (used in gRPC's CI), so we check that the binary
     // exists.
     #[cfg(feature = "protoc-gen-rust-grpc")]
-    if protoc_gen_rust_grpc::protoc().exists() {
+    if let Ok(protoc) = protoc_gen_rust_grpc::protoc() {
         unsafe {
-            env::set_var("PROTOC", protoc_gen_rust_grpc::protoc());
+            env::set_var("PROTOC", protoc);
         }
     }
 

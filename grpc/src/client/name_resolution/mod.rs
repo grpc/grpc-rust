@@ -134,7 +134,7 @@ impl Display for Target {
             "{}://{}{}",
             self.scheme(),
             self.authority_host_port(),
-            self.decoded_path
+            self.url.path()
         )
     }
 }
@@ -443,7 +443,7 @@ mod test {
                 want_host: "",
                 want_port: None,
                 want_path: "/foo bar",
-                want_str: "dns:///foo bar",
+                want_str: "dns:///foo%20bar",
             },
         ];
 

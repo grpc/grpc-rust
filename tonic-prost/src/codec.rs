@@ -74,7 +74,7 @@ where
 }
 
 /// A [`Encoder`] that knows how to encode `T`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProstEncoder<T> {
     _pd: PhantomData<T>,
     buffer_settings: BufferSettings,
@@ -87,6 +87,12 @@ impl<T> ProstEncoder<T> {
             _pd: PhantomData,
             buffer_settings,
         }
+    }
+}
+
+impl<T> Default for ProstEncoder<T> {
+    fn default() -> Self {
+        Self::new(Default::default())
     }
 }
 
@@ -107,7 +113,7 @@ impl<T: Message> Encoder for ProstEncoder<T> {
 }
 
 /// A [`Decoder`] that knows how to decode `U`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProstDecoder<U> {
     _pd: PhantomData<U>,
     buffer_settings: BufferSettings,
@@ -120,6 +126,12 @@ impl<U> ProstDecoder<U> {
             _pd: PhantomData,
             buffer_settings,
         }
+    }
+}
+
+impl<U> Default for ProstDecoder<U> {
+    fn default() -> Self {
+        Self::new(Default::default())
     }
 }
 

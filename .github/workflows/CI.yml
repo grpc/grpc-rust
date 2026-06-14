@@ -55,16 +55,9 @@ jobs:
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          mkdir -p protoc-cache
-          # Find where cmake built the binaries and any companion DLLs.
-          find target/ -name "protoc" -o -name "protoc.exe" -o -name "protoc-gen-rust-grpc" -o -name "protoc-gen-rust-grpc.exe" -o -name "*.dll" | while read -r file; do
-            # Verify it's in the build output directory to avoid copying source or unrelated files.
-            if [[ "$file" == *"/out/bin/"* ]] || [[ "$file" == *"/out/build/bin/"* ]]; then
-              cp "$file" protoc-cache/
-            fi
-          done
-          echo "Cached files:"
-          ls -la protoc-cache/
+          cp -r target/debug/build/protoc-gen-rust-grpc-*/out/install protoc-cache/
+          echo "Cached binaries (the biggest files):"
+          ls -la protoc-cache/bin/
 
   clippy:
     runs-on: ubuntu-latest
@@ -81,7 +74,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo clippy --workspace --all-features --all-targets
 
@@ -97,7 +90,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo run --package codegen
     - run: git diff --exit-code
@@ -119,7 +112,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo hack udeps --workspace --exclude-features=_tls-any,tls,tls-aws-lc,tls-ring,tls-connect-info --each-feature
     - run: cargo udeps --package tonic --features tls-ring,transport
@@ -149,7 +142,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - name: Check features
       run: cargo hack check --workspace --no-private --each-feature --no-dev-deps
@@ -180,7 +173,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo no-dev-deps --no-private check --all-features --workspace
 
@@ -197,7 +190,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo +nightly hack --no-private docs-rs
       env:
@@ -221,7 +214,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo nextest run --workspace --all-features
       env:
@@ -239,7 +232,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo hack --no-private test --doc --all-features
 
@@ -260,7 +253,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo build -p interop
     - name: Run interop tests
@@ -296,7 +289,7 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
     - run: cargo hack --no-private check-external-types --all-features
       env:

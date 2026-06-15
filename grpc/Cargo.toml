@@ -55,9 +55,10 @@ bytes = "1.10.1"
 futures = { version = "0.3", default-features = false, optional = true }
 hickory-resolver = { version = "0.25.1", optional = true }
 http = "1.1.0"
+httparse = "1.9"
 http-body = "1.0.1"
 hyper = { version = "1.6.0", features = ["client", "http2"] }
-hyper-util = { version = "0.1", features = ["client", "client-proxy"] }
+hyper-util = { version = "0.1", features = ["client-proxy"] }
 itoa = "1.0"
 parking_lot = "0.12.4"
 percent-encoding = "2.3"

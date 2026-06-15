@@ -56,8 +56,8 @@ jobs:
         shell: bash
         run: |
           cp -r target/debug/build/protoc-gen-rust-grpc-*/out/install protoc-cache/
-          echo "Cached binaries (the biggest files):"
-          ls -la protoc-cache/bin/
+          echo "Cached files:"
+          find protoc-cache/ -type f -exec ls -lh {} +
 
   clippy:
     runs-on: ubuntu-latest

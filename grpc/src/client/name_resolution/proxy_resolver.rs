@@ -119,21 +119,15 @@ impl Builder {
             return Ok(self.child_builder.build(target, options));
         };
         let path = target.path();
-        let path = path.strip_prefix(b"/").unwrap_or(path);
+        let path = path.strip_prefix('/').unwrap_or(path);
 
         // Attempt to convert the path to a UTF-8 string, then parse it as a
         // URL host.
-        let url_obj = match (&path)
-            .try_into()
-            .map_err(|err| format!("non-UTF-8 symbol in target host: {err}"))
-            .and_then(|target_host: &str| {
-                let target_host = authority_with_default_port(target_host, 443);
-                Url::parse(&format!("https://{target_host}"))
-                    .map_err(|err| format!("invalid target host in URL: {err}"))
-            }) {
+        let target_host = authority_with_default_port(path, 443);
+        let url_obj = match Url::parse(&format!("https://{target_host}")) {
             Ok(url) => url,
             Err(err) => {
-                return Err((err, options));
+                return Err((format!("invalid target host in URL: {err}"), options));
             }
         };
 
@@ -444,8 +438,8 @@ mod tests {
                 .await;
 
         assert_eq!(addresses.len(), 2);
-        assert_eq!(addresses[0].address, "127.0.0.1:8080");
-        assert_eq!(addresses[1].address, "[::1]:8080");
+        assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
+        assert_eq!(&*addresses[1].address, "[::1]:8080");
 
         let mut expected_header = HeaderValue::from_static("Basic dXNlcjpwYXNzd29yZA==");
         expected_header.set_sensitive(true);
@@ -475,7 +469,7 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(proxy_options_for_addr(&addresses[0]).is_none());
     }
 
@@ -560,7 +554,7 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(proxy_options_for_addr(&addresses[0]).is_none());
 
         // Check for abstract-unix scheme.
@@ -572,7 +566,7 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(proxy_options_for_addr(&addresses[0]).is_none());
     }
 
@@ -589,7 +583,7 @@ mod tests {
             run_resolver_and_get_addresses("dns:///target.example.com", dns_ips(), Some(&matcher))
                 .await;
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(
             proxy_options_for_addr(&addresses[0]).is_none(),
             "HTTP proxy should not match HTTPS destinations"
@@ -604,7 +598,7 @@ mod tests {
             run_resolver_and_get_addresses("dns:///target.example.com", dns_ips(), Some(&matcher))
                 .await;
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+        assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
         assert!(
             proxy_options_for_addr(&addresses[0]).is_some(),
             "HTTPS proxy should match HTTPS destinations"
@@ -621,7 +615,7 @@ mod tests {
             run_resolver_and_get_addresses("dns:///target.example.com", dns_ips(), Some(&matcher))
                 .await;
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(proxy_options_for_addr(&addresses[0]).is_none());
 
         // Target B: other.example.com (NOT matched by no_proxy) -> should proxy
@@ -629,7 +623,7 @@ mod tests {
             run_resolver_and_get_addresses("dns:///other.example.com", dns_ips(), Some(&matcher))
                 .await;
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+        assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
         assert!(proxy_options_for_addr(&addresses[0]).is_some());
     }
 
@@ -643,7 +637,7 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, DIRECT_ADDRESS);
+        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(proxy_options_for_addr(&addresses[0]).is_none());
     }
 
@@ -659,7 +653,7 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, "[::1]:8080");
+        assert_eq!(&*addresses[0].address, "[::1]:8080");
 
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
@@ -684,7 +678,7 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].address, "127.0.0.1:8080");
+        assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
 
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,

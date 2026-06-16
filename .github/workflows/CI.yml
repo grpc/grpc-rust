@@ -160,6 +160,7 @@ jobs:
       run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
       with:
+        # Windows is the long pole of a build. Caching it avoids adding ~5 minutes of build time
         cache-targets: ${{ matrix.os == 'windows-latest' }}
     - name: Check features
       run: cargo hack check --workspace --no-private --each-feature --no-dev-deps
@@ -238,6 +239,7 @@ jobs:
       run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
       with:
+        # Windows is the long pole of a build. Caching it avoids adding ~4 minutes of build time
         cache-targets: ${{ matrix.os == 'windows-latest' }}
     - run: cargo nextest run --workspace --all-features
       env:

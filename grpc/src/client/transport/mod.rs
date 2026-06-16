@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
@@ -62,7 +61,6 @@ pub(crate) struct TransportOptions {
     pub(crate) rate_limit: Option<(u64, Duration)>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
-    pub(crate) connect_deadline: Option<Instant>,
 }
 
 #[trait_variant::make(Send)]

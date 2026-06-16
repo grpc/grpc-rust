@@ -38,6 +38,7 @@ use http::HeaderValue;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tokio::time;
 use tokio::time::timeout;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
@@ -51,6 +52,7 @@ use tonic_prost::prost::Message as ProstMessage;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::Channel;
 use crate::client::Invoke as _;
@@ -67,13 +69,18 @@ use crate::core::RequestHeaders;
 use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
 use crate::core::Trailers;
+use crate::credentials::ChannelCredentials;
 use crate::credentials::CompositeChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
+use crate::credentials::ProtocolInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
+use crate::credentials::client::ClientConnectionSecurityContext;
+use crate::credentials::client::ClientConnectionSecurityInfo as ClientSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
+use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
@@ -85,6 +92,8 @@ use crate::echo_pb::echo_server::Echo;
 use crate::echo_pb::echo_server::EchoServer;
 use crate::metadata::AsciiMetadataKey;
 use crate::metadata::MetadataMap;
+use crate::private;
+use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::tokio::TokioRuntime;
 
@@ -706,7 +715,7 @@ async fn tonic_transport_invalid_base64_headers() {
     };
     let req = WrappedEchoRequest(request);
 
-    tokio::time::timeout(DEFAULT_TEST_DURATION, async {
+    time::timeout(DEFAULT_TEST_DURATION, async {
         while tx.send(&req, SendOptions::default()).await.is_ok() {}
     })
     .await
@@ -772,11 +781,113 @@ async fn tonic_transport_recv_drop_cancels_send() {
     };
     let req = WrappedEchoRequest(request);
 
-    tokio::time::timeout(DEFAULT_TEST_DURATION, async {
+    time::timeout(DEFAULT_TEST_DURATION, async {
         while tx.send(&req, SendOptions::default()).await.is_ok() {}
     })
     .await
     .expect("timed out waiting for stream to close");
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[derive(Debug, Clone)]
+struct MockConnectionSecurityContext;
+impl ClientConnectionSecurityContext for MockConnectionSecurityContext {
+    fn validate_authority(&self, _authority: &Authority) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SlowChannelCredentials {
+    sleep_duration: Duration,
+}
+
+impl SlowChannelCredentials {
+    fn new_arc(sleep_duration: Duration) -> Arc<Self> {
+        Arc::new(Self { sleep_duration })
+    }
+}
+
+impl ChannelCredentials for SlowChannelCredentials {
+    type ContextType = MockConnectionSecurityContext;
+    type Output<I> = I;
+
+    async fn connect<Input: GrpcEndpoint>(
+        &self,
+        _authority: &Authority,
+        source: Input,
+        _info: &ClientHandshakeInfo,
+        runtime: &GrpcRuntime,
+        _token: private::Internal,
+    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+        runtime.sleep(self.sleep_duration).await;
+        Ok(HandshakeOutput {
+            endpoint: source,
+            security: ClientSecurityInfo::new(
+                "mock",
+                SecurityLevel::NoSecurity,
+                MockConnectionSecurityContext,
+                Attributes::new(),
+            ),
+        })
+    }
+
+    fn info(&self) -> &ProtocolInfo {
+        static INFO: ProtocolInfo = ProtocolInfo::new("mock");
+        &INFO
+    }
+
+    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn connect_timeout_exceeded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {
+            response_headers: None,
+        };
+        let svc = EchoServer::new(echo_server);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    // Create the channel with SlowChannelCredentials (21s).
+    // The default timeout is 20s.
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::new(
+        &target,
+        SlowChannelCredentials::new_arc(Duration::from_secs(21)),
+        Default::default(),
+    );
+
+    // Spawn the RPC call because it will block waiting for connection.
+    let rpc_handle = tokio::spawn(async move { perform_unary_echo_failure(&channel).await });
+
+    // Advance time to trigger the timeout in subchannel connect.
+    time::pause();
+    time::sleep(Duration::from_secs(21)).await;
+    time::resume();
+
+    // The RPC should have failed with a timeout.
+    let trailers = rpc_handle.await.unwrap();
+
+    assert!(trailers.status().is_err());
+    let status = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status.code(), StatusCodeError::Unavailable);
 
     shutdown_notify.notify_one();
     server_handle.await.unwrap();

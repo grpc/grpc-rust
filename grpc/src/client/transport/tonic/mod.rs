@@ -31,7 +31,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use std::time::Instant;
 
 use bytes::Buf;
 use bytes::BufMut as _;
@@ -419,17 +418,7 @@ impl Transport for TransportBuilder {
                 runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
             }
         };
-        let transport = if let Some(deadline) = opts.connect_deadline {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            tokio::select! {
-                _ = runtime.sleep(timeout) => {
-                    return Err("timed out waiting for transport stream to connect".to_string());
-                }
-                transport = transport_fut => transport?,
-            }
-        } else {
-            transport_fut.await?
-        };
+        let transport = transport_fut.await?;
         let credentials = &security_info.credentials;
         let handshake_ouput = credentials
             .dyn_connect(

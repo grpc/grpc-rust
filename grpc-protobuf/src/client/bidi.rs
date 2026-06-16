@@ -39,9 +39,9 @@ use crate::GrpcStreamingResponse;
 use crate::private::Internal;
 
 /// Configures a bidirectional call for gRPC Protobuf.  Implements
-/// [`std::future::IntoFuture`] which begins the call and resolves to a pair of
-/// send/receive types: ([`GrpcStreamingRequest`], [`GrpcStreamingResponse`]).
-/// Implements [`crate::CallBuilder`] to provide common RPC configuration methods.
+/// [`IntoFuture`] which begins the call and resolves to a pair of send/receive
+/// types: ([`GrpcStreamingRequest`], [`GrpcStreamingResponse`]). Implements
+/// [`CallBuilder`] to provide common RPC configuration methods.
 pub struct BidiCallBuilder<'a, C, Req, Res> {
     channel: C,
     method: String,

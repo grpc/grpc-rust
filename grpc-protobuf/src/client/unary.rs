@@ -30,10 +30,10 @@ use grpc::StatusError;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RecvStream as _;
+use grpc::client::ResponseStreamItem;
 use grpc::client::SendOptions;
 use grpc::client::SendStream as _;
 use grpc::client::stream_util::RecvStreamValidator;
-use grpc::core::ClientResponseStreamItem;
 use grpc::core::RequestHeaders;
 use protobuf::AsMut;
 use protobuf::AsView;
@@ -47,9 +47,9 @@ use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
 use crate::client::Internal;
 
-/// Configures a unary call for gRPC Protobuf.  Implements `IntoFuture` which
-/// performs the call and resolves to the response as a `Result<Res, Status>`.
-/// Implements `CallBuilder` to provide common RPC configuration methods.
+/// Configures a unary call for gRPC Protobuf.  Implements [`IntoFuture`] which
+/// performs the call and resolves to the response as a [`Result<Res, Status>`].
+/// Implements [`CallBuilder`] to provide common RPC configuration methods.
 pub struct UnaryCallBuilder<'a, C, ReqMsgView, Res> {
     channel: C,
     method: String,
@@ -94,8 +94,8 @@ where
         let _ = tx.send(req, SendOptions::new().with_final_msg(true)).await;
         let mut res = ProtoRecvMessage::from_mut(res);
         loop {
-            let i = rx.next(&mut res).await;
-            if let ClientResponseStreamItem::Trailers(t) = i {
+            let i = rx.recv(&mut res).await;
+            if let ResponseStreamItem::Trailers(t) = i {
                 return t.status().clone();
             }
         }

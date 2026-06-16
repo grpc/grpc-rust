@@ -36,6 +36,7 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
@@ -129,12 +130,12 @@ impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
         }
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
         let mut channel_controller = SharingChannelController {
             balancer_inner: self.inner.clone(),
             delegate: channel_controller,
         };
-        self.delegate.work(&mut channel_controller);
+        self.delegate.work(data, &mut channel_controller);
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
@@ -332,7 +333,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -347,7 +348,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
 
         let event = rx_events.recv().unwrap();
         let TestEvent::NewSubchannel(internal_sc) = event else {
@@ -376,7 +377,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -391,7 +392,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
 
         // Confirm that only one new_subchannel was seen by the underlying
         // channel controller.
@@ -430,7 +431,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr1 = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -449,7 +450,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
 
         // Verify that two new_subchannel calls occurred.
         let event1 = rx_events.recv().unwrap();
@@ -492,7 +493,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -517,7 +518,7 @@ mod tests {
         let mut sharing = SubchannelSharing::new(mock);
 
         // The first call to work should create sc1 and sc2.
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
         let _ = rx_events.recv().unwrap();
 
         let external_sc1 = sc_out1.lock().unwrap().take().unwrap();
@@ -561,7 +562,7 @@ mod tests {
 
         // Create a subchannel with the same address again and confirm that a
         // new underlying subchannel is created.
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
         let event = rx_events.recv().unwrap();
         assert!(matches!(event, TestEvent::NewSubchannel(_)));
 
@@ -591,7 +592,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -609,7 +610,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
         let _ = rx_events.recv().unwrap();
 
         let external_sc1 = sc_out1.lock().unwrap().take().unwrap();
@@ -646,7 +647,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -680,7 +681,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
         let _ = rx_events.recv().unwrap();
 
         let event = rx_events.recv().unwrap();
@@ -722,7 +723,7 @@ mod tests {
                 })),
                 work: Some(Arc::new({
                     let called_clone = called.clone();
-                    move |_data, cc| {
+                    move |_data, _workitem, cc| {
                         called_clone.lock().unwrap().push("work");
                         cc.request_resolution();
                     }
@@ -740,7 +741,7 @@ mod tests {
 
         let update = ResolverUpdate::default();
         sharing.resolver_update(update, None, &mut cc).unwrap();
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
         sharing.exit_idle(&mut cc);
 
         assert_eq!(
@@ -766,7 +767,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -789,7 +790,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
         let event = rx_events.recv().unwrap();
         let TestEvent::NewSubchannel(_int_sc) = event else {
             panic!("expected NewSubchannel")
@@ -823,7 +824,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, cc| {
+                work: Some(Arc::new(move |_data, _workitem, cc| {
                     (rx_work.lock().unwrap().recv().unwrap())(cc);
                 })),
                 ..Default::default()
@@ -850,7 +851,7 @@ mod tests {
                 *sc1_clone.lock().unwrap() = Some(sc);
             }))
             .unwrap();
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
 
         let event = rx_events.recv().unwrap();
         let TestEvent::NewSubchannel(int_sc) = event else {
@@ -869,7 +870,7 @@ mod tests {
                 assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
             }))
             .unwrap();
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
 
         // Update the state to Ready.
         sharing.subchannel_update(int_sc.clone(), &SubchannelState::ready(), &mut cc);
@@ -883,6 +884,6 @@ mod tests {
                 assert_eq!(state.connectivity_state, ConnectivityState::Ready);
             }))
             .unwrap();
-        sharing.work(&mut cc);
+        sharing.work(None, &mut cc);
     }
 }

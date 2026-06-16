@@ -21,28 +21,19 @@ function(fetch_protobuf VERSION)
     elseif(VERSION STREQUAL "27.5")
         set(HASH "5c56c6be6ba37b0551f9c7b69e4e80d3df30bd962aacaed5ebf3e4df4bb0f746")
     else()
-        message(WARNING "Unknown protobuf version ${VERSION}, downloading without hash verification")
-        set(HASH "")
+        message(FATAL_ERROR "Unknown protobuf version ${VERSION}; cannot download")
     endif()
 
     set(PROTOBUF_URL "https://github.com/protocolbuffers/protobuf/releases/download/v${VERSION}/protobuf-${VERSION}.tar.gz")
 
     message(STATUS "Fetching protobuf ${VERSION} from ${PROTOBUF_URL}")
 
-    if(HASH)
-        FetchContent_Declare(
-            protobuf
-            URL ${PROTOBUF_URL}
-            URL_HASH SHA256=${HASH}
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-        )
-    else()
-        FetchContent_Declare(
-            protobuf
-            URL ${PROTOBUF_URL}
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-        )
-    endif()
+    FetchContent_Declare(
+        protobuf
+        URL ${PROTOBUF_URL}
+        URL_HASH SHA256=${HASH}
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
 
     # Set protobuf build options before FetchContent_MakeAvailable
     set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)

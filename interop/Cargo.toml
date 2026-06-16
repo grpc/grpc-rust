@@ -40,4 +40,4 @@ base64 = "0.22"
 
 [build-dependencies]
 tonic-prost-build = {path = "../tonic-prost-build"}
-grpc-protobuf-build = {path = "../grpc-protobuf-build"}
+grpc-protobuf-build = {path = "../grpc-protobuf-build", default-features = false}

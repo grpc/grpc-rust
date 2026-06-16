@@ -1,6 +1,18 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+
+    // Optionally use protoc-gen-rust-grpc's protoc for prost. protoc-gen-rust-grpc will skip its
+    // build when PROTOC_GEN_RUST_GRPC_NO_BUILD=1 (used in gRPC's CI), so we check that the binary
+    // exists.
+    #[cfg(feature = "protoc-gen-rust-grpc")]
+    if protoc_gen_rust_grpc::protoc().exists() {
+        unsafe {
+            env::set_var("PROTOC", protoc_gen_rust_grpc::protoc());
+        }
+    }
+
     tonic_prost_build::configure()
         .compile_protos(&["proto/routeguide/route_guide.proto"], &["proto"])
         .unwrap();
@@ -40,6 +52,36 @@ fn main() {
         .codec_path("crate::common::SmallBufferCodec")
         .compile_protos(&["proto/helloworld/helloworld.proto"], &["proto"])
         .unwrap();
+
+    println!("cargo:rerun-if-env-changed=GRPC_RUST_REGENERATE_PROTO");
+    let grpc_helloworld = env::var_os("CARGO_FEATURE_GRPC_HELLOWORLD").is_some();
+    let grpc_routeguide = env::var_os("CARGO_FEATURE_GRPC_ROUTEGUIDE").is_some();
+
+    if (grpc_helloworld || grpc_routeguide) && env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some() {
+        let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+
+        let generated_dir = manifest_dir.join("generated");
+        if generated_dir.exists() {
+            std::fs::remove_dir_all(&generated_dir)
+                .expect("All files in generated/ directory should be deletable");
+        }
+
+        grpc_protobuf_build::CodeGen::new()
+            .output_dir(generated_dir.join("helloworld"))
+            .input("helloworld.proto")
+            .include(manifest_dir.join("proto/helloworld"))
+            .client_only()
+            .compile()
+            .unwrap();
+
+        grpc_protobuf_build::CodeGen::new()
+            .output_dir(generated_dir.join("routeguide"))
+            .input("route_guide.proto")
+            .include(manifest_dir.join("proto/routeguide"))
+            .client_only()
+            .compile()
+            .unwrap();
+    }
 }
 
 // Manually define the json.helloworld.Greeter service which used a custom JsonCodec to use json

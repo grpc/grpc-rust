@@ -1,0 +1,255 @@
+name: Release protoc-gen-rust-grpc
+
+# Workflow explanation:
+#
+# This workflow consists of four steps:
+#
+# 1. detect-changes: determines if plugin files were modified (for PR testing)
+#    or if it's running as the result of a plugin release.  Passes that
+#    determination to the following steps as detect-changes.outputs.should_run.
+#
+# 2. build-plugin: (if should_run) builds the plugin for every platform.
+#    Uploads built artifacts if releasing.
+#
+# 3. publish-plugin: (if build-plugin && releasing) publishes plugin artifacts
+#    from above.
+#
+# 4. build-status: (PRs only) passes if the plugin either built correctly OR if
+#    the build was skipped.  Runs even when should_run is false.  This is
+#    required to be passing for branch protection rules.
+
+on:
+  release:
+    types: [published]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  # Determines whether the plugin needs to be built (i.e. a plugin release is
+  # happening or a PR changed this file or a source file of the plugin).
+  detect-changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.determine.outputs.should_run }}
+    steps:
+      - name: Checkout repository
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v6
+
+      - name: Check for path changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            should_run:
+              - '.github/workflows/release-protoc-gen-rust-grpc.yml'
+              - 'protoc-gen-rust-grpc/src/cpp_source/**'
+
+      - name: Determine if workflow should run
+        id: determine
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          FILTER_SHOULD_RUN: ${{ steps.filter.outputs.should_run }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            if [[ "$TAG_NAME" == protoc-gen-rust-grpc* ]]; then
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "should_run=$FILTER_SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Matrix-builds the plugin for Linux, macOS, and Windows targets, saving them as run artifacts.
+  build-plugin:
+    name: Build plugin binaries
+    needs: detect-changes
+    if: needs.detect-changes.outputs.should_run == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux Builds ---
+          - runs_on: ubuntu-latest
+            target: linux-x86_64
+            binary_name: protoc-gen-rust-grpc
+            cmake_flags: ""
+          - runs_on: ubuntu-latest
+            target: linux-x86_32
+            binary_name: protoc-gen-rust-grpc
+            # Multiarch build (32-bit x86)
+            cmake_flags: "-DCMAKE_CXX_FLAGS=-m32 -DCMAKE_C_FLAGS=-m32"
+            install_32bit: true
+          - runs_on: ubuntu-24.04-arm
+            target: linux-aarch_64
+            binary_name: protoc-gen-rust-grpc
+            cmake_flags: ""
+          - runs_on: ubuntu-latest
+            target: linux-ppcle_64
+            binary_name: protoc-gen-rust-grpc
+            # Cross-compilation using GCC cross-compiler
+            cmake_flags: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=ppc64le -DCMAKE_C_COMPILER=powerpc64le-linux-gnu-gcc -DCMAKE_CXX_COMPILER=powerpc64le-linux-gnu-g++"
+            install_cross: "g++-powerpc64le-linux-gnu"
+          - runs_on: ubuntu-latest
+            target: linux-s390_64
+            binary_name: protoc-gen-rust-grpc
+            # Cross-compilation using GCC cross-compiler
+            cmake_flags: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=s390x -DCMAKE_C_COMPILER=s390x-linux-gnu-gcc -DCMAKE_CXX_COMPILER=s390x-linux-gnu-g++"
+            install_cross: "g++-s390x-linux-gnu"
+
+          # --- macOS Builds ---
+          - runs_on: macos-latest
+            target: osx-x86_64
+            binary_name: protoc-gen-rust-grpc
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=x86_64"
+          - runs_on: macos-latest
+            target: osx-aarch_64
+            binary_name: protoc-gen-rust-grpc
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=arm64"
+          - runs_on: macos-latest
+            target: osx-universal_binary
+            binary_name: protoc-gen-rust-grpc
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES='arm64;x86_64'"
+
+          # --- Windows Builds ---
+          - runs_on: windows-latest
+            target: win32
+            binary_name: protoc-gen-rust-grpc.exe
+            cmake_flags: "-A Win32"
+          - runs_on: windows-latest
+            target: win64
+            binary_name: protoc-gen-rust-grpc.exe
+            cmake_flags: "-A x64"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Cross-Compilers (Ubuntu Cross)
+        if: runner.os == 'Linux' && matrix.install_cross != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.install_cross }}
+
+      - name: Install 32-bit Libraries (Ubuntu 32-bit)
+        if: runner.os == 'Linux' && matrix.install_32bit == true
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y g++-multilib gcc-multilib
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          # Extract version from release tag (e.g. protoc-gen-rust-grpc-v0.9.0 -> 0.9.0)
+          VERSION_FROM_TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$VERSION_FROM_TAG" ]; then
+            VERSION_FROM_TAG="test-version"
+          else
+            VERSION_FROM_TAG="${VERSION_FROM_TAG##*protoc-gen-rust-grpc-v}"
+          fi
+
+          echo "Building version: $VERSION_FROM_TAG"
+
+          # Export clean version and asset filename for subsequent steps
+          echo "VERSION_FROM_TAG=${VERSION_FROM_TAG}" >> $GITHUB_ENV
+          echo "ASSET_FILENAME=protoc-gen-rust-grpc-${VERSION_FROM_TAG}-${{ matrix.target }}.zip" >> $GITHUB_ENV
+
+          cmake -S protoc-gen-rust-grpc/src/cpp_source -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_PROTOC=OFF \
+            -DBUILD_PLUGIN=ON \
+            -DRUST_GRPC_VERSION="$VERSION_FROM_TAG" \
+            ${{ matrix.cmake_flags }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release
+
+      - name: Prepare and Zip Asset (non-Windows)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p bin
+          cp build/bin/${{ matrix.binary_name }} bin/
+          zip -r ${{ env.ASSET_FILENAME }} bin/
+
+      - name: Prepare and Zip Asset (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p bin
+          cp build/bin/Release/${{ matrix.binary_name }} bin/ || cp build/bin/${{ matrix.binary_name }} bin/
+          7z a ${{ env.ASSET_FILENAME }} bin/
+
+      - name: Upload build artifact
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_FILENAME }}
+          path: ${{ env.ASSET_FILENAME }}
+          retention-days: 1
+
+  # Downloads all built matrix artifacts and publishes them to the Github release.
+  publish-plugin:
+    name: Publish plugin binaries
+    needs: [detect-changes, build-plugin]
+    if: needs.detect-changes.outputs.should_run == 'true' && github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+
+      - name: Flatten artifacts directory
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -name "*.zip" -exec cp {} release_assets/ \;
+          echo "Release assets to upload:"
+          ls -la release_assets/
+
+      - name: Upload assets to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Required status check for PR presubmits (branch protection).
+  build-status:
+    name: plugin build status
+    needs: [detect-changes, build-plugin]
+    # `always()` is needed to prevent this from skipping if a "needs" dependency
+    # didn't run.
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check build status
+        run: |
+          DETECT_RESULT="${{ needs.detect-changes.result }}"
+          BUILD_RESULT="${{ needs.build-plugin.result }}"
+
+          echo "Detect changes result: $DETECT_RESULT"
+          echo "Build result: $BUILD_RESULT"
+
+          if [ "$DETECT_RESULT" != "success" ]; then
+            echo "Detect changes job failed."
+            exit 1
+          fi
+
+          if [ "$BUILD_RESULT" = "success" ] || [ "$BUILD_RESULT" = "skipped" ]; then
+            echo "All checks passed."
+            exit 0
+          else
+            echo "Build job failed or was cancelled."
+            exit 1
+          fi

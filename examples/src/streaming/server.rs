@@ -63,7 +63,7 @@ impl pb::echo_server::Echo for EchoServer {
             while let Some(item) = stream.next().await {
                 match tx.send(Result::<_, Status>::Ok(item)).await {
                     Ok(_) => {
-                        // item (server response) was queued to be send to client
+                        // item (server response) was queued to be sent to client
                     }
                     Err(_item) => {
                         // output_stream was build from rx and both are dropped
@@ -139,13 +139,12 @@ impl pb::echo_server::Echo for EchoServer {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let server = EchoServer {};
     Server::builder()
         .add_service(pb::echo_server::EchoServer::new(server))
-        .serve("[::1]:50051".to_socket_addrs().unwrap().next().unwrap())
-        .await
-        .unwrap();
+        .serve("[::1]:50051".to_socket_addrs()?.next().unwrap())
+        .await?;
 
     Ok(())
 }

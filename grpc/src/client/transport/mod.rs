@@ -34,6 +34,7 @@ use crate::credentials::common::Authority;
 use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::GrpcRuntime;
 
+pub(crate) mod http_connect;
 mod registry;
 
 // Using tower/buffer enables tokio's rt feature even though it's possible to

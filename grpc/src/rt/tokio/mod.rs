@@ -174,6 +174,22 @@ pub(crate) struct TokioIoStream<T> {
     network_type: &'static str,
 }
 
+impl<T> TokioIoStream<T> {
+    pub(crate) fn new(
+        inner: T,
+        local_addr: Box<str>,
+        peer_addr: Box<str>,
+        network_type: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            peer_addr,
+            local_addr,
+            network_type,
+        }
+    }
+}
+
 impl TokioIoStream<TcpStream> {
     pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
         Ok(TokioIoStream {

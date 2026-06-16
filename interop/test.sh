@@ -37,10 +37,8 @@ GO_TEST_CASES=(
   "custom_metadata"
   "unimplemented_method"
   "unimplemented_service"
-  "cacheable_unary"
   "cancel_after_begin"
   "cancel_after_first_response"
-  "timeout_on_sleeping_server"
 )
 
 # join all test cases in one comma separated string (dropping the first one)

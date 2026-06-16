@@ -44,8 +44,10 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Response;
+use tonic::Status as TonicStatus;
 use tonic::async_trait;
 use tonic::metadata::MetadataMap as TonicMetadata;
+use tonic::metadata::MetadataValue as TonicMetadataValue;
 use tonic::transport::Server;
 use tonic_prost::prost::Message as ProstMessage;
 
@@ -135,6 +137,7 @@ pub(crate) async fn tonic_transport_rpc() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -236,6 +239,7 @@ async fn grpc_invoke_tonic_unary() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -294,6 +298,7 @@ mod unix_tests {
         let server_handle = tokio::spawn(async move {
             let echo_server = EchoService {
                 response_headers: None,
+                response_error: None,
             };
             let svc = EchoServer::new(echo_server);
             let _ = Server::builder()
@@ -375,7 +380,7 @@ mod unix_tests {
             }
         }
 
-        // If they share absolutely nothing (e.g., C:\ vs D:\ on Windows), we can't
+        // If they share absolutely nothing (e.g., C:\\ vs D:\\ on Windows), we can't
         // make it relative.
         if common_components == 0 {
             return Err("no common ancestor".to_owned());
@@ -431,6 +436,7 @@ async fn grpc_invoke_tonic_unary_tls() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -460,6 +466,7 @@ async fn grpc_invoke_tonic_unary_tls() {
     let channel = Channel::new(&target, Arc::new(composite_creds), Default::default());
 
     let (headers, resp, trilers) = perform_unary_echo(&channel, "hello interop tls").await;
+
     assert_eq!(
         headers.metadata().get("x-test-metadata-echo").unwrap(),
         "test-value"
@@ -486,6 +493,7 @@ async fn grpc_invoke_failure_cases() {
     tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -622,10 +630,21 @@ async fn perform_unary_echo(
 }
 
 async fn perform_unary_echo_failure(channel: &Channel) -> Trailers {
-    let (_tx, mut rx) = channel
+    let (mut tx, mut rx) = channel
         .invoke(
             RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
             CallOptions::default(),
+        )
+        .await;
+
+    let req = WrappedEchoRequest(EchoRequest::default());
+    _ = tx
+        .send(
+            &req,
+            SendOptions {
+                final_msg: true,
+                ..Default::default()
+            },
         )
         .await;
 
@@ -652,7 +671,10 @@ async fn tonic_transport_invalid_base64_headers() {
     let response_headers = Some(TonicMetadata::from_headers(headers));
 
     let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService { response_headers };
+        let echo_server = EchoService {
+            response_headers,
+            response_error: None,
+        };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
             .add_service(svc)
@@ -727,6 +749,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -782,6 +805,59 @@ async fn tonic_transport_recv_drop_cancels_send() {
     server_handle.await.unwrap();
 }
 
+#[tokio::test]
+async fn trailers_only_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+
+    // Prepare custom metadata for the server resposnse.
+    let mut metadata = TonicMetadata::new();
+    metadata.insert(
+        "x-custom-trailer",
+        TonicMetadataValue::from_static("custom-value"),
+    );
+
+    let status =
+        TonicStatus::with_metadata(tonic::Code::InvalidArgument, "test error message", metadata);
+
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {
+            response_headers: None,
+            response_error: Some(status),
+        };
+        let svc = EchoServer::new(echo_server);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::new(
+        &target,
+        LocalChannelCredentials::new_arc(),
+        Default::default(),
+    );
+
+    let trailers = perform_unary_echo_failure(&channel).await;
+
+    let status_err = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status_err.code(), StatusCodeError::InvalidArgument);
+    assert_eq!(status_err.message(), "test error message");
+
+    let metadata_map = trailers.metadata();
+    let value = metadata_map.get("x-custom-trailer").unwrap();
+    assert_eq!(value, "custom-value");
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
 struct WrappedEchoRequest(EchoRequest);
 struct WrappedEchoResponse(EchoResponse);
 
@@ -802,6 +878,7 @@ impl RecvMessage for WrappedEchoResponse {
 #[derive(Debug)]
 struct EchoService {
     response_headers: Option<TonicMetadata>,
+    response_error: Option<TonicStatus>,
 }
 
 #[async_trait]
@@ -810,6 +887,9 @@ impl Echo for EchoService {
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
+        if let Some(err) = &self.response_error {
+            return Err(err.clone());
+        }
         let metadata = request.metadata().clone();
         let message = request.into_inner().message;
         let mut response = tonic::Response::new(EchoResponse { message });

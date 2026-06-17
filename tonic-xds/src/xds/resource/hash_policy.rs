@@ -68,10 +68,11 @@ impl HashPolicyConfig {
     /// Each matching policy contributes a hash; multiple policies are combined
     /// in order using Envoy's rotate-XOR rule (`combined = rotl(combined, 1) ^
     /// new`) — the reference deterministic combination A42 documents — which
-    /// preserves entropy and prevents duplicate policies from cancelling out. A
-    /// `terminal` policy that produces a hash stops further combination. Returns
-    /// `None` if no policy produced a hash, in which case the picker falls back
-    /// to a random hash.
+    /// preserves entropy and prevents duplicate policies from cancelling out.
+    /// Per A42, once a hash has been generated a `terminal` policy stops further
+    /// combination — even if that terminal policy itself produced no hash (e.g.
+    /// its header is absent), matching Envoy/grpc-go. Returns `None` if no policy
+    /// produced a hash, in which case the picker falls back to a random hash.
     pub(crate) fn request_hash(
         headers: &http::HeaderMap,
         policies: &[HashPolicyConfig],
@@ -83,9 +84,11 @@ impl HashPolicyConfig {
                     Some(prev) => prev.rotate_left(1) ^ new_hash,
                     None => new_hash,
                 });
-                if policy.terminal() {
-                    break;
-                }
+            }
+            // A42: a terminal policy short-circuits once *any* hash has been
+            // generated, regardless of whether this policy contributed one.
+            if policy.terminal() && hash.is_some() {
+                break;
             }
         }
         hash
@@ -224,8 +227,8 @@ mod tests {
     #[test]
     fn request_hash_terminal_on_unmatched_policy_does_not_short_circuit() {
         let h = headers_with(&[("b", "2")]);
-        // `a` is terminal but absent → produces no hash → does not short-circuit,
-        // so `b` still contributes.
+        // `a` is terminal but absent, and no hash has been generated yet → does
+        // not short-circuit, so `b` still contributes.
         let result = HashPolicyConfig::request_hash(
             &h,
             &[header_policy("a", true), header_policy("b", false)],
@@ -233,5 +236,23 @@ mod tests {
         let just_b = HashPolicyConfig::request_hash(&h, &[header_policy("b", false)]);
         assert_eq!(result, just_b);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn request_hash_terminal_absent_after_match_short_circuits() {
+        // A42: once a hash has been generated, a terminal policy short-circuits
+        // even if it produces no hash of its own (its header is absent here).
+        // `a` matches, then terminal `b` is absent → `c` must NOT contribute.
+        let h = headers_with(&[("a", "1"), ("c", "3")]);
+        let result = HashPolicyConfig::request_hash(
+            &h,
+            &[
+                header_policy("a", false),
+                header_policy("b", true),
+                header_policy("c", false),
+            ],
+        );
+        let just_a = HashPolicyConfig::request_hash(&h, &[header_policy("a", false)]);
+        assert_eq!(result, just_a);
     }
 }

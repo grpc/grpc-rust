@@ -41,7 +41,6 @@ impl HashPolicyConfig {
         match self {
             HashPolicyConfig::Header { header_name, .. } => {
                 // Per A42 (deferring to gRFC A28), `-bin` headers are ignored.
-                // TODO(madhurishgupta): special-case `content-type` per A28.
                 if header_name.ends_with("-bin") {
                     return None;
                 }

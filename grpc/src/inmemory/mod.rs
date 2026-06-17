@@ -428,9 +428,14 @@ impl Resolver for InMemoryResolver {
         let _ = channel_controller.update(ResolverUpdate {
             endpoints: Ok(endpoints),
             service_config: Ok(Some(ServiceConfig {
-                load_balancing_policy: Some(
-                    crate::client::service_config::LbPolicyType::RoundRobin,
-                ),
+                load_balancing_config: Some(vec![
+                    crate::client::service_config::LoadBalancingConfig {
+                        name: "round_robin".to_string(),
+                        config: serde_json::Value::Object(serde_json::Map::new()),
+                    }
+                ]),
+                method_config: None,
+                retry_throttling: None,
             })),
             ..Default::default()
         });

@@ -68,7 +68,6 @@ use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::{self};
-use crate::client::service_config::LbPolicyType;
 use crate::client::service_config::ServiceConfig;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
@@ -464,9 +463,9 @@ impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
         let json_config = if let Ok(Some(service_config)) = update.service_config.as_ref()
             && service_config
-                .load_balancing_policy
+                .load_balancing_config
                 .as_ref()
-                .is_some_and(|p| *p == LbPolicyType::RoundRobin)
+                .is_some_and(|lbc| lbc.iter().any(|c| c.name == "round_robin"))
         {
             json!([{round_robin::POLICY_NAME: {}}])
         } else {

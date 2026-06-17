@@ -1,11 +1,15 @@
 //! Client interface through which the user can watch and receive updates for xDS resources.
 
+use std::fmt;
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 use crate::client::config::ClientConfig;
 use crate::client::watch::ResourceWatcher;
 use crate::client::worker::{AdsWorker, WatcherId, WorkerCommand};
 use crate::codec::XdsCodec;
+use crate::metrics::MetricsRecorder;
 use crate::resource::{DecodedResource, DecoderFn, Resource};
 use crate::runtime::Runtime;
 use crate::transport::TransportBuilder;
@@ -16,12 +20,31 @@ pub mod watch;
 pub mod worker;
 
 /// Builder for [`XdsClient`].
-#[derive(Debug)]
 pub struct XdsClientBuilder<TB, C, R> {
     config: ClientConfig,
     transport_builder: TB,
     codec: C,
     runtime: R,
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+}
+
+impl<TB: fmt::Debug, C: fmt::Debug, R: fmt::Debug> fmt::Debug for XdsClientBuilder<TB, C, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdsClientBuilder")
+            .field("config", &self.config)
+            .field("transport_builder", &self.transport_builder)
+            .field("codec", &self.codec)
+            .field("runtime", &self.runtime)
+            .field(
+                "recorder",
+                &self
+                    .recorder
+                    .as_ref()
+                    .map(|_| "Some(Arc<dyn MetricsRecorder>)")
+                    .unwrap_or("None"),
+            )
+            .finish()
+    }
 }
 
 impl<TB, C, R> XdsClientBuilder<TB, C, R>
@@ -31,13 +54,35 @@ where
     R: Runtime,
 {
     /// Create a new builder with the given configuration, transport builder, codec, and runtime.
+    ///
+    /// No metrics recorder is configured by default; the worker skips all A78
+    /// metric emission. Configure a backend with
+    /// [`with_metrics_recorder`](Self::with_metrics_recorder) to receive measurements.
     pub fn new(config: ClientConfig, transport_builder: TB, codec: C, runtime: R) -> Self {
         Self {
             config,
             transport_builder,
             codec,
             runtime,
+            recorder: None,
         }
+    }
+
+    /// Set the metrics recorder.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use xds_client::MetricsRecorder;
+    ///
+    /// let recorder: Arc<dyn MetricsRecorder> = Arc::new(MyOtelRecorder::new());
+    /// let builder = XdsClient::builder(config, transport, codec, runtime)
+    ///     .with_metrics_recorder(recorder);
+    /// ```
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
     }
 
     /// Build the client and start the background worker.
@@ -54,6 +99,7 @@ where
             self.config,
             command_tx.clone(),
             command_rx,
+            self.recorder,
         );
 
         self.runtime.spawn(async move {

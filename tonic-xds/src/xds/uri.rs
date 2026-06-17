@@ -1,3 +1,5 @@
+use std::fmt;
+
 use thiserror::Error;
 use url::Url;
 
@@ -52,5 +54,13 @@ impl XdsUri {
         let target = uri.path().trim_start_matches('/').to_string();
 
         Ok(Self { target })
+    }
+}
+
+impl fmt::Display for XdsUri {
+    /// Formats as the canonical xDS URI string (e.g. `xds:///my-service`).
+    /// Round-trips with [`XdsUri::parse`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{XDS_SCHEME}:///{}", self.target)
     }
 }

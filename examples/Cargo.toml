@@ -108,6 +108,11 @@ path = "src/gcp/client.rs"
 required-features = ["gcp"]
 
 [[bin]]
+name = "grpc-gcp-client"
+path = "src/grpc-gcp/client.rs"
+required-features = ["grpc-gcp"]
+
+[[bin]]
 name = "tracing-client"
 path = "src/tracing/client.rs"
 required-features = ["tracing"]
@@ -282,9 +287,14 @@ types = ["dep:tonic-types"]
 h2c = ["dep:hyper", "dep:tower", "dep:http", "dep:hyper-util"]
 cancellation = ["dep:tokio-util"]
 tower = ["dep:tower", "dep:http"]
+grpc-gcp = [ "dep:protobuf", "dep:grpc-protobuf", "dep:grpc", "dep:grpc-google",
+"dep:rustls", "dep:protobuf-well-known-types" ]
 grpc-routeguide = ["dep:grpc", "dep:grpc-protobuf", "dep:protobuf", "dep:rand"]
 grpc-helloworld = ["dep:grpc", "dep:grpc-protobuf", "dep:protobuf"]
-full = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web", "tracing", "uds", "streaming", "mock", "json-codec", "compression", "tls", "tls-rustls", "tls-client-auth", "types", "cancellation", "h2c", "grpc-routeguide", "grpc-helloworld"]
+full = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web",
+"tracing", "uds", "streaming", "mock", "json-codec", "compression", "tls",
+"tls-rustls", "tls-client-auth", "types", "cancellation", "h2c",
+"grpc-routeguide", "grpc-helloworld", "grpc-gcp"]
 default = ["full"]
 
 [dependencies]
@@ -317,11 +327,15 @@ h2 = { version = "0.4", optional = true }
 tokio-rustls = { version = "0.26.1", optional = true, features = ["ring", "tls12"], default-features = false }
 hyper-rustls = { version = "0.27.0", features = ["http2", "ring", "tls12"], optional = true, default-features = false }
 tower-http = { version = "0.6", optional = true }
+grpc-google = { path = "../grpc-google", optional = true}
 grpc-protobuf = { path = "../grpc-protobuf", optional = true }
 protobuf = { version = "4.34.0-release", optional = true }
 grpc = { path = "../grpc", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true}
+protobuf-well-known-types = { version = "4.34.0-release", optional = true }
 
 [build-dependencies]
 tonic-prost-build = { path = "../tonic-prost-build" }
 grpc-protobuf-build = { path = "../grpc-protobuf-build", default-features = false }
 protoc-gen-rust-grpc = { path = "../protoc-gen-rust-grpc", optional = true }
+protobuf-well-known-types = { version = "4.34.0-release" }

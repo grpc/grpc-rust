@@ -151,7 +151,7 @@ pub(crate) async fn tonic_transport_rpc() {
         .unwrap();
     let config = Arc::new(TransportOptions::default());
     let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
+        credentials: LocalChannelCredentials::new_arc().into(),
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
@@ -668,7 +668,7 @@ async fn tonic_transport_invalid_base64_headers() {
         .unwrap();
     let config = Arc::new(TransportOptions::default());
     let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
+        credentials: LocalChannelCredentials::new_arc().into(),
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
@@ -743,7 +743,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
         .unwrap();
     let config = Arc::new(TransportOptions::default());
     let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
+        credentials: LocalChannelCredentials::new_arc().into(),
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };

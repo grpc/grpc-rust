@@ -54,6 +54,7 @@ use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
+use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::private;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
@@ -197,6 +198,25 @@ impl ProtocolInfo {
     /// Returns the security protocol name currently in use, e.g. "tls".
     pub fn security_protocol(&self) -> &'static str {
         self.security_protocol
+    }
+}
+
+/// A type-erased, reference-counted container for [`ChannelCredentials`].
+///
+/// Any type implementing [`ChannelCredentials`] that is wrapped in an [`Arc`]
+/// can be converted into `SharedChannelCredentials` via [`From`]/[`Into`].
+#[derive(Clone)]
+pub struct SharedChannelCredentials {
+    inner: Arc<dyn DynChannelCredentials>,
+}
+
+impl<C> From<Arc<C>> for SharedChannelCredentials
+where
+    C: ChannelCredentials + 'static,
+    C::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint,
+{
+    fn from(credentials: Arc<C>) -> Self {
+        SharedChannelCredentials { inner: credentials }
     }
 }
 

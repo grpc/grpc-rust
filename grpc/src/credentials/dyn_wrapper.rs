@@ -29,6 +29,7 @@ use tonic::async_trait;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
 use crate::credentials::ServerCredentials;
+use crate::credentials::SharedChannelCredentials;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
@@ -95,7 +96,7 @@ where
     }
 }
 
-impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
+impl ChannelCredentials for SharedChannelCredentials {
     type ContextType = Box<dyn ClientConnectionSecurityContext>;
     type Output<I> = BoxEndpoint;
 
@@ -107,17 +108,17 @@ impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
         runtime: &GrpcRuntime,
         _token: private::Internal,
     ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
-        (**self)
+        self.inner
             .dyn_connect(authority, Box::new(source), info, runtime)
             .await
     }
 
     fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
-        (**self).get_call_credentials()
+        self.inner.get_call_credentials()
     }
 
     fn info(&self) -> &ProtocolInfo {
-        (**self).info()
+        self.inner.info()
     }
 }
 
@@ -164,6 +165,7 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
+    use crate::client::Channel;
     use crate::credentials::LocalChannelCredentials;
     use crate::credentials::LocalServerCredentials;
     use crate::credentials::SecurityLevel;
@@ -272,5 +274,13 @@ mod tests {
         assert_eq!(&buf[..], b"hello dynamic grpc server");
 
         client_handle.abort();
+    }
+
+    #[test]
+    fn test_passing_sharable_to_channel() {
+        // Test verifies that type erased credentials can be passed to a new
+        // channel without wrapping them in a second Arc.
+        let dyn_creds: SharedChannelCredentials = LocalChannelCredentials::new_arc().into();
+        let _ = Channel::new("dns:///localhost:8080", dyn_creds, Default::default());
     }
 }

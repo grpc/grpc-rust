@@ -22,16 +22,15 @@
  *
  */
 
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::credentials::SharedChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::DynClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::GrpcRuntime;
 
 mod registry;
@@ -126,7 +125,7 @@ impl<T: Transport> DynTransport for T {
 
 #[derive(Clone)]
 pub(crate) struct SecurityOpts {
-    pub(crate) credentials: Arc<dyn DynChannelCredentials>,
+    pub(crate) credentials: SharedChannelCredentials,
     pub(crate) authority: Authority,
     pub(crate) handshake_info: ClientHandshakeInfo,
 }

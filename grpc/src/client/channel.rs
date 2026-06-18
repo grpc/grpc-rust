@@ -36,7 +36,6 @@ use std::vec;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -248,10 +247,9 @@ impl PersistentChannel {
         options: ChannelOptions,
         credentials: Arc<dyn DynChannelCredentials>,
     ) -> Self {
-        // TODO(arjan-bal): Return errors here instead of panicking.
-        let target = Url::from_str(&target.into()).unwrap();
+        // TODO(nathanielford): Return errors here instead of panicking.
+        let target = Target::from_str(&target.into()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        let target = name_resolution::Target::from(target);
         let authority = options
             .channel_authority
             .clone()
@@ -601,8 +599,8 @@ impl<T: Clone> WatcherIter<T> {
     }
 }
 
-/// Parses the host and port from a URL-encoded string. When the input can not
-/// be parsed as (host, port) pair, it returns the entire input as the host.
+/// Parses the host and port from a string. When the input can not be parsed
+/// as (host, port) pair, it returns the entire input as the host.
 fn parse_authority(host_and_port: &str) -> Authority {
     // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
     if let Some(stripped) = host_and_port.strip_prefix('[')

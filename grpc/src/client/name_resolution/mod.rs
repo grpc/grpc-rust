@@ -161,7 +161,8 @@ pub(crate) trait ResolverBuilder: Send + Sync {
     /// the name of an external server used for name resolution.
     ///
     /// By default, this method returns the path portion of the target URI,
-    /// with the leading prefix removed and percent-encoded.
+    /// with the leading prefix removed and percent-encoded based on
+    /// https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.
     fn default_authority(&self, target: &Target) -> String {
         static CUSTOM_AUTHORITY_SET: &AsciiSet = &NON_ALPHANUMERIC
             // Unreserved characters

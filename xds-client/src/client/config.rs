@@ -57,6 +57,15 @@ pub struct ClientConfig {
     ///
     /// Default: 30 seconds. Set to `None` to disable the timeout.
     pub(crate) resource_initial_timeout: Option<Duration>,
+
+    /// gRPC channel target this xDS client serves (per gRFC A78).
+    ///
+    /// Used as the `grpc.target` attribute on emitted metrics. This identifies
+    /// the consumer-facing data-plane channel (e.g. `xds:///my-service`).
+    ///
+    /// Set this when constructing the client. When unset, the `grpc.target`
+    /// attribute is emitted as an empty string.
+    pub(crate) target: Option<String>,
     // Future extensions:
     // - `authorities: HashMap<String, AuthorityConfig>` for xDS federation (gRFC A47)
     // - Locality / zone information for locality-aware routing
@@ -84,6 +93,7 @@ impl ClientConfig {
             retry_policy: RetryPolicy::default(),
             servers: vec![ServerConfig::new(server_uri)],
             resource_initial_timeout: Some(DEFAULT_RESOURCE_INITIAL_TIMEOUT),
+            target: None,
         }
     }
 
@@ -108,6 +118,7 @@ impl ClientConfig {
             retry_policy: RetryPolicy::default(),
             servers,
             resource_initial_timeout: Some(DEFAULT_RESOURCE_INITIAL_TIMEOUT),
+            target: None,
         }
     }
 
@@ -157,6 +168,19 @@ impl ClientConfig {
     /// ```
     pub fn with_resource_initial_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.resource_initial_timeout = timeout;
+        self
+    }
+
+    /// Set the gRPC channel target name (per gRFC A78).
+    ///
+    /// Used as the `grpc.target` attribute on emitted metrics. This is the
+    /// data-plane channel target (e.g. `xds:///my-service`).
+    ///
+    /// Consumers that wrap `xds-client` in a channel layer (e.g. tonic-xds)
+    /// should set this to the channel target. When unset, the `grpc.target`
+    /// attribute is emitted as an empty string.
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
         self
     }
 }

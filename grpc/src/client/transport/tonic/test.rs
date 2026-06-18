@@ -812,7 +812,7 @@ async fn trailers_only_metadata() {
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_notify_copy = shutdown_notify.clone();
 
-    // Prepare custom metadata for the server resposnse.
+    // Prepare custom metadata for the server response.
     let mut metadata = TonicMetadata::new();
     metadata.insert(
         "x-custom-trailer",

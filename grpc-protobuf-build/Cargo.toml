@@ -12,6 +12,9 @@ categories = ["web-programming", "network-programming", "asynchronous"]
 rust-version = { workspace = true }
 edition = "2024"
 
+[package.metadata.cargo_check_external_types]
+allowed_external_types = ["protobuf_codegen::Dependency"]
+
 [dependencies]
 prettyplease = "0.2.35"
 protobuf-codegen = { version = "4.34.0-release" }

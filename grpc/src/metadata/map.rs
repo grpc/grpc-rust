@@ -162,33 +162,24 @@ impl MetadataMap {
     /// # Errors
     ///
     /// Returns an error if base64 decoding of a binary metadata value fails.
-    pub(crate) fn from_headers(headers: HeaderMap) -> Result<Self, String> {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
         let mut ret = Vec::with_capacity(headers.len());
-        let mut current_key: Option<HeaderName> = None;
 
         for (key, value) in headers {
-            if let Some(k) = key {
-                current_key = Some(k);
-            }
-
-            // If we don't have a key yet, skip to the next iteration.
-            let Some(k) = current_key.as_ref() else {
-                continue;
-            };
-            let key_str = k.as_str();
+            let key_str = key.as_str();
 
             if Ascii::is_valid_key(key_str) {
                 // We copy the header value here because the `HeaderValue`
                 // struct doesn't provide an API to fetch the underlying `Bytes`.
                 if let Ok(mv) = MetadataValue::<Ascii>::try_from(value.as_bytes()) {
-                    ret.push((k.clone(), mv.into_inner()));
+                    ret.push((key.clone(), mv.into_inner()));
                 }
             } else if Binary::is_valid_key(key_str) {
                 let b = Binary::decode(value.as_bytes(), private::Internal).map_err(|e| {
                     format!("failed to decode base64 value for key '{key_str}': {e}")
                 })?;
                 let mv = unsafe { MetadataValue::<Binary>::from_shared_unchecked(b) };
-                ret.push((k.clone(), mv.into_inner()));
+                ret.push((key.clone(), mv.into_inner()));
             }
         }
 
@@ -918,11 +909,11 @@ impl MetadataMap {
     }
 }
 
-impl TryFrom<tonic::metadata::MetadataMap> for MetadataMap {
+impl TryFrom<&tonic::metadata::MetadataMap> for MetadataMap {
     type Error = String;
 
-    fn try_from(tonic_map: tonic::metadata::MetadataMap) -> Result<Self, Self::Error> {
-        Self::from_headers(tonic_map.into_headers())
+    fn try_from(tonic_map: &tonic::metadata::MetadataMap) -> Result<Self, Self::Error> {
+        Self::from_headers(tonic_map.as_ref())
     }
 }
 
@@ -1427,7 +1418,7 @@ mod tests {
         // in gRPC MetadataValue<Ascii>.
         http_map.insert("x-invalid-ascii", HeaderValue::from_bytes(&[0xFA]).unwrap());
 
-        let map = MetadataMap::from_headers(http_map).unwrap();
+        let map = MetadataMap::from_headers(&http_map).unwrap();
 
         assert_eq!(map.len(), 2);
         assert_eq!(map.get("x-host").unwrap(), "example.com");
@@ -1444,7 +1435,7 @@ mod tests {
         // Invalid Binary value (not valid base64)
         http_map.insert("invalid-bin", "not-base64-!!!".parse().unwrap());
 
-        let result = MetadataMap::from_headers(http_map);
+        let result = MetadataMap::from_headers(&http_map);
         assert!(result.is_err());
     }
 
@@ -1580,7 +1571,7 @@ mod tests {
         assert!(!tonic_map.get("x-host").unwrap().is_sensitive());
         assert!(!tonic_map.get_bin("trace-proto-bin").unwrap().is_sensitive());
 
-        let back_map: MetadataMap = tonic_map.try_into().unwrap();
+        let back_map: MetadataMap = (&tonic_map).try_into().unwrap();
         assert_eq!(back_map.len(), 2);
         assert_eq!(back_map.get("x-host").unwrap(), "example.com");
         assert_eq!(back_map.get_bin("trace-proto-bin").unwrap(), "Hello!!");

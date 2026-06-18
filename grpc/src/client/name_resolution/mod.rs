@@ -579,18 +579,14 @@ mod test {
     }
 
     struct TestResolverBuilder;
-    impl super::ResolverBuilder for TestResolverBuilder {
-        fn build(
-            &self,
-            _target: &super::Target,
-            _options: super::ResolverOptions,
-        ) -> Box<dyn super::Resolver> {
+    impl ResolverBuilder for TestResolverBuilder {
+        fn build(&self, _target: &Target, _options: ResolverOptions) -> Box<dyn Resolver> {
             unimplemented!()
         }
         fn scheme(&self) -> &str {
             "test"
         }
-        fn is_valid_uri(&self, _uri: &super::Target) -> bool {
+        fn is_valid_uri(&self, _uri: &Target) -> bool {
             true
         }
     }
@@ -633,7 +629,7 @@ mod test {
         let builder = TestResolverBuilder;
         for tc in test_cases {
             let target_str = format!("dns:///{}", tc.input_path);
-            let target: super::Target = target_str
+            let target: Target = target_str
                 .parse()
                 .unwrap_or_else(|e| panic!("{}: failed to parse target: {}", tc.name, e));
             assert_eq!(

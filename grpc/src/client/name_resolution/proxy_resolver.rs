@@ -118,11 +118,11 @@ impl Builder {
         let Some(matcher) = matcher else {
             return Ok(self.child_builder.build(target, options));
         };
+
         let path = target.path();
         let path = path.strip_prefix('/').unwrap_or(path);
 
-        // Attempt to convert the path to a UTF-8 string, then parse it as a
-        // URL host.
+        // Use the URL crate to validate the authority and punycode encode it.
         let target_host = authority_with_default_port(path, 443);
         let url_obj = match Url::parse(&format!("https://{target_host}")) {
             Ok(url) => url,
@@ -137,8 +137,6 @@ impl Builder {
         let port = url_obj.port().unwrap_or(443);
         let explicit_authority = format!("{host}:{port}");
 
-        // Safely build `http::Uri` with the explicit authority (guaranteed
-        // ASCII/Punycode).
         let uri = match http::Uri::builder()
             .scheme("https")
             .authority(explicit_authority.as_str())
@@ -176,9 +174,10 @@ impl Builder {
             ));
         };
 
-        // `proxy_host` must be a valid URL authority. Because the `url` crate
-        // implements the WHATWG standard, it leaves `[]` unescaped in the path.
-        // Therefore, we don't need to explicitly percent-decode the host string.
+        // `proxy_host` is be a valid URL authority. Because the `url` crate
+        // parses the target using the WHATWG standard, it allows unescaped `[]`
+        // characters in the path. Therefore, we don't need to explicitly
+        // percent-encode the host string when adding it to the target path.
         let target_str = format!("dns:///{}", proxy_host);
         let proxy_target: Target = match target_str.parse() {
             Ok(t) => t,
@@ -295,7 +294,6 @@ mod tests {
     use super::*;
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
     use crate::rt;
@@ -455,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_non_matched() {
+    async fn proxy_not_matched() {
         let matcher = Matcher::builder()
             .https("http://proxy.example.com:8080")
             .no("target.example.com")
@@ -540,7 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_unix_path_works() {
+    async fn unix_path_bypass() {
         let matcher = Matcher::builder()
             .https("http://proxy.example.com:8080")
             .build();

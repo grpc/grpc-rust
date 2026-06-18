@@ -48,6 +48,8 @@ jobs:
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
+        with:
+          cache-targets: "false"
       - name: Build protoc-gen-rust-grpc
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
         run: cargo build -p protoc-gen-rust-grpc
@@ -75,6 +77,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo clippy --workspace --all-features --all-targets
 
   codegen:
@@ -91,6 +95,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo run --package codegen
     - run: git diff --exit-code
 
@@ -112,6 +118,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo hack udeps --workspace --exclude-features=_tls-any,tls,tls-aws-lc,tls-ring,tls-connect-info --each-feature
     - run: cargo udeps --package tonic --features tls-ring,transport
     - run: cargo udeps --package tonic --features tls-ring,server
@@ -141,6 +149,9 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        # Windows is the long pole of a build. Caching it avoids adding ~5 minutes of build time
+        cache-targets: ${{ matrix.os == 'windows-latest' }}
     - name: Check features
       run: cargo hack check --workspace --no-private --each-feature --no-dev-deps
     - name: Check tonic feature powerset
@@ -172,6 +183,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo no-dev-deps --no-private check --all-features --workspace
 
   doc:
@@ -189,6 +202,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo +nightly hack --no-private docs-rs
       env:
         RUSTDOCFLAGS: "-D warnings"
@@ -212,6 +227,9 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        # Windows is the long pole of a build. Caching it avoids adding ~4 minutes of build time
+        cache-targets: ${{ matrix.os == 'windows-latest' }}
     - run: cargo nextest run --workspace --all-features
       env:
         QUICKCHECK_TESTS: 1000  # run a lot of quickcheck iterations
@@ -230,6 +248,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo hack --no-private test --doc --all-features
 
   interop:
@@ -250,6 +270,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo build -p interop
     - name: Run interop tests
       run: ./interop/test.sh
@@ -286,6 +308,8 @@ jobs:
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo hack --no-private check-external-types --all-features
       env:
         RUSTFLAGS: "-D warnings"

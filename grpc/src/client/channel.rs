@@ -598,3 +598,23 @@ impl<T: Clone> WatcherIter<T> {
         Some(self.rx.borrow_and_update().clone())
     }
 }
+
+/// Parses the host and port from a string. When the input can not be parsed
+/// as (host, port) pair, it returns the entire input as the host.
+fn parse_authority(host_and_port: &str) -> Authority {
+    // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
+    if let Some(stripped) = host_and_port.strip_prefix('[')
+        && let Some((host, port_str)) = stripped.split_once("]:")
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return Authority::new(host, Some(port));
+    }
+    // Handle unbracketed addresses (IPv4 or hostnames, e.g., "localhost:8080").
+    if let Some((host, port_str)) = host_and_port.rsplit_once(':')
+        && !host.contains(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return Authority::new(host, Some(port));
+    }
+    Authority::new(host_and_port.to_string(), None)
+}

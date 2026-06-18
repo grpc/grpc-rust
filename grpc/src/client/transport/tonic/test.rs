@@ -844,7 +844,7 @@ impl ChannelCredentials for SlowChannelCredentials {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn connect_timeout_exceeded() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -878,9 +878,7 @@ async fn connect_timeout_exceeded() {
     let rpc_handle = tokio::spawn(async move { perform_unary_echo_failure(&channel).await });
 
     // Advance time to trigger the timeout in subchannel connect.
-    time::pause();
     time::sleep(Duration::from_secs(21)).await;
-    time::resume();
 
     // The RPC should have failed with a timeout.
     let trailers = rpc_handle.await.unwrap();

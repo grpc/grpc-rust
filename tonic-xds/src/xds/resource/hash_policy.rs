@@ -46,19 +46,16 @@ impl HashPolicyConfig {
                 }
                 let mut values = headers.get_all(header_name).iter();
                 let first = values.next()?;
-                match values.next() {
-                    // Single value: hash directly (no allocation).
-                    None => Some(xxhash_rust::xxh64::xxh64(first.as_bytes(), 0)),
-                    // Multiple values: join with ',' then hash.
-                    Some(second) => {
-                        let mut buf = first.as_bytes().to_vec();
-                        for v in [second].into_iter().chain(values) {
-                            buf.push(b',');
-                            buf.extend_from_slice(v.as_bytes());
-                        }
-                        Some(xxhash_rust::xxh64::xxh64(&buf, 0))
-                    }
+                // Stream the comma-joined values straight into the hasher;
+                // XXH64 is order-/boundary-independent, so this yields the same
+                // digest as hashing one concatenated buffer, with no allocation.
+                let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+                hasher.update(first.as_bytes());
+                for v in values {
+                    hasher.update(b",");
+                    hasher.update(v.as_bytes());
                 }
+                Some(hasher.digest())
             }
         }
     }

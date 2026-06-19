@@ -1,0 +1,553 @@
+/*
+ *
+ * Copyright 2026 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+use std::fs;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Once;
+
+use rustls::crypto::ring;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+
+use super::HttpConnectHandshaker;
+use crate::client::name_resolution::proxy_resolver::ProxyOptions;
+use crate::credentials::ChannelCredentials;
+use crate::credentials::LocalChannelCredentials;
+use crate::credentials::ServerCredentials;
+use crate::credentials::client::ClientHandshakeInfo;
+use crate::credentials::common::Authority;
+use crate::credentials::rustls::Identity;
+use crate::credentials::rustls::RootCertificates;
+use crate::credentials::rustls::StaticProvider;
+use crate::credentials::rustls::client::ClientTlsConfig;
+use crate::credentials::rustls::client::RustlsChannelCredendials;
+use crate::credentials::rustls::server::RustlsServerCredendials;
+use crate::credentials::rustls::server::ServerTlsConfig;
+use crate::private;
+use crate::rt::AsyncIoAdapter;
+use crate::rt::GrpcRuntime;
+use crate::rt::tokio::TokioIoStream;
+use crate::rt::tokio::TokioRuntime;
+
+static INIT: Once = Once::new();
+
+fn init_provider() {
+    INIT.call_once(|| {
+        let _ = ring::default_provider().install_default();
+    });
+}
+
+#[tokio::test]
+async fn test_proxy_success_no_auth() {
+    init_provider();
+
+    let certs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("examples/data/tls");
+
+    let server_cert = fs::read(certs_path.join("server.pem")).expect("failed to read server.pem");
+    let server_key = fs::read(certs_path.join("server.key")).expect("failed to read server.key");
+    let ca_cert = fs::read(certs_path.join("ca.pem")).expect("failed to read ca.pem");
+
+    let identity = Identity::from_pem(server_cert, server_key);
+    let identity_provider = StaticProvider::new(vec![identity]);
+    let server_tls_config = ServerTlsConfig::new(identity_provider);
+    let server_creds = RustlsServerCredendials::new(server_tls_config).unwrap();
+
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = server_listener.accept().await.unwrap();
+        let stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let runtime = GrpcRuntime::new(TokioRuntime::default());
+        let handshake_res = server_creds
+            .accept(stream, runtime, private::Internal)
+            .await
+            .unwrap();
+
+        let mut tls_stream = AsyncIoAdapter::new(handshake_res.endpoint);
+        let mut buf = vec![0u8; 5];
+        tls_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello");
+        tls_stream.write_all(b"world").await.unwrap();
+    });
+
+    // Start Proxy
+    let target_host = format!("localhost:{}", server_addr.port());
+    let proxy_addr = spawn_proxy(ProxyConfig {
+        expected_host: target_host.clone(),
+        expected_auth: None,
+        connect_response: connect_success_response(),
+        target_addr: Some(server_addr),
+    })
+    .await;
+
+    // Connect Client via Proxy using HttpConnectHandshaker directly.
+    let root_certs = RootCertificates::from_pem(ca_cert);
+    let root_provider = StaticProvider::new(root_certs);
+    let tls_client_config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
+    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+
+    let proxy_options = ProxyOptions::new(target_host, None);
+    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(server_addr.port()));
+
+    let handshake_output = handshaker
+        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .await
+        .unwrap();
+
+    // Verify we can read/write to the TLS stream.
+    let mut client_stream = AsyncIoAdapter::new(handshake_output.endpoint);
+    client_stream.write_all(b"hello").await.unwrap();
+    let mut buf = vec![0u8; 5];
+    client_stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, b"world");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_proxy_success_with_auth() {
+    init_provider();
+
+    // Start TLS Server using RustlsServerCredendials.
+    let certs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("examples/data/tls");
+
+    let server_cert = fs::read(certs_path.join("server.pem")).expect("failed to read server.pem");
+    let server_key = fs::read(certs_path.join("server.key")).expect("failed to read server.key");
+    let ca_cert = fs::read(certs_path.join("ca.pem")).expect("failed to read ca.pem");
+
+    let identity = Identity::from_pem(server_cert, server_key);
+    let identity_provider = StaticProvider::new(vec![identity]);
+    let server_tls_config = ServerTlsConfig::new(identity_provider);
+    let server_creds = RustlsServerCredendials::new(server_tls_config).unwrap();
+
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = server_listener.accept().await.unwrap();
+        let stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let runtime = GrpcRuntime::new(TokioRuntime::default());
+        let handshake_res = server_creds
+            .accept(stream, runtime, private::Internal)
+            .await
+            .unwrap();
+
+        let mut tls_stream = AsyncIoAdapter::new(handshake_res.endpoint);
+        let mut buf = vec![0u8; 5];
+        tls_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello");
+        tls_stream.write_all(b"world").await.unwrap();
+    });
+
+    // Start Proxy (expects Basic auth).
+    let target_host = format!("localhost:{}", server_addr.port());
+    let expected_auth = "Basic dXNlcjpwYXNzd29yZA=="; // user:password
+    let proxy_addr = spawn_proxy(ProxyConfig {
+        expected_host: target_host.clone(),
+        expected_auth: Some(expected_auth.to_string()),
+        connect_response: connect_success_response(),
+        target_addr: Some(server_addr),
+    })
+    .await;
+
+    // Connect Client via Proxy with Auth Header.
+    let root_certs = RootCertificates::from_pem(ca_cert);
+    let root_provider = StaticProvider::new(root_certs);
+    let tls_client_config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
+    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+
+    let auth_header = http::HeaderValue::from_str(expected_auth).unwrap();
+    let proxy_options = ProxyOptions::new(target_host, Some(auth_header));
+    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(server_addr.port()));
+
+    let handshake_output = handshaker
+        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .await
+        .unwrap();
+
+    // Verify we can read/write to the TLS stream.
+    let mut client_stream = AsyncIoAdapter::new(handshake_output.endpoint);
+    client_stream.write_all(b"hello").await.unwrap();
+    let mut buf = vec![0u8; 5];
+    client_stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, b"world");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_proxy_failure_large_header() {
+    init_provider();
+
+    let target_host = "localhost:12345".to_string();
+    let proxy_addr = spawn_proxy(ProxyConfig {
+        expected_host: target_host.clone(),
+        expected_auth: None,
+        connect_response: connect_large_header_response(),
+        target_addr: None, // Will close after response
+    })
+    .await;
+
+    let tls_client_config = ClientTlsConfig::new()
+        .with_root_certificates_provider(StaticProvider::new(RootCertificates::from_pem(vec![])));
+    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+
+    let proxy_options = ProxyOptions::new(target_host, None);
+    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(12345));
+
+    let handshake_result = handshaker
+        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .await;
+
+    let err_msg = match handshake_result {
+        Ok(_) => panic!("Expected connection failure"),
+        Err(e) => e,
+    };
+    assert!(
+        err_msg.contains("Response too large"),
+        "Expected 'Response too large', got: {}",
+        err_msg
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_failure_invalid_response() {
+    init_provider();
+
+    let target_host = "localhost:12345".to_string();
+    let proxy_addr = spawn_proxy(ProxyConfig {
+        expected_host: target_host.clone(),
+        expected_auth: None,
+        connect_response: connect_invalid_response(),
+        target_addr: None,
+    })
+    .await;
+
+    let tls_client_config = ClientTlsConfig::new()
+        .with_root_certificates_provider(StaticProvider::new(RootCertificates::from_pem(vec![])));
+    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+
+    let proxy_options = ProxyOptions::new(target_host, None);
+    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(12345));
+
+    let handshake_result = handshaker
+        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .await;
+
+    let err_msg = match handshake_result {
+        Ok(_) => panic!("Expected connection failure"),
+        Err(e) => e,
+    };
+    assert!(
+        err_msg.contains("Failed to parse HTTP response"),
+        "Expected parse error, got: {}",
+        err_msg
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_failure_bad_status() {
+    init_provider();
+
+    let target_host = "localhost:12345".to_string();
+    let proxy_addr = spawn_proxy(ProxyConfig {
+        expected_host: target_host.clone(),
+        expected_auth: None,
+        connect_response: connect_status_response(502, "Bad Gateway"),
+        target_addr: None,
+    })
+    .await;
+
+    let tls_client_config = ClientTlsConfig::new()
+        .with_root_certificates_provider(StaticProvider::new(RootCertificates::from_pem(vec![])));
+    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+
+    let proxy_options = ProxyOptions::new(target_host, None);
+    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(12345));
+
+    let handshake_result = handshaker
+        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .await;
+
+    let err_msg = match handshake_result {
+        Ok(_) => panic!("Expected connection failure"),
+        Err(e) => e,
+    };
+    assert!(
+        err_msg.contains("Proxy returned status 502"),
+        "Expected 'Proxy returned status 502', got: {}",
+        err_msg
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_success_local_rewind_batched() {
+    let local_creds = LocalChannelCredentials::new();
+
+    // Start a mock target TCP server that sends the "later" part of the
+    // response.
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+
+    let initial_bytes = b"initial_batched_bytes_";
+    let later_bytes = b"later_server_bytes";
+
+    let target_handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = target_listener.accept().await {
+            stream.write_all(later_bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+
+    let target_host = format!("localhost:{}", target_addr.port());
+    let proxy_options = ProxyOptions::new(target_host.clone(), None);
+    let handshaker = HttpConnectHandshaker::new(local_creds, &proxy_options);
+
+    // Start Proxy configured to batch initial_bytes and tunnel to target
+    // server.
+    let proxy_addr = spawn_proxy(ProxyConfig {
+        expected_host: target_host.clone(),
+        expected_auth: None,
+        connect_response: connect_batched_response(initial_bytes),
+        target_addr: Some(target_addr),
+    })
+    .await;
+
+    // Connect Client via Proxy.
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(target_addr.port()));
+
+    let handshake_output = handshaker
+        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .await
+        .unwrap();
+
+    let mut proxied_stream = AsyncIoAdapter::new(handshake_output.endpoint);
+
+    // Verify we can read BOTH the batched initial_bytes and the subsequent
+    // later_bytes.
+    let mut expected_total = initial_bytes.to_vec();
+    expected_total.extend_from_slice(later_bytes);
+
+    let mut buf = vec![0u8; expected_total.len()];
+    proxied_stream.read_exact(&mut buf).await.unwrap();
+
+    assert_eq!(buf, expected_total);
+    target_handle.await.unwrap();
+}
+
+// --- Helper Functions for Payloads ---
+
+fn connect_success_response() -> Vec<u8> {
+    b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec()
+}
+
+fn connect_status_response(code: u16, phrase: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {} {}\r\n\r\n", code, phrase).into_bytes()
+}
+
+fn connect_large_header_response() -> Vec<u8> {
+    let mut res = b"HTTP/1.1 200 OK\r\n".to_vec();
+    // Exceed the 8KB buffer limit of HttpConnectHandshaker
+    let large_header = vec![b'A'; 9000];
+    res.extend_from_slice(b"X-Large: ");
+    res.extend_from_slice(&large_header);
+    res.extend_from_slice(b"\r\n\r\n");
+    res
+}
+
+fn connect_invalid_response() -> Vec<u8> {
+    b"NOT HTTP RESPONSE\r\n\r\n".to_vec()
+}
+
+fn connect_batched_response(server_bytes: &[u8]) -> Vec<u8> {
+    let mut res = connect_success_response();
+    res.extend_from_slice(server_bytes);
+    res
+}
+
+// --- Mock Proxy Server ---
+
+struct ProxyConfig {
+    expected_host: String,
+    expected_auth: Option<String>,
+    connect_response: Vec<u8>,
+    target_addr: Option<SocketAddr>,
+}
+
+async fn spawn_proxy(config: ProxyConfig) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut client_stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 16384];
+            let mut read = 0;
+
+            // Read request
+            loop {
+                let n = client_stream.read(&mut buf[read..]).await.unwrap();
+                if n == 0 {
+                    return; // Client disconnected
+                }
+                read += n;
+
+                let mut headers = [httparse::EMPTY_HEADER; 16];
+                let mut req = httparse::Request::new(&mut headers);
+                match req.parse(&buf[..read]) {
+                    Ok(httparse::Status::Complete(len)) => {
+                        // Validate method is CONNECT
+                        if req.method != Some("CONNECT") {
+                            let res = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+                            client_stream.write_all(res).await.unwrap();
+                            return;
+                        }
+
+                        // Validate path (host).
+                        let path = req.path.unwrap();
+                        if path != config.expected_host {
+                            let res = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+                            client_stream.write_all(res).await.unwrap();
+                            return;
+                        }
+
+                        // Validate Host header.
+                        let mut host_ok = false;
+                        for header in req.headers.iter() {
+                            if header.name.eq_ignore_ascii_case("host")
+                                && header.value == config.expected_host.as_bytes()
+                            {
+                                host_ok = true;
+                            }
+                        }
+                        if !host_ok {
+                            let res = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+                            client_stream.write_all(res).await.unwrap();
+                            return;
+                        }
+
+                        // Validate Auth if expected.
+                        if let Some(ref expected_auth) = config.expected_auth {
+                            let mut auth_ok = false;
+                            for header in req.headers.iter() {
+                                if header.name.eq_ignore_ascii_case("proxy-authorization")
+                                    && header.value == expected_auth.as_bytes()
+                                {
+                                    auth_ok = true;
+                                }
+                            }
+                            if !auth_ok {
+                                let res = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+                                client_stream.write_all(res).await.unwrap();
+                                return;
+                            }
+                        }
+
+                        // Send the configured response
+                        client_stream
+                            .write_all(&config.connect_response)
+                            .await
+                            .unwrap();
+                        client_stream.flush().await.unwrap();
+
+                        // Tunnel if target_addr is Some.
+                        if let Some(target_addr) = config.target_addr {
+                            let mut backend_stream = match TcpStream::connect(target_addr).await {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    return;
+                                }
+                            };
+                            let _ = tokio::io::copy_bidirectional(
+                                &mut client_stream,
+                                &mut backend_stream,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    Ok(httparse::Status::Partial) => {
+                        if read >= buf.len() {
+                            return; // Too large
+                        }
+                    }
+                    Err(_) => {
+                        let res = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+                        client_stream.write_all(res).await.unwrap();
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    addr
+}

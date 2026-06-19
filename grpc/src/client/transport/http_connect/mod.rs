@@ -185,3 +185,6 @@ impl<C: ChannelCredentials> ChannelCredentials for HttpConnectHandshaker<C> {
             .await
     }
 }
+
+#[cfg(test)]
+mod test;

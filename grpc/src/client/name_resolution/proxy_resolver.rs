@@ -221,6 +221,14 @@ impl ProxyOptions {
     pub(crate) fn target_authority(&self) -> &str {
         &self.connect_addr
     }
+
+    #[cfg(test)]
+    pub(crate) fn new(connect_addr: String, proxy_authorization_header: Option<HeaderValue>) -> Self {
+        Self {
+            proxy_authorization_header,
+            connect_addr,
+        }
+    }
 }
 
 impl Resolver for HttpsProxyResolver {

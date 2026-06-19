@@ -48,6 +48,8 @@ jobs:
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
+        with:
+          cache-targets: "false"
       - name: Build protoc-gen-rust-grpc
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
         run: cargo build -p protoc-gen-rust-grpc
@@ -55,16 +57,9 @@ jobs:
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          mkdir -p protoc-cache
-          # Find where cmake built the binaries and any companion DLLs.
-          find target/ -name "protoc" -o -name "protoc.exe" -o -name "protoc-gen-rust-grpc" -o -name "protoc-gen-rust-grpc.exe" -o -name "*.dll" | while read -r file; do
-            # Verify it's in the build output directory to avoid copying source or unrelated files.
-            if [[ "$file" == *"/out/bin/"* ]] || [[ "$file" == *"/out/build/bin/"* ]]; then
-              cp "$file" protoc-cache/
-            fi
-          done
+          cp -r target/debug/build/protoc-gen-rust-grpc-*/out/install protoc-cache/
           echo "Cached files:"
-          ls -la protoc-cache/
+          find protoc-cache/ -type f -exec ls -lh {} +
 
   clippy:
     runs-on: ubuntu-latest
@@ -74,15 +69,16 @@ jobs:
     - uses: hecrj/setup-rust-action@v2
       with:
         components: clippy
-    - uses: taiki-e/install-action@protoc
     - uses: actions/cache@v4
       with:
         path: protoc-cache
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo clippy --workspace --all-features --all-targets
 
   codegen:
@@ -97,8 +93,10 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo run --package codegen
     - run: git diff --exit-code
 
@@ -112,15 +110,16 @@ jobs:
         toolchain: nightly-2026-02-22
     - uses: taiki-e/install-action@cargo-hack
     - uses: taiki-e/install-action@cargo-udeps
-    - uses: taiki-e/install-action@protoc
     - uses: actions/cache@v4
       with:
         path: protoc-cache
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo hack udeps --workspace --exclude-features=_tls-any,tls,tls-aws-lc,tls-ring,tls-connect-info --each-feature
     - run: cargo udeps --package tonic --features tls-ring,transport
     - run: cargo udeps --package tonic --features tls-ring,server
@@ -142,15 +141,17 @@ jobs:
     - uses: actions/checkout@v6
     - uses: hecrj/setup-rust-action@v2
     - uses: taiki-e/install-action@cargo-hack
-    - uses: taiki-e/install-action@protoc
     - uses: actions/cache@v4
       with:
         path: protoc-cache
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        # Windows is the long pole of a build. Caching it avoids adding ~5 minutes of build time
+        cache-targets: ${{ matrix.os == 'windows-latest' }}
     - name: Check features
       run: cargo hack check --workspace --no-private --each-feature --no-dev-deps
     - name: Check tonic feature powerset
@@ -180,8 +181,10 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo no-dev-deps --no-private check --all-features --workspace
 
   doc:
@@ -197,8 +200,10 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo +nightly hack --no-private docs-rs
       env:
         RUSTDOCFLAGS: "-D warnings"
@@ -214,15 +219,17 @@ jobs:
     - uses: hecrj/setup-rust-action@v2
     - uses: taiki-e/install-action@cargo-hack
     - uses: taiki-e/install-action@cargo-nextest
-    - uses: taiki-e/install-action@protoc
     - uses: actions/cache@v4
       with:
         path: protoc-cache
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        # Windows is the long pole of a build. Caching it avoids adding ~4 minutes of build time
+        cache-targets: ${{ matrix.os == 'windows-latest' }}
     - run: cargo nextest run --workspace --all-features
       env:
         QUICKCHECK_TESTS: 1000  # run a lot of quickcheck iterations
@@ -239,8 +246,10 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo hack --no-private test --doc --all-features
 
   interop:
@@ -253,15 +262,16 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - uses: hecrj/setup-rust-action@v2
-    - uses: taiki-e/install-action@protoc
     - uses: actions/cache@v4
       with:
         path: protoc-cache
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo build -p interop
     - name: Run interop tests
       run: ./interop/test.sh
@@ -296,8 +306,10 @@ jobs:
         key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
     - name: Add cached binaries to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/protoc-cache" >> $GITHUB_PATH
+      run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: "false"
     - run: cargo hack --no-private check-external-types --all-features
       env:
         RUSTFLAGS: "-D warnings"

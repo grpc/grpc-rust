@@ -192,6 +192,23 @@ impl<VE> MetadataValue<VE> {
         self.inner.is_sensitive
     }
 
+    /// Converts a `MetadataValue` to a byte slice.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use grpc::metadata::*;
+    /// let val = AsciiMetadataValue::from_static("hello");
+    /// assert_eq!(val.as_bytes(), b"hello");
+    ///
+    /// let val = MetadataValue::from_bytes("hello 🦀".as_bytes());
+    /// assert_eq!(val.as_bytes(), "hello 🦀".as_bytes());
+    /// ```
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.inner.data.as_ref()
+    }
+
     /// Converts an `UnencodedHeaderValue` to a `MetadataValue`. This method
     /// assumes that the caller has made sure that the value is of the correct
     /// `Ascii` or `Binary` value encoding.
@@ -424,21 +441,6 @@ impl MetadataValue<Ascii> {
     /// ```
     pub fn to_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.inner.data.as_ref()) }
-    }
-
-    /// Converts a `MetadataValue` to a byte slice. For Binary values, use
-    /// `to_bytes`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use grpc::metadata::*;
-    /// let val = AsciiMetadataValue::from_static("hello");
-    /// assert_eq!(val.as_bytes(), b"hello");
-    /// ```
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.inner.data.as_ref()
     }
 }
 

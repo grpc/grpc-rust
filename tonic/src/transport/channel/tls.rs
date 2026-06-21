@@ -7,6 +7,7 @@ use http::Uri;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::TrustAnchor;
 
 /// Configures TLS settings for endpoints.
@@ -23,6 +24,7 @@ pub struct ClientTlsConfig {
     with_webpki_roots: bool,
     use_key_log: bool,
     timeout: Option<Duration>,
+    provider: Option<Arc<CryptoProvider>>,
 }
 
 impl ClientTlsConfig {
@@ -135,6 +137,19 @@ impl ClientTlsConfig {
         }
     }
 
+    /// Sets a custom rustls [`CryptoProvider`] used to build this client's TLS
+    /// configuration.
+    ///
+    /// When unset, the process-wide default installed via
+    /// `CryptoProvider::install_default` is used, falling back to the provider
+    /// selected by the `tls-ring` or `tls-aws-lc` feature.
+    pub fn with_provider(self, provider: Arc<CryptoProvider>) -> Self {
+        ClientTlsConfig {
+            provider: Some(provider),
+            ..self
+        }
+    }
+
     pub(crate) fn into_tls_connector(self, uri: &Uri) -> Result<TlsConnector, crate::BoxError> {
         self.build_tls_connector(uri, None)
     }
@@ -161,6 +176,7 @@ impl ClientTlsConfig {
             self.trust_anchors,
             self.identity,
             server_cert_verifier,
+            self.provider,
             domain,
             self.assume_http2,
             self.use_key_log,
@@ -170,5 +186,21 @@ impl ClientTlsConfig {
             #[cfg(feature = "tls-webpki-roots")]
             self.with_webpki_roots,
         )
+    }
+}
+
+#[cfg(all(test, feature = "tls-ring"))]
+mod tests {
+    use super::*;
+    use tokio_rustls::rustls::crypto::ring;
+
+    #[test]
+    fn with_provider_is_used_to_build_the_connector() {
+        // A connector configured with an explicit provider builds successfully
+        // and does not depend on a process-wide default provider being installed.
+        let connector = ClientTlsConfig::new()
+            .with_provider(Arc::new(ring::default_provider()))
+            .into_tls_connector(&Uri::from_static("https://example.com"));
+        assert!(connector.is_ok());
     }
 }

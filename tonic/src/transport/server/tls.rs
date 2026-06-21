@@ -1,4 +1,6 @@
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
+
+use tokio_rustls::rustls::crypto::CryptoProvider;
 
 use super::service::TlsAcceptor;
 use crate::transport::tls::{Certificate, Identity};
@@ -12,6 +14,7 @@ pub struct ServerTlsConfig {
     ignore_client_order: bool,
     use_key_log: bool,
     timeout: Option<Duration>,
+    provider: Option<Arc<CryptoProvider>>,
 }
 
 impl fmt::Debug for ServerTlsConfig {
@@ -82,6 +85,19 @@ impl ServerTlsConfig {
         }
     }
 
+    /// Sets a custom rustls [`CryptoProvider`] used to build this server's TLS
+    /// configuration.
+    ///
+    /// When unset, the process-wide default installed via
+    /// `CryptoProvider::install_default` is used, falling back to the provider
+    /// selected by the `tls-ring` or `tls-aws-lc` feature.
+    pub fn with_provider(self, provider: Arc<CryptoProvider>) -> Self {
+        ServerTlsConfig {
+            provider: Some(provider),
+            ..self
+        }
+    }
+
     pub(crate) fn tls_acceptor(&self) -> Result<TlsAcceptor, crate::BoxError> {
         TlsAcceptor::new(
             self.identity.as_ref().unwrap(),
@@ -90,6 +106,7 @@ impl ServerTlsConfig {
             self.ignore_client_order,
             self.use_key_log,
             self.timeout,
+            self.provider.clone(),
         )
     }
 }

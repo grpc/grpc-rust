@@ -35,6 +35,7 @@ impl TlsConnector {
         trust_anchors: Vec<TrustAnchor<'static>>,
         identity: Option<Identity>,
         server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+        provider: Option<Arc<crypto::CryptoProvider>>,
         domain: &str,
         assume_http2: bool,
         use_key_log: bool,
@@ -50,15 +51,20 @@ impl TlsConnector {
                 .unwrap()
         }
 
-        #[allow(unreachable_patterns)]
-        let builder = match crypto::CryptoProvider::get_default() {
-            Some(provider) => with_provider(provider.clone()),
-            #[cfg(feature = "tls-ring")]
-            None => with_provider(Arc::new(crypto::ring::default_provider())),
-            #[cfg(feature = "tls-aws-lc")]
-            None => with_provider(Arc::new(crypto::aws_lc_rs::default_provider())),
-            // somehow tls is enabled, but neither of the crypto features are enabled.
-            _ => ClientConfig::builder(),
+        let builder = match provider {
+            Some(provider) => with_provider(provider),
+            None => {
+                #[allow(unreachable_patterns)]
+                match crypto::CryptoProvider::get_default() {
+                    Some(provider) => with_provider(provider.clone()),
+                    #[cfg(feature = "tls-ring")]
+                    None => with_provider(Arc::new(crypto::ring::default_provider())),
+                    #[cfg(feature = "tls-aws-lc")]
+                    None => with_provider(Arc::new(crypto::aws_lc_rs::default_provider())),
+                    // somehow tls is enabled, but neither of the crypto features are enabled.
+                    _ => ClientConfig::builder(),
+                }
+            }
         };
 
         let builder = match server_cert_verifier {

@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time;
 use tokio_rustls::{
     TlsAcceptor as RustlsAcceptor,
-    rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier},
+    rustls::{RootCertStore, ServerConfig, crypto::CryptoProvider, server::WebPkiClientVerifier},
     server::TlsStream,
 };
 
@@ -29,8 +29,13 @@ impl TlsAcceptor {
         ignore_client_order: bool,
         use_key_log: bool,
         timeout: Option<Duration>,
+        provider: Option<Arc<CryptoProvider>>,
     ) -> Result<Self, crate::BoxError> {
-        let builder = ServerConfig::builder();
+        let builder = match provider {
+            Some(provider) => ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()?,
+            None => ServerConfig::builder(),
+        };
 
         let builder = match client_ca_root {
             None => builder.with_no_client_auth(),

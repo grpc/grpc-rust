@@ -12,6 +12,7 @@ members = [
   "examples",
   "codegen",
   "grpc",
+  "grpc-benchmark",
   "grpc-google",
   "grpc-protobuf",
   "grpc-protobuf-build",

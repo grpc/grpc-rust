@@ -119,12 +119,10 @@ impl Builder {
             return Ok(self.child_builder.build(target, options));
         };
 
-        let path = target.path();
-        let path = path.strip_prefix('/').unwrap_or(path);
-
+        let target_authority = self.child_builder.default_authority(target);
         // Use the URL crate to validate the authority and punycode encode it.
-        let target_host = authority_with_default_port(path, 443);
-        let url_obj = match Url::parse(&format!("https://{target_host}")) {
+        let target_authority = authority_with_default_port(&target_authority, 443);
+        let url_obj = match Url::parse(&format!("https://{target_authority}")) {
             Ok(url) => url,
             Err(err) => {
                 return Err((format!("invalid target host in URL: {err}"), options));
@@ -380,12 +378,12 @@ mod tests {
         }
     }
 
-    async fn run_resolver_and_get_addresses(
+    async fn run_resolver_and_get_addresses_with_builder(
         target_uri: &str,
         dns_ips: Vec<IpAddr>,
         matcher: Option<&Matcher>,
+        child_builder: Arc<dyn ResolverBuilder>,
     ) -> Vec<Address> {
-        let child_builder = Arc::new(MockResolverBuilder { scheme: "dns" });
         let builder = Builder::new(child_builder);
 
         let target: Target = target_uri.parse().unwrap();
@@ -422,6 +420,16 @@ mod tests {
             }
         }
         addresses
+    }
+
+    async fn run_resolver_and_get_addresses(
+        target_uri: &str,
+        dns_ips: Vec<IpAddr>,
+        matcher: Option<&Matcher>,
+    ) -> Vec<Address> {
+        let child_builder = Arc::new(MockResolverBuilder { scheme: "dns" });
+        run_resolver_and_get_addresses_with_builder(target_uri, dns_ips, matcher, child_builder)
+            .await
     }
 
     #[tokio::test]
@@ -597,10 +605,12 @@ mod tests {
                 .await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
-        assert!(
-            proxy_options_for_addr(&addresses[0]).is_some(),
-            "HTTPS proxy should match HTTPS destinations"
-        );
+        let expected_proxy_opts = ProxyOptions {
+            proxy_authorization_header: None,
+            connect_addr: "target.example.com:443".to_string(),
+        };
+        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        assert_eq!(proxy_opts, &expected_proxy_opts);
 
         // Case 3: https proxy and no proxy are configured.
         let matcher = Matcher::builder()
@@ -622,7 +632,12 @@ mod tests {
                 .await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
-        assert!(proxy_options_for_addr(&addresses[0]).is_some());
+        let expected_proxy_opts = ProxyOptions {
+            proxy_authorization_header: None,
+            connect_addr: "other.example.com:443".to_string(),
+        };
+        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        assert_eq!(proxy_opts, &expected_proxy_opts);
     }
 
     #[tokio::test]
@@ -681,6 +696,63 @@ mod tests {
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
             connect_addr: "[::1]:443".to_string(),
+        };
+
+        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        assert_eq!(proxy_opts, &expected_proxy_opts);
+    }
+
+    struct CustomAuthorityBuilder {
+        default_authority: String,
+    }
+
+    impl ResolverBuilder for CustomAuthorityBuilder {
+        fn build(&self, _target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
+            let addr = Address {
+                network_type: "tcp",
+                address: ByteStr::from(DIRECT_ADDRESS.to_string()),
+                attributes: Attributes::new(),
+            };
+            NopResolver::new_with_addr(addr, options)
+        }
+
+        fn scheme(&self) -> &str {
+            "custom"
+        }
+
+        fn is_valid_uri(&self, _uri: &Target) -> bool {
+            true
+        }
+
+        fn default_authority(&self, _target: &Target) -> String {
+            self.default_authority.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_resolver_builder_default_authority() {
+        let matcher = Matcher::builder()
+            .https("http://proxy.example.com:8080")
+            .build();
+
+        let custom_authority = "custom.authority.example.com:1234".to_string();
+        let child_builder = Arc::new(CustomAuthorityBuilder {
+            default_authority: custom_authority.clone(),
+        });
+
+        let dns_ips = vec!["127.0.0.1".parse().unwrap()];
+        let addresses = run_resolver_and_get_addresses_with_builder(
+            "custom:///whatever",
+            dns_ips,
+            Some(&matcher),
+            child_builder,
+        )
+        .await;
+
+        assert_eq!(addresses.len(), 1);
+        let expected_proxy_opts = ProxyOptions {
+            proxy_authorization_header: None,
+            connect_addr: "custom.authority.example.com:1234".to_string(),
         };
 
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");

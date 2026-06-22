@@ -40,6 +40,7 @@ use ::tokio::io::ReadBuf;
 
 use crate::private;
 
+pub mod address;
 pub(crate) mod hyper_wrapper;
 #[cfg(feature = "_runtime-tokio")]
 pub(crate) mod tokio;
@@ -47,6 +48,16 @@ pub(crate) mod tokio;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type BoxedTaskHandle = Box<dyn TaskHandle>;
 pub type BoxEndpoint = Box<dyn GrpcEndpoint>;
+
+/// A server-side listening socket that yields incoming connections.
+#[tonic::async_trait]
+pub(crate) trait EndpointListener: Send + Sync + 'static {
+    /// Accepts the next incoming connection.
+    async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String>;
+
+    /// Returns the local address this listener is bound to.
+    fn local_addr(&self) -> Box<dyn address::ListenerAddress>;
+}
 
 /// An abstraction over an asynchronous runtime.
 ///
@@ -86,6 +97,23 @@ pub trait Runtime: Send + Sync + Debug {
             Err("Unix sockets are not supported by this runtime on this platform".to_string())
         })
     }
+
+    /// Binds a TCP listener to the given address.
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    fn tcp_listener(
+        &self,
+        addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>>;
+
+    /// Binds a Unix listener to the given path.
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    fn unix_listener(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>>;
 }
 
 /// A future that resolves after a specified duration.
@@ -410,6 +438,21 @@ impl Runtime for NoOpRuntime {
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
         unimplemented!()
     }
+
+    fn tcp_listener(
+        &self,
+        _addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        unimplemented!()
+    }
+
+    fn unix_listener(
+        &self,
+        _path: PathBuf,
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        unimplemented!()
+    }
 }
 
 pub(crate) fn default_runtime() -> GrpcRuntime {
@@ -461,5 +504,20 @@ impl GrpcRuntime {
         opts: UnixSocketOptions,
     ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
         self.inner.unix_stream(path, opts)
+    }
+
+    pub(crate) fn tcp_listener(
+        &self,
+        addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        self.inner.tcp_listener(addr)
+    }
+
+    pub(crate) fn unix_listener(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        self.inner.unix_listener(path, opts)
     }
 }

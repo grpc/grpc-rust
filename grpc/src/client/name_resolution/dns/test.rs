@@ -124,7 +124,7 @@ pub(crate) fn target_parsing() {
             }),
         },
         TestCase {
-            input: "dns:///[fe80::1%80]:5678/abc",
+            input: "dns:///[fe80::1%2580]:5678/abc",
             want_result: Err("SocketAddr doesn't support IPv6 addresses with zones".to_string()),
         },
         TestCase {

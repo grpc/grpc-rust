@@ -34,6 +34,10 @@ use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use percent_encoding::AsciiSet;
+use percent_encoding::NON_ALPHANUMERIC;
+use percent_encoding::percent_decode_str;
+use percent_encoding::utf8_percent_encode;
 use url::Url;
 
 use crate::attributes::Attributes;
@@ -67,22 +71,19 @@ pub(crate) use registry::global_registry;
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
     url: Url,
+    decoded_path: String,
 }
 
 impl FromStr for Target {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.parse::<Url>() {
-            Ok(url) => Ok(Target { url }),
-            Err(err) => Err(err.to_string()),
-        }
-    }
-}
-
-impl From<url::Url> for Target {
-    fn from(url: url::Url) -> Self {
-        Target { url }
+        let url = s.parse::<Url>().map_err(|err| err.to_string())?;
+        let decoded_path = percent_decode_str(url.path())
+            .decode_utf8()
+            .map_err(|err| format!("invalid UTF-8 character in target path: {err}"))?
+            .into_owned();
+        Ok(Target { url, decoded_path })
     }
 }
 
@@ -123,9 +124,9 @@ impl Target {
         }
     }
 
-    /// Retrieves endpoint from `Url.path()`.
+    /// Retrieves the percent-decoded endpoint from `Url.path()`.
     pub fn path(&self) -> &str {
-        self.url.path()
+        &self.decoded_path
     }
 }
 
@@ -136,7 +137,7 @@ impl Display for Target {
             "{}://{}{}",
             self.scheme(),
             self.authority_host_port(),
-            self.path()
+            self.url.path()
         )
     }
 }
@@ -160,10 +161,36 @@ pub(crate) trait ResolverBuilder: Send + Sync {
     /// the name of an external server used for name resolution.
     ///
     /// By default, this method returns the path portion of the target URI,
-    /// with the leading prefix removed.
+    /// with the leading prefix removed and percent-encoded based on
+    /// https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.
     fn default_authority(&self, target: &Target) -> String {
+        static CUSTOM_AUTHORITY_SET: &AsciiSet = &NON_ALPHANUMERIC
+            // Unreserved characters
+            .remove(b'-')
+            .remove(b'_')
+            .remove(b'.')
+            .remove(b'~')
+            // Subdelim characters
+            .remove(b'!')
+            .remove(b'$')
+            .remove(b'&')
+            .remove(b'\'')
+            .remove(b'(')
+            .remove(b')')
+            .remove(b'*')
+            .remove(b'+')
+            .remove(b',')
+            .remove(b';')
+            .remove(b'=')
+            // Authority related delimiters
+            .remove(b':')
+            .remove(b'[')
+            .remove(b']')
+            .remove(b'@');
+
         let path = target.path();
-        path.strip_prefix("/").unwrap_or(path).to_string()
+        let path = path.strip_prefix("/").unwrap_or(path).to_string();
+        utf8_percent_encode(&path, CUSTOM_AUTHORITY_SET).to_string()
     }
 
     /// Returns a bool indicating whether the input uri is valid to create a
@@ -379,13 +406,12 @@ impl NopResolver {
 
 #[cfg(test)]
 mod test {
-    use super::Target;
-    use crate::attributes::Attributes;
-    use crate::byte_str::ByteStr;
-    use crate::client::name_resolution::Address;
     use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    use super::*;
 
     #[test]
     pub fn parse_target() {
@@ -436,6 +462,15 @@ mod test {
                 want_path: "/run/containerd/containerd.sock",
                 want_str: "unix:///run/containerd/containerd.sock",
             },
+            TestCase {
+                input: "dns:///foo%20bar",
+                want_scheme: "dns",
+                want_host_port: "",
+                want_host: "",
+                want_port: None,
+                want_path: "/foo bar",
+                want_str: "dns:///foo%20bar",
+            },
         ];
 
         for tc in test_cases {
@@ -447,6 +482,18 @@ mod test {
             assert_eq!(target.path(), tc.want_path);
             assert_eq!(&target.to_string(), tc.want_str);
         }
+    }
+
+    #[test]
+    fn parse_target_invalid_utf8() {
+        let input = "dns:///foo%FFbar";
+        let target: Result<Target, _> = input.parse();
+        assert!(target.is_err());
+        assert!(
+            target
+                .unwrap_err()
+                .contains("invalid UTF-8 character in target path")
+        );
     }
 
     // This test ensures that the Address struct correctly maintains its
@@ -529,5 +576,74 @@ mod test {
         // Removing using A (same attributes) should succeed.
         assert_eq!(map.remove(&addr_a), Some("subchannel_a"));
         assert!(map.is_empty());
+    }
+
+    struct TestResolverBuilder;
+    impl ResolverBuilder for TestResolverBuilder {
+        fn build(&self, _target: &Target, _options: ResolverOptions) -> Box<dyn Resolver> {
+            unimplemented!()
+        }
+        fn scheme(&self) -> &str {
+            "test"
+        }
+        fn is_valid_uri(&self, _uri: &Target) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_default_authority() {
+        struct TestCase {
+            name: &'static str,
+            input_path: &'static str,
+            want_path: &'static str,
+            want_authority: &'static str,
+        }
+        let test_cases = vec![
+            TestCase {
+                name: "ipv6_authority",
+                input_path: "%5B::1%5D",
+                want_path: "/[::1]",
+                want_authority: "[::1]",
+            },
+            TestCase {
+                name: "with_user_and_host",
+                input_path: "userinfo%40host:10001",
+                want_path: "/userinfo@host:10001",
+                want_authority: "userinfo@host:10001",
+            },
+            TestCase {
+                name: "with_multiple_slashes",
+                input_path: "projects/123/network/abc/service",
+                want_path: "/projects/123/network/abc/service",
+                want_authority: "projects%2F123%2Fnetwork%2Fabc%2Fservice",
+            },
+            TestCase {
+                name: "all_possible_allowed_chars",
+                input_path: "abc123-._~!$&'()*+,;=%40:%5B%5D",
+                want_path: "/abc123-._~!$&'()*+,;=@:[]",
+                want_authority: "abc123-._~!$&'()*+,;=@:[]",
+            },
+        ];
+
+        let builder = TestResolverBuilder;
+        for tc in test_cases {
+            let target_str = format!("dns:///{}", tc.input_path);
+            let target: Target = target_str
+                .parse()
+                .unwrap_or_else(|e| panic!("{}: failed to parse target: {}", tc.name, e));
+            assert_eq!(
+                target.path(),
+                tc.want_path,
+                "test case {} failed on path",
+                tc.name
+            );
+            let got = builder.default_authority(&target);
+            assert_eq!(
+                got, tc.want_authority,
+                "test case {} failed on authority",
+                tc.name
+            );
+        }
     }
 }

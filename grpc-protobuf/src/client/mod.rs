@@ -58,7 +58,8 @@ pub(crate) mod unary;
 /// Allows sending streaming RPC protobuf request messages.
 ///
 /// If this is dropped by the client before the RPC has completed, the client
-/// enters a half-closed state which the server may observe.
+/// enters a half-closed state indicating the client is done sending messages,
+/// which the server may observe.
 pub struct GrpcStreamingRequest<M, Tx> {
     tx: Tx,
     _phantom: PhantomData<M>,
@@ -126,7 +127,7 @@ where
     }
 
     /// Receives the next response message from the stream into `res` and
-    /// returns Ok on success or Err if the stream has ended.
+    /// returns `Ok` on success or `Err` if the stream has ended.
     pub async fn recv_into(&mut self, res: &mut impl AsMut<MutProxied = M>) -> Result<(), ()> {
         let mut res_view = ProtoRecvMessage::from_mut(res);
         let mut i = self.rx.recv(&mut res_view).await;

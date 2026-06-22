@@ -118,11 +118,17 @@ impl CompressionEncoding {
 
         split_by_comma(header_value_str).find_map(|value| match value {
             #[cfg(feature = "gzip")]
-            "gzip" => Some(CompressionEncoding::Gzip),
+            "gzip" if enabled_encodings.is_enabled(CompressionEncoding::Gzip) => {
+                Some(CompressionEncoding::Gzip)
+            }
             #[cfg(feature = "deflate")]
-            "deflate" => Some(CompressionEncoding::Deflate),
+            "deflate" if enabled_encodings.is_enabled(CompressionEncoding::Deflate) => {
+                Some(CompressionEncoding::Deflate)
+            }
             #[cfg(feature = "zstd")]
-            "zstd" => Some(CompressionEncoding::Zstd),
+            "zstd" if enabled_encodings.is_enabled(CompressionEncoding::Zstd) => {
+                Some(CompressionEncoding::Zstd)
+            }
             _ => None,
         })
     }
@@ -355,6 +361,87 @@ mod tests {
         };
 
         assert_eq!(encodings.into_accept_encoding_header_value().unwrap(), ZSTD);
+    }
+
+    #[test]
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    fn from_accept_encoding_header_respects_server_enabled_encodings() {
+        // Regression test for the case where the client advertises multiple
+        // encodings in its `grpc-accept-encoding` header but the server only
+        // enabled a subset of them via `.send_compressed(...)`.
+        //
+        // Previously, `from_accept_encoding_header` would pick the first
+        // encoding in the client's list whose `cfg(feature = ...)` was
+        // compiled in, without checking whether the server actually enabled
+        // that encoding. That meant a server configured for Zstd-only would
+        // gzip its responses whenever a client listed `gzip` before `zstd`
+        // in `grpc-accept-encoding` — even though the server never asked for
+        // gzip and (in `into_accept_encoding_header_value`) would never have
+        // advertised it.
+        //
+        // The selected encoding must come from the intersection of the
+        // server's enabled set and the client's accept list, preserving the
+        // client's preference order.
+        let mut enabled = EnabledCompressionEncodings::default();
+        enabled.enable(CompressionEncoding::Zstd);
+        assert!(enabled.is_enabled(CompressionEncoding::Zstd));
+        assert!(!enabled.is_enabled(CompressionEncoding::Gzip));
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            ACCEPT_ENCODING_HEADER,
+            HeaderValue::from_static("gzip,zstd,identity"),
+        );
+
+        assert_eq!(
+            CompressionEncoding::from_accept_encoding_header(&headers, enabled),
+            Some(CompressionEncoding::Zstd),
+            "server has only Zstd enabled; must not pick Gzip just because \
+             the client listed it first",
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    fn from_accept_encoding_header_returns_none_when_no_overlap() {
+        // If the client's `grpc-accept-encoding` and the server's enabled
+        // encodings have no overlap, no compression should be selected — the
+        // server should fall back to sending the response uncompressed.
+        let mut enabled = EnabledCompressionEncodings::default();
+        enabled.enable(CompressionEncoding::Zstd);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            ACCEPT_ENCODING_HEADER,
+            HeaderValue::from_static("gzip,identity"),
+        );
+
+        assert_eq!(
+            CompressionEncoding::from_accept_encoding_header(&headers, enabled),
+            None,
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    fn from_accept_encoding_header_uses_client_preference_order() {
+        // When multiple enabled encodings appear in the client's accept list,
+        // the client's ordering wins. Both encodings are enabled on the
+        // server, but the client prefers gzip.
+        let mut enabled = EnabledCompressionEncodings::default();
+        enabled.enable(CompressionEncoding::Zstd);
+        enabled.enable(CompressionEncoding::Gzip);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            ACCEPT_ENCODING_HEADER,
+            HeaderValue::from_static("gzip,zstd,identity"),
+        );
+
+        assert_eq!(
+            CompressionEncoding::from_accept_encoding_header(&headers, enabled),
+            Some(CompressionEncoding::Gzip),
+        );
     }
 
     #[test]

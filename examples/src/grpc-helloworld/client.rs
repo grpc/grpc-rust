@@ -1,8 +1,7 @@
 #[allow(unused)]
 mod generated {
     pub mod helloworld {
-        include!("generated/generated.rs"); // Contains messages
-        include!("generated/helloworld_grpc.pb.rs"); // Contains grpc stubs
+        grpc::include_generated_proto!("generated/helloworld", "helloworld");
     }
 }
 

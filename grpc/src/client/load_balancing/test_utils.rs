@@ -41,6 +41,7 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::name_resolution::Address;
@@ -102,7 +103,7 @@ pub(crate) enum TestEvent {
     UpdatePicker(LbState),
     RequestResolution,
     Connect(Address),
-    ScheduleWork,
+    ScheduleWork(Option<WorkData>),
 }
 
 // TODO(easwars): Remove this and instead derive Debug.
@@ -113,7 +114,7 @@ impl Debug for TestEvent {
             Self::UpdatePicker(state) => write!(f, "UpdatePicker({})", state.connectivity_state),
             Self::RequestResolution => write!(f, "RequestResolution"),
             Self::Connect(addr) => write!(f, "Connect({:?})", addr.address),
-            Self::ScheduleWork => write!(f, "ScheduleWork"),
+            Self::ScheduleWork(data) => write!(f, "ScheduleWork({:?})", data),
         }
     }
 }
@@ -153,8 +154,8 @@ pub(crate) struct TestWorkScheduler {
 }
 
 impl WorkScheduler for TestWorkScheduler {
-    fn schedule_work(&self) {
-        self.tx_events.send(TestEvent::ScheduleWork).unwrap();
+    fn schedule_work(&self, data: Option<WorkData>) {
+        self.tx_events.send(TestEvent::ScheduleWork(data)).unwrap();
     }
 }
 
@@ -179,7 +180,8 @@ type SubchannelUpdateFn = Arc<
 
 type ExitIdleFn = Arc<dyn Fn(&mut StubPolicyData, &mut dyn ChannelController) + Send + Sync>;
 
-type WorkFn = Arc<dyn Fn(&mut StubPolicyData, &mut dyn ChannelController) + Send + Sync>;
+type WorkFn =
+    Arc<dyn Fn(&mut StubPolicyData, Option<WorkData>, &mut dyn ChannelController) + Send + Sync>;
 
 /// This struct holds `LbPolicy` trait stub functions that tests are expected to
 /// implement.
@@ -253,9 +255,9 @@ impl LbPolicy for StubPolicy {
         }
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
         if let Some(f) = &self.funcs.work {
-            f(&mut self.data, channel_controller);
+            f(&mut self.data, data, channel_controller);
         }
     }
 }

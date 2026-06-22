@@ -47,9 +47,9 @@ use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
 use crate::client::Internal;
 
-/// Configures a unary call for gRPC Protobuf.  Implements `IntoFuture` which
-/// performs the call and resolves to the response as a `Result<Res, Status>`.
-/// Implements `CallBuilder` to provide common RPC configuration methods.
+/// Configures a unary call for gRPC Protobuf.  Implements [`IntoFuture`] which
+/// performs the call and resolves to the response as a [`Result<Res, Status>`].
+/// Implements [`CallBuilder`] to provide common RPC configuration methods.
 pub struct UnaryCallBuilder<'a, C, ReqMsgView, Res> {
     channel: C,
     method: String,

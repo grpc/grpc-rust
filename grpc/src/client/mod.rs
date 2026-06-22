@@ -26,15 +26,21 @@
 //!
 //! This module provides the core types and traits for building gRPC clients.
 //! While most applications will use generated code (e.g. using
-//! `protoc-gen-rust-grpc`) to interact with gRPC services, this module provides
-//! the underlying primitives.
+//! [`protoc-gen-rust-grpc`](https://crates.io/protoc-gen-rust-grpc)) to
+//! interact with gRPC services, this module provides the underlying primitives.
 //!
 //! # Key Concepts
 //!
 //! - **[`Channel`]:** The main entry point for client-side gRPC operations. It
 //!   manages connections to servers and load balancing between them.
-//! - **[`Invoke`]:** A trait for executing RPCs. Both [`Channel`] and
-//!   references to it implement this trait.
+//!
+//! # Additional Types
+//!
+//! For writing and using interceptors, the following types are important to
+//! understand:
+//!
+//! - **[`Invoke`]:** A trait for executing RPCs. [`Channel`] implements this
+//!   trait.
 //! - **[`SendStream`] / [`RecvStream`]:** Represent the sending and receiving
 //!   sides of an RPC call, returned by [`Invoke::invoke`].
 

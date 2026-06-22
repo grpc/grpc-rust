@@ -3,27 +3,33 @@
 Compiles proto files via protobuf rust and generates service stubs and proto
 definitions for use with tonic.
 
+> NOTE: This version is a preview and not recommended for any production
+> use.  All APIs are unstable.  Proceed at your own risk.
+
 ## Features
 
 Required dependencies
 
 ```toml
 [dependencies]
-tonic = "<tonic-version>"
 protobuf = "<protobuf-version>"
-tonic-protobuf =  "<tonic-version>"
 
 [build-dependencies]
-grpc-protobuf-build = "<tonic-version>"
+grpc-protobuf-build = "<grpc-version>"
 ```
-
-You must ensure you have the following programs in your PATH:
-1. protoc
-1. protoc-gen-rust-grpc
 
 ## Getting Started
 
-`grpc-protobuf-build` works by being included as a [`build.rs` file](https://doc.rust-lang.org/cargo/reference/build-scripts.html) at the root of the binary/library.
+Please see [our website] for everything you should need to get started using
+gRPC!
+
+[our website]: https://grpc.io/docs/languages/rust
+
+## Detailed Crate Usage
+
+`grpc-protobuf-build` works by being included as a [`build.rs`
+file](https://doc.rust-lang.org/cargo/reference/build-scripts.html) at the root
+of the binary/library.
 
 You can rely on the defaults via
 

@@ -26,7 +26,6 @@
 
 use core::panic;
 use std::error::Error;
-use std::mem;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -37,7 +36,6 @@ use std::vec;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -54,6 +52,7 @@ use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::pick_first;
@@ -248,10 +247,9 @@ impl PersistentChannel {
         options: ChannelOptions,
         credentials: Arc<dyn DynChannelCredentials>,
     ) -> Self {
-        // TODO(arjan-bal): Return errors here instead of panicking.
-        let target = Url::from_str(&target.into()).unwrap();
+        // TODO(nathanielford): Return errors here instead of panicking.
+        let target = Target::from_str(&target.into()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        let target = name_resolution::Target::from(target);
         let authority = options
             .channel_authority
             .clone()
@@ -344,15 +342,10 @@ impl ActiveChannel {
                         resolver.work(&mut resolver_channel_controller)
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
-                    WorkQueueItem::ScheduleLbPolicy => {
-                        *resolver_channel_controller
-                            .lb_work_scheduler
-                            .pending
-                            .lock()
-                            .unwrap() = false;
+                    WorkQueueItem::ScheduleLbPolicy(data) => {
                         resolver_channel_controller
                             .lb_policy
-                            .work(&mut resolver_channel_controller.lb_channel_controller);
+                            .work(data, &mut resolver_channel_controller.lb_channel_controller);
                     }
                     WorkQueueItem::SubchannelStateUpdate { subchannel, state } => {
                         resolver_channel_controller.lb_policy.subchannel_update(
@@ -447,10 +440,7 @@ impl ResolverChannelController {
         lb_watcher: Arc<Watcher<LbState>>,
         security_opts: SecurityOpts,
     ) -> Self {
-        let lb_work_scheduler = Arc::new(LbWorkScheduler {
-            pending: Mutex::default(),
-            wqtx: wqtx.clone(),
-        });
+        let lb_work_scheduler = Arc::new(LbWorkScheduler { wqtx: wqtx.clone() });
         let lb_channel_controller = LbChannelController {
             lb_work_scheduler: lb_work_scheduler.clone(),
             transport_registry: GLOBAL_TRANSPORT_REGISTRY.clone(),
@@ -538,23 +528,18 @@ impl load_balancing::ChannelController for LbChannelController {
 
 #[derive(Debug)]
 struct LbWorkScheduler {
-    pending: Mutex<bool>,
     wqtx: WorkQueueTx,
 }
 
 impl WorkScheduler for LbWorkScheduler {
-    fn schedule_work(&self) {
-        if mem::replace(&mut *self.pending.lock().unwrap(), true) {
-            // Already had a pending call scheduled.
-            return;
-        }
-        _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy);
+    fn schedule_work(&self, data: Option<WorkData>) {
+        _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy(data));
     }
 }
 
 pub(super) enum WorkQueueItem {
     // Call the LB policy to do work.
-    ScheduleLbPolicy,
+    ScheduleLbPolicy(Option<WorkData>),
     // Provide the subchannel state update to the LB policy.
     SubchannelStateUpdate {
         subchannel: Arc<dyn Subchannel>,
@@ -614,8 +599,8 @@ impl<T: Clone> WatcherIter<T> {
     }
 }
 
-/// Parses the host and port from a URL-encoded string. When the input can not
-/// be parsed as (host, port) pair, it returns the entire input as the host.
+/// Parses the host and port from a string. When the input can not be parsed
+/// as (host, port) pair, it returns the entire input as the host.
 fn parse_authority(host_and_port: &str) -> Authority {
     // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
     if let Some(stripped) = host_and_port.strip_prefix('[')

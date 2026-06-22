@@ -43,6 +43,7 @@ use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
@@ -585,7 +586,8 @@ impl LbPolicy for PickFirstPolicy {
         }
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        debug_assert!(data.is_none(), "expected no data but got {data:?}");
         if self.connectivity_state == ConnectivityState::Idle {
             // TODO: is it safe to assume any call to work() while idle means we
             // should connect?
@@ -618,7 +620,7 @@ impl Timer {
         let handle = runtime.clone().spawn(Box::pin(async move {
             runtime.sleep(std::time::Duration::from_millis(250)).await;
             expired_clone.store(true, Ordering::SeqCst);
-            work_scheduler.schedule_work();
+            work_scheduler.schedule_work(None);
         }));
         Self { expired, handle }
     }
@@ -668,7 +670,7 @@ impl IdlePicker {
 impl Picker for IdlePicker {
     fn pick(&self, _: &RequestHeaders) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
-            self.work_scheduler.schedule_work();
+            self.work_scheduler.schedule_work(None);
         }
         PickResult::Queue
     }
@@ -824,7 +826,7 @@ mod test {
 
     fn expect_schedule_work(rx: &mpsc::Receiver<TestEvent>) {
         match rx.try_recv() {
-            Ok(TestEvent::ScheduleWork) => {}
+            Ok(TestEvent::ScheduleWork(_)) => {}
             Ok(other) => panic!("expected ScheduleWork, got {:?}", other),
             Err(e) => panic!("expected ScheduleWork, got error: {:?}", e),
         }
@@ -1220,7 +1222,7 @@ mod test {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Manually call work() to process the timer expiration.
-        policy.work(controller.as_mut());
+        policy.work(None, controller.as_mut());
 
         // Expect Connect event for addr2 due to timer expiration.
         let addr = expect_connect(&rx);
@@ -1496,7 +1498,7 @@ mod test {
             .unwrap()
             .expired
             .store(true, Ordering::SeqCst);
-        policy.work(controller.as_mut());
+        policy.work(None, controller.as_mut());
 
         let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
@@ -1613,7 +1615,7 @@ mod test {
         expect_schedule_work(&rx);
 
         // 6. Call work to execute the scheduled connection attempt.
-        policy.work(controller.as_mut());
+        policy.work(None, controller.as_mut());
 
         // 7. Verify that the policy initiates a reconnection to addr1.
         let addr = expect_connect(&rx);

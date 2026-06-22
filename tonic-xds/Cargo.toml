@@ -43,6 +43,8 @@ tokio = { version = "1", features = ["sync", "time"] }
 # Used for weighted cluster selection and fractional route matching — does not need
 # cryptographic security, only statistical uniformity for traffic distribution.
 fastrand = "2"
+# gRFC A42 ring-hash: XXH64 (seed 0) for the request hash and ring construction.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 indexmap = "2"
 tracing = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }

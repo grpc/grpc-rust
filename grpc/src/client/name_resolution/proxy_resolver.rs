@@ -110,8 +110,8 @@ impl Builder {
         options: ResolverOptions,
         matcher: Option<&Matcher>,
     ) -> Result<Box<dyn Resolver>, (String, ResolverOptions)> {
-        // Skip proxy lookup for known non-TCP schemes.
-        if matches!(target.scheme(), "unix" | "unix-abstract") {
+        // Skip proxy lookup for non-DNS targets.
+        if target.scheme() != "dns" {
             return Ok(self.child_builder.build(target, options));
         }
         // If HTTPS_PROXY is unset, avoid parsing the target as a DNS hostname.
@@ -355,9 +355,7 @@ mod tests {
         }
     }
 
-    struct MockResolverBuilder {
-        scheme: &'static str,
-    }
+    struct MockResolverBuilder {}
 
     impl ResolverBuilder for MockResolverBuilder {
         fn build(&self, _target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
@@ -370,7 +368,7 @@ mod tests {
         }
 
         fn scheme(&self) -> &str {
-            self.scheme
+            "dns"
         }
 
         fn is_valid_uri(&self, _uri: &Target) -> bool {
@@ -427,7 +425,7 @@ mod tests {
         dns_ips: Vec<IpAddr>,
         matcher: Option<&Matcher>,
     ) -> Vec<Address> {
-        let child_builder = Arc::new(MockResolverBuilder { scheme: "dns" });
+        let child_builder = Arc::new(MockResolverBuilder {});
         run_resolver_and_get_addresses_with_builder(target_uri, dns_ips, matcher, child_builder)
             .await
     }
@@ -504,16 +502,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_custom_scheme_path_with_proxy_errors() {
+    async fn invalid_path_with_proxy_errors() {
         let matcher = Matcher::builder()
             .https("http://proxy.example.com:8080")
             .build();
 
         // The path has a space in the first segment of the path, which makes it
         // an invalid hostname.
-        let target_uri = "custom:///var%20/run/grpc.sock";
+        let target_uri = "dns:///var%20/run/grpc.sock";
 
-        let child_builder = Arc::new(MockResolverBuilder { scheme: "custom" });
+        let child_builder = Arc::new(MockResolverBuilder {});
         let builder = Builder::new(child_builder);
 
         let target: Target = target_uri.parse().unwrap();
@@ -717,7 +715,7 @@ mod tests {
         }
 
         fn scheme(&self) -> &str {
-            "custom"
+            "dns"
         }
 
         fn is_valid_uri(&self, _uri: &Target) -> bool {
@@ -742,7 +740,7 @@ mod tests {
 
         let dns_ips = vec!["127.0.0.1".parse().unwrap()];
         let addresses = run_resolver_and_get_addresses_with_builder(
-            "custom:///whatever",
+            "dns:///whatever",
             dns_ips,
             Some(&matcher),
             child_builder,

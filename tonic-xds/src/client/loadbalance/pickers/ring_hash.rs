@@ -15,6 +15,7 @@
 //! Currently it supports uniform per-member weighting and an eager-connect
 //! pick: the walk selects the first ready host.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -101,11 +102,15 @@ impl RingHashPicker {
         // ceil of ring_size / N, the total is exactly ring_size, and when
         // N > ring_size the trailing members get zero entries.
         let mut ring = Vec::with_capacity(ring_size as usize);
+        // Reuse one buffer for the per-entry key instead of allocating a fresh
+        // String each iteration; `clear` keeps the capacity.
+        let mut key = String::new();
         let mut emitted: u64 = 0;
         for (k, addr) in members.iter().enumerate() {
             let target = (ring_size as u128 * (k as u128 + 1)).div_ceil(n as u128) as u64;
             for i in 0..(target - emitted) {
-                let key = format!("{addr}_{i}");
+                key.clear();
+                write!(key, "{addr}_{i}").expect("writing into a String is infallible");
                 ring.push(RingEntry {
                     hash: xxhash_rust::xxh64::xxh64(key.as_bytes(), 0),
                     addr: addr.clone(),

@@ -50,29 +50,12 @@ struct RingEntry {
     addr: EndpointAddress,
 }
 
-/// A ring-hash picker. The ring is held behind an [`ArcSwap`] so the hot path
-/// reads it lock-free while membership rebuilds publish a new ring atomically.
-pub(crate) struct RingHashPicker {
-    config: RingHashConfig,
-    ring: ArcSwap<Vec<RingEntry>>,
-}
+/// A built hash ring: entries kept sorted by hash. [`Ring::new`] is the only
+/// way to construct one, so a `Ring` is always sorted and the binary search in
+/// [`Ring::pick`] is sound.
+struct Ring(Vec<RingEntry>);
 
-impl RingHashPicker {
-    /// Create a picker with an empty ring. The ring is populated on the first
-    /// [`ChannelPicker::on_members_changed`] call.
-    pub(crate) fn new(config: RingHashConfig) -> Self {
-        Self {
-            config,
-            ring: ArcSwap::from_pointee(Vec::new()),
-        }
-    }
-
-    /// Rebuild the ring over the given members and publish it atomically.
-    pub(crate) fn rebuild(&self, members: &IndexSet<EndpointAddress>) {
-        let ring = Self::build_ring(&self.config, members);
-        self.ring.store(Arc::new(ring));
-    }
-
+impl Ring {
     /// Build the ring over `members` with uniform weights. The ring size
     /// is the smallest multiple of `N` that is ≥ `min_ring_size` — the
     /// uniform-weight case of A42's "smallest number giving the smallest-weight
@@ -83,10 +66,10 @@ impl RingHashPicker {
     /// entries. Each entry is keyed
     /// `xxh64("{addr}_{i}", 0)`, `i` being the member's previous appearance
     /// count, and entries are then sorted by hash.
-    fn build_ring(config: &RingHashConfig, members: &IndexSet<EndpointAddress>) -> Vec<RingEntry> {
+    fn new(config: &RingHashConfig, members: &IndexSet<EndpointAddress>) -> Self {
         let n = members.len() as u64;
         if n == 0 {
-            return Vec::new();
+            return Ring(Vec::new());
         }
         // Smallest multiple of N ≥ min_ring_size (so the smallest-weight host
         // gets a whole number of entries), hard-clamped to max_ring_size.
@@ -101,7 +84,7 @@ impl RingHashPicker {
         // ceil(ring_size * (k + 1) / N). Each member therefore gets floor or
         // ceil of ring_size / N, the total is exactly ring_size, and when
         // N > ring_size the trailing members get zero entries.
-        let mut ring = Vec::with_capacity(ring_size as usize);
+        let mut entries = Vec::with_capacity(ring_size as usize);
         // Reuse one buffer for the per-entry key instead of allocating a fresh
         // String each iteration; `clear` keeps the capacity.
         let mut key = String::new();
@@ -111,15 +94,57 @@ impl RingHashPicker {
             for i in 0..(target - emitted) {
                 key.clear();
                 write!(key, "{addr}_{i}").expect("writing into a String is infallible");
-                ring.push(RingEntry {
+                entries.push(RingEntry {
                     hash: xxhash_rust::xxh64::xxh64(key.as_bytes(), 0),
                     addr: addr.clone(),
                 });
             }
             emitted = target;
         }
-        ring.sort_by_key(|e| e.hash);
-        ring
+        entries.sort_by_key(|e| e.hash);
+        Ring(entries)
+    }
+
+    /// Pick the channel for `hash`: find the ring position closest to the hash
+    /// (first entry with `hash ≥ request`, wrapping around the ring), then walk
+    /// clockwise to the first ready host. Returns `None` if the ring is empty
+    /// or no ring host is ready.
+    fn pick<'a, S>(&self, hash: u64, ready: &'a IndexMap<EndpointAddress, S>) -> Option<&'a S> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let start = self.0.partition_point(|e| e.hash < hash);
+        let len = self.0.len();
+        for off in 0..len {
+            let entry = &self.0[(start + off) % len];
+            if let Some(channel) = ready.get(&entry.addr) {
+                return Some(channel);
+            }
+        }
+        None
+    }
+}
+
+/// A ring-hash picker. The ring is held behind an [`ArcSwap`] so the hot path
+/// reads it lock-free while membership rebuilds publish a new ring atomically.
+pub(crate) struct RingHashPicker {
+    config: RingHashConfig,
+    ring: ArcSwap<Ring>,
+}
+
+impl RingHashPicker {
+    /// Create a picker with an empty ring. The ring is populated on the first
+    /// [`ChannelPicker::on_members_changed`] call.
+    pub(crate) fn new(config: RingHashConfig) -> Self {
+        Self {
+            config,
+            ring: ArcSwap::from_pointee(Ring(Vec::new())),
+        }
+    }
+
+    /// Rebuild the ring over the given members and publish it atomically.
+    pub(crate) fn rebuild(&self, members: &IndexSet<EndpointAddress>) {
+        self.ring.store(Arc::new(Ring::new(&self.config, members)));
     }
 }
 
@@ -132,11 +157,6 @@ impl<S, B> ChannelPicker<S, http::Request<B>> for RingHashPicker {
         if ready.is_empty() {
             return None;
         }
-        let ring = self.ring.load();
-        if ring.is_empty() {
-            return None;
-        }
-
         // The request hash comes from the route's hash policies (gRFC A42). If
         // absent (no policy produced a hash), use a per-request random hash so
         // the request lands somewhere on the ring.
@@ -145,19 +165,7 @@ impl<S, B> ChannelPicker<S, http::Request<B>> for RingHashPicker {
             .get::<RouteDecision>()
             .and_then(|d| d.request_hash)
             .unwrap_or_else(|| fastrand::u64(..));
-
-        // First entry with hash ≥ request hash, wrapping around the ring — the
-        // ring position closest to the hash. We then walk clockwise to the
-        // first ready host.
-        let start = ring.partition_point(|e| e.hash < hash);
-        let len = ring.len();
-        for off in 0..len {
-            let entry = &ring[(start + off) % len];
-            if let Some(channel) = ready.get(&entry.addr) {
-                return Some(channel);
-            }
-        }
-        None
+        self.ring.load().pick(hash, ready)
     }
 
     fn on_members_changed(&self, members: &IndexSet<EndpointAddress>) {
@@ -203,8 +211,8 @@ mod tests {
 
     #[test]
     fn empty_members_produce_empty_ring() {
-        let ring = RingHashPicker::build_ring(&RingHashConfig::default(), &IndexSet::new());
-        assert!(ring.is_empty());
+        let ring = Ring::new(&RingHashConfig::default(), &IndexSet::new());
+        assert!(ring.0.is_empty());
     }
 
     #[test]
@@ -214,7 +222,7 @@ mod tests {
             max_ring_size: 8_000_000,
         };
         // N=3: smallest multiple of 3 ≥ 1024 is 1026 (per_host 342).
-        let ring = RingHashPicker::build_ring(&cfg, &members(&[8080, 8081, 8082]));
+        let ring = Ring::new(&cfg, &members(&[8080, 8081, 8082])).0;
         assert_eq!(ring.len(), 1026);
     }
 
@@ -225,7 +233,7 @@ mod tests {
             max_ring_size: 8_000_000,
         };
         // N=4: 1024 is already a multiple of 4 → per_host 256, total 1024.
-        let ring = RingHashPicker::build_ring(&cfg, &members(&[8080, 8081, 8082, 8083]));
+        let ring = Ring::new(&cfg, &members(&[8080, 8081, 8082, 8083])).0;
         assert_eq!(ring.len(), 1024);
         let mut counts: std::collections::HashMap<EndpointAddress, usize> =
             std::collections::HashMap::new();
@@ -244,7 +252,7 @@ mod tests {
         };
         // ceil(1000/3)*3 = 1002 > max(10) → ring size hard-capped to exactly 10
         // (per A42), spread 4/3/3 across the members by cumulative rounding.
-        let ring = RingHashPicker::build_ring(&cfg, &members(&[8080, 8081, 8082]));
+        let ring = Ring::new(&cfg, &members(&[8080, 8081, 8082])).0;
         assert_eq!(ring.len(), 10);
         let mut counts: std::collections::HashMap<EndpointAddress, usize> =
             std::collections::HashMap::new();
@@ -265,7 +273,7 @@ mod tests {
             min_ring_size: 8,
             max_ring_size: 2,
         };
-        let ring = RingHashPicker::build_ring(&cfg, &members(&[8080, 8081, 8082, 8083]));
+        let ring = Ring::new(&cfg, &members(&[8080, 8081, 8082, 8083])).0;
         assert_eq!(ring.len(), 2);
         let distinct: std::collections::HashSet<EndpointAddress> =
             ring.iter().map(|e| e.addr.clone()).collect();
@@ -280,8 +288,8 @@ mod tests {
     fn ring_is_deterministic() {
         let cfg = RingHashConfig::default();
         let m = members(&[8080, 8081, 8082]);
-        let a = RingHashPicker::build_ring(&cfg, &m);
-        let b = RingHashPicker::build_ring(&cfg, &m);
+        let a = Ring::new(&cfg, &m).0;
+        let b = Ring::new(&cfg, &m).0;
         assert_eq!(a.len(), b.len());
         assert!(
             a.iter()
@@ -292,8 +300,7 @@ mod tests {
 
     #[test]
     fn ring_is_sorted_by_hash() {
-        let ring =
-            RingHashPicker::build_ring(&RingHashConfig::default(), &members(&[8080, 8081, 8082]));
+        let ring = Ring::new(&RingHashConfig::default(), &members(&[8080, 8081, 8082])).0;
         assert!(ring.windows(2).all(|w| w[0].hash <= w[1].hash));
     }
 
@@ -324,7 +331,8 @@ mod tests {
         // actual ring, so it pins the walk's start.
         let p = picker(&[8080, 8081, 8082]);
         let ready = ready(&[8080, 8081, 8082]);
-        let ring = p.ring.load();
+        let guard = p.ring.load();
+        let ring = &guard.0;
         let mid = ring[ring.len() / 2].hash;
         let probes = [
             0,                   // below most entries

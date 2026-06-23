@@ -71,6 +71,9 @@ impl Ring {
         if n == 0 {
             return Ring(Vec::new());
         }
+        // TODO(madhurishgupta): Full A42 sizes the ring by each endpoint's
+        // weight (EDS endpoint weight and locality weight). Currently this uses
+        // uniform weights.
         // Smallest multiple of N ≥ min_ring_size (so the smallest-weight host
         // gets a whole number of entries), hard-clamped to max_ring_size.
         let ring_size = config

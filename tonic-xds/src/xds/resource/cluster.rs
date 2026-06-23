@@ -6,6 +6,7 @@ use prost::Message;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
+use super::circuit_breaking::CircuitBreakingConfig;
 use super::security::{ClusterSecurityConfig, parse_transport_socket};
 
 /// Validated Cluster resource.
@@ -20,6 +21,8 @@ pub(crate) struct ClusterResource {
     /// TLS security config parsed from `transport_socket`. `None` means the
     /// cluster uses plaintext connections.
     pub security: Option<ClusterSecurityConfig>,
+    /// Parsed A32 circuit-breaking config. Enforcement is wired separately.
+    pub circuit_breaking: CircuitBreakingConfig,
 }
 
 /// Load balancing policies.
@@ -67,12 +70,14 @@ impl Resource for ClusterResource {
         };
 
         let security = parse_transport_socket(message.transport_socket)?;
+        let circuit_breaking = CircuitBreakingConfig::from_proto(message.circuit_breakers.as_ref());
 
         Ok(ClusterResource {
             name,
             eds_service_name,
             lb_policy,
             security,
+            circuit_breaking,
         })
     }
 }
@@ -88,7 +93,12 @@ impl ClusterResource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envoy_types::pb::envoy::config::cluster::v3::cluster::EdsClusterConfig;
+    use crate::xds::resource::circuit_breaking::DEFAULT_MAX_REQUESTS;
+    use envoy_types::pb::envoy::config::cluster::v3::{
+        CircuitBreakers, circuit_breakers::Thresholds, cluster::EdsClusterConfig,
+    };
+    use envoy_types::pb::envoy::config::core::v3::RoutingPriority;
+    use envoy_types::pb::google::protobuf::UInt32Value;
 
     fn make_cluster(name: &str) -> Cluster {
         Cluster {
@@ -105,6 +115,10 @@ mod tests {
         assert_eq!(validated.name, "my-cluster");
         assert_eq!(validated.lb_policy, LbPolicy::RoundRobin);
         assert!(validated.eds_service_name.is_none());
+        assert_eq!(
+            validated.circuit_breaking.max_requests,
+            DEFAULT_MAX_REQUESTS
+        );
     }
 
     #[test]
@@ -139,6 +153,26 @@ mod tests {
         };
         let validated = ClusterResource::validate(cluster).unwrap();
         assert_eq!(validated.lb_policy, LbPolicy::LeastRequest);
+    }
+
+    #[test]
+    fn test_circuit_breaking_max_requests() {
+        let cluster = Cluster {
+            name: "cb-cluster".to_string(),
+            lb_policy: cluster::LbPolicy::RoundRobin as i32,
+            circuit_breakers: Some(CircuitBreakers {
+                thresholds: vec![Thresholds {
+                    priority: RoutingPriority::Default as i32,
+                    max_requests: Some(UInt32Value { value: 17 }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let validated = ClusterResource::validate(cluster).unwrap();
+        assert_eq!(validated.circuit_breaking.max_requests, 17);
     }
 
     #[test]

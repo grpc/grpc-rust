@@ -25,17 +25,14 @@
 #[allow(unused)]
 mod generated {
     pub(crate) mod worker_service {
-        grpc::include_proto!("worker_service", "worker_service");
+        grpc::include_proto!("grpc/testing", "worker_service");
     }
 
     pub(crate) mod benchmark_service_grpc {
-        grpc::include_proto!("benchmark_service/grpc", "benchmark_service");
+        grpc::include_proto!("grpc/testing", "benchmark_service");
     }
 
     pub(crate) mod benchmark_service_tonic {
-        include!(concat!(
-            env!("OUT_DIR"),
-            "/benchmark_service/tonic/grpc.testing.rs"
-        ));
+        include!(concat!(env!("OUT_DIR"), "/tonic/grpc.testing.rs"));
     }
 }

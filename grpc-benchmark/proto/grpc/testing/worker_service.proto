@@ -16,9 +16,13 @@
 // of unary/streaming requests/responses.
 syntax = "proto3";
 
+import "grpc/testing/control.proto";
+
 package grpc.testing;
 
-import "control.proto";
+option java_multiple_files = true;
+option java_package = "io.grpc.testing";
+option java_outer_classname = "WorkerServiceProto";
 
 service WorkerService {
   // Start server with specified workload.

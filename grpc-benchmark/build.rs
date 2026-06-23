@@ -27,39 +27,34 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let dependencies = protobuf_well_known_types::get_dependency("protobuf_well_known_types")
+        .into_iter()
+        .map(|d| d.into())
+        .collect();
 
     grpc_protobuf_build::CodeGen::new()
-        .include("proto/grpc/testing")
+        .include("proto")
         .inputs([
-            "worker_service.proto",
-            "control.proto",
-            "payloads.proto",
-            "stats.proto",
+            "grpc/testing/worker_service.proto",
+            "grpc/testing/benchmark_service.proto",
+            "grpc/testing/messages.proto",
+            "grpc/testing/control.proto",
+            "grpc/testing/payloads.proto",
+            "grpc/testing/stats.proto",
+            "grpc/core/stats.proto",
         ])
-        .output_dir(out_dir.join("worker_service"))
+        .dependencies(dependencies)
         .client_only()
         .compile()
         .unwrap();
 
-    let behchmark_service_grpc = out_dir.join("benchmark_service/grpc");
-    let behchmark_service_tonic = out_dir.join("benchmark_service/tonic");
-
-    grpc_protobuf_build::CodeGen::new()
-        .include("proto/grpc/testing")
-        .inputs(["benchmark_service.proto", "messages.proto"])
-        .output_dir(behchmark_service_grpc)
-        .client_only()
-        .compile()
-        .unwrap();
+    let behchmark_service_tonic = out_dir.join("tonic");
 
     // TODO: Use gRPC server when available.
     let _ = std::fs::create_dir(behchmark_service_tonic.clone());
     tonic_prost_build::configure()
         .out_dir(behchmark_service_tonic)
         .build_client(false)
-        .compile_protos(
-            &["proto/grpc/testing/benchmark_service.proto"],
-            &["proto/grpc/testing/"],
-        )
+        .compile_protos(&["proto/grpc/testing/benchmark_service.proto"], &["proto"])
         .unwrap();
 }

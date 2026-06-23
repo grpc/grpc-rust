@@ -1,4 +1,4 @@
-// Copyright 2015 gRPC authors.
+// Copyright 2017 gRPC authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// An integration test service that covers all the method signature permutations
-// of unary/streaming requests/responses.
 syntax = "proto3";
 
-import "grpc/testing/control.proto";
+package grpc.core;
 
-package grpc.testing;
+message Bucket {
+  double start = 1;
+  uint64 count = 2;
+}
 
-option java_multiple_files = true;
-option java_package = "io.grpc.testing";
-option java_outer_classname = "ReportQpsScenarioServiceProto";
+message Histogram {
+  repeated Bucket buckets = 1;
+}
 
-service ReportQpsScenarioService {
-  // Report results of a QPS test benchmark scenario.
-  rpc ReportScenario(ScenarioResult) returns (Void);
+message Metric {
+  string name = 1;
+  oneof value {
+    uint64 count = 10;
+    Histogram histogram = 11;
+  }
+}
+
+message Stats {
+  repeated Metric metrics = 1;
 }

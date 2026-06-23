@@ -14,14 +14,15 @@
 
 syntax = "proto3";
 
+import "grpc/testing/payloads.proto";
+import "grpc/testing/stats.proto";
+import "google/protobuf/timestamp.proto";
+
 package grpc.testing;
 
-import "payloads.proto";
-import "stats.proto";
-
 option java_multiple_files = true;
-option java_outer_classname = "ControlProto";
 option java_package = "io.grpc.testing";
+option java_outer_classname = "ControlProto";
 
 enum ClientType {
   // Many languages support a basic distinction between using
@@ -63,7 +64,7 @@ message LoadParams {
   oneof load {
     ClosedLoopParams closed_loop = 1;
     PoissonParams poisson = 2;
-  }
+  };
 }
 
 // presence of SecurityParams implies use of TLS
@@ -126,9 +127,7 @@ message ClientConfig {
   int32 client_processes = 21;
 }
 
-message ClientStatus {
-  ClientStats stats = 1;
-}
+message ClientStatus { ClientStats stats = 1; }
 
 // Request current stats
 message Mark {
@@ -192,14 +191,16 @@ message ServerStatus {
   int32 cores = 3;
 }
 
-message CoreRequest {}
+message CoreRequest {
+}
 
 message CoreResponse {
   // Number of cores available on the server
   int32 cores = 1;
 }
 
-message Void {}
+message Void {
+}
 
 // A single performance scenario: input to qps_json_driver
 message Scenario {
@@ -228,16 +229,17 @@ message Scenarios {
 
 // Basic summary that can be computed from ClientStats and ServerStats
 // once the scenario has finished.
-message ScenarioResultSummary {
+message ScenarioResultSummary
+{
   // Total number of operations per second over all clients. What is counted as 1 'operation' depends on the benchmark scenarios:
-  // For unary benchmarks, an operation is processing of a single unary RPC.
-  // For streaming benchmarks, an operation is processing of a single ping pong of request and response.
+  // For unary benchmarks, an operation is processing of a single unary RPC. 
+  // For streaming benchmarks, an operation is processing of a single ping pong of request and response. 
   double qps = 1;
   // QPS per server core.
   double qps_per_server_core = 2;
   // The total server cpu load based on system time across all server processes, expressed as percentage of a single cpu core.
-  // For example, 85 implies 85% of a cpu core, 125 implies 125% of a cpu core. Since we are accumulating the cpu load across all the server
-  // processes, the value could > 100 when there are multiple servers or a single server using multiple threads and cores.
+  // For example, 85 implies 85% of a cpu core, 125 implies 125% of a cpu core. Since we are accumulating the cpu load across all the server 
+  // processes, the value could > 100 when there are multiple servers or a single server using multiple threads and cores. 
   // Same explanation for the total client cpu load below.
   double server_system_time = 3;
   // The total server cpu load based on user time across all server processes, expressed as percentage of a single cpu core. (85 => 85%, 125 => 125%)
@@ -264,6 +266,15 @@ message ScenarioResultSummary {
   // Number of polls called inside completion queue per request
   double client_polls_per_request = 15;
   double server_polls_per_request = 16;
+
+  // Queries per CPU-sec over all servers or clients
+  double server_queries_per_cpu_sec = 17;
+  double client_queries_per_cpu_sec = 18;
+
+
+  // Start and end time for the test scenario
+  google.protobuf.Timestamp start_time = 19;
+  google.protobuf.Timestamp end_time =20;
 }
 
 // Results of a single benchmark scenario.

@@ -1,10 +1,8 @@
 [package]
 name = "grpc-benchmark"
-version = "0.0.0-alpha"
 edition = "2024"
 authors = ["gRPC Authors"]
 license = "MIT"
-publish = false
 rust-version = { workspace = true }
 
 [dependencies]
@@ -12,9 +10,11 @@ grpc = { path = "../grpc" }
 grpc-protobuf = { path = "../grpc-protobuf" }
 prost = "0.14"
 protobuf = { version = "4.34.0-release" }
+protobuf-well-known-types = { version = "4.34.0-release" }
 tonic = { path = "../tonic" }
 tonic-prost = { path = "../tonic-prost" }
 
 [build-dependencies]
 tonic-prost-build = { path = "../tonic-prost-build" }
 grpc-protobuf-build = { path = "../grpc-protobuf-build" }
+protobuf-well-known-types = { version = "4.34.0-release" }

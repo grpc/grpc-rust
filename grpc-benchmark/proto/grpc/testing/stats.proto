@@ -1,4 +1,4 @@
-// Copyright 2015 The gRPC Authors
+// Copyright 2015 gRPC authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,12 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 syntax = "proto3";
 
 package grpc.testing;
 
-option java_outer_classname = "Stats";
-option java_package = "io.grpc.benchmarks.proto";
+import "grpc/core/stats.proto";
+
+option java_multiple_files = true;
+option java_package = "io.grpc.testing";
+option java_outer_classname = "StatsProto";
 
 message ServerStats {
   // wall clock time change in seconds since last reset
@@ -37,11 +41,14 @@ message ServerStats {
 
   // Number of polls called inside completion queue
   uint64 cq_poll_count = 6;
+
+  // Core library stats
+  grpc.core.Stats core_stats = 7;
 }
 
 // Histogram params based on grpc/support/histogram.c
 message HistogramParams {
-  double resolution = 1; // first bucket is [0, 1 + resolution)
+  double resolution = 1;   // first bucket is [0, 1 + resolution)
   double max_possible = 2; // use enough buckets to allow this value
 }
 
@@ -74,4 +81,7 @@ message ClientStats {
 
   // Number of polls called inside completion queue
   uint64 cq_poll_count = 6;
+
+  // Core library stats
+  grpc.core.Stats core_stats = 7;
 }

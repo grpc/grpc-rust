@@ -24,7 +24,8 @@ protoc-gen-rust-grpc = { version = "0.9.0", path = "../protoc-gen-rust-grpc", op
 
 [features]
 default = ["build-plugin"]
-build-plugin = ["dep:protoc-gen-rust-grpc"]
+# Alias for existing users
+build-plugin = ["protoc-gen-rust-grpc"]
 
 [build-dependencies]
 cmake = "0.1"

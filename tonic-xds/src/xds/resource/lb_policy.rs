@@ -22,9 +22,13 @@ pub(crate) struct RingHashSettings {
 }
 
 /// gRFC A42 ring-hash sizing. `minimum_ring_size` defaults to 1024 and
-/// `maximum_ring_size` to the local cap of 4096 when unset; both are clamped to
-/// that cap, and any configured value above the 8M ceiling is rejected.
+/// `maximum_ring_size` to the xDS default of 8M when unset; both are then
+/// clamped to the local cap of 4096, and any configured value above the 8M
+/// ceiling is rejected. Defaulting an unset max to 8M (rather than directly to
+/// the cap) keeps the `min > max` check from rejecting a `min` in the
+/// `(cap, ceiling]` range when `max` is unset.
 pub(crate) const RING_HASH_DEFAULT_MIN_SIZE: u64 = 1024;
+pub(crate) const RING_HASH_DEFAULT_MAX_SIZE: u64 = 8 * 1024 * 1024;
 pub(crate) const RING_HASH_SIZE_CAP: u64 = 4096;
 pub(crate) const RING_HASH_SIZE_CEILING: u64 = 8 * 1024 * 1024;
 
@@ -34,8 +38,8 @@ impl RingHashSettings {
     ///
     /// Rejects a `hash_function` other than `XX_HASH`, any ring size above the
     /// 8M ceiling, and `min_ring_size > max_ring_size`. Unset sizes take the
-    /// defaults (1024 / 4096); the resolved bounds are then clamped to the
-    /// local cap.
+    /// defaults (1024 / 8M); the resolved bounds are then clamped to the local
+    /// cap.
     pub(crate) fn validate(lb_config: Option<cluster::LbConfig>) -> xds_client::Result<Self> {
         let (min_field, max_field, hash_function) = match lb_config {
             Some(cluster::LbConfig::RingHashLbConfig(c)) => {
@@ -61,7 +65,7 @@ impl RingHashSettings {
         }
 
         let min = min_field.map_or(RING_HASH_DEFAULT_MIN_SIZE, |v| v.value);
-        let max = max_field.map_or(RING_HASH_SIZE_CAP, |v| v.value);
+        let max = max_field.map_or(RING_HASH_DEFAULT_MAX_SIZE, |v| v.value);
         if min > RING_HASH_SIZE_CEILING || max > RING_HASH_SIZE_CEILING {
             return Err(Error::Validation(format!(
                 "ring_hash ring size exceeds the maximum of {RING_HASH_SIZE_CEILING} \
@@ -173,5 +177,23 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("greater than max_ring_size"));
+    }
+
+    #[test]
+    fn ring_hash_min_above_cap_with_unset_max_is_accepted() {
+        // min in (cap, ceiling] with max unset must not NACK: max defaults to
+        // 8M, so min <= max, and both then clamp to the cap.
+        let settings = RingHashSettings::validate(lb_config(cluster::RingHashLbConfig {
+            minimum_ring_size: Some(ring_size(5000)),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(
+            settings,
+            RingHashSettings {
+                min_ring_size: 4096,
+                max_ring_size: 4096,
+            }
+        );
     }
 }

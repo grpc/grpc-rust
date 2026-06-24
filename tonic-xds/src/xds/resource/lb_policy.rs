@@ -1,6 +1,8 @@
 //! Cluster load-balancing policy (CDS) and ring-hash config validation.
 
-use envoy_types::pb::envoy::config::cluster::v3::cluster;
+use envoy_types::pb::envoy::config::cluster::v3::cluster::{
+    self, ring_hash_lb_config::HashFunction,
+};
 use xds_client::Error;
 
 /// Load balancing policies.
@@ -35,8 +37,6 @@ impl RingHashSettings {
     /// defaults (1024 / 4096); the resolved bounds are then clamped to the
     /// local cap.
     pub(crate) fn validate(lb_config: Option<cluster::LbConfig>) -> xds_client::Result<Self> {
-        use cluster::ring_hash_lb_config::HashFunction;
-
         let (min_field, max_field, hash_function) = match lb_config {
             Some(cluster::LbConfig::RingHashLbConfig(c)) => {
                 (c.minimum_ring_size, c.maximum_ring_size, c.hash_function)

@@ -15,24 +15,34 @@ pub(crate) enum LbPolicy {
 }
 
 /// Validated gRFC A42 ring-hash sizing parsed from `ring_hash_lb_config`.
+///
+/// Fields are private so a `RingHashSettings` can only be obtained from
+/// [`RingHashSettings::validate`] — i.e. every value is already within bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RingHashSettings {
-    pub min_ring_size: u64,
-    pub max_ring_size: u64,
+    min_ring_size: u64,
+    max_ring_size: u64,
 }
 
 /// gRFC A42 ring-hash sizing. `minimum_ring_size` defaults to 1024 and
-/// `maximum_ring_size` to the xDS default of 8M when unset; both are then
-/// clamped to the local cap of 4096, and any configured value above the 8M
-/// ceiling is rejected. Defaulting an unset max to 8M (rather than directly to
+/// `maximum_ring_size` to the 8M ceiling when unset; both are then clamped to
+/// the local cap of 4096, and any configured value above the ceiling is
+/// rejected. Defaulting an unset max to the ceiling (rather than directly to
 /// the cap) keeps the `min > max` check from rejecting a `min` in the
 /// `(cap, ceiling]` range when `max` is unset.
 pub(crate) const RING_HASH_DEFAULT_MIN_SIZE: u64 = 1024;
-pub(crate) const RING_HASH_DEFAULT_MAX_SIZE: u64 = 8 * 1024 * 1024;
 pub(crate) const RING_HASH_SIZE_CAP: u64 = 4096;
 pub(crate) const RING_HASH_SIZE_CEILING: u64 = 8 * 1024 * 1024;
 
 impl RingHashSettings {
+    pub(crate) fn min_ring_size(&self) -> u64 {
+        self.min_ring_size
+    }
+
+    pub(crate) fn max_ring_size(&self) -> u64 {
+        self.max_ring_size
+    }
+
     /// Validate a Cluster's `lb_config` oneof as `ring_hash_lb_config` (gRFC
     /// A42).
     ///
@@ -65,7 +75,7 @@ impl RingHashSettings {
         }
 
         let min = min_field.map_or(RING_HASH_DEFAULT_MIN_SIZE, |v| v.value);
-        let max = max_field.map_or(RING_HASH_DEFAULT_MAX_SIZE, |v| v.value);
+        let max = max_field.map_or(RING_HASH_SIZE_CEILING, |v| v.value);
         if min > RING_HASH_SIZE_CEILING || max > RING_HASH_SIZE_CEILING {
             return Err(Error::Validation(format!(
                 "ring_hash ring size exceeds the maximum of {RING_HASH_SIZE_CEILING} \

@@ -166,13 +166,11 @@ mod tests {
             ..Default::default()
         };
         let validated = ClusterResource::validate(cluster).unwrap();
-        assert_eq!(
-            validated.lb_policy,
-            LbPolicy::RingHash(RingHashSettings {
-                min_ring_size: 1024,
-                max_ring_size: 4096,
-            })
-        );
+        let LbPolicy::RingHash(settings) = validated.lb_policy else {
+            panic!("expected RingHash, got {:?}", validated.lb_policy);
+        };
+        assert_eq!(settings.min_ring_size(), 1024);
+        assert_eq!(settings.max_ring_size(), 4096);
     }
 
     #[test]

@@ -59,6 +59,7 @@ use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
 use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::common::Authority;
+use crate::private;
 use crate::rt::GrpcRuntime;
 
 type SharedInvoke = Arc<dyn DynInvoke>;
@@ -185,7 +186,7 @@ impl DynInvoke for InternalSubchannel {
             let creds = data
                 .security_opts
                 .credentials
-                .get_call_credentials()
+                .get_call_credentials(private::Internal)
                 .cloned();
 
             (state, creds)

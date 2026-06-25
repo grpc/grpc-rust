@@ -24,6 +24,8 @@
 
 use std::sync::Arc;
 
+use tonic::async_trait;
+
 use crate::attributes::Attributes;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
@@ -32,11 +34,11 @@ use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CompositeCallCredentials;
 use crate::credentials::common::Authority;
 use crate::private;
-use crate::rt::GrpcEndpoint;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcRuntime;
 
-pub struct HandshakeOutput<T> {
-    pub endpoint: T,
+pub struct HandshakeOutput {
+    pub endpoint: BoxEndpoint,
     pub security: ChannelSecurityInfo,
 }
 
@@ -155,17 +157,16 @@ impl<T: ChannelCredentials> CompositeChannelCredentials<T> {
     }
 }
 
+#[async_trait]
 impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T> {
-    type Output<I> = T::Output<I>;
-
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
+    ) -> Result<HandshakeOutput, String> {
         self.channel_creds
             .connect(authority, source, info, runtime, token)
             .await

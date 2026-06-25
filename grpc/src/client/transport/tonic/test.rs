@@ -95,7 +95,7 @@ use crate::echo_pb::echo_server::EchoServer;
 use crate::metadata::AsciiMetadataKey;
 use crate::metadata::MetadataMap;
 use crate::private;
-use crate::rt::GrpcEndpoint;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::tokio::TokioRuntime;
 
@@ -833,17 +833,16 @@ impl SlowChannelCredentials {
     }
 }
 
+#[async_trait]
 impl ChannelCredentials for SlowChannelCredentials {
-    type Output<I> = I;
-
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         _authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
+    ) -> Result<HandshakeOutput, String> {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,

@@ -87,7 +87,7 @@ use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
 use crate::core::Trailers;
 use crate::credentials::client::ChannelSecurityInfo;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
+use crate::private;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 use crate::rt::TcpOptions;
@@ -425,11 +425,12 @@ impl Transport for TransportBuilder {
         let transport = transport_fut.await?;
         let credentials = &security_info.credentials;
         let handshake_ouput = credentials
-            .dyn_connect(
+            .connect(
                 &security_info.authority,
                 transport,
                 &security_info.handshake_info,
                 &runtime,
+                private::Internal,
             )
             .await?;
 

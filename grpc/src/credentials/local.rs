@@ -26,6 +26,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use tonic::async_trait;
+
 use crate::attributes::Attributes;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
@@ -42,6 +44,7 @@ use crate::credentials::common::Authority;
 use crate::credentials::server;
 use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
@@ -112,17 +115,16 @@ fn security_level_for_endpoint(
     ))
 }
 
+#[async_trait]
 impl ChannelCredentials for LocalChannelCredentials {
-    type Output<I> = I;
-
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         _authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         _runtime: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
+    ) -> Result<HandshakeOutput, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(HandshakeOutput {

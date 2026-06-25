@@ -48,12 +48,14 @@ use std::sync::Arc;
 pub use client::CompositeChannelCredentials;
 pub use local::LocalChannelCredentials;
 pub use local::LocalServerCredentials;
+use tonic::async_trait;
 
 use crate::credentials::call::CallCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
@@ -62,11 +64,8 @@ use crate::rt::GrpcRuntime;
 ///
 /// Also includes the ability to attach [`CallCredentials`] when used with the
 /// [`CompositeChannelCredentials`].
-#[trait_variant::make(Send)]
-pub trait ChannelCredentials: Sync + 'static {
-    #[doc(hidden)]
-    type Output<I>;
-
+#[async_trait]
+pub trait ChannelCredentials: Send + Sync + 'static {
     /// Provides the ProtocolInfo of these credentials.
     fn info(&self) -> &ProtocolInfo;
 
@@ -89,14 +88,14 @@ pub trait ChannelCredentials: Sync + 'static {
     /// * `source` - The raw connection handle.
     /// * `info` - Additional context passed from the resolver or load balancer.
     #[doc(hidden)]
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>>, String>;
+    ) -> Result<HandshakeOutput, String>;
 }
 
 /// Server-side trait for all live gRPC wire protocols and supported

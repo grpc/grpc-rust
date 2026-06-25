@@ -5,6 +5,10 @@
 //! because they are connection-pool or retry specific and do not apply to gRPC's
 //! A32 request limiter.
 //!
+//! This parser intentionally stays detached from `ClusterResource` until
+//! enforcement lands; otherwise cluster validation would advertise support before
+//! requests are actually limited.
+//!
 //! [gRFC A32]: https://github.com/grpc/proposal/blob/master/A32-xds-circuit-breaking.md
 
 use envoy_types::pb::envoy::config::cluster::v3::{CircuitBreakers, circuit_breakers::Thresholds};

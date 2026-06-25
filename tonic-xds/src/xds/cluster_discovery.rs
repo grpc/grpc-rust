@@ -319,7 +319,6 @@ mod tests {
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: None,
-            circuit_breaking: Default::default(),
         }
     }
 

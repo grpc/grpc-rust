@@ -195,7 +195,6 @@ mod tests {
             eds_service_name: None,
             lb_policy: lb,
             security: None,
-            circuit_breaking: Default::default(),
         })
     }
 

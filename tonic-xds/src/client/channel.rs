@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
 use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
-use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient};
+use xds_client::{
+    CallCredentials, ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
+};
 
 use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 
@@ -25,6 +27,7 @@ use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 pub struct XdsChannelConfig {
     target_uri: XdsUri,
     bootstrap: Option<BootstrapConfig>,
+    call_creds: Option<Arc<dyn CallCredentials>>,
 }
 
 impl XdsChannelConfig {
@@ -34,6 +37,7 @@ impl XdsChannelConfig {
         Self {
             target_uri,
             bootstrap: None,
+            call_creds: None,
         }
     }
 
@@ -58,6 +62,15 @@ impl XdsChannelConfig {
     pub fn with_bootstrap_from_env(mut self) -> Result<Self, BootstrapError> {
         self.bootstrap = Some(BootstrapConfig::from_env()?);
         Ok(self)
+    }
+
+    /// Set per-stream call credentials for the ADS stream (e.g. `google_default`).
+    ///
+    /// Attached on each (re)connect, only over a secure channel; over an insecure
+    /// channel, stream creation fails. Not refreshed mid-stream.
+    pub fn with_call_credentials(mut self, creds: Arc<dyn CallCredentials>) -> Self {
+        self.call_creds = Some(creds);
+        self
     }
 }
 
@@ -189,6 +202,10 @@ impl XdsChannelBuilder {
                  (enable tls-ring or tls-aws-lc)"
                     .into(),
             )));
+        }
+
+        if let Some(creds) = self.config.call_creds.clone() {
+            transport_builder = transport_builder.with_call_credentials(creds);
         }
 
         #[cfg(feature = "_tls-any")]
@@ -721,6 +738,23 @@ mod tests {
             let _ = server.shutdown.send(());
             let _ = server.handle.await;
         }
+    }
+
+    #[test]
+    fn config_stores_call_credentials() {
+        #[derive(Debug)]
+        struct DummyCreds;
+        #[tonic::async_trait]
+        impl xds_client::CallCredentials for DummyCreds {
+            async fn get_request_metadata(
+                &self,
+            ) -> xds_client::Result<std::collections::HashMap<String, String>> {
+                Ok(std::collections::HashMap::new())
+            }
+        }
+        let config = XdsChannelConfig::new(XdsUri::parse("xds:///svc").unwrap())
+            .with_call_credentials(std::sync::Arc::new(DummyCreds));
+        assert!(config.call_creds.is_some());
     }
 
     /// Smoke test: verifies builder wiring with a disconnected XdsClient

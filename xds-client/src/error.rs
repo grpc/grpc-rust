@@ -14,6 +14,11 @@ pub enum Error {
     #[error("stream error: {0}")]
     Stream(#[from] tonic::Status),
 
+    /// Call credentials failed, or require a secure transport.
+    #[cfg(feature = "transport-tonic")]
+    #[error("call credentials error: {0}")]
+    CallCredentials(String),
+
     /// The stream was closed unexpectedly.
     #[error("stream closed unexpectedly")]
     StreamClosed,

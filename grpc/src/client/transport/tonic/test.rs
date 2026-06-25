@@ -80,7 +80,7 @@ use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
 use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo as ClientSecurityInfo;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
@@ -846,7 +846,7 @@ impl ChannelCredentials for SlowChannelCredentials {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ClientSecurityInfo::new(
+            security: ChannelSecurityInfo::new(
                 "mock",
                 SecurityLevel::NoSecurity,
                 Box::new(MockConnectionSecurityContext),

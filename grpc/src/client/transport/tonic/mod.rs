@@ -86,7 +86,7 @@ use crate::core::RequestHeaders;
 use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
 use crate::core::Trailers;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
@@ -373,7 +373,7 @@ impl Transport for TransportBuilder {
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,

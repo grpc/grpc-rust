@@ -79,8 +79,8 @@ use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo as ClientSecurityInfo;
+use crate::credentials::client::ChannelSecurityContext;
+use crate::credentials::client::ChannelSecurityInfo as ClientSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
@@ -816,7 +816,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
 
 #[derive(Debug, Clone)]
 struct MockConnectionSecurityContext;
-impl ClientConnectionSecurityContext for MockConnectionSecurityContext {
+impl ChannelSecurityContext for MockConnectionSecurityContext {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -834,7 +834,6 @@ impl SlowChannelCredentials {
 }
 
 impl ChannelCredentials for SlowChannelCredentials {
-    type ContextType = MockConnectionSecurityContext;
     type Output<I> = I;
 
     async fn connect<Input: GrpcEndpoint>(
@@ -844,14 +843,14 @@ impl ChannelCredentials for SlowChannelCredentials {
         _info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,
             security: ClientSecurityInfo::new(
                 "mock",
                 SecurityLevel::NoSecurity,
-                MockConnectionSecurityContext,
+                Box::new(MockConnectionSecurityContext),
                 Attributes::new(),
             ),
         })

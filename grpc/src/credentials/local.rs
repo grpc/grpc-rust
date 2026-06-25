@@ -34,8 +34,8 @@ use crate::credentials::ProtocolInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::ServerCredentials;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo;
+use crate::credentials::client::ChannelSecurityContext;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
@@ -74,7 +74,7 @@ impl LocalChannelCredentials {
 #[derive(Debug, Clone)]
 pub struct LocalConnectionSecurityContext;
 
-impl ClientConnectionSecurityContext for LocalConnectionSecurityContext {
+impl ChannelSecurityContext for LocalConnectionSecurityContext {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -113,7 +113,6 @@ fn security_level_for_endpoint(
 }
 
 impl ChannelCredentials for LocalChannelCredentials {
-    type ContextType = LocalConnectionSecurityContext;
     type Output<I> = I;
 
     async fn connect<Input: GrpcEndpoint>(
@@ -123,15 +122,15 @@ impl ChannelCredentials for LocalChannelCredentials {
         _info: &ClientHandshakeInfo,
         _runtime: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ClientConnectionSecurityInfo::new(
+            security: ChannelSecurityInfo::new(
                 PROTOCOL_NAME,
                 security_level,
-                LocalConnectionSecurityContext,
+                Box::new(LocalConnectionSecurityContext),
                 Attributes::new(),
             ),
         })
@@ -199,7 +198,6 @@ mod test {
     use crate::credentials::ChannelCredentials;
     use crate::credentials::SecurityLevel;
     use crate::credentials::ServerCredentials;
-    use crate::credentials::client::ClientConnectionSecurityContext;
     use crate::credentials::client::ClientHandshakeInfo;
     use crate::credentials::common::Authority;
     use crate::rt;

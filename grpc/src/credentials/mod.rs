@@ -50,7 +50,6 @@ pub use local::LocalChannelCredentials;
 pub use local::LocalServerCredentials;
 
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
@@ -65,8 +64,6 @@ use crate::rt::GrpcRuntime;
 /// [`CompositeChannelCredentials`].
 #[trait_variant::make(Send)]
 pub trait ChannelCredentials: Sync + 'static {
-    #[doc(hidden)]
-    type ContextType: ClientConnectionSecurityContext;
     #[doc(hidden)]
     type Output<I>;
 
@@ -99,7 +96,7 @@ pub trait ChannelCredentials: Sync + 'static {
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String>;
+    ) -> Result<HandshakeOutput<Self::Output<Input>>, String>;
 }
 
 /// Server-side trait for all live gRPC wire protocols and supported

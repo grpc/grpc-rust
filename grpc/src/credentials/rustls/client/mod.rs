@@ -40,8 +40,8 @@ use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo;
+use crate::credentials::client::ChannelSecurityContext;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
@@ -199,7 +199,7 @@ pub struct ClientTlsSecurityContext {
     verified_peer_cert: Option<CertificateDer<'static>>,
 }
 
-impl ClientConnectionSecurityContext for ClientTlsSecurityContext {
+impl ChannelSecurityContext for ClientTlsSecurityContext {
     fn validate_authority(&self, authority: &Authority) -> bool {
         let server_name = match ServerName::try_from(authority.host()) {
             Ok(n) => n,
@@ -221,7 +221,6 @@ impl ClientConnectionSecurityContext for ClientTlsSecurityContext {
 }
 
 impl ChannelCredentials for RustlsChannelCredendials {
-    type ContextType = ClientTlsSecurityContext;
     type Output<I> = TlsStream<I>;
 
     async fn connect<Input: GrpcEndpoint>(
@@ -231,7 +230,7 @@ impl ChannelCredentials for RustlsChannelCredendials {
         _info: &ClientHandshakeInfo,
         _rt: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<TlsStream<Input>, ClientTlsSecurityContext>, String> {
+    ) -> Result<HandshakeOutput<TlsStream<Input>>, String> {
         let server_name = ServerName::try_from(authority.host())
             .map_err(|e| format!("invalid authority: {}", e))?
             .to_owned();
@@ -257,12 +256,12 @@ impl ChannelCredentials for RustlsChannelCredendials {
             .and_then(|certs| certs.first())
             .map(|c| c.clone().into_owned());
 
-        let cs_info = ClientConnectionSecurityInfo::new(
+        let cs_info = ChannelSecurityInfo::new(
             "tls",
             SecurityLevel::PrivacyAndIntegrity,
-            ClientTlsSecurityContext {
+            Box::new(ClientTlsSecurityContext {
                 verified_peer_cert: peer_cert,
-            },
+            }),
             Attributes::new(),
         );
         let ep = TlsStream::new(RustlsStream::Client(tls_stream));

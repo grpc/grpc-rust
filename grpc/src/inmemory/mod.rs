@@ -66,9 +66,8 @@ use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
 use crate::core::Trailers;
 use crate::credentials::SecurityLevel;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
+use crate::credentials::client::ChannelSecurityContext;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::common::Authority;
 use crate::rt::GrpcRuntime;
 use crate::server::Call as ServerCall;
@@ -350,7 +349,7 @@ impl Transport for InMemoryTransport {
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -365,13 +364,12 @@ impl Transport for InMemoryTransport {
             s: s.clone(),
             closed_tx: Some(closed_tx),
         };
-        let sec_info = ClientConnectionSecurityInfo::new(
+        let sec_info = ChannelSecurityInfo::new(
             "inmemory",
             SecurityLevel::PrivacyAndIntegrity,
-            InMemoryChannelecurityContext {},
+            Box::new(InMemoryChannelecurityContext {}),
             Attributes::new(),
-        )
-        .into_boxed();
+        );
 
         Ok((conn, sec_info, closed_rx))
     }
@@ -381,7 +379,7 @@ impl Transport for InMemoryTransport {
 #[derive(Debug, Clone)]
 struct InMemoryChannelecurityContext;
 
-impl ClientConnectionSecurityContext for InMemoryChannelecurityContext {
+impl ChannelSecurityContext for InMemoryChannelecurityContext {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }

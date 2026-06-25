@@ -35,12 +35,12 @@ use crate::private;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
-pub struct HandshakeOutput<T, C: ClientConnectionSecurityContext> {
+pub struct HandshakeOutput<T> {
     pub endpoint: T,
-    pub security: ClientConnectionSecurityInfo<C>,
+    pub security: ChannelSecurityInfo,
 }
 
-pub trait ClientConnectionSecurityContext: Send + Sync + 'static {
+pub trait ChannelSecurityContext: Send + Sync + 'static {
     /// Checks if the established connection is authorized to send requests to
     /// the given authority.
     ///
@@ -57,29 +57,26 @@ pub trait ClientConnectionSecurityContext: Send + Sync + 'static {
     }
 }
 
-impl ClientConnectionSecurityContext for Box<dyn ClientConnectionSecurityContext> {
+impl ChannelSecurityContext for Box<dyn ChannelSecurityContext> {
     fn validate_authority(&self, authority: &Authority) -> bool {
         (**self).validate_authority(authority)
     }
 }
 
 /// Represents the security state of an established client-side connection.
-pub struct ClientConnectionSecurityInfo<C> {
+pub struct ChannelSecurityInfo {
     security_protocol: &'static str,
     security_level: SecurityLevel,
-    security_context: C,
+    security_context: Box<dyn ChannelSecurityContext>,
     /// Stores extra data derived from the underlying protocol.
     attributes: Attributes,
 }
 
-pub type DynClientConnectionSecurityInfo =
-    ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>;
-
-impl<C> ClientConnectionSecurityInfo<C> {
+impl ChannelSecurityInfo {
     pub fn new(
         security_protocol: &'static str,
         security_level: SecurityLevel,
-        security_context: C,
+        security_context: Box<dyn ChannelSecurityContext>,
         attributes: Attributes,
     ) -> Self {
         Self {
@@ -98,24 +95,12 @@ impl<C> ClientConnectionSecurityInfo<C> {
         self.security_level
     }
 
-    pub fn security_context(&self) -> &C {
+    pub fn security_context(&self) -> &dyn ChannelSecurityContext {
         &self.security_context
     }
 
     pub fn attributes(&self) -> &Attributes {
         &self.attributes
-    }
-
-    pub fn into_boxed(self) -> DynClientConnectionSecurityInfo
-    where
-        C: ClientConnectionSecurityContext + 'static,
-    {
-        ClientConnectionSecurityInfo {
-            security_protocol: self.security_protocol,
-            security_level: self.security_level,
-            security_context: Box::new(self.security_context),
-            attributes: self.attributes,
-        }
     }
 }
 
@@ -171,7 +156,6 @@ impl<T: ChannelCredentials> CompositeChannelCredentials<T> {
 }
 
 impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T> {
-    type ContextType = T::ContextType;
     type Output<I> = T::Output<I>;
 
     async fn connect<Input: GrpcEndpoint>(
@@ -181,7 +165,7 @@ impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
         self.channel_creds
             .connect(authority, source, info, runtime, token)
             .await

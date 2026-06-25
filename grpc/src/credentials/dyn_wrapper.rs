@@ -30,7 +30,6 @@ use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
 use crate::credentials::ServerCredentials;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
@@ -51,7 +50,7 @@ pub(crate) trait DynChannelCredentials: Send + Sync {
         source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-    ) -> Result<HandshakeOutput<BoxEndpoint, Box<dyn ClientConnectionSecurityContext>>, String>;
+    ) -> Result<HandshakeOutput<BoxEndpoint>, String>;
 
     fn info(&self) -> &ProtocolInfo;
 
@@ -70,8 +69,7 @@ where
         source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-    ) -> Result<HandshakeOutput<BoxEndpoint, Box<dyn ClientConnectionSecurityContext>>, String>
-    {
+    ) -> Result<HandshakeOutput<BoxEndpoint>, String> {
         let output = self
             .connect(authority, source, info, runtime, private::Internal)
             .make_send()
@@ -82,7 +80,7 @@ where
 
         Ok(HandshakeOutput {
             endpoint: Box::new(stream),
-            security: sec_info.into_boxed(),
+            security: sec_info,
         })
     }
 
@@ -96,7 +94,6 @@ where
 }
 
 impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
-    type ContextType = Box<dyn ClientConnectionSecurityContext>;
     type Output<I> = BoxEndpoint;
 
     async fn connect<Input: GrpcEndpoint>(
@@ -106,7 +103,7 @@ impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
         (**self)
             .dyn_connect(authority, Box::new(source), info, runtime)
             .await

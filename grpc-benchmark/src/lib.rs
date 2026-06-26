@@ -21,6 +21,7 @@
  * IN THE SOFTWARE.
  *
  */
+#![cfg(target_os = "linux")]
 
 #[allow(unused)]
 pub mod generated {

@@ -22,41 +22,36 @@
  *
  */
 
-use std::env;
-use std::process;
-use std::time::Duration;
+#[cfg(target_os = "linux")]
+mod app {
+    use std::time::Duration;
 
-use grpc_benchmark::generated::services::grpc::testing::worker_service_server::WorkerServiceServer;
-use grpc_benchmark::worker::WorkerServer;
-use tokio::sync::mpsc;
-use tokio::time;
-use tonic::transport::Server;
+    use grpc_benchmark::generated::services::grpc::testing::worker_service_server::WorkerServiceServer;
+    use grpc_benchmark::worker::WorkerServer;
+    use tokio::sync::mpsc;
+    use tokio::time;
+    use tonic::transport::Server;
 
-#[derive(Debug)]
-struct Args {
-    /// Port to expose grpc.testing.WorkerService, Used by driver to initiate
-    /// work.
-    driver_port: u16,
+    pub async fn run_worker(worker_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        let addr = format!("0.0.0.0:{}", worker_port).parse().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let svc = WorkerServiceServer::new(WorkerServer::new(tx));
+
+        Server::builder()
+            .add_service(svc)
+            .serve_with_shutdown(addr, async {
+                rx.recv().await;
+                // Wait for the quit_worker response to be sent.
+                time::sleep(Duration::from_secs(1)).await;
+            })
+            .await?;
+
+        Ok(())
+    }
 }
 
-async fn run_worker(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = format!("0.0.0.0:{}", args.driver_port).parse().unwrap();
-    let (tx, mut rx) = mpsc::channel(1);
-
-    let svc = WorkerServiceServer::new(WorkerServer::new(tx));
-
-    Server::builder()
-        .add_service(svc)
-        .serve_with_shutdown(addr, async {
-            rx.recv().await;
-            // Wait for the quit_worker response to be sent.
-            time::sleep(Duration::from_secs(1)).await;
-        })
-        .await?;
-
-    Ok(())
-}
-
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The default Tokio runtime uses 1 thread per logical processor. While the
@@ -69,11 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut driver_port = None;
 
     // Skip the first argument (the binary name itself).
-    for arg in env::args().skip(1) {
+    for arg in std::env::args().skip(1) {
         if let Some(port_str) = arg.strip_prefix("--driver_port=") {
             driver_port = Some(port_str.parse::<u16>().unwrap_or_else(|_| {
                 eprintln!("Error: --driver_port must be a valid u16 integer.");
-                process::exit(1);
+                std::process::exit(1);
             }));
         } else {
             eprintln!("Warning: Unrecognized argument '{}'", arg);
@@ -82,13 +77,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(dp) = driver_port else {
         eprintln!("Usage: worker --driver_port=<port>");
-        process::exit(1);
+        std::process::exit(1);
     };
 
-    let args = Args { driver_port: dp };
-
-    println!("{:?}", args);
-    run_worker(args).await?;
+    app::run_worker(dp).await?;
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    println!("This benchmark worker is only supported on Linux.");
 }

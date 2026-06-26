@@ -9,7 +9,6 @@ use crate::error::{Error, Result};
 use crate::transport::{Transport, TransportBuilder, TransportStream};
 use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
@@ -23,8 +22,11 @@ use tonic::{Status, Streaming};
 /// Attached on each (re)connect, only when the channel is secure.
 #[tonic::async_trait]
 pub trait CallCredentials: Send + Sync + std::fmt::Debug + 'static {
-    /// Header key / value map to attach to the ADS stream.
-    async fn get_request_metadata(&self) -> Result<HashMap<String, String>>;
+    /// Generates the authentication metadata for a specific call.
+    async fn get_request_metadata(
+        &self,
+        metadata: &mut tonic::metadata::MetadataMap,
+    ) -> std::result::Result<(), Status>;
 
     /// Whether these credentials require a secure (TLS) transport.
     fn requires_secure_transport(&self) -> bool {
@@ -304,13 +306,10 @@ impl Transport for TonicTransport {
 
         // Inject the configured call credentials.
         if let Some(creds) = &self.call_creds {
-            for (name, value) in creds.get_request_metadata().await? {
-                let key = tonic::metadata::AsciiMetadataKey::from_bytes(name.as_bytes())
-                    .map_err(|e| Error::CallCredentials(e.to_string()))?;
-                let val = tonic::metadata::AsciiMetadataValue::try_from(value)
-                    .map_err(|e| Error::CallCredentials(e.to_string()))?;
-                request.metadata_mut().insert(key, val);
-            }
+            creds
+                .get_request_metadata(request.metadata_mut())
+                .await
+                .map_err(|e| Error::CallCredentials(e.to_string()))?;
         }
 
         let response = grpc
@@ -361,7 +360,7 @@ mod tests {
     use prost::Message;
     use std::net::SocketAddr;
     use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -370,7 +369,7 @@ mod tests {
     /// Mock ADS server that echoes back a response for each request.
     #[derive(Default)]
     struct MockAdsServer {
-        auth: Arc<Mutex<Option<String>>>,
+        expected_auth: Option<String>,
     }
 
     #[tonic::async_trait]
@@ -382,8 +381,16 @@ mod tests {
             &self,
             request: Request<tonic::Streaming<DiscoveryRequest>>,
         ) -> std::result::Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
-            if let Some(v) = request.metadata().get("authorization") {
-                *self.auth.lock().unwrap() = v.to_str().ok().map(str::to_owned);
+            if let Some(expected) = &self.expected_auth {
+                let got = request
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok());
+                if got != Some(expected.as_str()) {
+                    return Err(Status::unauthenticated(
+                        "missing or unexpected authorization",
+                    ));
+                }
             }
             let mut inbound = request.into_inner();
 
@@ -415,11 +422,12 @@ mod tests {
         }
     }
 
-    async fn start_mock_server() -> (SocketAddr, Arc<Mutex<Option<String>>>) {
+    async fn start_mock_server(expected_auth: Option<&str>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = MockAdsServer::default();
-        let auth = server.auth.clone();
+        let server = MockAdsServer {
+            expected_auth: expected_auth.map(str::to_owned),
+        };
 
         tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -431,7 +439,7 @@ mod tests {
 
         // Give the server a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        (addr, auth)
+        addr
     }
 
     #[derive(Debug)]
@@ -442,8 +450,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl CallCredentials for MockCreds {
-        async fn get_request_metadata(&self) -> Result<HashMap<String, String>> {
-            Ok(self.pairs.clone().into_iter().collect())
+        async fn get_request_metadata(
+            &self,
+            metadata: &mut tonic::metadata::MetadataMap,
+        ) -> std::result::Result<(), tonic::Status> {
+            for (name, value) in &self.pairs {
+                let key = tonic::metadata::AsciiMetadataKey::from_bytes(name.as_bytes())
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                let val = tonic::metadata::AsciiMetadataValue::try_from(value)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                metadata.insert(key, val);
+            }
+            Ok(())
         }
         fn requires_secure_transport(&self) -> bool {
             self.requires_secure
@@ -452,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_creds_attach_metadata() {
-        let (addr, auth) = start_mock_server().await;
+        let addr = start_mock_server(Some("Bearer test-token")).await;
         let creds = Arc::new(MockCreds {
             pairs: vec![("authorization".into(), "Bearer test-token".into())],
             requires_secure: false,
@@ -468,13 +486,14 @@ mod tests {
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
         let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
-        let _ = stream.recv().await.unwrap().unwrap();
-        assert_eq!(auth.lock().unwrap().as_deref(), Some("Bearer test-token"));
+        let response = stream.recv().await.unwrap().unwrap();
+        let response = DiscoveryResponse::decode(response).unwrap();
+        assert_eq!(response.version_info, "1");
     }
 
     #[tokio::test]
     async fn with_channel_secure_admits_secure_call_creds() {
-        let (addr, auth) = start_mock_server().await;
+        let addr = start_mock_server(Some("Bearer secure-token")).await;
         let channel = Endpoint::from_shared(format!("http://{addr}"))
             .unwrap()
             .connect_lazy();
@@ -494,8 +513,9 @@ mod tests {
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
         let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
-        let _ = stream.recv().await.unwrap().unwrap();
-        assert_eq!(auth.lock().unwrap().as_deref(), Some("Bearer secure-token"));
+        let response = stream.recv().await.unwrap().unwrap();
+        let response = DiscoveryResponse::decode(response).unwrap();
+        assert_eq!(response.version_info, "1");
     }
 
     #[tokio::test]
@@ -539,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tonic_transport_connect_and_stream() {
-        let (addr, _auth) = start_mock_server().await;
+        let addr = start_mock_server(None).await;
         let uri = format!("http://{addr}");
 
         let transport = TonicTransport::connect(&uri).await.unwrap();

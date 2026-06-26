@@ -748,8 +748,9 @@ mod tests {
         impl xds_client::CallCredentials for DummyCreds {
             async fn get_request_metadata(
                 &self,
-            ) -> xds_client::Result<std::collections::HashMap<String, String>> {
-                Ok(std::collections::HashMap::new())
+                _metadata: &mut tonic::metadata::MetadataMap,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
             }
         }
         let config = XdsChannelConfig::new(XdsUri::parse("xds:///svc").unwrap())

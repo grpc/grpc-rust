@@ -68,8 +68,6 @@ tonic-prost-build = "0.14"
 async-stream = "0.3"
 tempfile = "3.27.0"
 rcgen = "0.14"
-grpc = { path = "../grpc" }
-grpc-google = { path = "../grpc-google" }
 google-cloud-auth = { version = "1.9", default-features = false }
 
 [features]

@@ -58,8 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // testing framework supports specifying the thread count in the test config,
     // the tests that run on k8s use specific machine sizes and don't depend on
     // the clients/servers to restrict their resource usage. Tokio doesn't
-    // support nested runtimes, so adding support for per test thread config
-    // is not presently supported.
+    // support nested runtimes, so support for per test thread config is not
+    // presently supported.
 
     let mut driver_port = None;
 

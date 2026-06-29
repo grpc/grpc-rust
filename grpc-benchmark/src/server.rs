@@ -54,7 +54,7 @@ use crate::generated::services::grpc::testing::payload_config::Payload::BytebufP
 use crate::generated::services::grpc::testing::payload_config::Payload::ComplexParams;
 use crate::generated::services::grpc::testing::payload_config::Payload::SimpleParams;
 
-const DEFAULT_PORT: usize = 50055;
+const DEFAULT_PORT: u16 = 50055;
 const SERVER_PEM: &[u8] = include_bytes!("../data/tls/server1.pem");
 const SERVER_KEY: &[u8] = include_bytes!("../data/tls/server1.key");
 
@@ -62,11 +62,11 @@ pub struct BenchmarkServer {
     last_reset_time: Instant,
     last_rusage: Usage,
     shutdown_notify: Arc<Notify>,
-    pub port: usize,
+    port: u16,
 }
 
 impl BenchmarkServer {
-    pub fn start(config: ServerConfig) -> Result<Self, Status> {
+    pub(crate) fn start(config: ServerConfig) -> Result<Self, Status> {
         println!("Starting benchmark server with config: {:?}", config);
 
         let mut server_builder = Server::builder();
@@ -103,7 +103,7 @@ impl BenchmarkServer {
         let shutdown_notify = Arc::new(Notify::new());
         let shutdown_notify_copy = shutdown_notify.clone();
         let port = if config.port > 0 {
-            config.port as usize
+            config.port as u16
         } else {
             DEFAULT_PORT
         };
@@ -123,7 +123,7 @@ impl BenchmarkServer {
         })
     }
 
-    pub fn get_stats(&mut self, reset: bool) -> Result<ServerStats, Status> {
+    pub(crate) fn get_stats(&mut self, reset: bool) -> Result<ServerStats, Status> {
         let now = Instant::now();
         let wall_time_elapsed = now.duration_since(self.last_reset_time);
         let latest_rusage = getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
@@ -147,6 +147,10 @@ impl BenchmarkServer {
             total_cpu_time: 0,
             core_stats: None,
         })
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
     }
 }
 

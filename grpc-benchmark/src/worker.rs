@@ -118,7 +118,7 @@ impl WorkerService for WorkerServer {
                 yield ServerStatus {
                     stats: Some(stats),
                     cores: core_count()?,
-                    port: server.port as i32,
+                    port: server.port() as i32,
                 };
             }
         };

@@ -29,10 +29,10 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use tower::Service;
 use tower::discover::{Change, Discover};
 
@@ -87,6 +87,11 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     connecting: KeyedFutures<EndpointAddress, ReadyChannel<C::Service>>,
     /// Ready-to-serve channels.
     ready: IndexMap<EndpointAddress, ReadyChannel<C::Service>>,
+    /// Full set of cluster members (healthy EDS endpoints), independent of
+    /// connection or ejection state. Updated only by discovery events. Stateful
+    /// pickers (ring-hash) build over this set via `on_members_changed`, so the
+    /// ring stays stable across connection flaps and ejections.
+    members: IndexSet<EndpointAddress>,
     /// Currently-ejected channels. Each entry is an
     /// [`EjectedChannel`] whose `Sleep` fires when the ejection
     /// window expires.
@@ -127,6 +132,7 @@ where
             connector,
             connecting: KeyedFutures::new(),
             ready: IndexMap::new(),
+            members: IndexSet::new(),
             ejected: KeyedFutures::new(),
             outlier,
             picker,
@@ -143,18 +149,23 @@ where
     /// ([`LbError::DiscoverClosed`] or [`LbError::DiscoverError`])
     /// or stays pending — there is no success outcome.
     fn poll_discover(&mut self, cx: &mut Context<'_>) -> Poll<LbError> {
-        loop {
-            match ready!(Pin::new(&mut self.discovery).poll_discover(cx)) {
-                None => {
+        // Track membership changes so the picker's ring is rebuilt at most once
+        // per drain (a burst of N inserts → one rebuild, not N).
+        let mut members_changed = false;
+        let outcome = loop {
+            match Pin::new(&mut self.discovery).poll_discover(cx) {
+                Poll::Pending => break Poll::Pending,
+                Poll::Ready(None) => {
                     tracing::error!("discover object is closed");
-                    return Poll::Ready(LbError::DiscoverClosed);
+                    break Poll::Ready(LbError::DiscoverClosed);
                 }
-                Some(Err(e)) => return Poll::Ready(LbError::DiscoverError(e.into())),
-                Some(Ok(Change::Insert(addr, idle))) => {
+                Poll::Ready(Some(Err(e))) => break Poll::Ready(LbError::DiscoverError(e.into())),
+                Poll::Ready(Some(Ok(Change::Insert(addr, idle)))) => {
                     tracing::trace!("discovery: insert {addr}");
                     let _ = self.connecting.cancel(&addr);
                     self.ready.swap_remove(&addr);
                     let _ = self.ejected.cancel(&addr);
+                    members_changed |= self.members.insert(addr.clone());
                     // Note: the outlier-detection registry entry is
                     // intentionally preserved across re-insert so a
                     // transient discovery flap keeps its counters and
@@ -162,15 +173,20 @@ where
                     let connecting = idle.connect(self.connector.clone(), self.registry());
                     let _ = self.connecting.add(addr, connecting);
                 }
-                Some(Ok(Change::Remove(addr))) => {
+                Poll::Ready(Some(Ok(Change::Remove(addr)))) => {
                     tracing::trace!("discovery: remove {addr}");
                     let _ = self.connecting.cancel(&addr);
                     self.ready.swap_remove(&addr);
                     let _ = self.ejected.cancel(&addr);
+                    members_changed |= self.members.swap_remove(&addr);
                     self.outlier.registry().remove_channel(&addr);
                 }
             }
+        };
+        if members_changed {
+            self.picker.on_members_changed(&self.members);
         }
+        outcome
     }
 
     /// Drain completed connection futures. Each yields a fully-formed
@@ -531,6 +547,107 @@ mod tests {
     }
 
     // -- poll_discover tests --
+
+    // Picker that records every membership it is notified about, so tests can
+    // assert how many times (and with what set) the ring is rebuilt.
+    struct RecordingPicker {
+        seen: Arc<std::sync::Mutex<Vec<IndexSet<EndpointAddress>>>>,
+    }
+    impl ChannelPicker<ReadyChannel<MockService>, &'static str> for RecordingPicker {
+        fn pick<'a>(
+            &self,
+            _req: &&'static str,
+            ready: &'a IndexMap<EndpointAddress, ReadyChannel<MockService>>,
+        ) -> Option<&'a ReadyChannel<MockService>> {
+            ready.values().next()
+        }
+        fn on_members_changed(&self, members: &IndexSet<EndpointAddress>) {
+            self.seen.lock().unwrap().push(members.clone());
+        }
+    }
+
+    /// Build an LB whose picker records each `on_members_changed` call.
+    fn make_recording_lb(
+        discover: MockDiscover,
+    ) -> (Lb, Arc<std::sync::Mutex<Vec<IndexSet<EndpointAddress>>>>) {
+        let connector = Arc::new(MockConnector::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
+            Arc::new(RecordingPicker { seen: seen.clone() });
+        let config = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
+        let lb = LoadBalancer::new(discover, connector, picker, config);
+        (lb, seen)
+    }
+
+    fn insert(port: u16) -> DiscoverItem {
+        Ok(Change::Insert(addr(port), IdleChannel::new(addr(port))))
+    }
+
+    fn remove(port: u16) -> DiscoverItem {
+        Ok(Change::Remove(addr(port)))
+    }
+
+    /// A burst of inserts drained in one poll rebuilds the ring exactly once,
+    /// with the full member set (gRFC A42 ring-hash relies on this). A later
+    /// drain (the remove) is a distinct, single rebuild.
+    #[tokio::test]
+    async fn discovery_insert_burst_rebuilds_once() {
+        let (tx, discover) = new_discover();
+        let (mut lb, seen) = make_recording_lb(discover);
+
+        // Two inserts buffered, drained in one poll → one rebuild with both.
+        tx.send(insert(8080)).await.unwrap();
+        tx.send(insert(8081)).await.unwrap();
+        let _ = poll_ready_now(&mut lb);
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.len(), 1, "a 2-insert burst should rebuild the ring once");
+            let last = s.last().unwrap();
+            assert_eq!(last.len(), 2);
+            assert!(last.contains(&addr(8080)) && last.contains(&addr(8081)));
+        }
+
+        // A separate drain (the remove) is exactly one more rebuild.
+        tx.send(remove(8080)).await.unwrap();
+        let _ = poll_ready_now(&mut lb);
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.len(), 2, "the remove drain is one more rebuild");
+            let last = s.last().unwrap();
+            assert_eq!(last.len(), 1);
+            assert!(last.contains(&addr(8081)));
+        }
+    }
+
+    /// A burst mixing inserts and removes in a single drain rebuilds the ring
+    /// exactly once, over the net resulting membership.
+    #[tokio::test]
+    async fn discovery_mixed_burst_rebuilds_once_with_net_membership() {
+        let (tx, discover) = new_discover();
+        let (mut lb, seen) = make_recording_lb(discover);
+
+        // Pre-populate {8080, 8081} (one rebuild).
+        tx.send(insert(8080)).await.unwrap();
+        tx.send(insert(8081)).await.unwrap();
+        let _ = poll_ready_now(&mut lb);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // Mixed burst in one drain: remove 8080, add 8082 → net {8081, 8082}.
+        tx.send(remove(8080)).await.unwrap();
+        tx.send(insert(8082)).await.unwrap();
+        let _ = poll_ready_now(&mut lb);
+
+        let s = seen.lock().unwrap();
+        assert_eq!(
+            s.len(),
+            2,
+            "the mixed burst should rebuild exactly once more"
+        );
+        let last = s.last().unwrap();
+        assert_eq!(last.len(), 2);
+        assert!(last.contains(&addr(8081)) && last.contains(&addr(8082)));
+        assert!(!last.contains(&addr(8080)));
+    }
 
     #[tokio::test]
     async fn test_discover_insert_starts_connecting() {

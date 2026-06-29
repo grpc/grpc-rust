@@ -55,8 +55,8 @@ use crate::generated::services::grpc::testing::payload_config::Payload::ComplexP
 use crate::generated::services::grpc::testing::payload_config::Payload::SimpleParams;
 
 const DEFAULT_PORT: usize = 50055;
-const SERVER_PEM: &[u8] = include_bytes!("../data/tls/server.pem");
-const SERVER_KEY: &[u8] = include_bytes!("../data/tls/server.key");
+const SERVER_PEM: &[u8] = include_bytes!("../data/tls/server1.pem");
+const SERVER_KEY: &[u8] = include_bytes!("../data/tls/server1.key");
 
 pub struct BenchmarkServer {
     last_reset_time: Instant,

@@ -12,7 +12,7 @@ grpc-protobuf = { path = "../grpc-protobuf" }
 nix = { version = "0.31.3", features = ["resource"] }
 prost = "0.14"
 prost-types = "0.14"
-protobuf = { version = "4.34.0-release" }
+protobuf = { version = "4.35.1-release" }
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
 tokio-stream = "0.1.18"
 tonic = { path = "../tonic", features = ["tls-aws-lc"] }

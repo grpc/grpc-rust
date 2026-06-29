@@ -174,20 +174,23 @@ jobs:
         shell: bash
         run: cmake --build build --config Release
 
+      - name: Install
+        shell: bash
+        run: cmake --install build --config Release --prefix install
+
       - name: Prepare and Zip Asset (non-Windows)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p bin
-          cp build/bin/${{ matrix.binary_name }} bin/
-          zip -r ${{ env.ASSET_FILENAME }} bin/
+          cd install
+          zip -r ../${{ env.ASSET_FILENAME }} bin/
 
       - name: Prepare and Zip Asset (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          mkdir -p bin
-          cp build/bin/Release/${{ matrix.binary_name }} bin/ || cp build/bin/${{ matrix.binary_name }} bin/
-          7z a ${{ env.ASSET_FILENAME }} bin/
+          cd install
+          7z a ../${{ env.ASSET_FILENAME }} bin/
+
 
       - name: Upload build artifact
         if: github.event_name == 'release'

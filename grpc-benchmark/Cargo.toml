@@ -10,7 +10,7 @@ grpc = { path = "../grpc" }
 grpc-protobuf = { path = "../grpc-protobuf" }
 prost = "0.14"
 prost-types = "0.14"
-protobuf = { version = "4.34.0-release" }
+protobuf = { version = "4.35.1-release" }
 tonic = { path = "../tonic" }
 tonic-prost = { path = "../tonic-prost" }
 

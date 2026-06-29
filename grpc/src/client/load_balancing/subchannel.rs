@@ -23,6 +23,7 @@
  */
 
 use std::any::Any;
+use std::any::TypeId;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -137,6 +138,11 @@ pub(crate) trait Subchannel:
     /// TODO: Consider whether this should really be public.
     fn address(&self) -> Address;
 
+    /// Returns the value of an attribute for this subchannel corresponding to
+    /// the `id`, or `None` if no attribute exists for it.  Values returned here
+    /// should not change over the life of the subchannel.
+    fn get_attribute_dyn(&self, id: TypeId) -> Option<&dyn Any>;
+
     /// Notifies the Subchannel to connect.
     fn connect(&self);
 }
@@ -147,6 +153,15 @@ impl dyn Subchannel {
         T: 'static,
     {
         (self as &dyn Any).downcast_ref()
+    }
+
+    /// Returns the value of an attribute for this subchannel of the
+    /// corresponding `T` type, or `None` if no attribute exists for it.  This
+    /// method is a more type-friendly convenience wrapper around
+    /// [`Subchannel::get_attribute_dyn`].
+    pub fn get_attribute<T: 'static>(&self) -> Option<&T> {
+        self.get_attribute_dyn(TypeId::of::<T>())
+            .and_then(|any| any.downcast_ref::<T>())
     }
 }
 
@@ -219,6 +234,11 @@ pub(crate) trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Syn
     fn address(&self) -> Address {
         self.delegate().address()
     }
+
+    fn get_attribute_dyn(&self, id: TypeId) -> Option<&dyn Any> {
+        self.delegate().get_attribute_dyn(id)
+    }
+
     fn connect(&self) {
         self.delegate().connect()
     }
@@ -228,6 +248,11 @@ impl<T: ForwardingSubchannel> Subchannel for T {
     fn address(&self) -> Address {
         self.address()
     }
+
+    fn get_attribute_dyn(&self, id: TypeId) -> Option<&dyn Any> {
+        self.get_attribute_dyn(id)
+    }
+
     fn connect(&self) {
         self.connect()
     }

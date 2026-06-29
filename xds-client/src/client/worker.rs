@@ -6,6 +6,7 @@
 //! - Dispatching resources to watchers
 //! - ACK/NACK protocol
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,9 +21,176 @@ use crate::client::watch::{ProcessingDone, ResourceEvent};
 use crate::codec::XdsCodec;
 use crate::error::{Error, Result};
 use crate::message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Node};
+use crate::metrics::{self, KeyValue, MetricsRecorder};
 use crate::resource::{DecodedResource, DecoderFn};
 use crate::runtime::Runtime;
 use crate::transport::{Transport, TransportBuilder, TransportStream};
+
+/// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
+///
+/// Both values are stored as `Arc<str>` so each emission clones them as a
+/// cheap atomic op (via the `StringValue::RefCounted` variant) instead of
+/// allocating a new `String` per attribute slot.
+struct ClientAttrs {
+    target: Arc<str>,
+    server: Arc<str>,
+}
+
+impl ClientAttrs {
+    /// Sentinel `grpc.xds.authority` value used for the unnamed top-level
+    /// (non-federated) authority.
+    ///
+    /// Matches grpc-go's top-level placeholder.
+    ///
+    /// TODO: once federated bootstrap support lands, derive the authority from
+    /// the resource name (`xdstp://<authority>/...`) on a per-resource basis.
+    const TOP_LEVEL_AUTHORITY: &'static str = "#old";
+
+    fn connection_attrs(&self) -> [KeyValue; 2] {
+        [
+            KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
+        ]
+    }
+
+    fn type_attrs(&self, type_url: &Arc<str>) -> [KeyValue; 3] {
+        [
+            KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
+        ]
+    }
+
+    fn cache_state_attrs(&self, type_url: &Arc<str>, cache_state: &'static str) -> [KeyValue; 4] {
+        [
+            KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
+            KeyValue::str(
+                metrics::attrs::GRPC_XDS_AUTHORITY,
+                Self::TOP_LEVEL_AUTHORITY,
+            ),
+            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_CACHE_STATE, cache_state),
+        ]
+    }
+}
+
+/// Worker-side wrapper around an optional [`MetricsRecorder`] backend.
+pub(crate) struct RecorderHandle {
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+    attrs: ClientAttrs,
+}
+
+impl RecorderHandle {
+    pub(crate) fn new(recorder: Option<Arc<dyn MetricsRecorder>>, target: Arc<str>) -> Self {
+        Self {
+            recorder,
+            attrs: ClientAttrs {
+                target,
+                server: Arc::from(""),
+            },
+        }
+    }
+
+    /// Update the `grpc.xds.server` attribute for subsequent emissions.
+    pub(crate) fn set_server(&mut self, server: Arc<str>) {
+        self.attrs.server = server;
+    }
+
+    /// `grpc.xds_client.connected` — 1 for connected, 0 for disconnected.
+    fn record_connected(&self, connected: bool) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.record_gauge_i64(
+            &metrics::instruments::XDS_CLIENT_CONNECTED,
+            if connected { 1 } else { 0 },
+            &self.attrs.connection_attrs(),
+        );
+    }
+
+    /// `grpc.xds_client.server_failure` — incremented once per failed connection cycle.
+    fn record_server_failure(&self) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.add_counter_u64(
+            &metrics::instruments::XDS_CLIENT_SERVER_FAILURE,
+            1,
+            &self.attrs.connection_attrs(),
+        );
+    }
+
+    /// `grpc.xds_client.resource_updates_valid` + `_invalid`, with aggregated
+    /// counts from a single response.
+    fn record_resource_updates(&self, type_url: &Arc<str>, valid: u64, invalid: u64) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        if valid == 0 && invalid == 0 {
+            return;
+        }
+        let type_attrs = self.attrs.type_attrs(type_url);
+        if valid > 0 {
+            recorder.add_counter_u64(
+                &metrics::instruments::XDS_CLIENT_RESOURCE_UPDATES_VALID,
+                valid,
+                &type_attrs,
+            );
+        }
+        if invalid > 0 {
+            recorder.add_counter_u64(
+                &metrics::instruments::XDS_CLIENT_RESOURCE_UPDATES_INVALID,
+                invalid,
+                &type_attrs,
+            );
+        }
+    }
+
+    /// `grpc.xds_client.resources` — up-down-counter deltas for a state transition.
+    /// `prev` is `None` when the resource is being inserted into the cache for the first time.
+    fn record_resource_transition(
+        &self,
+        type_url: &Arc<str>,
+        prev: Option<&ResourceState>,
+        new: &ResourceState,
+    ) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let new_label = new.cache_state_label();
+        let prev_label = prev.map(ResourceState::cache_state_label);
+        if prev_label == Some(new_label) {
+            return;
+        }
+        if let Some(prev) = prev_label {
+            recorder.add_up_down_counter_i64(
+                &metrics::instruments::XDS_CLIENT_RESOURCES,
+                -1,
+                &self.attrs.cache_state_attrs(type_url, prev),
+            );
+        }
+        recorder.add_up_down_counter_i64(
+            &metrics::instruments::XDS_CLIENT_RESOURCES,
+            1,
+            &self.attrs.cache_state_attrs(type_url, new_label),
+        );
+    }
+
+    /// `grpc.xds_client.resources` — emit a `-1` delta for a resource
+    /// that is leaving the cache without any successor state.
+    fn record_resource_removal(&self, type_url: &Arc<str>, prev: &ResourceState) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.add_up_down_counter_i64(
+            &metrics::instruments::XDS_CLIENT_RESOURCES,
+            -1,
+            &self
+                .attrs
+                .cache_state_attrs(type_url, prev.cache_state_label()),
+        );
+    }
+}
 
 /// Global counter for generating unique watcher IDs.
 static NEXT_WATCHER_ID: AtomicU64 = AtomicU64::new(1);
@@ -114,6 +282,21 @@ enum ResourceState {
     DoesNotExist,
 }
 
+impl ResourceState {
+    /// Canonical A78 `grpc.xds.cache_state` attribute value for this state.
+    ///
+    /// When gRFC A88 (data error caching) is implemented, a `NACKedButCached`
+    /// variant will map to `"nacked_but_cached"` here.
+    fn cache_state_label(&self) -> &'static str {
+        match self {
+            ResourceState::Requested => "requested",
+            ResourceState::Received => "acked",
+            ResourceState::NACKed(_) => "nacked",
+            ResourceState::DoesNotExist => "does_not_exist",
+        }
+    }
+}
+
 /// A cached resource entry.
 #[derive(Debug, Clone)]
 struct CachedResource {
@@ -190,6 +373,9 @@ impl CachedResource {
 
 /// Per-type_url state tracking.
 struct TypeState {
+    /// Reference-counted type URL, shared with metric attribute slots so
+    /// per-emission attribute construction is a cheap.
+    type_url: Arc<str>,
     /// Decoder function for this resource type.
     decoder: DecoderFn,
     /// Version from last successful response.
@@ -209,6 +395,7 @@ struct TypeState {
 impl std::fmt::Debug for TypeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypeState")
+            .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
             .field("version_info", &self.version_info)
             .field("nonce", &self.nonce)
@@ -224,8 +411,9 @@ impl std::fmt::Debug for TypeState {
 }
 
 impl TypeState {
-    fn new(decoder: DecoderFn, all_resources_required_in_sotw: bool) -> Self {
+    fn new(type_url: Arc<str>, decoder: DecoderFn, all_resources_required_in_sotw: bool) -> Self {
         Self {
+            type_url,
             decoder,
             version_info: String::new(),
             nonce: String::new(),
@@ -342,6 +530,20 @@ pub(crate) struct AdsWorker<TB, C, R> {
     /// Cancellation handles for resource timers (gRFC A57).
     /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
     resource_timers: HashMap<(String, String), oneshot::Sender<()>>,
+    /// Optional backend + per-client A78 metric attributes
+    /// (`grpc.target` + `grpc.xds.server`).
+    recorder: RecorderHandle,
+}
+
+/// Outcome of a connected ADS session (see [`AdsWorker::run_connected`]).
+enum ConnectedOutcome {
+    /// All `XdsClient` handles were dropped; the worker should shut down.
+    Shutdown,
+    /// The ADS stream failed; the worker should reconnect. `saw_response`
+    /// indicates whether at least one response was received before the failure
+    /// — per gRFC A78, a stream that fails after a response is not counted as a
+    /// server failure.
+    Failed { saw_response: bool },
 }
 
 impl<TB, C, R> AdsWorker<TB, C, R>
@@ -358,7 +560,9 @@ where
         config: ClientConfig,
         command_tx: mpsc::Sender<WorkerCommand>,
         command_rx: mpsc::Receiver<WorkerCommand>,
+        recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
+        let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
         Self {
             transport_builder,
             codec,
@@ -371,6 +575,7 @@ where
             command_rx,
             type_states: HashMap::new(),
             resource_timers: HashMap::new(),
+            recorder: RecorderHandle::new(recorder, target),
         }
     }
 
@@ -379,6 +584,11 @@ where
     /// This method runs until all `XdsClient` handles are dropped
     /// (which closes the command channel).
     pub(crate) async fn run(mut self) {
+        // gRFC A78 defines `grpc.xds_client.server_failure` as a count of xDS
+        // servers *going from healthy to unhealthy*. `healthy` mirrors the
+        // `connected` gauge so the counter (and gauge) are recorded only on that
+        // transition.
+        let mut healthy = false;
         loop {
             // Wait for at least one subscription before connecting.
             // This prevents deadlock with servers that require a message before
@@ -405,10 +615,12 @@ where
                 Some(s) => s,
                 None => return, // No servers configured
             };
+            self.recorder.set_server(Arc::from(server.uri()));
 
             let transport = match self.transport_builder.build(server).await {
                 Ok(t) => t,
                 Err(_) => {
+                    self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -423,6 +635,7 @@ where
                     s
                 }
                 Err(_) => {
+                    self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -431,9 +644,21 @@ where
                 }
             };
 
+            if !healthy {
+                self.recorder.record_connected(true);
+                healthy = true;
+            }
+
             match self.run_connected(stream).await {
-                Ok(()) => return, // shutdown
-                Err(_e) => {
+                ConnectedOutcome::Shutdown => return,
+                ConnectedOutcome::Failed { saw_response } => {
+                    // gRFC A78: a server goes unhealthy (one `server_failure`) on
+                    // a connectivity failure or when the ADS stream fails
+                    // *without* seeing a response message. A stream that failed
+                    // after receiving a response is not counted; just reconnect.
+                    if !saw_response {
+                        self.record_unhealthy(&mut healthy);
+                    }
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -441,6 +666,19 @@ where
                     continue;
                 }
             }
+        }
+    }
+
+    /// Record an xDS server transition to unhealthy (gRFC A78
+    /// `grpc.xds_client.server_failure`). Increments the `server_failure`
+    /// counter and drops the `connected` gauge to 0, but only on the
+    /// healthy -> unhealthy edge, so repeated reconnect attempts during a single
+    /// outage are not counted.
+    fn record_unhealthy(&self, healthy: &mut bool) {
+        if *healthy {
+            self.recorder.record_server_failure();
+            self.recorder.record_connected(false);
+            *healthy = false;
         }
     }
 
@@ -477,28 +715,38 @@ where
 
     /// Run the main event loop while connected.
     ///
-    /// Returns `Ok(())` if the worker should shut down (command channel closed).
-    /// Returns `Err` if an error occurred and the worker should reconnect.
-    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> Result<()> {
+    /// Returns [`ConnectedOutcome::Shutdown`] if the worker should shut down
+    /// (command channel closed), or [`ConnectedOutcome::Failed`] if the stream
+    /// failed and the worker should reconnect (carrying whether a response was
+    /// seen, per gRFC A78).
+    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> ConnectedOutcome {
+        // Whether at least one response was received on this stream. Per gRFC
+        // A78 a stream that fails *after* receiving a response is not counted as
+        // a server failure.
+        let mut saw_response = false;
         loop {
             tokio::select! {
                 result = stream.recv() => {
                     match result {
                         Ok(Some(bytes)) => {
-                            self.handle_response(&mut stream, bytes).await?;
+                            saw_response = true;
+                            if self.handle_response(&mut stream, bytes).await.is_err() {
+                                return ConnectedOutcome::Failed { saw_response };
+                            }
                         }
-                        // Stream closed by server; return Err to trigger reconnection
-                        Ok(None) => return Err(Error::StreamClosed),
-                        Err(e) => return Err(e),
+                        // Stream closed by server or errored; reconnect.
+                        Ok(None) | Err(_) => return ConnectedOutcome::Failed { saw_response },
                     }
                 }
 
                 cmd = self.command_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            self.handle_command(Some(&mut stream), cmd).await?;
+                            if self.handle_command(Some(&mut stream), cmd).await.is_err() {
+                                return ConnectedOutcome::Failed { saw_response };
+                            }
                         }
-                        None => return Ok(()),
+                        None => return ConnectedOutcome::Shutdown,
                     }
                 }
             }
@@ -566,21 +814,28 @@ where
         let type_state = self
             .type_states
             .entry(type_url_string.clone())
-            .or_insert_with(|| TypeState::new(decoder, all_resources_required_in_sotw));
+            .or_insert_with(|| {
+                TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
+            });
 
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
 
         // Track if we need to start a timer (resource in Requested state)
         let mut start_timer_for: Option<String> = None;
+        // Track newly-inserted cache entry for the resources gauge (None -> Requested).
+        let mut was_new = false;
 
         // For named subscriptions, check cache and send cached state to new watcher.
         // For wildcard subscriptions, watchers receive updates as they come in.
         if let WatcherSubscription::Named(ref resource_name) = watcher_subscription {
-            let cached = type_state
-                .cache
-                .entry(resource_name.clone())
-                .or_insert_with(CachedResource::requested);
+            let cached = match type_state.cache.entry(resource_name.clone()) {
+                Entry::Vacant(v) => {
+                    was_new = true;
+                    v.insert(CachedResource::requested())
+                }
+                Entry::Occupied(o) => o.into_mut(),
+            };
 
             if let Some(event) = cached.to_event() {
                 // Send cached state to watcher (non-blocking, ignore if full)
@@ -603,6 +858,15 @@ where
         type_state.recalculate_subscriptions();
 
         let subscriptions_changed = type_state.subscription != old_subscription;
+
+        // Emit resources gauge transition for newly-inserted cache entry.
+        if was_new {
+            self.recorder.record_resource_transition(
+                &type_state.type_url,
+                None,
+                &ResourceState::Requested,
+            );
+        }
 
         // Start timer if resource is in Requested state
         if let (Some(resource_name), Some(timeout)) =
@@ -633,6 +897,10 @@ where
         let subscriptions_changed = type_state.subscription != old_subscription;
 
         if type_state.watchers.is_empty() {
+            for cached in type_state.cache.values() {
+                self.recorder
+                    .record_resource_removal(&type_state.type_url, &cached.state);
+            }
             self.type_states.remove(&type_url);
             // Cancel all pending resource timers for this type.
             self.resource_timers.retain(|key, _| key.0 != type_url);
@@ -678,8 +946,8 @@ where
         let response = self.codec.decode_response(bytes)?;
         let type_url = response.type_url.clone();
 
-        let decoder = match self.type_states.get(&type_url) {
-            Some(s) => &s.decoder,
+        let (type_url_arc, decoder) = match self.type_states.get(&type_url) {
+            Some(s) => (Arc::clone(&s.type_url), &s.decoder),
             None => {
                 return Ok(());
             }
@@ -707,6 +975,13 @@ where
                 }
             }
         }
+
+        // Emit A78 resource_updates_valid/invalid counters once per response with
+        // aggregated counts (equivalent to per-resource increments in any backend).
+        let valid_count = valid_resources.len() as u64;
+        let invalid_count = (top_level_errors.len() + per_resource_errors.len()) as u64;
+        self.recorder
+            .record_resource_updates(&type_url_arc, valid_count, invalid_count);
 
         if let Some(type_state) = self.type_states.get_mut(&type_url) {
             type_state.nonce = response.nonce.clone();
@@ -784,9 +1059,14 @@ where
             Some(s) => {
                 for resource in &resources {
                     let resource_name = resource.name().to_string();
-                    s.cache.insert(
+                    let prev = s.cache.insert(
                         resource_name,
                         CachedResource::received(Arc::new(resource.clone())),
+                    );
+                    self.recorder.record_resource_transition(
+                        &s.type_url,
+                        prev.as_ref().map(|c| &c.state),
+                        &ResourceState::Received,
                     );
                 }
                 s.watchers
@@ -835,9 +1115,14 @@ where
             None => return,
         };
 
-        type_state.cache.insert(
+        let prev = type_state.cache.insert(
             resource_name.to_string(),
             CachedResource::nacked(error.to_string()),
+        );
+        self.recorder.record_resource_transition(
+            &type_state.type_url,
+            prev.as_ref().map(|c| &c.state),
+            &ResourceState::NACKed(error.to_string()),
         );
 
         // Cancel the resource timer (gRFC A57).
@@ -885,9 +1170,14 @@ where
             .collect();
 
         for name in deleted_names {
-            type_state
+            let prev = type_state
                 .cache
                 .insert(name.clone(), CachedResource::does_not_exist());
+            self.recorder.record_resource_transition(
+                &type_state.type_url,
+                prev.as_ref().map(|c| &c.state),
+                &ResourceState::DoesNotExist,
+            );
 
             for event_tx in type_state.matching_watchers(&name) {
                 let (done, rx) = ProcessingDone::channel();
@@ -1015,9 +1305,14 @@ where
             return;
         }
 
-        type_state
+        let prev = type_state
             .cache
             .insert(name.to_string(), CachedResource::does_not_exist());
+        self.recorder.record_resource_transition(
+            &type_state.type_url,
+            prev.as_ref().map(|c| &c.state),
+            &ResourceState::DoesNotExist,
+        );
 
         for event_tx in type_state.matching_watchers(name) {
             let (done, _rx) = ProcessingDone::channel();
@@ -1027,5 +1322,206 @@ where
             };
             let _ = event_tx.send(event).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// Captures every measurement so tests can assert on the call sequence.
+    #[derive(Default)]
+    struct CapturingRecorder {
+        events: Mutex<Vec<Recorded>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Recorded {
+        instrument: &'static str,
+        kind: Measurement,
+        attrs: Vec<(&'static str, String)>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Measurement {
+        CounterU64(u64),
+        UpDownI64(i64),
+        Gauge(i64),
+    }
+
+    impl CapturingRecorder {
+        fn take(&self) -> Vec<Recorded> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    fn stringify(attrs: &[KeyValue]) -> Vec<(&'static str, String)> {
+        attrs
+            .iter()
+            .map(|kv| {
+                let v = match &kv.value {
+                    metrics::Value::Bool(b) => b.to_string(),
+                    metrics::Value::Int(i) => i.to_string(),
+                    metrics::Value::F64(f) => f.to_string(),
+                    metrics::Value::Str(s) => s.to_string(),
+                };
+                (kv.key, v)
+            })
+            .collect()
+    }
+
+    impl MetricsRecorder for CapturingRecorder {
+        fn add_counter_u64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: u64,
+            attrs: &[KeyValue],
+        ) {
+            self.events.lock().unwrap().push(Recorded {
+                instrument: instrument.name,
+                kind: Measurement::CounterU64(value),
+                attrs: stringify(attrs),
+            });
+        }
+
+        fn add_up_down_counter_i64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: i64,
+            attrs: &[KeyValue],
+        ) {
+            self.events.lock().unwrap().push(Recorded {
+                instrument: instrument.name,
+                kind: Measurement::UpDownI64(value),
+                attrs: stringify(attrs),
+            });
+        }
+
+        fn record_histogram_f64(&self, _: &'static metrics::Instrument, _: f64, _: &[KeyValue]) {
+            unreachable!("worker emits no histograms");
+        }
+
+        fn record_gauge_i64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: i64,
+            attrs: &[KeyValue],
+        ) {
+            self.events.lock().unwrap().push(Recorded {
+                instrument: instrument.name,
+                kind: Measurement::Gauge(value),
+                attrs: stringify(attrs),
+            });
+        }
+    }
+
+    fn attr<'a>(rec: &'a Recorded, key: &str) -> Option<&'a str> {
+        rec.attrs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Build a [`RecorderHandle`] backed by a [`CapturingRecorder`], wired
+    /// with the canonical test attributes used by the transition tests.
+    fn test_handle() -> (Arc<CapturingRecorder>, RecorderHandle) {
+        let recorder = Arc::new(CapturingRecorder::default());
+        let dyn_recorder: Arc<dyn MetricsRecorder> = recorder.clone();
+        let mut handle = RecorderHandle::new(Some(dyn_recorder), Arc::from("xds:///my-service"));
+        handle.set_server(Arc::from("xds.example.com:443"));
+        (recorder, handle)
+    }
+
+    fn test_type_url() -> Arc<str> {
+        Arc::from("envoy.config.listener.v3.Listener")
+    }
+
+    #[test]
+    fn transition_from_none_emits_only_increment() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(&type_url, None, &ResourceState::Requested);
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].instrument, "grpc.xds_client.resources");
+        assert_eq!(events[0].kind, Measurement::UpDownI64(1));
+        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("requested"));
+        assert_eq!(
+            attr(&events[0], "grpc.xds.resource_type"),
+            Some("envoy.config.listener.v3.Listener")
+        );
+        assert_eq!(attr(&events[0], "grpc.target"), Some("xds:///my-service"));
+        assert_eq!(attr(&events[0], "grpc.xds.authority"), Some("#old"));
+        assert_eq!(attr(&events[0], "grpc.xds.server"), None);
+    }
+
+    #[test]
+    fn transition_emits_decrement_then_increment() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(
+            &type_url,
+            Some(&ResourceState::Received),
+            &ResourceState::NACKed("validation failed".into()),
+        );
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, Measurement::UpDownI64(-1));
+        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("acked"));
+        assert_eq!(events[1].kind, Measurement::UpDownI64(1));
+        assert_eq!(attr(&events[1], "grpc.xds.cache_state"), Some("nacked"));
+    }
+
+    #[test]
+    fn transition_to_same_state_is_a_no_op() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(
+            &type_url,
+            Some(&ResourceState::NACKed("first".into())),
+            &ResourceState::NACKed("second".into()),
+        );
+
+        assert!(recorder.take().is_empty());
+    }
+
+    #[test]
+    fn removal_emits_single_decrement_against_prev_state() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_removal(&type_url, &ResourceState::Received);
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].instrument, "grpc.xds_client.resources");
+        assert_eq!(events[0].kind, Measurement::UpDownI64(-1));
+        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("acked"));
+        assert_eq!(
+            attr(&events[0], "grpc.xds.resource_type"),
+            Some("envoy.config.listener.v3.Listener")
+        );
+    }
+
+    #[test]
+    fn add_then_remove_balances_to_zero() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(&type_url, None, &ResourceState::Received);
+        handle.record_resource_removal(&type_url, &ResourceState::Received);
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 2);
+        let net: i64 = events
+            .iter()
+            .map(|e| match e.kind {
+                Measurement::UpDownI64(v) => v,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(net, 0);
     }
 }

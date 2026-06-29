@@ -44,9 +44,10 @@ use crate::ProtoSendMessage;
 use crate::client::Internal;
 
 /// Configures a server-streaming call for gRPC Protobuf.  Implements
-/// `IntoFuture` which begins the call and resolves to a `GrpcStreamingResponse`
-/// which allows for receiving response messages and the status.  Implements
-/// `CallBuilder` to provide common RPC configuration methods.
+/// [`IntoFuture`] which begins the call and resolves to a
+/// [`GrpcStreamingResponse`] which allows for receiving response messages and
+/// the status.  Implements [`CallBuilder`] to provide common RPC configuration
+/// methods.
 pub struct ServerStreamingCallBuilder<'a, C, ReqMsgView, Res> {
     channel: C,
     method: String,

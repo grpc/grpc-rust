@@ -31,7 +31,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use std::time::Instant;
 
 use bytes::Buf;
 use bytes::BufMut as _;
@@ -73,6 +72,7 @@ use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::RecvStream;
+use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
@@ -81,14 +81,13 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
-use crate::core::ClientResponseStreamItem;
 use crate::core::RecvMessage;
 use crate::core::RequestHeaders;
 use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
 use crate::core::Trailers;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
+use crate::credentials::client::ChannelSecurityInfo;
+use crate::private;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 use crate::rt::TcpOptions;
@@ -202,10 +201,7 @@ impl Invoke for TonicTransport {
 }
 
 // Converts from a tonic status to a trailers stream item.
-fn trailers_from_tonic_status(
-    status: TonicStatus,
-    md: Option<TonicMeta>,
-) -> ClientResponseStreamItem {
+fn trailers_from_tonic_status(status: &TonicStatus, md: &TonicMeta) -> ResponseStreamItem {
     let status_res = match status.code() {
         Code::Ok => Ok(()),
         code => Err(StatusError::new(
@@ -217,16 +213,15 @@ fn trailers_from_tonic_status(
 }
 
 // Builds a trailers with a status
-fn trailers_from_status(status: Status, md: Option<TonicMeta>) -> ClientResponseStreamItem {
-    let trailers = match md.map(TryInto::try_into) {
-        Some(Err(e)) => Trailers::new(Err(StatusError::new(
+fn trailers_from_status(status: Status, md: &TonicMeta) -> ResponseStreamItem {
+    let trailers = match md.try_into() {
+        Err(e) => Trailers::new(Err(StatusError::new(
             StatusCodeError::Internal,
             format!("failed to parse metadata: {e}"),
         ))),
-        Some(Ok(metadata)) => Trailers::new(status).with_metadata(metadata),
-        None => Trailers::new(status),
+        Ok(metadata) => Trailers::new(status).with_metadata(metadata),
     };
-    ClientResponseStreamItem::Trailers(trailers)
+    ResponseStreamItem::Trailers(trailers)
 }
 
 struct TonicSendStream {
@@ -261,17 +256,15 @@ enum StreamState {
 }
 
 impl RecvStream for TonicRecvStream {
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> ClientResponseStreamItem {
+    async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         // Take the current state, leaving `Closed` in its place temporarily
         let state = std::mem::replace(&mut self.state, StreamState::Closed);
 
         match state {
             // Closed is terminal.
-            StreamState::Closed => ClientResponseStreamItem::StreamClosed,
+            StreamState::Closed => ResponseStreamItem::StreamClosed,
             // Stay closed after sending trailers.
-            StreamState::Error(error) => {
-                ClientResponseStreamItem::Trailers(Trailers::new(Err(error)))
-            }
+            StreamState::Error(error) => ResponseStreamItem::Trailers(Trailers::new(Err(error))),
             StreamState::AwaitingHeaders(rx) => match rx.await {
                 Ok(Ok(response)) => {
                     let (metadata, stream, _extensions) = response.into_parts();
@@ -282,13 +275,11 @@ impl RecvStream for TonicRecvStream {
                     // In contrast, standard gRPC implementations eagerly decode
                     // these headers and immediately fail the RPC with an
                     // Internal status.
-                    match metadata.try_into() {
+                    match (&metadata).try_into() {
                         Ok(md) => {
                             // Start streaming and return the headers.
                             self.state = StreamState::Streaming(stream);
-                            ClientResponseStreamItem::Headers(
-                                ResponseHeaders::new().with_metadata(md),
-                            )
+                            ResponseStreamItem::Headers(ResponseHeaders::new().with_metadata(md))
                         }
                         Err(e) => {
                             if let Some(notify) = self.stop_notify.take() {
@@ -299,7 +290,7 @@ impl RecvStream for TonicRecvStream {
                                     StatusCodeError::Internal,
                                     format!("error decoding response: {e}"),
                                 )),
-                                None,
+                                &TonicMeta::default(),
                             )
                         }
                     }
@@ -307,16 +298,21 @@ impl RecvStream for TonicRecvStream {
                 // Stay closed after sending trailers.
                 Err(_) => trailers_from_status(
                     Err(StatusError::new(StatusCodeError::Unknown, "Task cancelled")),
-                    None,
+                    &TonicMeta::default(),
                 ),
-                Ok(Err(status)) => trailers_from_tonic_status(status, None),
+                Ok(Err(status)) => {
+                    // In a Trailers-only response, the tonic status contains
+                    // the metadata.
+                    trailers_from_tonic_status(&status, status.metadata())
+                }
             },
             StreamState::Streaming(mut stream) => match stream.message().await {
                 Ok(Some(mut buf)) => match msg.decode(&mut buf) {
                     Ok(()) => {
-                        // More messages may remain in the stream; set receiver again.
+                        // More messages may remain in the stream; set receiver
+                        // again.
                         self.state = StreamState::Streaming(stream);
-                        ClientResponseStreamItem::Message
+                        ResponseStreamItem::Message
                     }
                     Err(e) => {
                         if let Some(notify) = self.stop_notify.take() {
@@ -327,20 +323,20 @@ impl RecvStream for TonicRecvStream {
                                 StatusCodeError::Internal,
                                 format!("error decoding response: {e}"),
                             )),
-                            None,
+                            &TonicMeta::default(),
                         )
                     }
                 },
                 // Stay closed after sending trailers.
                 Err(status) => {
                     let trailers = stream.trailers().await;
-                    let md = trailers.unwrap_or_default();
-                    trailers_from_tonic_status(status, md)
+                    let md = trailers.unwrap_or_default().unwrap_or_default();
+                    trailers_from_tonic_status(&status, &md)
                 }
                 Ok(None) => {
                     let trailers = stream.trailers().await;
-                    let md = trailers.unwrap_or_default();
-                    trailers_from_status(Ok(()), md)
+                    let md = trailers.unwrap_or_default().unwrap_or_default();
+                    trailers_from_status(Ok(()), &md)
                 }
             },
         }
@@ -377,7 +373,7 @@ impl Transport for TransportBuilder {
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -426,24 +422,15 @@ impl Transport for TransportBuilder {
                 runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
             }
         };
-        let transport = if let Some(deadline) = opts.connect_deadline {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            tokio::select! {
-                _ = runtime.sleep(timeout) => {
-                    return Err("timed out waiting for transport stream to connect".to_string());
-                }
-                transport = transport_fut => transport?,
-            }
-        } else {
-            transport_fut.await?
-        };
+        let transport = transport_fut.await?;
         let credentials = &security_info.credentials;
         let handshake_ouput = credentials
-            .dyn_connect(
+            .connect(
                 &security_info.authority,
                 transport,
                 &security_info.handshake_info,
                 &runtime,
+                private::Internal,
             )
             .await?;
 

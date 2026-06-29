@@ -24,14 +24,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::credentials::ChannelCredentials;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::GrpcRuntime;
 
 mod registry;
@@ -62,7 +61,6 @@ pub(crate) struct TransportOptions {
     pub(crate) rate_limit: Option<(u64, Duration)>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
-    pub(crate) connect_deadline: Option<Instant>,
 }
 
 #[trait_variant::make(Send)]
@@ -78,7 +76,7 @@ pub(crate) trait Transport: Sync {
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -96,7 +94,7 @@ pub(crate) trait DynTransport: Send + Sync {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -114,7 +112,7 @@ impl<T: Transport> DynTransport for T {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -126,7 +124,7 @@ impl<T: Transport> DynTransport for T {
 
 #[derive(Clone)]
 pub(crate) struct SecurityOpts {
-    pub(crate) credentials: Arc<dyn DynChannelCredentials>,
+    pub(crate) credentials: Arc<dyn ChannelCredentials>,
     pub(crate) authority: Authority,
     pub(crate) handshake_info: ClientHandshakeInfo,
 }

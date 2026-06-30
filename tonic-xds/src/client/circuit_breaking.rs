@@ -7,12 +7,12 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::{Request, Response};
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
-use tokio::sync::watch;
 use tonic::body::Body as TonicBody;
 use tower::{BoxError, Layer, Service};
 
@@ -38,7 +38,7 @@ struct ClusterCircuitBreakersInner {
 impl Drop for ClusterCircuitBreakersInner {
     fn drop(&mut self) {
         for state in self.configs.iter() {
-            if let Some(previous) = state.config_tx.send_replace(None) {
+            if let Some(previous) = state.config.swap(None) {
                 let counter_key = previous.counter_key.clone();
                 drop(previous);
                 self.counters.deactivate(&counter_key);
@@ -107,7 +107,7 @@ impl ClusterCircuitBreakers {
         config: CircuitBreakerRuntimeConfig,
     ) {
         let previous = state.current_config();
-        if previous.as_ref() == Some(&config) {
+        if previous.as_deref() == Some(&config) {
             return;
         }
 
@@ -118,19 +118,19 @@ impl ClusterCircuitBreakers {
             self.inner.counters.activate(&config.counter_key);
         }
 
-        let previous = state.config_tx.send_replace(Some(config));
+        let previous = state.config.swap(Some(Arc::new(config)));
         if counter_key_changed && let Some(previous) = previous {
             self.deactivate_config(previous);
         }
     }
 
     fn clear_state(&self, state: &ClusterCircuitBreakerState) {
-        if let Some(previous) = state.config_tx.send_replace(None) {
+        if let Some(previous) = state.config.swap(None) {
             self.deactivate_config(previous);
         }
     }
 
-    fn deactivate_config(&self, config: CircuitBreakerRuntimeConfig) {
+    fn deactivate_config(&self, config: Arc<CircuitBreakerRuntimeConfig>) {
         let counter_key = config.counter_key.clone();
         drop(config);
         self.inner.counters.deactivate(&counter_key);
@@ -142,7 +142,7 @@ impl ClusterCircuitBreakers {
 
     fn acquire_with_config(
         &self,
-        runtime_config: CircuitBreakerRuntimeConfig,
+        runtime_config: Arc<CircuitBreakerRuntimeConfig>,
     ) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
         let limit = CircuitBreakerLimit {
             max_requests: runtime_config.max_requests,
@@ -150,14 +150,14 @@ impl ClusterCircuitBreakers {
         self.inner
             .counters
             .acquire(
-                runtime_config.counter_key,
-                runtime_config.counter,
+                runtime_config.counter_key.clone(),
+                runtime_config.counter.clone(),
                 limit.max_requests,
             )
             .ok_or(limit)
     }
 
-    fn runtime_config_or_default(&self, cluster: &str) -> CircuitBreakerRuntimeConfig {
+    fn runtime_config_or_default(&self, cluster: &str) -> Arc<CircuitBreakerRuntimeConfig> {
         self.inner
             .configs
             .get(cluster)
@@ -165,11 +165,11 @@ impl ClusterCircuitBreakers {
             .unwrap_or_else(|| {
                 let counter_key = counter_key(cluster, cluster);
                 let counter = self.inner.counters.counter(&counter_key);
-                CircuitBreakerRuntimeConfig {
+                Arc::new(CircuitBreakerRuntimeConfig {
                     max_requests: self.inner.default_max_requests,
                     counter_key: Arc::from(counter_key),
                     counter,
-                }
+                })
             })
     }
 
@@ -235,19 +235,27 @@ fn counter_key(cluster: &str, eds_service_name: &str) -> String {
     format!("{cluster}\0{eds_service_name}")
 }
 
-#[derive(Debug)]
 struct ClusterCircuitBreakerState {
-    config_tx: watch::Sender<Option<CircuitBreakerRuntimeConfig>>,
+    config: ArcSwapOption<CircuitBreakerRuntimeConfig>,
+}
+
+impl fmt::Debug for ClusterCircuitBreakerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterCircuitBreakerState")
+            .field("current_config", &self.current_config())
+            .finish()
+    }
 }
 
 impl ClusterCircuitBreakerState {
     fn new() -> Self {
-        let (config_tx, _) = watch::channel(None);
-        Self { config_tx }
+        Self {
+            config: ArcSwapOption::empty(),
+        }
     }
 
-    fn current_config(&self) -> Option<CircuitBreakerRuntimeConfig> {
-        self.config_tx.borrow().clone()
+    fn current_config(&self) -> Option<Arc<CircuitBreakerRuntimeConfig>> {
+        self.config.load_full()
     }
 }
 

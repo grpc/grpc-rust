@@ -38,5 +38,9 @@ fn main() {
     cmake_config.define("BUILD_PROTOC", "ON");
     cmake_config.define("BUILD_PLUGIN", "ON");
     cmake_config.define("CMAKE_INSTALL_PREFIX", &install_dir);
+    // Make sure to not use stale configuration from a previous devel build, lest we get a bunch of
+    // linker errors when building at various points in the tree without cargo clean-ing between.
+    cmake_config.always_configure(true);
+    cmake_config.configure_arg("--fresh");
     cmake_config.build();
 }

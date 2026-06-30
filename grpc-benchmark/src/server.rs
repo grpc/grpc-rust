@@ -22,14 +22,13 @@
  *
  */
 
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nix::sys::resource::Usage;
-use nix::sys::resource::UsageWho;
-use nix::sys::resource::getrusage;
-use nix::sys::time::TimeValLike;
 use tokio::sync::Notify;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
@@ -53,6 +52,7 @@ use crate::generated::services::grpc::testing::benchmark_service_server::Benchma
 use crate::generated::services::grpc::testing::payload_config::Payload::BytebufParams;
 use crate::generated::services::grpc::testing::payload_config::Payload::ComplexParams;
 use crate::generated::services::grpc::testing::payload_config::Payload::SimpleParams;
+use crate::rusage::Rusage;
 
 const DEFAULT_PORT: u16 = 50055;
 const SERVER_PEM: &[u8] = include_bytes!("../data/tls/server1.pem");
@@ -60,7 +60,7 @@ const SERVER_KEY: &[u8] = include_bytes!("../data/tls/server1.key");
 
 pub struct BenchmarkServer {
     last_reset_time: Instant,
-    last_rusage: Usage,
+    last_rusage: Rusage,
     shutdown_notify: Arc<Notify>,
     port: u16,
 }
@@ -107,7 +107,7 @@ impl BenchmarkServer {
         } else {
             DEFAULT_PORT
         };
-        let addr = format!("[::]:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         tokio::spawn(router.serve_with_shutdown(addr, async move {
             shutdown_notify_copy.notified().await;
             println!("BenchmarkServer is shutting down.")
@@ -115,7 +115,7 @@ impl BenchmarkServer {
 
         Ok(BenchmarkServer {
             last_reset_time: Instant::now(),
-            last_rusage: getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
+            last_rusage: Rusage::now().map_err(|err| {
                 Status::internal(format!("failed to query system resource usage: {err}"))
             })?,
             shutdown_notify,
@@ -126,11 +126,12 @@ impl BenchmarkServer {
     pub(crate) fn get_stats(&mut self, reset: bool) -> Result<ServerStats, Status> {
         let now = Instant::now();
         let wall_time_elapsed = now.duration_since(self.last_reset_time);
-        let latest_rusage = getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
+        let latest_rusage = Rusage::now().map_err(|err| {
             Status::internal(format!("failed to query system resource usage: {err}"))
         })?;
-        let user_time = latest_rusage.user_time() - self.last_rusage.user_time();
-        let system_time = latest_rusage.system_time() - self.last_rusage.system_time();
+        let user_time_ns = latest_rusage.user_time_nanos() - self.last_rusage.user_time_nanos();
+        let system_time_ns =
+            latest_rusage.system_time_nanos() - self.last_rusage.system_time_nanos();
 
         if reset {
             self.last_rusage = latest_rusage;
@@ -139,8 +140,8 @@ impl BenchmarkServer {
 
         Ok(ServerStats {
             time_elapsed: wall_time_elapsed.as_nanos() as f64 / 1e9,
-            time_user: user_time.num_nanoseconds() as f64 / 1e9,
-            time_system: system_time.num_nanoseconds() as f64 / 1e9,
+            time_user: user_time_ns as f64 / 1e9,
+            time_system: system_time_ns as f64 / 1e9,
             // The following fields are not set by Java and Go.
             idle_cpu_time: 0,
             cq_poll_count: 0,

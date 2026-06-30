@@ -22,36 +22,35 @@
  *
  */
 
-#[cfg(target_os = "linux")]
-mod app {
-    use std::time::Duration;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::time::Duration;
 
-    use grpc_benchmark::generated::services::grpc::testing::worker_service_server::WorkerServiceServer;
-    use grpc_benchmark::worker::WorkerServer;
-    use tokio::sync::mpsc;
-    use tokio::time;
-    use tonic::transport::Server;
+use grpc_benchmark::generated::services::grpc::testing::worker_service_server::WorkerServiceServer;
+use grpc_benchmark::worker::WorkerServer;
+use tokio::sync::mpsc;
+use tokio::time;
+use tonic::transport::Server;
 
-    pub async fn run_worker(worker_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        let addr = format!("0.0.0.0:{}", worker_port).parse().unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
+pub async fn run_worker(worker_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), worker_port);
+    let (tx, mut rx) = mpsc::channel(1);
 
-        let svc = WorkerServiceServer::new(WorkerServer::new(tx));
+    let svc = WorkerServiceServer::new(WorkerServer::new(tx));
 
-        Server::builder()
-            .add_service(svc)
-            .serve_with_shutdown(addr, async {
-                rx.recv().await;
-                // Wait for the quit_worker response to be sent.
-                time::sleep(Duration::from_secs(1)).await;
-            })
-            .await?;
+    Server::builder()
+        .add_service(svc)
+        .serve_with_shutdown(addr, async {
+            rx.recv().await;
+            // Wait for the quit_worker response to be sent.
+            time::sleep(Duration::from_secs(1)).await;
+        })
+        .await?;
 
-        Ok(())
-    }
+    Ok(())
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The default Tokio runtime uses 1 thread per logical processor. While the
@@ -80,12 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
 
-    app::run_worker(dp).await?;
+    run_worker(dp).await?;
 
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    println!("This benchmark worker is only supported on Linux.");
 }

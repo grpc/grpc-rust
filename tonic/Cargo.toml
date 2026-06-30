@@ -133,6 +133,7 @@ allowed_external_types = [
   "tower_layer::Layer",
   "tower_layer::stack::Stack",
   "tower_layer::identity::Identity",
+  "tower::util::boxed::sync::BoxService",
 ]
 
 [[bench]]

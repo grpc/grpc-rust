@@ -5,11 +5,12 @@ use super::ClientTlsConfig;
 use super::service::TlsConnector;
 use super::service::{self, Executor, SharedExec};
 use super::uds_connector::UdsConnector;
+use crate::body::Body;
 use crate::transport::Error;
 #[cfg(feature = "_tls-any")]
 use crate::transport::error;
 use bytes::Bytes;
-use http::{HeaderValue, uri::Uri};
+use http::{HeaderValue, Request, Response, uri::Uri};
 use hyper::rt;
 use hyper_util::client::legacy::connect::HttpConnector;
 #[cfg(feature = "_tls-any")]
@@ -17,7 +18,21 @@ use std::sync::Arc;
 use std::{fmt, future::Future, net::IpAddr, pin::Pin, str, str::FromStr, time::Duration};
 #[cfg(feature = "_tls-any")]
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+use tower::layer::Layer;
+use tower::layer::util::Stack;
+use tower::util::{BoxLayer, BoxService};
 use tower_service::Service;
+
+/// A boxed [`Layer`] applied to the [`Connection`](super::service::Connection) service.
+///
+/// The layer wraps the boxed connection service, allowing arbitrary `tower`
+/// middleware to be added to an [`Endpoint`] without leaking type parameters.
+pub(crate) type BoxedLayer = BoxLayer<
+    BoxService<Request<Body>, Response<Body>, crate::BoxError>,
+    Request<Body>,
+    Response<Body>,
+    crate::BoxError,
+>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum EndpointType {
@@ -56,6 +71,7 @@ pub struct Endpoint {
     pub(crate) http2_adaptive_window: Option<bool>,
     pub(crate) local_address: Option<IpAddr>,
     pub(crate) executor: SharedExec,
+    pub(crate) layer: Option<BoxedLayer>,
 }
 
 impl Endpoint {
@@ -105,6 +121,7 @@ impl Endpoint {
             http2_adaptive_window: None,
             executor: SharedExec::tokio(),
             local_address: None,
+            layer: None,
         }
     }
 
@@ -136,6 +153,7 @@ impl Endpoint {
             http2_adaptive_window: None,
             executor: SharedExec::tokio(),
             local_address: None,
+            layer: None,
         }
     }
 
@@ -516,6 +534,29 @@ impl Endpoint {
         E: Executor<Pin<Box<dyn Future<Output = ()> + Send>>> + Send + Sync + 'static,
     {
         self.executor = SharedExec::new(executor);
+        self
+    }
+
+    /// Add a [`tower::Layer`] to the stack of middleware applied to each
+    /// connection.
+    ///
+    /// Calling this method multiple times stacks the layers, with the most
+    /// recently added layer wrapping the previously added ones.
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<BoxService<Request<Body>, Response<Body>, crate::BoxError>>
+            + Send
+            + Sync
+            + 'static,
+        L::Service: Service<Request<Body>, Response = Response<Body>, Error = crate::BoxError>
+            + Send
+            + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send + 'static,
+    {
+        self.layer = Some(match self.layer.take() {
+            Some(existing) => BoxLayer::new(Stack::new(existing, layer)),
+            None => BoxLayer::new(layer),
+        });
         self
     }
 

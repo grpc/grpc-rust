@@ -32,7 +32,6 @@ pub(crate) struct ClusterCircuitBreakers {
 struct ClusterCircuitBreakersInner {
     configs: DashMap<String, Arc<ClusterCircuitBreakerState>>,
     counters: ClusterRequestCounters,
-    default_max_requests: u32,
 }
 
 impl Drop for ClusterCircuitBreakersInner {
@@ -57,7 +56,6 @@ impl ClusterCircuitBreakers {
             inner: Arc::new(ClusterCircuitBreakersInner {
                 configs: DashMap::new(),
                 counters,
-                default_max_requests: DEFAULT_MAX_REQUESTS,
             }),
         }
     }
@@ -76,14 +74,14 @@ impl ClusterCircuitBreakers {
     ) {
         let cluster = cluster.into();
         let eds_service_name = eds_service_name.into();
-        let counter_key = counter_key(&cluster, &eds_service_name);
+        let counter_key = CounterKey::new(cluster.as_str(), eds_service_name.as_str());
         let counter = self.inner.counters.counter(&counter_key);
         let state = self.ensure_state(&cluster);
         self.update_state_config(
             &state,
             CircuitBreakerRuntimeConfig {
                 max_requests: config.max_requests,
-                counter_key: Arc::from(counter_key),
+                counter_key,
                 counter,
             },
         );
@@ -99,6 +97,18 @@ impl ClusterCircuitBreakers {
             .entry(cluster.to_string())
             .or_insert_with(|| Arc::new(ClusterCircuitBreakerState::new()))
             .clone()
+    }
+
+    fn cluster_breaker(&self, cluster: &str) -> Arc<ClusterCircuitBreaker> {
+        let state = self.ensure_state(cluster);
+        let cluster: Arc<str> = Arc::from(cluster);
+        let default_counter_key = CounterKey::same_cluster(cluster.clone());
+        Arc::new(ClusterCircuitBreaker {
+            cluster,
+            state,
+            counters: self.inner.counters.clone(),
+            default_counter_key,
+        })
     }
 
     fn update_state_config(
@@ -137,54 +147,23 @@ impl ClusterCircuitBreakers {
     }
 
     fn acquire(&self, cluster: &str) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
-        self.acquire_with_config(self.runtime_config_or_default(cluster))
-    }
-
-    fn acquire_with_config(
-        &self,
-        runtime_config: Arc<CircuitBreakerRuntimeConfig>,
-    ) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
-        let limit = CircuitBreakerLimit {
-            max_requests: runtime_config.max_requests,
-        };
-        self.inner
-            .counters
-            .acquire(
-                runtime_config.counter_key.clone(),
-                runtime_config.counter.clone(),
-                limit.max_requests,
-            )
-            .ok_or(limit)
-    }
-
-    fn runtime_config_or_default(&self, cluster: &str) -> Arc<CircuitBreakerRuntimeConfig> {
-        self.inner
-            .configs
-            .get(cluster)
-            .and_then(|state| state.current_config())
-            .unwrap_or_else(|| {
-                let counter_key = counter_key(cluster, cluster);
-                let counter = self.inner.counters.counter(&counter_key);
-                Arc::new(CircuitBreakerRuntimeConfig {
-                    max_requests: self.inner.default_max_requests,
-                    counter_key: Arc::from(counter_key),
-                    counter,
-                })
-            })
+        self.cluster_breaker(cluster).acquire()
     }
 
     #[cfg(test)]
     fn in_flight(&self, cluster: &str) -> u32 {
-        let runtime_config = self.runtime_config_or_default(cluster);
-        self.inner.counters.in_flight(&runtime_config.counter_key)
+        let breaker = self.cluster_breaker(cluster);
+        self.inner
+            .counters
+            .in_flight(&breaker.current_counter_key())
     }
 
     #[cfg(test)]
     fn dropped_requests(&self, cluster: &str) -> u64 {
-        let runtime_config = self.runtime_config_or_default(cluster);
+        let breaker = self.cluster_breaker(cluster);
         self.inner
             .counters
-            .dropped_requests(&runtime_config.counter_key)
+            .dropped_requests(&breaker.current_counter_key())
     }
 
     #[cfg(test)]
@@ -219,7 +198,7 @@ struct CircuitBreakerLimit {
 #[derive(Clone, Debug)]
 struct CircuitBreakerRuntimeConfig {
     max_requests: u32,
-    counter_key: Arc<str>,
+    counter_key: CounterKey,
     counter: Arc<InFlightCounter>,
 }
 
@@ -231,8 +210,26 @@ impl PartialEq for CircuitBreakerRuntimeConfig {
 
 impl Eq for CircuitBreakerRuntimeConfig {}
 
-fn counter_key(cluster: &str, eds_service_name: &str) -> String {
-    format!("{cluster}\0{eds_service_name}")
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CounterKey {
+    cluster: Arc<str>,
+    eds_service_name: Arc<str>,
+}
+
+impl CounterKey {
+    fn new(cluster: impl Into<Arc<str>>, eds_service_name: impl Into<Arc<str>>) -> Self {
+        Self {
+            cluster: cluster.into(),
+            eds_service_name: eds_service_name.into(),
+        }
+    }
+
+    fn same_cluster(cluster: Arc<str>) -> Self {
+        Self {
+            cluster: cluster.clone(),
+            eds_service_name: cluster,
+        }
+    }
 }
 
 struct ClusterCircuitBreakerState {
@@ -259,6 +256,52 @@ impl ClusterCircuitBreakerState {
     }
 }
 
+#[derive(Debug)]
+struct ClusterCircuitBreaker {
+    cluster: Arc<str>,
+    state: Arc<ClusterCircuitBreakerState>,
+    counters: ClusterRequestCounters,
+    default_counter_key: CounterKey,
+}
+
+impl ClusterCircuitBreaker {
+    fn acquire(&self) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
+        if let Some(config) = self.state.current_config() {
+            return self.acquire_with_config(
+                config.counter_key.clone(),
+                config.counter.clone(),
+                config.max_requests,
+            );
+        }
+
+        let counter = self.counters.counter(&self.default_counter_key);
+        self.acquire_with_config(
+            self.default_counter_key.clone(),
+            counter,
+            DEFAULT_MAX_REQUESTS,
+        )
+    }
+
+    fn acquire_with_config(
+        &self,
+        counter_key: CounterKey,
+        counter: Arc<InFlightCounter>,
+        max_requests: u32,
+    ) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
+        let limit = CircuitBreakerLimit { max_requests };
+        self.counters
+            .acquire(counter_key, counter, max_requests)
+            .ok_or(limit)
+    }
+
+    fn current_counter_key(&self) -> CounterKey {
+        self.state
+            .current_config()
+            .map(|config| config.counter_key.clone())
+            .unwrap_or_else(|| self.default_counter_key.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ClusterRequestCounters {
     inner: Arc<ClusterRequestCounterState>,
@@ -266,8 +309,8 @@ struct ClusterRequestCounters {
 
 #[derive(Debug, Default)]
 struct ClusterRequestCounterState {
-    counters: DashMap<String, Arc<InFlightCounter>>,
-    active_refs: DashMap<String, Arc<AtomicUsize>>,
+    counters: DashMap<CounterKey, Arc<InFlightCounter>>,
+    active_refs: DashMap<CounterKey, Arc<AtomicUsize>>,
 }
 
 impl ClusterRequestCounters {
@@ -286,15 +329,15 @@ impl ClusterRequestCounters {
         }
     }
 
-    fn activate(&self, counter_key: &str) {
+    fn activate(&self, counter_key: &CounterKey) {
         self.inner
             .active_refs
-            .entry(counter_key.to_string())
+            .entry(counter_key.clone())
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    fn deactivate(&self, counter_key: &str) {
+    fn deactivate(&self, counter_key: &CounterKey) {
         let should_cleanup = self
             .inner
             .active_refs
@@ -315,7 +358,7 @@ impl ClusterRequestCounters {
 
     fn acquire(
         &self,
-        counter_key: Arc<str>,
+        counter_key: CounterKey,
         counter: Arc<InFlightCounter>,
         limit: u32,
     ) -> Option<CircuitBreakerPermit> {
@@ -332,15 +375,15 @@ impl ClusterRequestCounters {
         }
     }
 
-    fn counter(&self, counter_key: &str) -> Arc<InFlightCounter> {
+    fn counter(&self, counter_key: &CounterKey) -> Arc<InFlightCounter> {
         self.inner
             .counters
-            .entry(counter_key.to_string())
+            .entry(counter_key.clone())
             .or_insert_with(|| Arc::new(InFlightCounter::default()))
             .clone()
     }
 
-    fn cleanup_if_unused(&self, counter_key: &str) {
+    fn cleanup_if_unused(&self, counter_key: &CounterKey) {
         let active_refs = self.active_refs(counter_key);
         if active_refs != 0 {
             return;
@@ -354,7 +397,7 @@ impl ClusterRequestCounters {
             .remove_if(counter_key, |_, refs| refs.load(Ordering::Acquire) == 0);
     }
 
-    fn active_refs(&self, counter_key: &str) -> usize {
+    fn active_refs(&self, counter_key: &CounterKey) -> usize {
         self.inner
             .active_refs
             .get(counter_key)
@@ -363,7 +406,7 @@ impl ClusterRequestCounters {
     }
 
     #[cfg(test)]
-    fn in_flight(&self, counter_key: &str) -> u32 {
+    fn in_flight(&self, counter_key: &CounterKey) -> u32 {
         self.inner
             .counters
             .get(counter_key)
@@ -372,7 +415,7 @@ impl ClusterRequestCounters {
     }
 
     #[cfg(test)]
-    fn dropped_requests(&self, counter_key: &str) -> u64 {
+    fn dropped_requests(&self, counter_key: &CounterKey) -> u64 {
         self.inner
             .counters
             .get(counter_key)
@@ -429,7 +472,7 @@ impl InFlightCounter {
 #[derive(Debug)]
 struct CircuitBreakerPermit {
     counter: Option<Arc<InFlightCounter>>,
-    counter_key: Arc<str>,
+    counter_key: CounterKey,
     counters: ClusterRequestCounters,
 }
 
@@ -446,11 +489,15 @@ impl Drop for CircuitBreakerPermit {
 #[derive(Clone)]
 pub(crate) struct CircuitBreakingLayer {
     circuit_breakers: ClusterCircuitBreakers,
+    breaker_cache: Arc<DashMap<String, Arc<ClusterCircuitBreaker>>>,
 }
 
 impl CircuitBreakingLayer {
     pub(crate) fn new(circuit_breakers: ClusterCircuitBreakers) -> Self {
-        Self { circuit_breakers }
+        Self {
+            circuit_breakers,
+            breaker_cache: Arc::new(DashMap::new()),
+        }
     }
 }
 
@@ -458,6 +505,7 @@ impl fmt::Debug for CircuitBreakingLayer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CircuitBreakingLayer")
             .field("circuit_breakers", &self.circuit_breakers)
+            .field("cached_clusters", &self.breaker_cache.len())
             .finish()
     }
 }
@@ -469,6 +517,7 @@ impl<S> Layer<S> for CircuitBreakingLayer {
         CircuitBreakingService {
             inner: service,
             circuit_breakers: self.circuit_breakers.clone(),
+            breaker_cache: self.breaker_cache.clone(),
         }
     }
 }
@@ -477,6 +526,7 @@ impl<S> Layer<S> for CircuitBreakingLayer {
 pub(crate) struct CircuitBreakingService<S> {
     inner: S,
     circuit_breakers: ClusterCircuitBreakers,
+    breaker_cache: Arc<DashMap<String, Arc<ClusterCircuitBreaker>>>,
 }
 
 impl<S: fmt::Debug> fmt::Debug for CircuitBreakingService<S> {
@@ -484,7 +534,21 @@ impl<S: fmt::Debug> fmt::Debug for CircuitBreakingService<S> {
         f.debug_struct("CircuitBreakingService")
             .field("inner", &self.inner)
             .field("circuit_breakers", &self.circuit_breakers)
+            .field("cached_clusters", &self.breaker_cache.len())
             .finish()
+    }
+}
+
+impl<S> CircuitBreakingService<S> {
+    fn breaker_for_cluster(&self, cluster: &str) -> Arc<ClusterCircuitBreaker> {
+        if let Some(breaker) = self.breaker_cache.get(cluster) {
+            return breaker.clone();
+        }
+
+        self.breaker_cache
+            .entry(cluster.to_string())
+            .or_insert_with(|| self.circuit_breakers.cluster_breaker(cluster))
+            .clone()
     }
 }
 
@@ -506,7 +570,11 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let Some(route_decision) = request.extensions().get::<RouteDecision>().cloned() else {
+        let Some(cluster) = request
+            .extensions()
+            .get::<RouteDecision>()
+            .map(|route_decision| route_decision.cluster.as_str())
+        else {
             return Box::pin(async {
                 Ok(status_response(tonic::Status::internal(
                     CircuitBreakingError::NoRoutingDecision.to_string(),
@@ -514,14 +582,13 @@ where
             });
         };
 
-        let cluster = route_decision.cluster;
-        let circuit_breakers = self.circuit_breakers.clone();
+        let breaker = self.breaker_for_cluster(cluster);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
-            let permit = match circuit_breakers.acquire(&cluster) {
+            let permit = match breaker.acquire() {
                 Ok(permit) => permit,
-                Err(limit) => return Ok(limit_exceeded_response(&cluster, limit)),
+                Err(limit) => return Ok(limit_exceeded_response(&breaker.cluster, limit)),
             };
 
             std::future::poll_fn(|cx| inner.poll_ready(cx))
@@ -849,7 +916,7 @@ mod tests {
     #[test]
     fn cleanup_keeps_counter_with_outstanding_clone() {
         let counters = ClusterRequestCounters::isolated();
-        let counter_key = counter_key(CLUSTER, CLUSTER);
+        let counter_key = CounterKey::new(CLUSTER, CLUSTER);
         let counter = counters.counter(&counter_key);
 
         counters.cleanup_if_unused(&counter_key);
@@ -858,6 +925,32 @@ mod tests {
         drop(counter);
         counters.cleanup_if_unused(&counter_key);
         assert_eq!(counters.counter_count(), 0);
+    }
+
+    #[test]
+    fn structured_counter_keys_do_not_collide_on_embedded_delimiters() {
+        let counters = ClusterRequestCounters::isolated();
+        let first_key = CounterKey::new("cluster\0eds", "service");
+        let second_key = CounterKey::new("cluster", "eds\0service");
+
+        let first = counters.counter(&first_key);
+        let second = counters.counter(&second_key);
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(counters.counter_count(), 2);
+    }
+
+    #[test]
+    fn cached_cluster_breaker_does_not_pin_default_counter() {
+        let counters = ClusterRequestCounters::isolated();
+        let breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        let breaker = breakers.cluster_breaker(CLUSTER);
+        let permit = breaker.acquire().unwrap();
+        assert_eq!(counters.counter_count(), 1);
+
+        drop(permit);
+        assert_eq!(counters.counter_count(), 0);
+        assert_eq!(breaker.cluster.as_ref(), CLUSTER);
     }
 
     #[tokio::test]

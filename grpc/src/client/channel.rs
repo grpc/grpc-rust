@@ -82,9 +82,7 @@ use crate::core::RequestHeaders;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::default_runtime;
 
@@ -166,11 +164,11 @@ impl Channel {
     /// Constructs a new gRPC channel.  Channel creation cannot fail, but if the
     /// target string is invalid, the returned channel will never connect, and
     /// will fail all RPCs.
-    pub fn new<C>(target: impl Into<String>, credentials: Arc<C>, options: ChannelOptions) -> Self
-    where
-        C: ChannelCredentials,
-        C::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
-    {
+    pub fn new(
+        target: impl Into<String>,
+        credentials: Arc<dyn ChannelCredentials>,
+        options: ChannelOptions,
+    ) -> Self {
         pick_first::reg();
         round_robin::reg();
         dns::reg();
@@ -185,7 +183,7 @@ impl Channel {
                 target,
                 default_runtime(),
                 options,
-                credentials as Arc<dyn DynChannelCredentials>,
+                credentials,
             )),
         }
     }
@@ -245,7 +243,7 @@ impl PersistentChannel {
         target: impl Into<String>,
         runtime: GrpcRuntime,
         options: ChannelOptions,
-        credentials: Arc<dyn DynChannelCredentials>,
+        credentials: Arc<dyn ChannelCredentials>,
     ) -> Self {
         // TODO(nathanielford): Return errors here instead of panicking.
         let target = Target::from_str(&target.into()).unwrap();

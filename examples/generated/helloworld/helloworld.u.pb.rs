@@ -1,5 +1,5 @@
 const _: () = ::protobuf::__internal::assert_compatible_gencode_version(
-    "4.34.0-release",
+    "4.35.1-release",
 );
 pub(crate) static mut helloworld__HelloRequest_msg_init: ::protobuf::__internal::runtime::MiniTableInitPtr = ::protobuf::__internal::runtime::MiniTableInitPtr(
     ::protobuf::__internal::runtime::MiniTablePtr::dangling(),
@@ -8,7 +8,10 @@ pub(crate) static mut helloworld__HelloRequest_msg_init: ::protobuf::__internal:
 pub struct HelloRequest {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<HelloRequest>,
 }
-impl ::protobuf::Message for HelloRequest {}
+impl ::protobuf::Message for HelloRequest {
+    type MessageView<'msg> = HelloRequestView<'msg>;
+    type MessageMut<'msg> = HelloRequestMut<'msg>;
+}
 impl ::std::default::Default for HelloRequest {
     fn default() -> Self {
         Self::new()
@@ -19,8 +22,8 @@ impl ::std::fmt::Debug for HelloRequest {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for HelloRequest {}
-unsafe impl Send for HelloRequest {}
+unsafe impl ::std::marker::Sync for HelloRequest {}
+unsafe impl ::std::marker::Send for HelloRequest {}
 impl ::protobuf::Proxied for HelloRequest {
     type View<'msg> = HelloRequestView<'msg>;
 }
@@ -62,11 +65,11 @@ impl<'msg> HelloRequestView<'msg> {
     }
     pub fn name(self) -> ::protobuf::View<'msg, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
 }
-unsafe impl Sync for HelloRequestView<'_> {}
-unsafe impl Send for HelloRequestView<'_> {}
+unsafe impl ::std::marker::Sync for HelloRequestView<'_> {}
+unsafe impl ::std::marker::Send for HelloRequestView<'_> {}
 impl<'msg> ::protobuf::AsView for HelloRequestView<'msg> {
     type Proxied = HelloRequest;
     fn as_view(&self) -> ::protobuf::View<'msg, HelloRequest> {
@@ -98,14 +101,14 @@ impl<'msg> ::protobuf::IntoProxied<HelloRequest> for HelloRequestMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for HelloRequest {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for HelloRequest {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for HelloRequestView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for HelloRequestView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for HelloRequestMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for HelloRequestMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -136,14 +139,14 @@ impl<'msg> HelloRequestMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, HelloRequest> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> HelloRequest {
         ::protobuf::AsView::as_view(self).to_owned()
     }
     pub fn name(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_name(
         &mut self,
@@ -158,16 +161,12 @@ impl<'msg> HelloRequestMut<'msg> {
         }
     }
 }
-unsafe impl Send for HelloRequestMut<'_> {}
-unsafe impl Sync for HelloRequestMut<'_> {}
+unsafe impl ::std::marker::Send for HelloRequestMut<'_> {}
+unsafe impl ::std::marker::Sync for HelloRequestMut<'_> {}
 impl<'msg> ::protobuf::AsView for HelloRequestMut<'msg> {
     type Proxied = HelloRequest;
     fn as_view(&self) -> ::protobuf::View<'_, HelloRequest> {
-        HelloRequestView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for HelloRequestMut<'msg> {
@@ -175,19 +174,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for HelloRequestMut<'msg> {
     where
         'msg: 'shorter,
     {
-        HelloRequestView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for HelloRequestMut<'msg> {
     type MutProxied = HelloRequest;
     fn as_mut(&mut self) -> HelloRequestMut<'msg> {
-        HelloRequestMut {
-            inner: self.inner,
-        }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for HelloRequestMut<'msg> {
@@ -222,7 +215,7 @@ impl HelloRequest {
     }
     pub fn name(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_name(
         &mut self,
@@ -351,7 +344,10 @@ pub(crate) static mut helloworld__HelloReply_msg_init: ::protobuf::__internal::r
 pub struct HelloReply {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<HelloReply>,
 }
-impl ::protobuf::Message for HelloReply {}
+impl ::protobuf::Message for HelloReply {
+    type MessageView<'msg> = HelloReplyView<'msg>;
+    type MessageMut<'msg> = HelloReplyMut<'msg>;
+}
 impl ::std::default::Default for HelloReply {
     fn default() -> Self {
         Self::new()
@@ -362,8 +358,8 @@ impl ::std::fmt::Debug for HelloReply {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for HelloReply {}
-unsafe impl Send for HelloReply {}
+unsafe impl ::std::marker::Sync for HelloReply {}
+unsafe impl ::std::marker::Send for HelloReply {}
 impl ::protobuf::Proxied for HelloReply {
     type View<'msg> = HelloReplyView<'msg>;
 }
@@ -405,11 +401,11 @@ impl<'msg> HelloReplyView<'msg> {
     }
     pub fn message(self) -> ::protobuf::View<'msg, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
 }
-unsafe impl Sync for HelloReplyView<'_> {}
-unsafe impl Send for HelloReplyView<'_> {}
+unsafe impl ::std::marker::Sync for HelloReplyView<'_> {}
+unsafe impl ::std::marker::Send for HelloReplyView<'_> {}
 impl<'msg> ::protobuf::AsView for HelloReplyView<'msg> {
     type Proxied = HelloReply;
     fn as_view(&self) -> ::protobuf::View<'msg, HelloReply> {
@@ -441,14 +437,14 @@ impl<'msg> ::protobuf::IntoProxied<HelloReply> for HelloReplyMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for HelloReply {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for HelloReply {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for HelloReplyView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for HelloReplyView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for HelloReplyMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for HelloReplyMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -479,14 +475,14 @@ impl<'msg> HelloReplyMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, HelloReply> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> HelloReply {
         ::protobuf::AsView::as_view(self).to_owned()
     }
     pub fn message(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_message(
         &mut self,
@@ -501,16 +497,12 @@ impl<'msg> HelloReplyMut<'msg> {
         }
     }
 }
-unsafe impl Send for HelloReplyMut<'_> {}
-unsafe impl Sync for HelloReplyMut<'_> {}
+unsafe impl ::std::marker::Send for HelloReplyMut<'_> {}
+unsafe impl ::std::marker::Sync for HelloReplyMut<'_> {}
 impl<'msg> ::protobuf::AsView for HelloReplyMut<'msg> {
     type Proxied = HelloReply;
     fn as_view(&self) -> ::protobuf::View<'_, HelloReply> {
-        HelloReplyView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for HelloReplyMut<'msg> {
@@ -518,17 +510,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for HelloReplyMut<'msg> {
     where
         'msg: 'shorter,
     {
-        HelloReplyView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for HelloReplyMut<'msg> {
     type MutProxied = HelloReply;
     fn as_mut(&mut self) -> HelloReplyMut<'msg> {
-        HelloReplyMut { inner: self.inner }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for HelloReplyMut<'msg> {
@@ -563,7 +551,7 @@ impl HelloReply {
     }
     pub fn message(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_message(
         &mut self,

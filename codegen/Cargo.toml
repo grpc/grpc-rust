@@ -12,4 +12,3 @@ quote = "1"
 syn = "2"
 tempfile = "3.8.0"
 tonic-prost-build = {path = "../tonic-prost-build", default-features = false, features = ["cleanup-markdown"]}
-grpc-protobuf-build = { path = "../grpc-protobuf-build" }

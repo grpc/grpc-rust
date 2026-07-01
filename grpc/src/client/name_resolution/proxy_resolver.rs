@@ -22,15 +22,12 @@
  *
  */
 
-use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-use http::HeaderValue;
 use hyper_util::client::proxy::matcher::Matcher;
 use url::Url;
 
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ChannelController;
 use crate::client::name_resolution::NopResolver;
 use crate::client::name_resolution::Resolver;
@@ -40,6 +37,7 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::service_config::ServiceConfig;
+use crate::client::transport::ProxyOptions;
 use crate::credentials::common::Authority;
 
 static MATCHER: LazyLock<Option<Matcher>> = LazyLock::new(build_matcher);
@@ -160,10 +158,7 @@ impl Builder {
             header.set_sensitive(true);
         }
 
-        let proxy_options = ProxyOptions {
-            proxy_authorization_header,
-            connect_authority: explicit_authority,
-        };
+        let proxy_options = ProxyOptions::new(explicit_authority, proxy_authorization_header);
 
         let Some(proxy_host) = intercept.uri().authority() else {
             return NopResolver::new_with_err(
@@ -201,26 +196,6 @@ struct HttpsProxyResolver {
     proxy_options: Arc<ProxyOptions>,
 }
 
-/// Options for establishing an HTTP CONNECT proxy tunnel.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
-pub(crate) struct ProxyOptions {
-    proxy_authorization_header: Option<HeaderValue>,
-    connect_authority: String,
-}
-
-impl ProxyOptions {
-    /// Returns the value of the `Proxy-Authorization` header, if present.
-    pub(crate) fn proxy_authorization_header(&self) -> Option<&http::HeaderValue> {
-        self.proxy_authorization_header.as_ref()
-    }
-
-    /// Returns the address of the proxy server to connect to (host:port).
-    /// This is Punycode-encoded, i.e., it's a valid URL host:port.
-    pub(crate) fn connect_authority(&self) -> &str {
-        &self.connect_authority
-    }
-}
-
 impl Resolver for HttpsProxyResolver {
     fn resolve_now(&mut self) {
         self.child.resolve_now();
@@ -245,7 +220,7 @@ impl<'a> ChannelController for InterceptingController<'a> {
         if let Ok(endpoints) = &mut update.endpoints {
             for endpoint in endpoints {
                 for address in &mut endpoint.addresses {
-                    address.attributes = address.attributes.add(self.proxy_options.clone());
+                    ProxyOptions::add_to_addr(address, self.proxy_options.clone());
                 }
             }
         }
@@ -255,13 +230,6 @@ impl<'a> ChannelController for InterceptingController<'a> {
     fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
         self.inner.parse_service_config(config)
     }
-}
-
-/// Extracts `ProxyOptions` from the given `Address` attributes, if present.
-pub(crate) fn proxy_options_for_addr(addr: &Address) -> Option<&ProxyOptions> {
-    addr.attributes
-        .get::<Arc<ProxyOptions>>()
-        .map(AsRef::as_ref)
 }
 
 fn get_first_env(names: &[&str]) -> String {
@@ -289,9 +257,12 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
 
+    use http::HeaderValue;
+
     use super::*;
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
+    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
     use crate::rt;
@@ -444,13 +415,11 @@ mod tests {
 
         let mut expected_header = HeaderValue::from_static("Basic dXNlcjpwYXNzd29yZA==");
         expected_header.set_sensitive(true);
-        let expected_proxy_opts = ProxyOptions {
-            proxy_authorization_header: Some(expected_header),
-            connect_authority: "target.example.com:443".to_string(),
-        };
+        let expected_proxy_opts =
+            ProxyOptions::new("target.example.com:443".to_string(), Some(expected_header));
 
         for address in &addresses {
-            let proxy_opts = proxy_options_for_addr(address).expect("ProxyOptions not found");
+            let proxy_opts = ProxyOptions::from_addr(address).expect("ProxyOptions not found");
             assert_eq!(proxy_opts, &expected_proxy_opts);
         }
     }
@@ -471,7 +440,7 @@ mod tests {
 
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
     }
 
     #[tokio::test]
@@ -488,13 +457,10 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        let proxy_opts = ProxyOptions::from_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(
             proxy_opts,
-            &ProxyOptions {
-                proxy_authorization_header: None,
-                connect_authority: "xn--tst-qla.example.com:443".to_string(),
-            }
+            &ProxyOptions::new("xn--tst-qla.example.com:443".to_string(), None)
         );
     }
 
@@ -553,7 +519,7 @@ mod tests {
 
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
 
         // Check for abstract-unix scheme.
         let addresses = run_resolver_and_get_addresses(
@@ -565,7 +531,7 @@ mod tests {
 
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
     }
 
     #[tokio::test]
@@ -583,7 +549,7 @@ mod tests {
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
         assert!(
-            proxy_options_for_addr(&addresses[0]).is_none(),
+            ProxyOptions::from_addr(&addresses[0]).is_none(),
             "HTTP proxy should not match HTTPS destinations"
         );
 
@@ -597,11 +563,8 @@ mod tests {
                 .await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
-        let expected_proxy_opts = ProxyOptions {
-            proxy_authorization_header: None,
-            connect_authority: "target.example.com:443".to_string(),
-        };
-        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        let expected_proxy_opts = ProxyOptions::new("target.example.com:443".to_string(), None);
+        let proxy_opts = ProxyOptions::from_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
 
         // Case 3: https proxy and no proxy are configured.
@@ -616,7 +579,7 @@ mod tests {
                 .await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
 
         // Target B: other.example.com (NOT matched by no_proxy) -> should proxy
         let addresses =
@@ -624,11 +587,8 @@ mod tests {
                 .await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
-        let expected_proxy_opts = ProxyOptions {
-            proxy_authorization_header: None,
-            connect_authority: "other.example.com:443".to_string(),
-        };
-        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        let expected_proxy_opts = ProxyOptions::new("other.example.com:443".to_string(), None);
+        let proxy_opts = ProxyOptions::from_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
     }
 
@@ -643,7 +603,7 @@ mod tests {
 
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(proxy_options_for_addr(&addresses[0]).is_none());
+        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
     }
 
     #[tokio::test]
@@ -660,12 +620,9 @@ mod tests {
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, "[::1]:8080");
 
-        let expected_proxy_opts = ProxyOptions {
-            proxy_authorization_header: None,
-            connect_authority: "target.example.com:443".to_string(),
-        };
+        let expected_proxy_opts = ProxyOptions::new("target.example.com:443".to_string(), None);
 
-        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        let proxy_opts = ProxyOptions::from_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
     }
 
@@ -685,12 +642,9 @@ mod tests {
         assert_eq!(addresses.len(), 1);
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
 
-        let expected_proxy_opts = ProxyOptions {
-            proxy_authorization_header: None,
-            connect_authority: "[::1]:443".to_string(),
-        };
+        let expected_proxy_opts = ProxyOptions::new("[::1]:443".to_string(), None);
 
-        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        let proxy_opts = ProxyOptions::from_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
     }
 
@@ -742,12 +696,10 @@ mod tests {
         .await;
 
         assert_eq!(addresses.len(), 1);
-        let expected_proxy_opts = ProxyOptions {
-            proxy_authorization_header: None,
-            connect_authority: "custom.authority.example.com:1234".to_string(),
-        };
+        let expected_proxy_opts =
+            ProxyOptions::new("custom.authority.example.com:1234".to_string(), None);
 
-        let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
+        let proxy_opts = ProxyOptions::from_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
     }
 }

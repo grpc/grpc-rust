@@ -25,8 +25,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::HeaderValue;
+
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::client::name_resolution::Address;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::DynClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
@@ -127,4 +130,50 @@ pub(crate) struct SecurityOpts {
     pub(crate) credentials: Arc<dyn DynChannelCredentials>,
     pub(crate) authority: Authority,
     pub(crate) handshake_info: ClientHandshakeInfo,
+}
+
+/// Options for establishing an HTTP CONNECT proxy tunnel.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub(crate) struct ProxyOptions {
+    proxy_authorization_header: Option<HeaderValue>,
+    connect_authority: String,
+}
+
+impl ProxyOptions {
+    /// Creates a new `ProxyOptions`.
+    ///
+    /// # Arguments
+    /// * `target_authority` - The address of the target server to connect to (host:port).
+    ///   Must be a valid hostname.
+    /// * `proxy_authorization_header` - The value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn new(
+        target_authority: String,
+        proxy_authorization_header: Option<HeaderValue>,
+    ) -> Self {
+        Self {
+            proxy_authorization_header,
+            connect_authority: target_authority,
+        }
+    }
+
+    /// Returns the value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn proxy_authorization_header(&self) -> Option<&HeaderValue> {
+        self.proxy_authorization_header.as_ref()
+    }
+
+    /// Returns the address of the proxy server to connect to (host:port).
+    /// This is Punycode-encoded, i.e., it's a valid URL host:port.
+    pub(crate) fn connect_authority(&self) -> &str {
+        &self.connect_authority
+    }
+
+    /// Extracts `ProxyOptions` from the given `Address` attributes, if present.
+    pub(crate) fn from_addr(addr: &Address) -> Option<&Self> {
+        addr.attributes.get::<Arc<Self>>().map(AsRef::as_ref)
+    }
+
+    /// Adds these `ProxyOptions` to the given `Address` attributes.
+    pub(crate) fn add_to_addr(addr: &mut Address, options: Arc<Self>) {
+        addr.attributes = addr.attributes.add(options);
+    }
 }

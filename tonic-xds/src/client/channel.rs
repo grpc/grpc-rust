@@ -1,4 +1,3 @@
-use crate::XdsUri;
 use crate::client::cluster::ClusterClientRegistryGrpc;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
@@ -10,15 +9,14 @@ use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
+use crate::{TonicCallCredentials, XdsUri};
 use http::Request;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
 use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
-use xds_client::{
-    CallCredentials, ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
-};
+use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient};
 
 use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 
@@ -27,7 +25,7 @@ use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 pub struct XdsChannelConfig {
     target_uri: XdsUri,
     bootstrap: Option<BootstrapConfig>,
-    call_creds: Option<Arc<dyn CallCredentials>>,
+    call_creds: Option<Arc<dyn TonicCallCredentials>>,
 }
 
 impl XdsChannelConfig {
@@ -68,7 +66,7 @@ impl XdsChannelConfig {
     ///
     /// Attached on each (re)connect, only over a secure channel; over an insecure
     /// channel, stream creation fails. Not refreshed mid-stream.
-    pub fn with_call_credentials(mut self, creds: Arc<dyn CallCredentials>) -> Self {
+    pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
         self.call_creds = Some(creds);
         self
     }
@@ -745,7 +743,7 @@ mod tests {
         #[derive(Debug)]
         struct DummyCreds;
         #[tonic::async_trait]
-        impl xds_client::CallCredentials for DummyCreds {
+        impl crate::TonicCallCredentials for DummyCreds {
             async fn get_request_metadata(
                 &self,
                 _metadata: &mut tonic::metadata::MetadataMap,

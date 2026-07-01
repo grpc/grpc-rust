@@ -21,7 +21,7 @@ use tonic::{Status, Streaming};
 ///
 /// Attached on each (re)connect, only when the channel is secure.
 #[tonic::async_trait]
-pub trait CallCredentials: Send + Sync + std::fmt::Debug + 'static {
+pub trait TonicCallCredentials: Send + Sync + std::fmt::Debug + 'static {
     /// Generates the authentication metadata for a specific call.
     async fn get_request_metadata(
         &self,
@@ -101,7 +101,7 @@ impl Decoder for BytesDecoder {
 pub struct TonicTransport {
     channel: Channel,
     secure: bool,
-    call_creds: Option<Arc<dyn CallCredentials>>,
+    call_creds: Option<Arc<dyn TonicCallCredentials>>,
 }
 
 impl TonicTransport {
@@ -157,7 +157,7 @@ pub struct TonicTransportBuilder {
     /// Note: a minimal hook; the `grpc` crate provides the richer pre-built-channel pattern.
     channel: Option<(Channel, bool)>,
     /// Per-stream call credentials for the ADS stream.
-    call_creds: Option<Arc<dyn CallCredentials>>,
+    call_creds: Option<Arc<dyn TonicCallCredentials>>,
 }
 
 impl TonicTransportBuilder {
@@ -180,7 +180,7 @@ impl TonicTransportBuilder {
     ///
     /// Attached on each (re)connect, only over a secure channel; over an insecure
     /// channel, stream creation fails. Not refreshed mid-stream.
-    pub fn with_call_credentials(mut self, creds: Arc<dyn CallCredentials>) -> Self {
+    pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
         self.call_creds = Some(creds);
         self
     }
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl CallCredentials for MockCreds {
+    impl TonicCallCredentials for MockCreds {
         async fn get_request_metadata(
             &self,
             metadata: &mut tonic::metadata::MetadataMap,

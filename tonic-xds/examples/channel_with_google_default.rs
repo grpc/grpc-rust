@@ -1,7 +1,7 @@
 //! Call an xDS-fronted service through GCP Traffic Director (`google_default`).
 //!
 //! Supplies the Application Default Credentials (ADC) token as xDS call
-//! credentials by implementing `CallCredentials` directly against
+//! credentials by implementing `TonicCallCredentials` directly against
 //! `google-cloud-auth`.
 //!
 //! Needs a `google_default` bootstrap + ADC:
@@ -15,18 +15,17 @@ use std::sync::Arc;
 
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder};
 use tonic_xds::testutil::proto::helloworld::{HelloRequest, greeter_client::GreeterClient};
-use tonic_xds::{XdsChannelBuilder, XdsChannelConfig, XdsUri};
-use xds_client::CallCredentials;
+use tonic_xds::{TonicCallCredentials, XdsChannelBuilder, XdsChannelConfig, XdsUri};
 
 const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// Fetches ADC tokens directly from `google-cloud-auth`.
 #[derive(Debug)]
-struct AdcCallCredentials {
+struct AdcTonicCallCredentials {
     creds: AccessTokenCredentials,
 }
 
-impl AdcCallCredentials {
+impl AdcTonicCallCredentials {
     fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let creds = Builder::default()
             .with_scopes([CLOUD_PLATFORM_SCOPE])
@@ -36,7 +35,7 @@ impl AdcCallCredentials {
 }
 
 #[tonic::async_trait]
-impl CallCredentials for AdcCallCredentials {
+impl TonicCallCredentials for AdcTonicCallCredentials {
     async fn get_request_metadata(
         &self,
         metadata: &mut tonic::metadata::MetadataMap,
@@ -65,7 +64,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let target_str = std::env::var("XDS_TARGET").unwrap_or_else(|_| "xds:///my-service".into());
     let target = XdsUri::parse(&target_str)?;
 
-    let creds: Arc<dyn CallCredentials> = Arc::new(AdcCallCredentials::new()?);
+    let creds: Arc<dyn TonicCallCredentials> = Arc::new(AdcTonicCallCredentials::new()?);
 
     let channel =
         XdsChannelBuilder::new(XdsChannelConfig::new(target).with_call_credentials(creds))

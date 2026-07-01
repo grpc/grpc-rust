@@ -24,9 +24,10 @@
 
 use crate::attributes::Attributes;
 use crate::credentials::SecurityLevel;
+use crate::rt::BoxEndpoint;
 
-pub struct HandshakeOutput<T> {
-    pub endpoint: T,
+pub struct HandshakeOutput {
+    pub endpoint: BoxEndpoint,
     pub security: ServerConnectionSecurityInfo,
 }
 

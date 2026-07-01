@@ -45,7 +45,6 @@ use crate::credentials::server;
 use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
 use crate::rt::BoxEndpoint;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
 pub const PROTOCOL_NAME: &str = "local";
@@ -162,15 +161,14 @@ impl LocalServerCredentials {
     }
 }
 
+#[async_trait]
 impl ServerCredentials for LocalServerCredentials {
-    type Output<I> = I;
-
-    async fn accept<Input: GrpcEndpoint>(
+    async fn accept(
         &self,
-        source: Input,
+        source: BoxEndpoint,
         _runtime: GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<server::HandshakeOutput<Self::Output<Input>>, String> {
+    ) -> Result<server::HandshakeOutput, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(server::HandshakeOutput {
@@ -321,7 +319,7 @@ mod test {
         let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
 
         let output = creds
-            .accept(server_stream, runtime, private::Internal)
+            .accept(Box::new(server_stream), runtime, private::Internal)
             .await
             .unwrap();
         let endpoint = output.endpoint;
@@ -336,6 +334,58 @@ mod test {
             .await
             .unwrap();
         assert_eq!(&buf[..], b"hello grpc");
+
+        client_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dyn_server_credential_dispatch() {
+        let creds = LocalServerCredentials::new();
+        let dyn_creds: Arc<dyn ServerCredentials> = Arc::new(creds);
+
+        let info = dyn_creds.info();
+        assert_eq!(info.security_protocol, "local");
+
+        let addr = "127.0.0.1:0";
+        let runtime = rt::default_runtime();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr).await.unwrap();
+            let data = b"hello dynamic grpc server";
+            stream.write_all(data).await.unwrap();
+
+            // Keep the connection alive for a bit so server can read
+            let mut buf = vec![0u8; 1];
+            let _ = stream.read(&mut buf).await;
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
+
+        let result = dyn_creds
+            .accept(
+                Box::new(server_stream) as BoxEndpoint,
+                runtime,
+                private::Internal,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        let endpoint = output.endpoint;
+        let security_info = output.security;
+
+        assert_eq!(security_info.security_protocol(), "local");
+        assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
+
+        let mut buf = vec![0u8; 25];
+        EndpointIoStream::new(endpoint)
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..], b"hello dynamic grpc server");
 
         client_handle.abort();
     }

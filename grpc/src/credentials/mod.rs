@@ -37,7 +37,6 @@
 
 pub mod call;
 pub(crate) mod client;
-pub(crate) mod dyn_wrapper;
 mod local;
 #[cfg(feature = "tls-rustls")]
 pub mod rustls;
@@ -56,7 +55,6 @@ use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
 use crate::rt::BoxEndpoint;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
 /// Client-side trait for all live gRPC wire protocols and supported transport
@@ -100,11 +98,8 @@ pub trait ChannelCredentials: Send + Sync + 'static {
 
 /// Server-side trait for all live gRPC wire protocols and supported
 /// transport security protocols (e.g., TLS, ALTS).
-#[trait_variant::make(Send)]
-pub trait ServerCredentials: Sync + 'static {
-    #[doc(hidden)]
-    type Output<I>;
-
+#[async_trait]
+pub trait ServerCredentials: Send + Sync + 'static {
     /// Provides the ProtocolInfo of these credentials.
     fn info(&self) -> &ProtocolInfo;
 
@@ -113,12 +108,12 @@ pub trait ServerCredentials: Sync + 'static {
     /// This method wraps the incoming raw `source` connection with the configured
     /// security protocol (e.g., TLS).
     #[doc(hidden)]
-    async fn accept<Input: GrpcEndpoint>(
+    async fn accept(
         &self,
-        source: Input,
+        source: BoxEndpoint,
         runtime: GrpcRuntime,
         token: private::Internal,
-    ) -> Result<server::HandshakeOutput<Self::Output<Input>>, String>;
+    ) -> Result<server::HandshakeOutput, String>;
 }
 
 /// Defines the level of protection provided by an established connection.

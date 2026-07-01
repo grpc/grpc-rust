@@ -30,14 +30,14 @@ use http::HeaderValue;
 use hyper_util::client::proxy::matcher::Matcher;
 use url::Url;
 
-use super::ResolverOptions;
-use super::Target;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ChannelController;
 use crate::client::name_resolution::NopResolver;
 use crate::client::name_resolution::Resolver;
 use crate::client::name_resolution::ResolverBuilder;
+use crate::client::name_resolution::ResolverOptions;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::service_config::ServiceConfig;
 use crate::credentials::common::Authority;
@@ -79,10 +79,7 @@ pub(crate) struct Builder {
 
 impl ResolverBuilder for Builder {
     fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
-        match self.new_resolver(target, options, MATCHER.as_ref()) {
-            Ok(resolver) => resolver,
-            Err((err, options)) => NopResolver::new_with_err(err, options),
-        }
+        self.new_resolver(target, options, MATCHER.as_ref())
     }
 
     fn scheme(&self) -> &str {
@@ -109,14 +106,14 @@ impl Builder {
         target: &Target,
         options: ResolverOptions,
         matcher: Option<&Matcher>,
-    ) -> Result<Box<dyn Resolver>, (String, ResolverOptions)> {
+    ) -> Box<dyn Resolver> {
         // Skip proxy lookup for non-DNS targets.
         if target.scheme() != "dns" {
-            return Ok(self.child_builder.build(target, options));
+            return self.child_builder.build(target, options);
         }
         // If HTTPS_PROXY is unset, avoid parsing the target as a DNS hostname.
         let Some(matcher) = matcher else {
-            return Ok(self.child_builder.build(target, options));
+            return self.child_builder.build(target, options);
         };
 
         let target_authority = self.child_builder.default_authority(target);
@@ -125,7 +122,10 @@ impl Builder {
         let url_obj = match Url::parse(&format!("https://{target_authority}")) {
             Ok(url) => url,
             Err(err) => {
-                return Err((format!("invalid target host in URL: {err}"), options));
+                return NopResolver::new_with_err(
+                    format!("invalid target host in URL: {err}"),
+                    options,
+                );
             }
         };
 
@@ -144,15 +144,15 @@ impl Builder {
             Ok(uri) => uri,
             Err(err) => {
                 // This should not error since the url crate parsed the host.
-                return Err((
+                return NopResolver::new_with_err(
                     format!("failed to parse target authority: {}", err),
                     options,
-                ));
+                );
             }
         };
 
         let Some(intercept) = matcher.intercept(&uri) else {
-            return Ok(self.child_builder.build(target, options));
+            return self.child_builder.build(target, options);
         };
 
         let mut proxy_authorization_header = intercept.basic_auth().cloned();
@@ -162,14 +162,14 @@ impl Builder {
 
         let proxy_options = ProxyOptions {
             proxy_authorization_header,
-            connect_addr: explicit_authority,
+            connect_authority: explicit_authority,
         };
 
         let Some(proxy_host) = intercept.uri().authority() else {
-            return Err((
+            return NopResolver::new_with_err(
                 format!("proxy URI missing authority: {}", intercept.uri()),
                 options,
-            ));
+            );
         };
 
         // `proxy_host` is be a valid URL authority. Because the `url` crate
@@ -180,19 +180,19 @@ impl Builder {
         let proxy_target: Target = match target_str.parse() {
             Ok(t) => t,
             Err(e) => {
-                return Err((
+                return NopResolver::new_with_err(
                     format!("failed to parse proxy target {target_str}: {e}"),
                     options,
-                ));
+                );
             }
         };
 
         let child = dns::Builder {}.build(&proxy_target, options);
 
-        Ok(Box::new(HttpsProxyResolver {
+        Box::new(HttpsProxyResolver {
             child,
             proxy_options: Arc::new(proxy_options),
-        }))
+        })
     }
 }
 
@@ -205,7 +205,7 @@ struct HttpsProxyResolver {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub(crate) struct ProxyOptions {
     proxy_authorization_header: Option<HeaderValue>,
-    connect_addr: String,
+    connect_authority: String,
 }
 
 impl ProxyOptions {
@@ -216,8 +216,8 @@ impl ProxyOptions {
 
     /// Returns the address of the proxy server to connect to (host:port).
     /// This is Punycode-encoded, i.e., it's a valid URL host:port.
-    pub(crate) fn target_authority(&self) -> &str {
-        &self.connect_addr
+    pub(crate) fn connect_authority(&self) -> &str {
+        &self.connect_authority
     }
 }
 
@@ -398,10 +398,7 @@ mod tests {
             work_scheduler,
         };
 
-        let mut resolver = match builder.new_resolver(&target, options, matcher) {
-            Ok(resolver) => resolver,
-            Err((err, _)) => panic!("failed to build resolver: {err}"),
-        };
+        let mut resolver = builder.new_resolver(&target, options, matcher);
 
         work_rx.recv().await.unwrap();
 
@@ -449,7 +446,7 @@ mod tests {
         expected_header.set_sensitive(true);
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: Some(expected_header),
-            connect_addr: "target.example.com:443".to_string(),
+            connect_authority: "target.example.com:443".to_string(),
         };
 
         for address in &addresses {
@@ -496,7 +493,7 @@ mod tests {
             proxy_opts,
             &ProxyOptions {
                 proxy_authorization_header: None,
-                connect_addr: "xn--tst-qla.example.com:443".to_string(),
+                connect_authority: "xn--tst-qla.example.com:443".to_string(),
             }
         );
     }
@@ -528,10 +525,7 @@ mod tests {
             work_scheduler,
         };
 
-        let mut resolver = match builder.new_resolver(&target, options, Some(&matcher)) {
-            Ok(resolver) => resolver,
-            Err((err, options)) => NopResolver::new_with_err(err, options),
-        };
+        let mut resolver = builder.new_resolver(&target, options, Some(&matcher));
 
         work_rx.recv().await.unwrap();
 
@@ -605,7 +599,7 @@ mod tests {
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
-            connect_addr: "target.example.com:443".to_string(),
+            connect_authority: "target.example.com:443".to_string(),
         };
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
@@ -632,7 +626,7 @@ mod tests {
         assert_eq!(&*addresses[0].address, "127.0.0.1:8080");
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
-            connect_addr: "other.example.com:443".to_string(),
+            connect_authority: "other.example.com:443".to_string(),
         };
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
         assert_eq!(proxy_opts, &expected_proxy_opts);
@@ -668,7 +662,7 @@ mod tests {
 
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
-            connect_addr: "target.example.com:443".to_string(),
+            connect_authority: "target.example.com:443".to_string(),
         };
 
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
@@ -693,7 +687,7 @@ mod tests {
 
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
-            connect_addr: "[::1]:443".to_string(),
+            connect_authority: "[::1]:443".to_string(),
         };
 
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");
@@ -750,7 +744,7 @@ mod tests {
         assert_eq!(addresses.len(), 1);
         let expected_proxy_opts = ProxyOptions {
             proxy_authorization_header: None,
-            connect_addr: "custom.authority.example.com:1234".to_string(),
+            connect_authority: "custom.authority.example.com:1234".to_string(),
         };
 
         let proxy_opts = proxy_options_for_addr(&addresses[0]).expect("ProxyOptions not found");

@@ -132,19 +132,23 @@ pub(crate) struct SecurityOpts {
     pub(crate) handshake_info: ClientHandshakeInfo,
 }
 
-/// Options for establishing an HTTP CONNECT proxy tunnel.
+/// Configuration options for establishing an HTTP `CONNECT` proxy tunnel.
+///
+/// This may be added as an [`Address`] attribute by a
+/// [`crate::client::name_resolution::Resolver`]. If present, the subchannel
+/// will automatically handle the HTTP `CONNECT` handshake.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub(crate) struct ProxyOptions {
     proxy_authorization_header: Option<HeaderValue>,
-    connect_authority: String,
+    target_authority: String,
 }
 
 impl ProxyOptions {
     /// Creates a new `ProxyOptions`.
     ///
     /// # Arguments
-    /// * `target_authority` - The address of the target server to connect to (host:port).
-    ///   Must be a valid hostname.
+    /// * `target_authority` - The address of the target server to connect to
+    ///   (host:port). Must be a valid hostname.
     /// * `proxy_authorization_header` - The value of the `Proxy-Authorization` header, if present.
     pub(crate) fn new(
         target_authority: String,
@@ -152,7 +156,7 @@ impl ProxyOptions {
     ) -> Self {
         Self {
             proxy_authorization_header,
-            connect_authority: target_authority,
+            target_authority,
         }
     }
 
@@ -163,8 +167,8 @@ impl ProxyOptions {
 
     /// Returns the address of the proxy server to connect to (host:port).
     /// This is Punycode-encoded, i.e., it's a valid URL host:port.
-    pub(crate) fn connect_authority(&self) -> &str {
-        &self.connect_authority
+    pub(crate) fn target_authority(&self) -> &str {
+        &self.target_authority
     }
 
     /// Extracts `ProxyOptions` from the given `Address` attributes, if present.

@@ -80,7 +80,7 @@ mod tests {
     use crate::credentials::SecurityLevel;
     use crate::rt;
     use crate::rt::AsyncIoAdapter;
-    use crate::rt::tokio::TokioIoStream;
+    use crate::rt::TokioIoStream;
 
     #[tokio::test]
     async fn test_dyn_server_credential_dispatch() {

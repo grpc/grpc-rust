@@ -46,7 +46,7 @@ use crate::credentials::rustls::server::ServerTlsConfig;
 use crate::credentials::rustls::server::TlsClientCertificateRequestType;
 use crate::private;
 use crate::rt::AsyncIoAdapter;
-use crate::rt::tokio::TokioIoStream;
+use crate::rt::TokioIoStream;
 use crate::rt::{self};
 
 static INIT: Once = Once::new();

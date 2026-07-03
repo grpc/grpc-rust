@@ -206,7 +206,7 @@ mod test {
     use crate::rt::AsyncIoAdapter;
     use crate::rt::GrpcEndpoint;
     use crate::rt::TcpOptions;
-    use crate::rt::tokio::TokioIoStream;
+    use crate::rt::TokioIoStream;
 
     #[test]
     fn test_security_level_for_endpoint_success() {

@@ -42,7 +42,7 @@ use crate::rt::AsyncIoAdapter;
 use crate::rt::BoxEndpoint;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
-use crate::rt::tokio::TokioIoStream;
+use crate::rt::TokioIoStream;
 
 mod rewind;
 

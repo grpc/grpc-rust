@@ -50,18 +50,18 @@ use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::private::Sealed;
 use crate::client::name_resolution::Address;
-use crate::client::name_resolution::proxy_resolver::proxy_options_for_addr;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::transport::DynTransport;
+use crate::client::transport::ProxyOptions;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::RequestHeaders;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::common::Authority;
+use crate::private;
 use crate::rt::GrpcRuntime;
 
 type SharedInvoke = Arc<dyn DynInvoke>;
@@ -86,7 +86,7 @@ impl Backoff for NopBackoff {
 
 struct ReadyState {
     service: Box<dyn DynInvoke>,
-    security_info: ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>,
+    security_info: ChannelSecurityInfo,
     authority: Authority,
 }
 
@@ -188,7 +188,7 @@ impl DynInvoke for InternalSubchannel {
             let creds = data
                 .security_opts
                 .credentials
-                .get_call_credentials()
+                .get_call_credentials(private::Internal)
                 .cloned();
 
             (state, creds)
@@ -314,7 +314,7 @@ impl InternalSubchannel {
         let on_drop = Arc::new(Notify::new());
         let address_string = address.address.to_string();
         let transport_options = TransportOptions::default();
-        if let Some(proxy_opts) = proxy_options_for_addr(&address) {
+        if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {
             security_opts.credentials = Arc::new(HttpConnectHandshaker::new(
                 security_opts.credentials,
                 proxy_opts,

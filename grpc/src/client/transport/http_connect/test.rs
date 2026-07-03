@@ -25,6 +25,7 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Once;
 
 use rustls::crypto::ring;
@@ -34,7 +35,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use super::HttpConnectHandshaker;
-use crate::client::name_resolution::proxy_resolver::ProxyOptions;
+use crate::client::transport::ProxyOptions;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
 use crate::credentials::ServerCredentials;
@@ -115,7 +116,7 @@ async fn test_proxy_success_no_auth() {
     let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
 
     let proxy_options = ProxyOptions::new(target_host, None);
-    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+    let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
     let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
@@ -125,7 +126,13 @@ async fn test_proxy_success_no_auth() {
     let authority = Authority::new("localhost".to_string(), Some(server_addr.port()));
 
     let handshake_output = handshaker
-        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
         .await
         .unwrap();
 
@@ -196,7 +203,7 @@ async fn test_proxy_success_with_auth() {
 
     let auth_header = http::HeaderValue::from_str(expected_auth).unwrap();
     let proxy_options = ProxyOptions::new(target_host, Some(auth_header));
-    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+    let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
     let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
@@ -206,7 +213,13 @@ async fn test_proxy_success_with_auth() {
     let authority = Authority::new("localhost".to_string(), Some(server_addr.port()));
 
     let handshake_output = handshaker
-        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
         .await
         .unwrap();
 
@@ -238,7 +251,7 @@ async fn test_proxy_failure_large_header() {
     let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
 
     let proxy_options = ProxyOptions::new(target_host, None);
-    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+    let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
     let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
@@ -248,7 +261,13 @@ async fn test_proxy_failure_large_header() {
     let authority = Authority::new("localhost".to_string(), Some(12345));
 
     let handshake_result = handshaker
-        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
         .await;
 
     let err_msg = match handshake_result {
@@ -280,7 +299,7 @@ async fn test_proxy_failure_invalid_response() {
     let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
 
     let proxy_options = ProxyOptions::new(target_host, None);
-    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+    let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
     let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
@@ -290,7 +309,13 @@ async fn test_proxy_failure_invalid_response() {
     let authority = Authority::new("localhost".to_string(), Some(12345));
 
     let handshake_result = handshaker
-        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
         .await;
 
     let err_msg = match handshake_result {
@@ -322,7 +347,7 @@ async fn test_proxy_failure_bad_status() {
     let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
 
     let proxy_options = ProxyOptions::new(target_host, None);
-    let handshaker = HttpConnectHandshaker::new(rustls_creds, &proxy_options);
+    let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
     let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
@@ -332,7 +357,13 @@ async fn test_proxy_failure_bad_status() {
     let authority = Authority::new("localhost".to_string(), Some(12345));
 
     let handshake_result = handshaker
-        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
         .await;
 
     let err_msg = match handshake_result {
@@ -348,7 +379,7 @@ async fn test_proxy_failure_bad_status() {
 
 #[tokio::test]
 async fn test_proxy_success_local_rewind_batched() {
-    let local_creds = LocalChannelCredentials::new();
+    let local_creds = LocalChannelCredentials::new_arc();
 
     // Start a mock target TCP server that sends the "later" part of the
     // response.
@@ -388,7 +419,13 @@ async fn test_proxy_success_local_rewind_batched() {
     let authority = Authority::new("localhost".to_string(), Some(target_addr.port()));
 
     let handshake_output = handshaker
-        .connect(&authority, endpoint, &info, &runtime, private::Internal)
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
         .await
         .unwrap();
 
@@ -506,7 +543,7 @@ async fn spawn_proxy(config: ProxyConfig) -> SocketAddr {
                                 }
                             }
                             if !auth_ok {
-                                let res = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+                                let res = b"HTTP/1.1 407 Proxy Authentication Required\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
                                 client_stream.write_all(res).await.unwrap();
                                 return;
                             }

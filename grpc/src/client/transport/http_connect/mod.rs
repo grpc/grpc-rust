@@ -27,8 +27,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tonic::async_trait;
 
-use crate::client::name_resolution::proxy_resolver::ProxyOptions;
+use crate::client::transport::ProxyOptions;
 use crate::client::transport::http_connect::rewind::Rewind;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
@@ -38,6 +39,7 @@ use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
 use crate::rt::AsyncIoAdapter;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::tokio::TokioIoStream;
@@ -135,14 +137,14 @@ async fn do_connect_handshake<I: GrpcEndpoint>(
 
 /// A credential wrapper that performs an HTTP CONNECT handshake before
 /// delegating to an inner security credential (like TLS).
-pub(crate) struct HttpConnectHandshaker<C> {
-    inner: C,
+pub(crate) struct HttpConnectHandshaker {
+    inner: Arc<dyn ChannelCredentials>,
     options: ProxyOptions,
 }
 
-impl<C: ChannelCredentials> HttpConnectHandshaker<C> {
+impl HttpConnectHandshaker {
     /// Constructs a new `ProxyChannelCredentials` wrapping the inner credentials.
-    pub(crate) fn new(inner: C, options: &ProxyOptions) -> Self {
+    pub(crate) fn new(inner: Arc<dyn ChannelCredentials>, options: &ProxyOptions) -> Self {
         Self {
             inner,
             options: options.clone(),
@@ -153,12 +155,8 @@ impl<C: ChannelCredentials> HttpConnectHandshaker<C> {
 /// The I/O stream wrapper returned after the HTTP CONNECT handshake succeeds.
 type ProxyStream<I> = TokioIoStream<Rewind<AsyncIoAdapter<I>>>;
 
-impl<C: ChannelCredentials> ChannelCredentials for HttpConnectHandshaker<C> {
-    // The security context is entirely dictated by the inner credential (e.g., TLS).
-    type ContextType = C::ContextType;
-
-    type Output<I> = C::Output<ProxyStream<I>>;
-
+#[async_trait]
+impl ChannelCredentials for HttpConnectHandshaker {
     fn info(&self) -> &ProtocolInfo {
         self.inner.info()
     }
@@ -167,21 +165,21 @@ impl<C: ChannelCredentials> ChannelCredentials for HttpConnectHandshaker<C> {
         self.inner.get_call_credentials(token)
     }
 
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+    ) -> Result<HandshakeOutput, String> {
         // Perform the HTTP CONNECT handshake.
         let proxied_stream = do_connect_handshake(source, &self.options).await?;
 
         // Delegate the actual security handshake (e.g., TLS) to the wrapped
         // credentials.
         self.inner
-            .connect(authority, proxied_stream, info, runtime, token)
+            .connect(authority, Box::new(proxied_stream), info, runtime, token)
             .await
     }
 }

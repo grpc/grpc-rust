@@ -25,11 +25,13 @@
 use std::net::IpAddr;
 
 use hickory_resolver::TokioResolver;
+use hickory_resolver::config::ConnectionConfig;
 use hickory_resolver::config::LookupIpStrategy;
-use hickory_resolver::config::NameServerConfigGroup;
+use hickory_resolver::config::NameServerConfig;
+use hickory_resolver::config::ProtocolConfig;
 use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::config::ResolverOpts;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use crate::rt::ResolverOptions;
 use crate::rt::{self};
@@ -53,18 +55,26 @@ impl rt::DnsResolver for DnsResolver {
     }
 
     async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, String> {
-        let response: Vec<_> = self
+        let lookup = self
             .resolver
             .txt_lookup(name)
             .await
-            .map_err(|err| err.to_string())?
+            .map_err(|err| err.to_string())?;
+        let response: Vec<_> = lookup
+            .answers()
             .iter()
-            .map(|txt_record| {
-                txt_record
-                    .iter()
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                    .collect::<Vec<String>>()
-                    .join("")
+            .filter_map(|record| {
+                if let hickory_resolver::proto::rr::RData::TXT(ref txt) = record.data {
+                    Some(
+                        txt.txt_data
+                            .iter()
+                            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                            .collect::<Vec<String>>()
+                            .join(""),
+                    )
+                } else {
+                    None
+                }
             })
             .collect();
         Ok(response)
@@ -74,12 +84,16 @@ impl rt::DnsResolver for DnsResolver {
 impl DnsResolver {
     pub(super) fn new(opts: ResolverOptions) -> Result<Self, String> {
         let builder = if let Some(server_addr) = opts.server_addr {
-            let provider = TokioConnectionProvider::default();
-            let name_servers = NameServerConfigGroup::from_ips_clear(
-                &[server_addr.ip()],
-                server_addr.port(),
+            let provider = TokioRuntimeProvider::default();
+            let mut udp_config = ConnectionConfig::new(ProtocolConfig::Udp);
+            udp_config.port = server_addr.port();
+            let mut tcp_config = ConnectionConfig::new(ProtocolConfig::Tcp);
+            tcp_config.port = server_addr.port();
+            let name_servers = vec![NameServerConfig::new(
+                server_addr.ip(),
                 true,
-            );
+                vec![udp_config, tcp_config],
+            )];
             let config = ResolverConfig::from_parts(None, vec![], name_servers);
             TokioResolver::builder_with_config(config, provider)
         } else {
@@ -88,7 +102,10 @@ impl DnsResolver {
         let mut resolver_opts = ResolverOpts::default();
         resolver_opts.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
         Ok(DnsResolver {
-            resolver: builder.with_options(resolver_opts).build(),
+            resolver: builder
+                .with_options(resolver_opts)
+                .build()
+                .map_err(|err| err.to_string())?,
         })
     }
 }
@@ -99,16 +116,18 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use hickory_resolver::Name;
-    use hickory_server::ServerFuture;
-    use hickory_server::authority::Catalog;
-    use hickory_server::authority::ZoneType;
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    use hickory_server::Server;
     use hickory_server::proto::rr::LowerName;
+    use hickory_server::proto::rr::Name;
     use hickory_server::proto::rr::RData;
     use hickory_server::proto::rr::Record;
     use hickory_server::proto::rr::rdata::A;
     use hickory_server::proto::rr::rdata::TXT;
-    use hickory_server::store::in_memory::InMemoryAuthority;
+    use hickory_server::store::in_memory::InMemoryZoneHandler;
+    use hickory_server::zone_handler::AxfrPolicy;
+    use hickory_server::zone_handler::Catalog;
+    use hickory_server::zone_handler::ZoneType;
     use tokio::net::UdpSocket;
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
@@ -214,8 +233,11 @@ mod tests {
     /// read from the returned struct.
     async fn start_in_memory_dns_server(host: &str, records: Vec<Record>) -> FakeDns {
         // Create a simple A record for `test.local.`
-        let authority =
-            InMemoryAuthority::empty(Name::from_ascii(host).unwrap(), ZoneType::Primary, false);
+        let authority = InMemoryZoneHandler::<TokioRuntimeProvider>::empty(
+            Name::from_ascii(host).unwrap(),
+            ZoneType::Primary,
+            AxfrPolicy::Deny,
+        );
 
         for record in records {
             authority.upsert(record, 0).await;
@@ -227,7 +249,7 @@ mod tests {
             vec![Arc::new(authority)],
         );
 
-        let mut server = ServerFuture::new(catalog);
+        let mut server = Server::new(catalog);
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();

@@ -40,7 +40,6 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::credentials::ChannelCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::ALPN_PROTO_STR_H2;
@@ -432,18 +431,10 @@ async fn check_client_resumption_disabled(
             .unwrap();
         let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
-        let result = creds
-            .connect(
-                &authority,
-                endpoint,
-                &ClientHandshakeInfo::default(),
-                &runtime,
-                private::Internal,
-            )
+        let (tls_stream, _security) = creds
+            .connect_tls(&authority, endpoint)
             .await
             .expect("Handshake failed");
-
-        let tls_stream = result.endpoint;
 
         let connection = match tls_stream.inner() {
             tokio_rustls::TlsStream::Client(conn) => conn.get_ref().1,

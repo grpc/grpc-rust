@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use crate::client::route::{RouteDecision, RouteInput, Router};
 use crate::common::async_util::{AbortOnDrop, BoxFuture};
 use crate::xds::cache::XdsCache;
+use crate::xds::resource::hash_policy::HashPolicyConfig;
 use crate::xds::resource::route_config::{
     HeaderMatchSpecifierConfig, HeaderMatcherConfig, PathSpecifierConfig, RouteConfig,
     RouteConfigAction, RouteConfigMatch, RouteConfigResource, VirtualHostConfig, WeightedCluster,
@@ -118,7 +119,19 @@ fn resolve_route(
             .ok_or(RoutingError::EmptyWeightedClusters)?
             .to_string(),
     };
-    Ok(RouteDecision { cluster })
+
+    // gRFC A42 ring-hash request hash. The policy list is empty for now, so
+    // `request_hash` resolves to `None` and the ring-hash picker falls back to a
+    // random hash.
+    // TODO(madhurishgupta): populate hash policies from the route's RDS
+    // `RouteAction.hash_policy` (later PR).
+    let policies: &[HashPolicyConfig] = &[];
+    let request_hash = HashPolicyConfig::request_hash(headers, policies);
+
+    Ok(RouteDecision {
+        cluster,
+        request_hash,
+    })
 }
 
 /// Error returned when routing fails.

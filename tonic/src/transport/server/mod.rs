@@ -209,7 +209,42 @@ impl<L> Server<L> {
         Server { load_shed, ..self }
     }
 
-    /// Set a timeout on for all request handlers.
+    /// Set a maximum duration for each request handler.
+    ///
+    /// If [`timeout`] is not called, the server does not impose a per-request deadline.
+    /// Clients may still send a [`grpc-timeout`][spec] metadata header (for example via
+    /// [`Endpoint::timeout`]), which is enforced even when no server timeout is configured.
+    ///
+    /// # Precedence
+    ///
+    /// When both the server and the client set a deadline, the shorter duration is used.
+    ///
+    /// # Error behavior
+    ///
+    /// The timeout applies to the wall-clock time for the request handler future to
+    /// complete. If the handler does not finish within the budget, the request fails with
+    /// [`TimeoutExpired`], which surfaces to clients as a [`Status`] with code
+    /// [`Code::Cancelled`] and message `"Timeout expired"`.
+    ///
+    /// # Streaming note
+    ///
+    /// The deadline applies to the handler future returned by the service, not to
+    /// individual messages within a streaming RPC. Streaming timeouts may therefore differ
+    /// from per-message expectations.
+    ///
+    /// # Graceful shutdown
+    ///
+    /// When using [`Server::serve_with_shutdown`] or [`Server::serve_with_incoming_shutdown`],
+    /// completing the shutdown signal stops accepting new connections and begins draining
+    /// in-flight requests. Active unary handlers may continue until they finish or their
+    /// configured timeout elapses. Streaming connections are drained by hyper's graceful
+    /// shutdown and are not bounded by this timeout in the same way as unary requests.
+    ///
+    /// # Related APIs
+    ///
+    /// Prefer this method over wrapping the service with [`tower::timeout::TimeoutLayer`]
+    /// via [`Server::layer`]. `TimeoutLayer` can produce different error types than
+    /// [`TimeoutExpired`].
     ///
     /// # Example
     ///
@@ -220,6 +255,16 @@ impl<L> Server<L> {
     /// # let builder = Server::builder();
     /// builder.timeout(Duration::from_secs(30));
     /// ```
+    ///
+    /// [`timeout`]: Server::timeout
+    /// [`Endpoint::timeout`]: crate::transport::channel::Endpoint::timeout
+    /// [`TimeoutExpired`]: crate::TimeoutExpired
+    /// [`Status`]: crate::Status
+    /// [`Code::Cancelled`]: crate::Code::Cancelled
+    /// [`Server::serve_with_shutdown`]: Server::serve_with_shutdown
+    /// [`Server::serve_with_incoming_shutdown`]: Server::serve_with_incoming_shutdown
+    /// [`Server::layer`]: Server::layer
+    /// [spec]: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
     #[must_use]
     pub fn timeout(self, timeout: Duration) -> Self {
         Server {
@@ -1088,9 +1133,14 @@ impl<L> Router<L> {
     /// `serve_with_shutdown` this method will also take a signal future to
     /// gracefully shutdown the server.
     ///
+    /// After the shutdown signal completes, the server stops accepting new connections and
+    /// drains in-flight work. Active unary handlers respect [`Server::timeout`] (if
+    /// configured) while connections close.
+    ///
     /// This method discards any provided [`Server`] TCP configuration.
     ///
     /// [`Server`]: struct.Server.html
+    /// [`Server::timeout`]: Server::timeout
     pub async fn serve_with_incoming_shutdown<I, IO, IE, F, ResBody>(
         self,
         incoming: I,

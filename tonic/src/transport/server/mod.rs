@@ -242,7 +242,7 @@ impl<L> Server<L> {
     ///
     /// # Related APIs
     ///
-    /// Prefer this method over wrapping the service with [`tower::timeout::TimeoutLayer`]
+    /// Prefer this method over wrapping the service with `tower::timeout::TimeoutLayer`
     /// via [`Server::layer`]. `TimeoutLayer` can produce different error types than
     /// [`TimeoutExpired`].
     ///

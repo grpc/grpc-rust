@@ -893,11 +893,9 @@ async fn connect_timeout_exceeded() {
     // Create the channel with SlowChannelCredentials (21s).
     // The default timeout is 20s.
     let target = format!("dns:///{}", addr);
-    let channel = Channel::new(
-        &target,
-        SlowChannelCredentials::new_arc(Duration::from_secs(21)),
-        Default::default(),
-    );
+    let channel = Channel::builder(&target)
+        .credentials(SlowChannelCredentials::new_arc(Duration::from_secs(21)))
+        .build();
 
     // Spawn the RPC call because it will block waiting for connection.
     let rpc_handle = tokio::spawn(async move { perform_unary_echo_failure(&channel).await });
@@ -949,11 +947,9 @@ async fn trailers_only_metadata() {
     });
 
     let target = format!("dns:///{}", addr);
-    let channel = Channel::new(
-        &target,
-        LocalChannelCredentials::new_arc(),
-        Default::default(),
-    );
+    let channel = Channel::builder(&target)
+        .credentials(LocalChannelCredentials::new_arc())
+        .build();
 
     let trailers = perform_unary_echo_failure(&channel).await;
 

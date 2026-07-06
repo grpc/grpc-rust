@@ -129,10 +129,4 @@ mod tests {
 
         client_handle.abort();
     }
-
-    #[test]
-    fn test_channel_builder_with_dyn_creds() {
-        let dyn_creds = LocalChannelCredentials::new_arc() as Arc<dyn DynChannelCredentials>;
-        let _builder = crate::client::Channel::builder("localhost").credentials(dyn_creds);
-    }
 }

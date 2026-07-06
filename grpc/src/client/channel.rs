@@ -76,6 +76,7 @@ use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::RequestHeaders;
+use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt;
@@ -140,36 +141,36 @@ impl Invoke for Channel {
 pub struct MissingOpt;
 pub struct PresentOpt<T>(pub T);
 
-// An opaque struct for holding credentials provided to the builder while
-// complying with compiler public/private interface rules.
-pub struct CredentialConfig(
-    pub(crate) Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>,
-);
+type PresentCredentials = PresentOpt<Arc<dyn ChannelCredentials>>;
+type PresentRuntime = PresentOpt<GrpcRuntime>;
 
-/// A trait for types that can be converted into a `CredentialConfig`.
 pub trait IntoCredentialConfig {
-    #[doc(hidden)]
-    fn into_config(self) -> CredentialConfig;
+    fn into_config(self) -> Arc<dyn ChannelCredentials>;
 }
 
 impl<C> IntoCredentialConfig for Arc<C>
 where
-    C: crate::credentials::ChannelCredentials + Sized + 'static,
-    C::Output<Box<dyn crate::rt::GrpcEndpoint>>: crate::rt::GrpcEndpoint,
+    C: ChannelCredentials + Sized + 'static,
 {
-    fn into_config(self) -> CredentialConfig {
-        CredentialConfig(self)
+    fn into_config(self) -> Arc<dyn ChannelCredentials> {
+        self
     }
 }
 
-impl IntoCredentialConfig for Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials> {
-    fn into_config(self) -> CredentialConfig {
-        CredentialConfig(self)
+impl IntoCredentialConfig for Arc<dyn ChannelCredentials> {
+    fn into_config(self) -> Arc<dyn ChannelCredentials> {
+        self
     }
 }
 
-type PresentCredentials = PresentOpt<CredentialConfig>;
-type PresentRuntime = PresentOpt<GrpcRuntime>;
+impl<C> IntoCredentialConfig for C
+where
+    C: ChannelCredentials + Sized + 'static,
+{
+    fn into_config(self) -> Arc<dyn ChannelCredentials> {
+        Arc::new(self)
+    }
+}
 
 pub struct ChannelBuilder<C, R> {
     // Required values.
@@ -178,14 +179,14 @@ pub struct ChannelBuilder<C, R> {
     runtime: R, // Can be defaulted w/Tokio runtime feature.
 
     // Optional values.
-    // TODO(nford) In follow-up implement the following optional values:
+    // TODO(nathanielford) In follow-up implement the following optional values:
     // - default_service_config
     // - http_proxy_cfg
     // - disable_health_checks
     // - idle_timeout
     // - enable_channelz
     // - keepalive_cfg
-    channel_authority: Option<String>, // TODO(nford) Revist if this is subsumed by the SecurityOpts authority.
+    channel_authority: Option<String>, // TODO(nathanielford) Revist if this is subsumed by the SecurityOpts authority.
 }
 
 /// Impl for adding the (required) credentials to the builder.
@@ -221,7 +222,7 @@ impl<C> ChannelBuilder<C, MissingOpt> {
 }
 
 impl<C, R> ChannelBuilder<C, R> {
-    // TODO(nford) Revist if this is subsumed by the SecurityOpts authority.
+    // TODO(nathanielford) Revist if this is subsumed by the SecurityOpts authority.
     // May need to change how this is being set on the builder.
     pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
         self.channel_authority = Some(authority.into());
@@ -242,24 +243,24 @@ impl ChannelBuilder<PresentCredentials, MissingOpt> {
 
 impl ChannelBuilder<PresentCredentials, PresentRuntime> {
     pub fn build(self) -> Channel {
-        // TODO(nford) This construction is currently a rough-cut placeholder.
+        // TODO(nathanielford) This construction is currently a rough-cut placeholder.
         // The design of PersistentChannel and how and where it is initialized
         // will be finalized with the 'Internal Channel Design' with
         // consideration for:
         // - error handling (inc. always-failing resolvers due to invalid targets))
         // - testing (inc. credential and transport configuration)
 
-        // TODO(nford) Find a better place to set up default registries.
+        // TODO(nathanielford) Find a better place to set up default registries.
         setup_registeries();
 
-        let target = Url::from_str(self.target.as_str()).unwrap();
+        let target = Target::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
         let target = name_resolution::Target::from(target);
         let authority = self
             .channel_authority
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
-            credentials: self.credentials.0.0,
+            credentials: self.credentials.0,
             authority: Authority::from_host_port_str(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
@@ -345,7 +346,7 @@ impl ActiveChannel {
         let work_scheduler = Arc::new(ResolverWorkScheduler { wqtx });
         let resolver_opts = name_resolution::ResolverOptions {
             // authority: persistent_channel.security_opts.authority.clone(),
-            authority: "ignored".to_string(), // TODO(nford) currently, this option is always ignored.
+            authority: "ignored".to_string(), // TODO(nathanielford) currently, this option is always ignored.
             work_scheduler,
             runtime: runtime.clone(),
         };

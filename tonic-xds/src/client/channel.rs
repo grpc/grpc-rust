@@ -353,18 +353,44 @@ impl XdsChannelBuilder {
         self.build_tonic_grpc_channel()
     }
 
-    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, and retry policy.
-    #[cfg(all(test, feature = "tower-lb"))]
-    pub(crate) fn build_grpc_channel_from_parts(
+    /// Test-only: builds an `XdsChannelGrpc` (router + LB layer, no resource
+    /// manager) from a pre-populated cache. Only the LB backend is
+    /// feature-selected here — the test bodies that call this are identical
+    /// for both `tower-lb` and `tonic-xds-lb`.
+    #[cfg(test)]
+    pub(crate) fn build_grpc_channel_from_cache(
         &self,
-        router: Arc<dyn Router>,
-        discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
+        cache: Arc<XdsCache>,
         retry_policy: GrpcRetryPolicy,
     ) -> XdsChannelGrpc {
+        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
+
+        #[cfg(feature = "tower-lb")]
+        let lb_service = {
+            #[cfg(feature = "_tls-any")]
+            let discovery: Arc<
+                dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
+            > = Arc::new(XdsClusterDiscovery::new(
+                cache,
+                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap()),
+            ));
+            #[cfg(not(feature = "_tls-any"))]
+            let discovery: Arc<
+                dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
+            > = Arc::new(XdsClusterDiscovery::new(cache));
+            let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
+            XdsLbService::new(cluster_registry, discovery)
+        };
+
+        #[cfg(feature = "tonic-xds-lb")]
+        let lb_service = XdsLoadBalanceService::new(
+            cache,
+            #[cfg(feature = "_tls-any")]
+            Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap()),
+        );
+
         let routing_layer = XdsRoutingLayer::new(router, self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
@@ -386,121 +412,105 @@ impl XdsChannelBuilder {
     }
 }
 
-#[cfg(all(test, feature = "tower-lb"))]
-mod tests {
-    use super::{XdsChannelBuilder, XdsChannelConfig};
+/// Feature-agnostic test helpers shared by both LB backends' channel tests.
+#[cfg(test)]
+mod test_support {
+    use super::{XdsChannelConfig, XdsChannelGrpc};
     use crate::XdsUri;
-    use crate::client::channel::XdsChannelGrpc;
     use crate::client::endpoint::EndpointAddress;
-    use crate::client::endpoint::EndpointChannel;
-
-    fn test_config() -> XdsChannelConfig {
-        XdsChannelConfig::new(XdsUri::parse("xds:///test-service").unwrap())
-    }
-    use crate::client::lb::{BoxDiscover, ClusterDiscovery};
-    use crate::client::retry::GrpcRetryPolicy;
-    use crate::client::route::RouteDecision;
-    use crate::client::route::RouteInput;
-    use crate::client::route::Router;
-    use crate::common::async_util::BoxFuture;
-    use crate::testutil::grpc::GreeterClient;
-    use crate::testutil::grpc::HelloRequest;
-    use crate::testutil::grpc::TestServer;
-    use crate::xds::cache::XdsCache;
+    use crate::testutil::grpc::{GreeterClient, HelloRequest, TestServer, spawn_greeter_server};
     use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::route_config::RouteConfigResource;
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use tonic::transport::Channel;
-    use tower::discover::Change;
 
-    /// Sets up multiple gRPC test servers and returns their addresses, clients and shutdown handles.
-    async fn setup_grpc_servers(
-        count: usize,
-    ) -> (Vec<String>, Vec<crate::testutil::grpc::TestServer>) {
-        use crate::testutil::grpc::spawn_greeter_server;
+    pub(super) fn test_config() -> XdsChannelConfig {
+        XdsChannelConfig::new(XdsUri::parse("xds:///test-service").unwrap())
+    }
 
+    /// Spawns `count` greeter servers named `server-0` .. `server-{count-1}`.
+    pub(super) async fn setup_grpc_servers(count: usize) -> Vec<TestServer> {
         let mut servers = Vec::new();
-        let mut server_addrs = Vec::new();
-
         for i in 0..count {
-            let server_name = format!("server-{i}");
-            let server = spawn_greeter_server(&server_name, None, None)
+            let server = spawn_greeter_server(&format!("server-{i}"), None, None)
                 .await
                 .expect("Failed to spawn gRPC server");
-
-            server_addrs.push(server.addr.to_string());
             servers.push(server);
         }
-
-        (server_addrs, servers)
+        servers
     }
 
-    /// A mock XdsManager that provides pre-configured endpoints for testing.
-    struct MockXdsManager {
-        endpoints: Vec<(EndpointAddress, Channel)>,
+    /// A minimal plaintext `ClusterResource`.
+    pub(super) fn make_test_cluster(
+        cluster_name: &str,
+    ) -> Arc<crate::xds::resource::ClusterResource> {
+        use crate::xds::resource::cluster::{ClusterResource, LbPolicy};
+        Arc::new(ClusterResource {
+            name: cluster_name.to_string(),
+            eds_service_name: None,
+            lb_policy: LbPolicy::RoundRobin,
+            security: None,
+        })
     }
 
-    impl MockXdsManager {
-        /// Creates a new MockXdsManager from test servers.
-        fn from_test_servers(servers: &[TestServer]) -> Self {
-            let endpoints = servers
-                .iter()
-                .map(|s| {
-                    let addr = EndpointAddress::from(s.addr);
-                    (addr, s.channel.clone())
-                })
-                .collect();
-            Self { endpoints }
-        }
+    /// A `RouteConfigResource` that routes all traffic to `cluster_name`.
+    pub(super) fn make_test_route_config(cluster_name: &str) -> Arc<RouteConfigResource> {
+        use crate::xds::resource::route_config::{
+            PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
+        };
+        Arc::new(RouteConfigResource {
+            name: "test-route".to_string(),
+            virtual_hosts: vec![VirtualHostConfig {
+                name: "default".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![RouteConfig {
+                    match_criteria: RouteConfigMatch {
+                        path_specifier: PathSpecifierConfig::Prefix(String::new()),
+                        headers: vec![],
+                        case_sensitive: false,
+                        match_fraction: None,
+                    },
+                    action: RouteConfigAction::Cluster(cluster_name.to_string()),
+                }],
+            }],
+        })
     }
 
-    impl Router for MockXdsManager {
-        fn route(
-            &self,
-            _input: &RouteInput<'_>,
-        ) -> BoxFuture<Result<RouteDecision, crate::xds::routing::RoutingError>> {
-            Box::pin(async move {
-                Ok(RouteDecision {
-                    cluster: "test-cluster".to_string(),
-                    request_hash: None,
-                })
-            })
-        }
+    /// An `EndpointsResource` built from test server addresses.
+    pub(super) fn make_test_endpoints(
+        cluster_name: &str,
+        servers: &[TestServer],
+    ) -> Arc<EndpointsResource> {
+        use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
+        Arc::new(EndpointsResource {
+            cluster_name: cluster_name.to_string(),
+            localities: vec![LocalityEndpoints {
+                locality: None,
+                endpoints: servers
+                    .iter()
+                    .map(|s| ResolvedEndpoint {
+                        address: EndpointAddress::from(s.addr),
+                        health_status: HealthStatus::Healthy,
+                        load_balancing_weight: 1,
+                    })
+                    .collect(),
+                load_balancing_weight: 100,
+                priority: 0,
+            }],
+        })
     }
 
-    impl ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for MockXdsManager {
-        fn discover_cluster(
-            &self,
-            _cluster_name: &str,
-        ) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
-            let endpoints = self.endpoints.clone();
-            let (tx, rx) = mpsc::channel(16);
-
-            tokio::spawn(async move {
-                for (addr, channel) in endpoints {
-                    let endpoint_channel = EndpointChannel::new(channel);
-                    let change = Change::Insert(addr, endpoint_channel);
-                    tx.send(Ok(change)).await.expect("Failed to send SD change");
-                }
-            });
-
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
-        }
-    }
-
-    /// Sends multiple gRPC requests using the provided client and returns statistics about the requests.
-    async fn send_grpc_requests(
-        mut grpc_client: crate::testutil::grpc::GreeterClient<XdsChannelGrpc>,
+    /// Sends `num_requests` gRPC requests and returns
+    /// `(successful, error_types, per_server_counts)`. The message format is
+    /// `"{server-name}: {request}"`, so `per_server_counts` reflects the LB
+    /// distribution.
+    pub(super) async fn send_grpc_requests(
+        mut grpc_client: GreeterClient<XdsChannelGrpc>,
         num_requests: usize,
-    ) -> (
-        usize,
-        std::collections::HashMap<String, usize>,
-        std::collections::HashMap<String, usize>,
-    ) {
+    ) -> (usize, HashMap<String, usize>, HashMap<String, usize>) {
         let mut successful_requests = 0;
-        let mut error_types = std::collections::HashMap::new();
-        let mut server_counts = std::collections::HashMap::new();
+        let mut error_types = HashMap::new();
+        let mut server_counts = HashMap::new();
 
         for i in 0..num_requests {
             let request_timeout = tokio::time::Duration::from_secs(3);
@@ -511,7 +521,6 @@ mod tests {
             match tokio::time::timeout(request_timeout, request_future).await {
                 Ok(Ok(response)) => {
                     successful_requests += 1;
-                    // Extract server name from response message (format: "server-X: test-request-Y")
                     let message = response.into_inner().message;
                     if let Some(server_name) = message.split(':').next() {
                         *server_counts.entry(server_name.to_string()).or_insert(0) += 1;
@@ -532,69 +541,65 @@ mod tests {
 
         (successful_requests, error_types, server_counts)
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::XdsChannelBuilder;
+    use super::test_support::{
+        make_test_cluster, make_test_endpoints, make_test_route_config, send_grpc_requests,
+        setup_grpc_servers, test_config,
+    };
+    use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig};
+    use crate::testutil::grpc::{GreeterClient, HelloRequest};
+    use crate::xds::cache::XdsCache;
+    use std::sync::Arc;
+
+    /// Power-of-two-choices distribution: with a pre-populated cache, requests
+    /// are routed and load-balanced roughly evenly across all backends. Runs
+    /// identically against whichever LB backend the crate is built with.
     #[tokio::test]
-    /// Tests the `XdsChannelGrpc` with a power-of-two-choices load balancer.
     async fn test_xds_channel_grpc_with_p2c_lb() {
+        let cluster_name = "test-cluster";
         let num_requests = 1000;
         let num_servers = 5;
-        let (_, servers) = setup_grpc_servers(num_servers).await;
+        let servers = setup_grpc_servers(num_servers).await;
 
-        // Create a mock XdsManager with the test servers
-        let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
 
-        let xds_channel_builder = XdsChannelBuilder::new(test_config());
-        let xds_channel = xds_channel_builder.build_grpc_channel_from_parts(
-            xds_manager.clone(),
-            xds_manager.clone(),
-            GrpcRetryPolicy::default(),
-        );
-
-        let client = GreeterClient::new(xds_channel);
+        let channel = XdsChannelBuilder::new(test_config())
+            .build_grpc_channel_from_cache(cache, GrpcRetryPolicy::default());
+        let client = GreeterClient::new(channel);
 
         let (successful_requests, error_types, server_counts) =
             send_grpc_requests(client, num_requests).await;
 
-        println!("Successful requests: {successful_requests}");
-        println!("Error types: {error_types:?}");
-        println!("Per-server call counts: {server_counts:?}");
-
         assert_eq!(
             successful_requests, num_requests,
-            "Expected 100% success rate. Got {successful_requests} successful out of {num_requests} requests. Errors: {error_types:?}",
+            "Expected 100% success rate. Errors: {error_types:?}",
         );
-
         assert!(
             error_types.is_empty(),
             "Expected no errors but got: {error_types:?}",
         );
-
-        let actual_server_count = server_counts.len();
         assert_eq!(
-            actual_server_count, num_servers,
-            "Expected all {num_servers} servers to receive requests, but only {actual_server_count} servers received traffic. Server counts: {server_counts:?}",
+            server_counts.len(),
+            num_servers,
+            "Expected all {num_servers} servers to receive traffic. Counts: {server_counts:?}",
         );
 
         let expected_per_server = num_requests / num_servers;
         let min_requests_per_server = (expected_per_server as f64 / 1.5) as usize;
         let max_requests_per_server = (expected_per_server as f64 * 1.5) as usize;
-
         for (server_name, count) in &server_counts {
             assert!(
-                *count >= min_requests_per_server,
-                "Server {server_name} received only {count} requests, expected at least {min_requests_per_server} (expected ~{expected_per_server} per server with 1.5x variance)",
-            );
-            assert!(
-                *count <= max_requests_per_server,
-                "Server {server_name} received {count} requests, expected at most {max_requests_per_server} (expected ~{expected_per_server} per server with 1.5x variance)",
+                *count >= min_requests_per_server && *count <= max_requests_per_server,
+                "Server {server_name} received {count} requests, expected ~{expected_per_server} (±1.5x). Counts: {server_counts:?}",
             );
         }
-
-        let total_server_requests: usize = server_counts.values().sum();
-        assert_eq!(
-            total_server_requests, successful_requests,
-            "Total server requests ({total_server_requests}) should equal successful requests ({successful_requests}). Server counts: {server_counts:?}",
-        );
 
         for server in servers {
             let _ = server.shutdown.send(());
@@ -602,32 +607,31 @@ mod tests {
         }
     }
 
+    /// The retry layer retries UNAVAILABLE and succeeds on the second attempt.
     #[tokio::test]
     async fn test_retry_once_on_unavailable() {
-        use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig};
         use crate::testutil::grpc::spawn_fail_first_n_server;
 
+        let cluster_name = "test-cluster";
         // Server fails the first request with UNAVAILABLE, succeeds on retry.
         let server = spawn_fail_first_n_server("retry-server", 1)
             .await
             .expect("Failed to spawn server");
-
         let servers = vec![server];
-        let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
 
         let retry_policy = GrpcRetryPolicy::new(
             GrpcRetryPolicyConfig::new()
                 .retry_on(vec![tonic::Code::Unavailable])
                 .num_retries(1),
         );
-
-        let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(
-            xds_manager.clone(),
-            xds_manager.clone(),
-            retry_policy,
-        );
-
-        let mut client = GreeterClient::new(xds_channel);
+        let channel = XdsChannelBuilder::new(test_config())
+            .build_grpc_channel_from_cache(cache, retry_policy);
+        let mut client = GreeterClient::new(channel);
 
         let response = client
             .say_hello(HelloRequest {
@@ -635,109 +639,29 @@ mod tests {
             })
             .await
             .expect("request should succeed after retry");
-
         assert_eq!(response.into_inner().message, "retry-server: retry-test");
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
     }
 
-    /// Helper: creates a minimal plaintext `ClusterResource` for tests that
-    /// drive `XdsClusterDiscovery`. The cluster watch in `discover_cluster`
-    /// blocks until a cluster is in the cache.
-    fn make_test_cluster(cluster_name: &str) -> Arc<crate::xds::resource::ClusterResource> {
-        use crate::xds::resource::cluster::{ClusterResource, LbPolicy};
-        Arc::new(ClusterResource {
-            name: cluster_name.to_string(),
-            eds_service_name: None,
-            lb_policy: LbPolicy::RoundRobin,
-            security: None,
-        })
-    }
-
-    /// Helper: creates a `RouteConfigResource` that routes all traffic to the given cluster.
-    fn make_test_route_config(cluster_name: &str) -> Arc<RouteConfigResource> {
-        use crate::xds::resource::route_config::*;
-
-        Arc::new(RouteConfigResource {
-            name: "test-route".to_string(),
-            virtual_hosts: vec![VirtualHostConfig {
-                name: "default".to_string(),
-                domains: vec!["*".to_string()],
-                routes: vec![RouteConfig {
-                    match_criteria: RouteConfigMatch {
-                        path_specifier: PathSpecifierConfig::Prefix(String::new()),
-                        headers: vec![],
-                        case_sensitive: false,
-                        match_fraction: None,
-                    },
-                    action: RouteConfigAction::Cluster(cluster_name.to_string()),
-                }],
-            }],
-        })
-    }
-
-    /// Helper: creates an `EndpointsResource` from test server addresses.
-    fn make_test_endpoints(cluster_name: &str, servers: &[TestServer]) -> Arc<EndpointsResource> {
-        use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
-
-        Arc::new(EndpointsResource {
-            cluster_name: cluster_name.to_string(),
-            localities: vec![LocalityEndpoints {
-                locality: None,
-                endpoints: servers
-                    .iter()
-                    .map(|s| ResolvedEndpoint {
-                        address: EndpointAddress::from(s.addr),
-                        health_status: HealthStatus::Healthy,
-                        load_balancing_weight: 1,
-                    })
-                    .collect(),
-                load_balancing_weight: 100,
-                priority: 0,
-            }],
-        })
-    }
-
-    /// Builds an XdsChannelGrpc using real XdsRouter and XdsClusterDiscovery
-    /// backed by the given cache.
-    async fn build_xds_channel_from_cache(cache: Arc<XdsCache>) -> XdsChannelGrpc {
-        use crate::xds::cluster_discovery::XdsClusterDiscovery;
-        use crate::xds::routing::XdsRouter;
-
-        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
-
-        #[cfg(feature = "_tls-any")]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = {
-            use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
-            Arc::new(XdsClusterDiscovery::new(cache, registry))
-        };
-        #[cfg(not(feature = "_tls-any"))]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache));
-
-        let builder = XdsChannelBuilder::new(test_config());
-        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default())
-    }
-
-    /// Tests the full xDS stack (XdsRouter + XdsClusterDiscovery) with a
-    /// pre-populated cache, validating that requests are routed and
-    /// load-balanced across real backend servers.
+    /// Routes and load-balances across real backends via a pre-populated cache.
     #[tokio::test]
     async fn test_xds_channel_with_real_router_and_discovery() {
         let num_servers = 3;
         let num_requests = 300;
         let cluster_name = "test-cluster";
-        let (_, servers) = setup_grpc_servers(num_servers).await;
+        let servers = setup_grpc_servers(num_servers).await;
 
         let cache = Arc::new(XdsCache::new());
         cache.update_route_config(make_test_route_config(cluster_name));
         cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
         cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
 
-        let channel = build_xds_channel_from_cache(cache).await;
+        let channel = XdsChannelBuilder::new(test_config())
+            .build_grpc_channel_from_cache(cache, GrpcRetryPolicy::default());
         let client = GreeterClient::new(channel);
 
         let (successful, error_types, server_counts) =
@@ -759,12 +683,11 @@ mod tests {
         }
     }
 
-    /// Tests that endpoint changes are picked up dynamically by the
-    /// XdsClusterDiscovery while the channel is serving requests.
+    /// Endpoint changes in the cache are picked up dynamically while serving.
     #[tokio::test]
     async fn test_xds_channel_handles_dynamic_endpoint_updates() {
         let cluster_name = "test-cluster";
-        let (_, servers) = setup_grpc_servers(2).await;
+        let servers = setup_grpc_servers(2).await;
 
         let cache = Arc::new(XdsCache::new());
         cache.update_route_config(make_test_route_config(cluster_name));
@@ -775,7 +698,8 @@ mod tests {
             make_test_endpoints(cluster_name, &servers[..1]),
         );
 
-        let channel = build_xds_channel_from_cache(cache.clone()).await;
+        let channel = XdsChannelBuilder::new(test_config())
+            .build_grpc_channel_from_cache(cache.clone(), GrpcRetryPolicy::default());
         let client = GreeterClient::new(channel.clone());
 
         // Phase 1: all traffic goes to server-0.
@@ -789,7 +713,7 @@ mod tests {
 
         // Add second server.
         cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
-        // Give the endpoint manager diff loop time to process the update.
+        // Give the endpoint diff loop time to process the update.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Phase 2: traffic should go to both servers.

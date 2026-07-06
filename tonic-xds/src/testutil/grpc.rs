@@ -60,7 +60,10 @@ impl Greeter for FailFirstNGreeter {
 
 /// A test server that runs a gRPC service and provides a channel for clients to connect.
 pub(crate) struct TestServer {
-    /// The gRPC channel for talking to the test server.
+    /// The gRPC channel for talking to the test server. Currently unused by the
+    /// cache-driven channel tests (which connect via discovered endpoints), but
+    /// retained as a convenience for direct-connection tests.
+    #[allow(dead_code)]
     pub channel: Channel,
     /// Signal the server to shutdown.
     pub shutdown: oneshot::Sender<()>,

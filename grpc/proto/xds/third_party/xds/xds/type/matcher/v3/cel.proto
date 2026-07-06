@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package xds.type.matcher.v3;
+
+import "xds/type/v3/cel.proto";
+import "validate/validate.proto";
+
+option java_package = "com.github.xds.type.matcher.v3";
+option java_outer_classname = "CelProto";
+option java_multiple_files = true;
+option go_package = "github.com/cncf/xds/go/xds/type/matcher/v3";
+
+// [#protodoc-title: Common Expression Language (CEL) matchers]
+
+// Performs a match by evaluating a `Common Expression Language
+// <https://github.com/google/cel-spec>`_ (CEL) expression against the standardized set of
+// :ref:`HTTP attributes <arch_overview_attributes>` specified via ``HttpAttributesCelMatchInput``.
+//
+// .. attention::
+//
+//   The match is ``true``, iff the result of the evaluation is a bool AND true.
+//   In all other cases, the match is ``false``, including but not limited to: non-bool types,
+//   ``false``, ``null``, ``int(1)``, etc.
+//   In case CEL expression raises an error, the result of the evaluation is interpreted "no match".
+//
+// Refer to :ref:`Unified Matcher API <envoy_v3_api_msg_.xds.type.matcher.v3.Matcher>` documentation
+// for usage details.
+//
+// [#comment: envoy.matching.matchers.cel_matcher]
+message CelMatcher {
+  // Either parsed or checked representation of the CEL program.
+  type.v3.CelExpression expr_match = 1 [(validate.rules).message = {required: true}];
+
+  // Free-form description of the CEL AST, e.g. the original expression text, to be
+  // used for debugging assistance.
+  string description = 2;
+}

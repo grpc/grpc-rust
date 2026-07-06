@@ -51,10 +51,8 @@ pub struct WorkerServer {
 }
 
 impl WorkerServer {
-    pub fn new(shutdown_notify: Arc<Notify>) -> Self {
-        WorkerServer {
-            quit_notify: shutdown_notify,
-        }
+    pub fn new(quit_notify: Arc<Notify>) -> Self {
+        WorkerServer { quit_notify }
     }
 }
 

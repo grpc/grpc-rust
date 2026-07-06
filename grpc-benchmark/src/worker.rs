@@ -93,8 +93,8 @@ impl WorkerService for WorkerServer {
                     Argtype::Setup(server_config) => {
                         println!("Server creation requested.");
 
-                        if benchmark_server.take().is_some() {
-                            eprintln!("Server setup received when server already exists, shutting down the existing server");
+                        if benchmark_server.is_some() {
+                             Err(Status::already_exists("server already started"))?;
                         }
 
                         let server = BenchmarkServer::start(server_config).map_err(|status| {

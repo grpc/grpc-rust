@@ -71,8 +71,8 @@ impl BenchmarkServer {
 
         let mut server_builder = Server::builder();
         // Parse security config.
-        if let Some(securit_params) = config.security_params {
-            let tls_config = if securit_params.use_test_ca {
+        if let Some(security_params) = config.security_params {
+            let tls_config = if security_params.use_test_ca {
                 ServerTlsConfig::new().identity(Identity::from_pem(SERVER_PEM, SERVER_KEY))
             } else {
                 ServerTlsConfig::new()

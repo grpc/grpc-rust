@@ -5,3 +5,4 @@ pub(crate) mod keyed_futures;
 pub(crate) mod loadbalancer;
 pub(crate) mod outlier_detection;
 pub(crate) mod pickers;
+pub(crate) mod service;

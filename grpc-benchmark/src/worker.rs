@@ -24,9 +24,10 @@
 
 use std::pin::Pin;
 use std::result::Result;
+use std::sync::Arc;
 use std::thread::available_parallelism;
 
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -46,12 +47,14 @@ use crate::generated::services::grpc::testing::worker_service_server::WorkerServ
 use crate::server::BenchmarkServer;
 
 pub struct WorkerServer {
-    shutdown_channel: mpsc::Sender<()>,
+    quit_notify: Arc<Notify>,
 }
 
 impl WorkerServer {
-    pub fn new(shutdown_channel: mpsc::Sender<()>) -> Self {
-        WorkerServer { shutdown_channel }
+    pub fn new(shutdown_notify: Arc<Notify>) -> Self {
+        WorkerServer {
+            quit_notify: shutdown_notify,
+        }
     }
 }
 
@@ -146,10 +149,7 @@ impl WorkerService for WorkerServer {
     }
 
     async fn quit_worker(&self, _request: Request<Void>) -> Result<Response<Void>, Status> {
-        self.shutdown_channel
-            .send(())
-            .await
-            .map(|_| Response::new(Void {}))
-            .map_err(|err| Status::internal(format!("failed to stop server: {err}")))
+        self.quit_notify.notify_one();
+        Ok(Response::new(Void {}))
     }
 }

@@ -23,6 +23,6 @@ allowed_external_types = [
 [dependencies]
 bytes = "1.11.1"
 grpc = { version = "0.10.0", path = "../grpc" }
-protobuf = "4.34.0-release"
+protobuf = "4.35.1-release"
 
 [dev-dependencies]

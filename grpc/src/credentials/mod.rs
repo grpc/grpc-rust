@@ -48,13 +48,14 @@ use std::sync::Arc;
 pub use client::CompositeChannelCredentials;
 pub use local::LocalChannelCredentials;
 pub use local::LocalServerCredentials;
+use tonic::async_trait;
 
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
@@ -63,13 +64,8 @@ use crate::rt::GrpcRuntime;
 ///
 /// Also includes the ability to attach [`CallCredentials`] when used with the
 /// [`CompositeChannelCredentials`].
-#[trait_variant::make(Send)]
-pub trait ChannelCredentials: Sync + 'static {
-    #[doc(hidden)]
-    type ContextType: ClientConnectionSecurityContext;
-    #[doc(hidden)]
-    type Output<I>;
-
+#[async_trait]
+pub trait ChannelCredentials: Send + Sync + 'static {
     /// Provides the ProtocolInfo of these credentials.
     fn info(&self) -> &ProtocolInfo;
 
@@ -92,14 +88,14 @@ pub trait ChannelCredentials: Sync + 'static {
     /// * `source` - The raw connection handle.
     /// * `info` - Additional context passed from the resolver or load balancer.
     #[doc(hidden)]
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
         token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String>;
+    ) -> Result<HandshakeOutput, String>;
 }
 
 /// Server-side trait for all live gRPC wire protocols and supported
@@ -161,12 +157,37 @@ pub(crate) mod common {
             }
         }
 
+        /// Parses the host and port from a string. When the input can not be parsed
+        /// as (host, port) pair, it returns the entire input as the host.
+        pub(crate) fn from_host_port_str(host_and_port: &str) -> Self {
+            // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
+            if let Some(stripped) = host_and_port.strip_prefix('[')
+                && let Some((host, port_str)) = stripped.split_once("]:")
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                return Self::new(host, Some(port));
+            }
+            // Handle unbracketed addresses (IPv4 or hostnames, e.g.,
+            // "localhost:8080").
+            if let Some((host, port_str)) = host_and_port.rsplit_once(':')
+                && !host.contains(':')
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                return Self::new(host, Some(port));
+            }
+            Self::new(host_and_port.to_string(), None)
+        }
+
         pub fn host(&self) -> &str {
             &self.host
         }
 
         pub fn port(&self) -> Option<u16> {
             self.port
+        }
+
+        pub fn set_port(&mut self, port: Option<u16>) {
+            self.port = port;
         }
 
         pub fn host_port_string(&self) -> String {
@@ -217,5 +238,160 @@ mod tests {
 
         let authority = Authority::new("::1", None);
         assert_eq!(&authority.host_port_string(), "::1");
+    }
+
+    #[test]
+    fn test_parse_authority() {
+        struct TestCase {
+            input: &'static str,
+            expected: Authority,
+        }
+
+        let cases = [
+            TestCase {
+                input: "localhost:http",
+                expected: Authority::new("localhost:http", None),
+            },
+            TestCase {
+                input: "localhost:80",
+                expected: Authority::new("localhost", Some(80)),
+            },
+            // host name with zone identifier.
+            TestCase {
+                input: "localhost%lo0:80",
+                expected: Authority::new("localhost%lo0", Some(80)),
+            },
+            TestCase {
+                input: "localhost%lo0:http",
+                expected: Authority::new("localhost%lo0:http", None),
+            },
+            TestCase {
+                input: "[localhost%lo0]:http",
+                expected: Authority::new("[localhost%lo0]:http", None),
+            },
+            TestCase {
+                input: "[localhost%lo0]:80",
+                expected: Authority::new("localhost%lo0", Some(80)),
+            },
+            // IP literal
+            TestCase {
+                input: "127.0.0.1:http",
+                expected: Authority::new("127.0.0.1:http", None),
+            },
+            TestCase {
+                input: "127.0.0.1:80",
+                expected: Authority::new("127.0.0.1", Some(80)),
+            },
+            TestCase {
+                input: "[::1]:http",
+                expected: Authority::new("[::1]:http", None),
+            },
+            TestCase {
+                input: "[::1]:80",
+                expected: Authority::new("::1", Some(80)),
+            },
+            // IP literal with zone identifier.
+            TestCase {
+                input: "[::1%lo0]:http",
+                expected: Authority::new("[::1%lo0]:http", None),
+            },
+            TestCase {
+                input: "[::1%lo0]:80",
+                expected: Authority::new("::1%lo0", Some(80)),
+            },
+            TestCase {
+                input: ":http",
+                expected: Authority::new(":http", None),
+            },
+            TestCase {
+                input: ":80",
+                expected: Authority::new("", Some(80)),
+            },
+            TestCase {
+                input: "grpc.io:",
+                expected: Authority::new("grpc.io:", None),
+            },
+            TestCase {
+                input: "127.0.0.1:",
+                expected: Authority::new("127.0.0.1:", None),
+            },
+            TestCase {
+                input: "[::1]:",
+                expected: Authority::new("[::1]:", None),
+            },
+            TestCase {
+                input: "grpc.io:https%foo",
+                expected: Authority::new("grpc.io:https%foo", None),
+            },
+            TestCase {
+                input: "grpc.io",
+                expected: Authority::new("grpc.io", None),
+            },
+            TestCase {
+                input: "127.0.0.1",
+                expected: Authority::new("127.0.0.1", None),
+            },
+            TestCase {
+                input: "[::1]",
+                expected: Authority::new("[::1]", None),
+            },
+            TestCase {
+                input: "[fe80::1%lo0]",
+                expected: Authority::new("[fe80::1%lo0]", None),
+            },
+            TestCase {
+                input: "[localhost%lo0]",
+                expected: Authority::new("[localhost%lo0]", None),
+            },
+            TestCase {
+                input: "localhost%lo0",
+                expected: Authority::new("localhost%lo0", None),
+            },
+            TestCase {
+                input: "::1",
+                expected: Authority::new("::1", None),
+            },
+            TestCase {
+                input: "fe80::1%lo0",
+                expected: Authority::new("fe80::1%lo0", None),
+            },
+            TestCase {
+                input: "fe80::1%lo0:80",
+                expected: Authority::new("fe80::1%lo0:80", None),
+            },
+            TestCase {
+                input: "[foo:bar]",
+                expected: Authority::new("[foo:bar]", None),
+            },
+            TestCase {
+                input: "[foo:bar]baz",
+                expected: Authority::new("[foo:bar]baz", None),
+            },
+            TestCase {
+                input: "[foo]bar:baz",
+                expected: Authority::new("[foo]bar:baz", None),
+            },
+            TestCase {
+                input: "[foo]:[bar]:baz",
+                expected: Authority::new("[foo]:[bar]:baz", None),
+            },
+            TestCase {
+                input: "[foo]:[bar]baz",
+                expected: Authority::new("[foo]:[bar]baz", None),
+            },
+            TestCase {
+                input: "foo[bar]:baz",
+                expected: Authority::new("foo[bar]:baz", None),
+            },
+            TestCase {
+                input: "foo]bar:baz",
+                expected: Authority::new("foo]bar:baz", None),
+            },
+        ];
+
+        for TestCase { input, expected } in cases {
+            let auth = Authority::from_host_port_str(input);
+            assert_eq!(auth, expected, "authority mismatch for {}", input);
+        }
     }
 }

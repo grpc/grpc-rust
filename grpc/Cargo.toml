@@ -53,14 +53,16 @@ tls-rustls = [
 base64 = "0.22"
 bytes = "1.10.1"
 futures = { version = "0.3", default-features = false, optional = true }
-hickory-resolver = { version = "0.25.1", optional = true }
+hickory-resolver = { version = "0.26.1", optional = true }
 http = "1.1.0"
 http-body = "1.0.1"
 hyper = { version = "1.6.0", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["client-proxy"] }
 itoa = "1.0"
 parking_lot = "0.12.4"
+percent-encoding = "2.3"
 pin-project-lite = "0.2.16"
-rand = "0.9"
+rand = "0.10"
 rustls = { version = "0.23", optional = true, default-features = false, features = [
     "tls12",
     "logging",
@@ -70,8 +72,8 @@ rustls-pemfile = { version = "2.1", optional = true, default-features = false, f
     "std",
 ] }
 rustls-pki-types = { version = "1.8", optional = true, default-features = false }
-rustls-platform-verifier = { version = "0.6", optional = true, default-features = false }
-rustls-webpki = { version = "0.102", optional = true, default-features = false }
+rustls-platform-verifier = { version = "0.7", optional = true, default-features = false }
+rustls-webpki = { version = "0.103", optional = true, default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 socket2 = { version = "0.6", optional = true }
@@ -91,9 +93,10 @@ trait-variant = "0.1.2"
 url = "2.5.0"
 
 [dev-dependencies]
+tokio = { version = "1.37.0", features = ["test-util"] }
 async-stream = "0.3.6"
-criterion = "0.5"
-hickory-server = "0.25.2"
+criterion = "0.8"
+hickory-server = "0.26.1"
 prost = "0.14.0"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile = "3.26"

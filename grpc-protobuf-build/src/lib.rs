@@ -267,8 +267,8 @@ impl CodeGen {
             return Ok((protoc.clone(), plugin.clone()));
         }
 
-        // 2. Compiled via protoc-gen-rust-grpc (build-plugin feature)
-        #[cfg(feature = "build-plugin")]
+        // 2. Compiled via protoc-gen-rust-grpc
+        #[cfg(feature = "protoc-gen-rust-grpc")]
         {
             let compiled_protoc = protoc_gen_rust_grpc::protoc();
             let compiled_plugin = protoc_gen_rust_grpc::protoc_gen_rust_grpc();

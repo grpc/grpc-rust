@@ -197,7 +197,8 @@ impl XdsChannelBuilder {
         )?);
 
         let node = Node::try_from(bootstrap.node)?;
-        let client_config = ClientConfig::new(node, &server_uri);
+        let client_config =
+            ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
         let xds_client =
             XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime).build();
 
@@ -377,6 +378,7 @@ mod tests {
             Box::pin(async move {
                 Ok(RouteDecision {
                     cluster: "test-cluster".to_string(),
+                    request_hash: None,
                 })
             })
         }

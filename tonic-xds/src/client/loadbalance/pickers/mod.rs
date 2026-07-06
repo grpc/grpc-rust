@@ -1,6 +1,7 @@
 pub(crate) mod p2c;
+pub(crate) mod ring_hash;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::client::endpoint::EndpointAddress;
 
@@ -11,4 +12,13 @@ use crate::client::endpoint::EndpointAddress;
 /// specific channel state type.
 pub(crate) trait ChannelPicker<S, Req> {
     fn pick<'a>(&self, req: &Req, ready: &'a IndexMap<EndpointAddress, S>) -> Option<&'a S>;
+
+    /// Notify the picker that the cluster's member set changed.
+    ///
+    /// `members` is the full healthy-EDS membership, independent of connection
+    /// or ejection state. Stateful pickers (e.g. ring-hash) rebuild their
+    /// internal structure here so the ring stays stable across connection
+    /// flaps and ejections (which do not change membership). Default: no-op
+    /// (e.g. [`p2c::P2cPicker`], which is stateless).
+    fn on_members_changed(&self, _members: &IndexSet<EndpointAddress>) {}
 }

@@ -38,19 +38,23 @@ use http::HeaderValue;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tokio::time;
 use tokio::time::timeout;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Response;
+use tonic::Status as TonicStatus;
 use tonic::async_trait;
 use tonic::metadata::MetadataMap as TonicMetadata;
+use tonic::metadata::MetadataValue as TonicMetadataValue;
 use tonic::transport::Server;
 use tonic_prost::prost::Message as ProstMessage;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::Channel;
 use crate::client::Invoke as _;
@@ -67,13 +71,18 @@ use crate::core::RequestHeaders;
 use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
 use crate::core::Trailers;
+use crate::credentials::ChannelCredentials;
 use crate::credentials::CompositeChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
+use crate::credentials::ProtocolInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
+use crate::credentials::client::ChannelSecurityContext;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
+use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
@@ -85,6 +94,8 @@ use crate::echo_pb::echo_server::Echo;
 use crate::echo_pb::echo_server::EchoServer;
 use crate::metadata::AsciiMetadataKey;
 use crate::metadata::MetadataMap;
+use crate::private;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::tokio::TokioRuntime;
 
@@ -135,6 +146,7 @@ pub(crate) async fn tonic_transport_rpc() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -236,6 +248,7 @@ async fn grpc_invoke_tonic_unary() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -289,6 +302,7 @@ mod unix_tests {
         let server_handle = tokio::spawn(async move {
             let echo_server = EchoService {
                 response_headers: None,
+                response_error: None,
             };
             let svc = EchoServer::new(echo_server);
             let _ = Server::builder()
@@ -370,7 +384,7 @@ mod unix_tests {
             }
         }
 
-        // If they share absolutely nothing (e.g., C:\ vs D:\ on Windows), we can't
+        // If they share absolutely nothing (e.g., C:\\ vs D:\\ on Windows), we can't
         // make it relative.
         if common_components == 0 {
             return Err("no common ancestor".to_owned());
@@ -426,6 +440,7 @@ async fn grpc_invoke_tonic_unary_tls() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -457,6 +472,7 @@ async fn grpc_invoke_tonic_unary_tls() {
         .build();
 
     let (headers, resp, trilers) = perform_unary_echo(&channel, "hello interop tls").await;
+
     assert_eq!(
         headers.metadata().get("x-test-metadata-echo").unwrap(),
         "test-value"
@@ -483,6 +499,7 @@ async fn grpc_invoke_failure_cases() {
     tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -625,10 +642,21 @@ async fn perform_unary_echo(
 }
 
 async fn perform_unary_echo_failure(channel: &Channel) -> Trailers {
-    let (_tx, mut rx) = channel
+    let (mut tx, mut rx) = channel
         .invoke(
             RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
             CallOptions::default(),
+        )
+        .await;
+
+    let req = WrappedEchoRequest(EchoRequest::default());
+    _ = tx
+        .send(
+            &req,
+            SendOptions {
+                final_msg: true,
+                ..Default::default()
+            },
         )
         .await;
 
@@ -655,7 +683,10 @@ async fn tonic_transport_invalid_base64_headers() {
     let response_headers = Some(TonicMetadata::from_headers(headers));
 
     let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService { response_headers };
+        let echo_server = EchoService {
+            response_headers,
+            response_error: None,
+        };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
             .add_service(svc)
@@ -709,7 +740,7 @@ async fn tonic_transport_invalid_base64_headers() {
     };
     let req = WrappedEchoRequest(request);
 
-    tokio::time::timeout(DEFAULT_TEST_DURATION, async {
+    time::timeout(DEFAULT_TEST_DURATION, async {
         while tx.send(&req, SendOptions::default()).await.is_ok() {}
     })
     .await
@@ -730,6 +761,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
     let server_handle = tokio::spawn(async move {
         let echo_server = EchoService {
             response_headers: None,
+            response_error: None,
         };
         let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
@@ -775,11 +807,163 @@ async fn tonic_transport_recv_drop_cancels_send() {
     };
     let req = WrappedEchoRequest(request);
 
-    tokio::time::timeout(DEFAULT_TEST_DURATION, async {
+    time::timeout(DEFAULT_TEST_DURATION, async {
         while tx.send(&req, SendOptions::default()).await.is_ok() {}
     })
     .await
     .expect("timed out waiting for stream to close");
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[derive(Debug, Clone)]
+struct MockConnectionSecurityContext;
+impl ChannelSecurityContext for MockConnectionSecurityContext {
+    fn validate_authority(&self, _authority: &Authority) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SlowChannelCredentials {
+    sleep_duration: Duration,
+}
+
+impl SlowChannelCredentials {
+    fn new_arc(sleep_duration: Duration) -> Arc<Self> {
+        Arc::new(Self { sleep_duration })
+    }
+}
+
+#[async_trait]
+impl ChannelCredentials for SlowChannelCredentials {
+    async fn connect(
+        &self,
+        _authority: &Authority,
+        source: BoxEndpoint,
+        _info: &ClientHandshakeInfo,
+        runtime: &GrpcRuntime,
+        _token: private::Internal,
+    ) -> Result<HandshakeOutput, String> {
+        runtime.sleep(self.sleep_duration).await;
+        Ok(HandshakeOutput {
+            endpoint: source,
+            security: ChannelSecurityInfo::new(
+                "mock",
+                SecurityLevel::NoSecurity,
+                Box::new(MockConnectionSecurityContext),
+                Attributes::new(),
+            ),
+        })
+    }
+
+    fn info(&self) -> &ProtocolInfo {
+        static INFO: ProtocolInfo = ProtocolInfo::new("mock");
+        &INFO
+    }
+
+    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        None
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_timeout_exceeded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {
+            response_headers: None,
+            response_error: None,
+        };
+        let svc = EchoServer::new(echo_server);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    // Create the channel with SlowChannelCredentials (21s).
+    // The default timeout is 20s.
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::new(
+        &target,
+        SlowChannelCredentials::new_arc(Duration::from_secs(21)),
+        Default::default(),
+    );
+
+    // Spawn the RPC call because it will block waiting for connection.
+    let rpc_handle = tokio::spawn(async move { perform_unary_echo_failure(&channel).await });
+
+    // Advance time to trigger the timeout in subchannel connect.
+    time::sleep(Duration::from_secs(21)).await;
+
+    // The RPC should have failed with a timeout.
+    let trailers = rpc_handle.await.unwrap();
+
+    assert!(trailers.status().is_err());
+    let status = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status.code(), StatusCodeError::Unavailable);
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn trailers_only_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+
+    // Prepare custom metadata for the server response.
+    let mut metadata = TonicMetadata::new();
+    metadata.insert(
+        "x-custom-trailer",
+        TonicMetadataValue::from_static("custom-value"),
+    );
+
+    let status =
+        TonicStatus::with_metadata(tonic::Code::InvalidArgument, "test error message", metadata);
+
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {
+            response_headers: None,
+            response_error: Some(status),
+        };
+        let svc = EchoServer::new(echo_server);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::new(
+        &target,
+        LocalChannelCredentials::new_arc(),
+        Default::default(),
+    );
+
+    let trailers = perform_unary_echo_failure(&channel).await;
+
+    let status_err = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status_err.code(), StatusCodeError::InvalidArgument);
+    assert_eq!(status_err.message(), "test error message");
+
+    let metadata_map = trailers.metadata();
+    let value = metadata_map.get("x-custom-trailer").unwrap();
+    assert_eq!(value, "custom-value");
 
     shutdown_notify.notify_one();
     server_handle.await.unwrap();
@@ -805,6 +989,7 @@ impl RecvMessage for WrappedEchoResponse {
 #[derive(Debug)]
 struct EchoService {
     response_headers: Option<TonicMetadata>,
+    response_error: Option<TonicStatus>,
 }
 
 #[async_trait]
@@ -813,6 +998,9 @@ impl Echo for EchoService {
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
+        if let Some(err) = &self.response_error {
+            return Err(err.clone());
+        }
         let metadata = request.metadata().clone();
         let message = request.into_inner().message;
         let mut response = tonic::Response::new(EchoResponse { message });

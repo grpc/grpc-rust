@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.14)
 project(protoc-gen-rust-grpc LANGUAGES CXX)
 
+set(PROTOBUF_VERSION "35.1" CACHE STRING "Version of protobuf to download")
+set(CMAKE_BINARY_DIR "${CMAKE_BINARY_DIR}/proto-${PROTOBUF_VERSION}")
+
 # Parse version from Cargo.toml unless already set (e.g. from CI or environment)
 if(NOT RUST_GRPC_VERSION)
     if(DEFINED ENV{RUST_GRPC_VERSION})
@@ -25,7 +28,6 @@ elseif(MSVC)
 endif()
 
 # Options
-set(PROTOBUF_VERSION "34.0" CACHE STRING "Version of protobuf to download")
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 option(BUILD_PROTOC "Build protoc executable" ON)
 option(BUILD_PLUGIN "Build protoc-gen-rust-grpc plugin" ON)
@@ -39,7 +41,7 @@ include(FetchProtobuf)
 
 # Download and configure abseil
 # Abseil version that's compatible with protobuf
-set(ABSEIL_VERSION "20240722.0")
+set(ABSEIL_VERSION "20260526.0")
 set(ABSEIL_URL "https://github.com/abseil/abseil-cpp/archive/refs/tags/${ABSEIL_VERSION}.tar.gz")
 
 message(STATUS "Downloading abseil-cpp ${ABSEIL_VERSION}")
@@ -47,7 +49,7 @@ message(STATUS "Downloading abseil-cpp ${ABSEIL_VERSION}")
 FetchContent_Declare(
     absl
     URL ${ABSEIL_URL}
-    URL_HASH SHA256=f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3
+    URL_HASH SHA256=6e1aee535473414164bf83e4ebc40240dec71a4701f8a642d906e95bea1aea0c
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 

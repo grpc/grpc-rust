@@ -24,14 +24,16 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
+
+use http::HeaderValue;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::client::name_resolution::Address;
+use crate::credentials::ChannelCredentials;
+use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::GrpcRuntime;
 
 mod registry;
@@ -62,7 +64,6 @@ pub(crate) struct TransportOptions {
     pub(crate) rate_limit: Option<(u64, Duration)>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
-    pub(crate) connect_deadline: Option<Instant>,
 }
 
 #[trait_variant::make(Send)]
@@ -78,7 +79,7 @@ pub(crate) trait Transport: Sync {
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -96,7 +97,7 @@ pub(crate) trait DynTransport: Send + Sync {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -114,7 +115,7 @@ impl<T: Transport> DynTransport for T {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            DynClientConnectionSecurityInfo,
+            ChannelSecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -126,7 +127,57 @@ impl<T: Transport> DynTransport for T {
 
 #[derive(Clone)]
 pub(crate) struct SecurityOpts {
-    pub(crate) credentials: Arc<dyn DynChannelCredentials>,
+    pub(crate) credentials: Arc<dyn ChannelCredentials>,
     pub(crate) authority: Authority,
     pub(crate) handshake_info: ClientHandshakeInfo,
+}
+
+/// Configuration options for establishing an HTTP `CONNECT` proxy tunnel.
+///
+/// This may be added as an [`Address`] attribute by a
+/// [`crate::client::name_resolution::Resolver`]. If present, the subchannel
+/// will automatically handle the HTTP `CONNECT` handshake.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub(crate) struct ProxyOptions {
+    proxy_authorization_header: Option<HeaderValue>,
+    target_authority: String,
+}
+
+impl ProxyOptions {
+    /// Creates a new `ProxyOptions`.
+    ///
+    /// # Arguments
+    /// * `target_authority` - The address of the target server to connect to
+    ///   (host:port). Must be a valid hostname.
+    /// * `proxy_authorization_header` - The value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn new(
+        target_authority: String,
+        proxy_authorization_header: Option<HeaderValue>,
+    ) -> Self {
+        Self {
+            proxy_authorization_header,
+            target_authority,
+        }
+    }
+
+    /// Returns the value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn proxy_authorization_header(&self) -> Option<&HeaderValue> {
+        self.proxy_authorization_header.as_ref()
+    }
+
+    /// Returns the address of the proxy server to connect to (host:port).
+    /// This is Punycode-encoded, i.e., it's a valid URL host:port.
+    pub(crate) fn target_authority(&self) -> &str {
+        &self.target_authority
+    }
+
+    /// Extracts `ProxyOptions` from the given `Address` attributes, if present.
+    pub(crate) fn from_addr(addr: &Address) -> Option<&Self> {
+        addr.attributes.get::<Arc<Self>>().map(AsRef::as_ref)
+    }
+
+    /// Adds these `ProxyOptions` to the given `Address` attributes.
+    pub(crate) fn add_to_addr(addr: &mut Address, options: Arc<Self>) {
+        addr.attributes = addr.attributes.add(options);
+    }
 }

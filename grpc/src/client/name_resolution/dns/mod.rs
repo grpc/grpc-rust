@@ -110,7 +110,7 @@ pub(crate) fn reg() {
     global_registry().add_builder(Box::new(Builder {}));
 }
 
-struct Builder {}
+pub(crate) struct Builder {}
 
 struct DnsOptions {
     min_resolution_interval: Duration,

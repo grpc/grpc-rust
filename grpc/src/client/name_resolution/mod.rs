@@ -57,6 +57,7 @@ pub(crate) mod unix;
 #[cfg(target_os = "linux")]
 pub(crate) mod unix_abstract;
 pub(crate) use registry::global_registry;
+pub(crate) mod proxy_resolver;
 
 /// Target represents a target for gRPC, as specified in:
 /// https://github.com/grpc/grpc/blob/master/doc/naming.md.

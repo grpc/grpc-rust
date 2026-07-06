@@ -52,12 +52,12 @@ jobs:
           cache-targets: "false"
       - name: Build protoc-gen-rust-grpc
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
-        run: cargo build -p protoc-gen-rust-grpc
+        run: cargo build -p protoc-gen-rust-grpc --release
       - name: Populate cache directory if needed
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          cp -r target/debug/build/protoc-gen-rust-grpc-*/out/install protoc-cache/
+          cp -r target/release/build/protoc-gen-rust-grpc-*/out/install protoc-cache/
           echo "Cached files:"
           find protoc-cache/ -type f -exec ls -lh {} +
 

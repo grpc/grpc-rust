@@ -192,12 +192,12 @@ impl StatusError {
         &self.message
     }
 
-    /// Get the value for [`type_url`].
+    /// Get the value for `type_url`.
     pub fn get_payload<'a>(&'a self, type_url: &[u8]) -> Option<&'a [u8]> {
         self.payloads.get(type_url).map(|v| v.as_slice())
     }
 
-    /// Set the value for [`type_url`].
+    /// Set the value for `type_url`.
     pub fn set_payload(&mut self, type_url: &[u8], payload: &[u8]) {
         self.payloads.insert(type_url.to_vec(), payload.to_vec());
     }

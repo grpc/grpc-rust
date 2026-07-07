@@ -96,6 +96,7 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Creates a new channel builder for the given target.
     pub fn builder(target: impl Into<String>) -> ChannelBuilder<MissingOpt, MissingOpt> {
         ChannelBuilder {
             target: target.into(),
@@ -186,15 +187,14 @@ pub struct ChannelBuilder<C, R> {
     // - idle_timeout
     // - enable_channelz
     // - keepalive_cfg
-    channel_authority: Option<String>, // TODO(nathanielford) Revist if this is subsumed by the SecurityOpts authority.
+    channel_authority: Option<String>, // TODO(nathanielford) Revisit if this is subsumed by the SecurityOpts authority.
 }
 
-/// Impl for adding the (required) credentials to the builder.
 // This is provided as a separate builder function to allow for the possibility
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
 impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
-    /// Adds (required) channel credentials to the builder.
+    /// (Required) Adds channel credentials to the builder.
     pub fn credentials(
         self,
         credentials: impl IntoCredentialConfig,
@@ -208,10 +208,10 @@ impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
     }
 }
 
-/// Impl for adding the (required) runtime to the builder. If the Tokio runtime
-/// feature is enabled, skipping this will cause the default Tokio runtime to be
-/// used.
 impl<C> ChannelBuilder<C, MissingOpt> {
+    /// (Required) Adds the runtime to the builder. If the Tokio runtime
+    /// feature is enabled, skipping this will cause the default Tokio runtime
+    /// to be used.
     pub fn runtime(self, runtime: GrpcRuntime) -> ChannelBuilder<C, PresentRuntime> {
         ChannelBuilder {
             target: self.target,
@@ -223,8 +223,8 @@ impl<C> ChannelBuilder<C, MissingOpt> {
 }
 
 impl<C, R> ChannelBuilder<C, R> {
-    // TODO(nathanielford) Revisit if this is subsumed by the SecurityOpts
-    // authority. May need to change how this is being set on the builder.
+    /// Overrides the authority used for the channel. This will override both
+    /// any authority specified in the target or by the name resolver.
     pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
         self.channel_authority = Some(authority.into());
         self
@@ -237,12 +237,24 @@ impl<C, R> ChannelBuilder<C, R> {
 /// and the builder will work as normal.
 #[cfg(feature = "_runtime-tokio")]
 impl ChannelBuilder<PresentCredentials, MissingOpt> {
+    /// Builds the channel with the provided configuration, using the default
+    /// Tokio runtime if no runtime was explicitly provided.
     pub fn build(self) -> Channel {
         self.runtime(default_runtime()).build()
     }
 }
 
 impl ChannelBuilder<PresentCredentials, PresentRuntime> {
+    /// Builds the channel with the provided configuration.
+    /// # Example
+    ///
+    /// ```
+    /// use grpc::credentials::LocalChannelCredentials;
+    ///
+    /// let channel = Channel::builder("dns:///localhost:123")
+    ///     .credentials(Arc::new(LocalChannelCredentials::new()))
+    ///     .build();
+    /// ```
     pub fn build(self) -> Channel {
         // TODO(nathanielford) This construction is currently a rough-cut placeholder.
         // The design of PersistentChannel and how and where it is initialized

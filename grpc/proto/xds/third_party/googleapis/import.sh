@@ -12,9 +12,15 @@ DOWNLOAD_URL="https://github.com/googleapis/googleapis/archive/${VERSION}.tar.gz
 DOWNLOAD_BASE_DIR="googleapis-${VERSION}"
 SOURCE_PROTO_BASE_DIR="${DOWNLOAD_BASE_DIR}"
 # Sorted alphabetically.
+# annotations.proto/http.proto/status.proto are not needed by grpc-java (it
+# resolves them from external Bazel/Maven deps), but we vendor them so protoc
+# can resolve every non-well-known import from the committed tree.
 FILES=(
+google/api/annotations.proto
 google/api/expr/v1alpha1/checked.proto
 google/api/expr/v1alpha1/syntax.proto
+google/api/http.proto
+google/rpc/status.proto
 )
 
 import_protos

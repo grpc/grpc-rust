@@ -55,6 +55,14 @@ pub mod core;
 pub mod credentials;
 pub mod metadata;
 
+/// xDS support: generated protobuf message structs (and, later, xDS logic).
+///
+/// Message-only (decode-focused) code generated from the vendored xDS protos
+/// under `proto/xds/third_party`. Regenerate on demand with
+/// `cargo run -p codegen --features xds`. Requires the `xds` feature.
+#[cfg(feature = "xds")]
+pub mod xds;
+
 pub(crate) mod inmemory;
 pub(crate) mod server;
 

@@ -439,6 +439,10 @@ mod tests {
             "node": {"id": "n1"}
         }"#;
         let config = BootstrapConfig::from_json(json).unwrap();
+        assert!(matches!(
+            config.xds_servers[0].channel_creds[0].cred_type,
+            ChannelCredentialType::Unsupported(_)
+        ));
         assert_eq!(config.selected_credential(), None);
     }
 
@@ -643,23 +647,6 @@ mod tests {
             config.selected_credential(),
             Some(&ChannelCredentialType::GoogleDefault)
         );
-    }
-
-    #[test]
-    fn selected_credential_unknown_type_skipped() {
-        let json = r#"{
-            "xds_servers": [{
-                "server_uri": "localhost:5000",
-                "channel_creds": [{"type": "some_future_type"}]
-            }],
-            "node": {"id": "n1"}
-        }"#;
-        let config = BootstrapConfig::from_json(json).unwrap();
-        assert!(matches!(
-            config.xds_servers[0].channel_creds[0].cred_type,
-            ChannelCredentialType::Unsupported(_)
-        ));
-        assert_eq!(config.selected_credential(), None);
     }
 
     #[test]

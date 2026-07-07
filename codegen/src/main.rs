@@ -100,7 +100,6 @@ fn main() {
 #[cfg(feature = "xds")]
 fn regenerate_xds() {
     use std::path::PathBuf;
-    use std::process::Command;
 
     let grpc_dir = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -145,59 +144,68 @@ fn regenerate_xds() {
     }
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    // One shared crate mapping: every xDS proto -> its in-crate module path;
-    // well-known types -> the external `protobuf_well_known_types` crate. Files
-    // NOT in a given invocation are resolved through this mapping, so cross-file
-    // refs become `crate::xds::generated::...` / `::protobuf_well_known_types::`.
-    let mapping_path = out_dir.join("crate_mapping.txt");
-    {
-        let mut m = String::new();
-        for p in &protos {
-            m.push_str(&format!("{}\n1\n{}\n", crate_module_path(p), p));
-        }
-        for dep in protobuf_well_known_types::get_dependency("protobuf_well_known_types") {
-            m.push_str(&format!("{}\n{}\n", dep.crate_name, dep.proto_files.len()));
-            for f in &dep.proto_files {
-                m.push_str(&format!("{f}\n"));
-            }
-        }
-        // `descriptor.proto` is imported only to DEFINE custom options (validate
-        // rules, xDS/udpa annotations); no generated message references its
-        // types, so we don't generate it. But protoc still calls GetCrateName on
-        // it while emitting the entry-point dep list (which we delete), and that
-        // FATALs on an unmapped import — so give it a benign mapping entry.
-        m.push_str("protobuf_well_known_types\n1\ngoogle/protobuf/descriptor.proto\n");
-        std::fs::write(&mapping_path, m).unwrap();
+    // Generate each proto in its OWN invocation: within a single-file invocation
+    // there are no in-crate name collisions. Every OTHER file is declared as a
+    // dependency mapped to its in-crate module path, so cross-file references
+    // resolve to `crate::xds::generated::...` instead of one flat namespace.
+    // Using protobuf_codegen's typed `Dependency` API lets it own the
+    // `crate_mapping.txt` format rather than us hand-writing it.
+    //
+    // `CodeGen::new()` eagerly reads `OUT_DIR` (it targets build scripts); set
+    // it before the first call — the value is overridden by `.output_dir()`.
+    // SAFETY: codegen's `main` is single-threaded up to this point.
+    unsafe {
+        std::env::set_var("OUT_DIR", &out_dir);
     }
 
-    // Generate each proto in its own invocation. Within a single-file invocation
-    // there are no internal name collisions; all cross-file refs go through the
-    // crate mapping above.
-    let rust_out = format!(
-        "experimental-codegen=enabled,kernel=upb,crate_mapping={}:{}",
-        mapping_path.display(),
-        out_dir.display()
-    );
-    for p in &protos {
-        let mut cmd = Command::new(&protoc);
-        for inc in &include_dirs {
-            cmd.arg(format!("--proto_path={}", inc.display()));
+    // Deps shared by every invocation: well-known types resolve to the external
+    // `protobuf_well_known_types` crate. `descriptor.proto` is imported only to
+    // DEFINE custom options (validate rules, xDS/udpa annotations); nothing
+    // references its types so we don't generate it, but protoc still calls
+    // GetCrateName on it while emitting the (deleted) entry point and FATALs on
+    // an unmapped import — so map it benignly too.
+    let mut base_deps = protobuf_well_known_types::get_dependency("protobuf_well_known_types");
+    base_deps.push(protobuf_codegen::Dependency {
+        crate_name: "protobuf_well_known_types".to_string(),
+        proto_import_paths: vec![protoc_include.clone()],
+        proto_files: vec!["google/protobuf/descriptor.proto".to_string()],
+    });
+
+    // The vendored roots plus protoc's bundle (for the well-known types) resolve
+    // every import, so per-file deps carry only the crate mapping (no extra
+    // search paths).
+    let includes: Vec<PathBuf> = include_dirs
+        .iter()
+        .cloned()
+        .chain(std::iter::once(protoc_include.clone()))
+        .collect();
+
+    for file in &protos {
+        let mut deps = base_deps.clone();
+        for other in &protos {
+            if other != file {
+                deps.push(protobuf_codegen::Dependency {
+                    crate_name: crate_module_path(other),
+                    proto_import_paths: Vec::new(),
+                    proto_files: vec![other.clone()],
+                });
+            }
         }
-        cmd.arg(format!("--proto_path={}", protoc_include.display()));
-        cmd.arg(format!("--rust_out={rust_out}"));
-        cmd.arg(p);
-        let output = cmd.output().unwrap();
-        assert!(
-            output.status.success(),
-            "protoc failed for {p}:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        protobuf_codegen::CodeGen::new()
+            .protoc_path(&protoc)
+            .input(file)
+            .includes(includes.iter())
+            .output_dir(&out_dir)
+            .dependency(deps)
+            .generate_and_compile()
+            .unwrap_or_else(|e| panic!("xDS codegen failed for {file}: {e}"));
     }
 
     // Drop protoc's per-invocation artifacts: the flat `generated.rs`
-    // aggregators (we build our own nested module tree) and the crate mapping.
-    let _ = std::fs::remove_file(&mapping_path);
+    // aggregators (we build our own nested module tree) and the `crate_mapping.txt`
+    // protobuf_codegen writes into the output dir.
     remove_files_named(&out_dir, "generated.rs");
+    let _ = std::fs::remove_file(out_dir.join("crate_mapping.txt"));
 
     // Emit the wrapper module tree: each file becomes a `pub mod <stem>` that
     // re-exports its `.u.pb.rs` (so the file's own `super::` sibling refs
@@ -244,7 +252,7 @@ fn raw_ident(seg: &str) -> String {
 #[cfg(feature = "xds")]
 fn write_module_tree(dir: &std::path::Path) {
     const ALLOW: &str = "#![allow(missing_docs, unreachable_pub, non_camel_case_types, \
-        non_snake_case, unused, clippy::all)]";
+        non_snake_case, non_upper_case_globals, unused, clippy::all)]";
     const HEADER: &str =
         "// @generated by `cargo run -p codegen --features xds`. Do not edit.";
 

@@ -23,3 +23,9 @@ protoc-gen-rust-grpc = { version = "0.10.0", path = "../protoc-gen-rust-grpc", o
 default = []
 # Regenerate the checked-in xDS message structs under grpc/src/generated/xds.
 xds = ["dep:protobuf-codegen", "dep:protobuf-well-known-types", "dep:protoc-gen-rust-grpc"]
+# Other workspace members expose `protoc-gen-rust-grpc` as a feature, so a
+# workspace-wide `--features protoc-gen-rust-grpc` (e.g. `cargo hack
+# --each-feature`) resolves it against every member. Alias it to `xds` here so
+# it resolves for this package too and pulls in the code that uses the dep
+# (otherwise the dep would appear unused under that feature).
+protoc-gen-rust-grpc = ["xds"]

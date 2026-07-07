@@ -99,8 +99,8 @@ impl Channel {
     pub fn builder(target: impl Into<String>) -> ChannelBuilder<MissingOpt, MissingOpt> {
         ChannelBuilder {
             target: target.into(),
-            credentials: MissingOpt,
-            runtime: MissingOpt,
+            credentials: MissingOpt(()),
+            runtime: MissingOpt(()),
             channel_authority: None,
         }
     }
@@ -138,8 +138,8 @@ impl Invoke for Channel {
     }
 }
 
-pub struct MissingOpt;
-pub struct PresentOpt<T>(pub T);
+pub struct MissingOpt(());
+pub struct PresentOpt<T>(T);
 
 type PresentCredentials = PresentOpt<Arc<dyn ChannelCredentials>>;
 type PresentRuntime = PresentOpt<GrpcRuntime>;

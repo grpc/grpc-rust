@@ -194,6 +194,7 @@ pub struct ChannelBuilder<C, R> {
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
 impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
+    /// Adds (required) channel credentials to the builder.
     pub fn credentials(
         self,
         credentials: impl IntoCredentialConfig,
@@ -222,8 +223,8 @@ impl<C> ChannelBuilder<C, MissingOpt> {
 }
 
 impl<C, R> ChannelBuilder<C, R> {
-    // TODO(nathanielford) Revist if this is subsumed by the SecurityOpts authority.
-    // May need to change how this is being set on the builder.
+    // TODO(nathanielford) Revisit if this is subsumed by the SecurityOpts
+    // authority. May need to change how this is being set on the builder.
     pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
         self.channel_authority = Some(authority.into());
         self
@@ -255,6 +256,7 @@ impl ChannelBuilder<PresentCredentials, PresentRuntime> {
 
         let target = Target::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
+        // TODO(nathanielford): Return errors here instead of panicking.
         let target = name_resolution::Target::from(target);
         let authority = self
             .channel_authority

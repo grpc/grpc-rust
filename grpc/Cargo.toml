@@ -23,7 +23,7 @@ allowed_external_types = [
 ]
 
 [features]
-default = ["dns", "_runtime-tokio", "tls-rustls", "xds"]
+default = ["dns", "_runtime-tokio", "tls-rustls"]
 dns = ["dep:hickory-resolver", "_runtime-tokio"]
 # The following feature is used to ensure all modules use the runtime
 # abstraction instead of using tokio directly.

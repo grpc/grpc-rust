@@ -20,6 +20,6 @@ protobuf-well-known-types = { version = "4.35.1-release", optional = true }
 protoc-gen-rust-grpc = { version = "0.10.0", path = "../protoc-gen-rust-grpc", optional = true }
 
 [features]
-default = [ "xds" ]
+default = []
 # Regenerate the checked-in xDS message structs under grpc/src/generated/xds.
 xds = ["dep:protobuf-codegen", "dep:protobuf-well-known-types", "dep:protoc-gen-rust-grpc"]

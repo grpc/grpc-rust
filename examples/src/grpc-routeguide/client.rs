@@ -179,9 +179,11 @@ async fn main() {
     println!("Connecting to {address}...");
 
     // Create a new gRPC channel:
-    let channel = Channel::builder(format!("dns:///{address}"))
-        .credentials(Arc::new(LocalChannelCredentials::new()))
-        .build();
+    let channel = Channel::builder(
+        format!("dns:///{address}"),
+        Arc::new(LocalChannelCredentials::new()),
+    )
+    .build();
 
     let client = RouteGuideClient::new(channel);
 

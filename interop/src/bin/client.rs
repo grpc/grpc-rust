@@ -98,14 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     GrpcClientTlsConfig::new()
                         .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;
-                grpc::client::Channel::builder("dns:///localhost:10000")
-                    .credentials(Arc::new(creds))
+                grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
                     .channel_authority("test.test.google.fr")
                     .build()
             } else {
-                grpc::client::Channel::builder("dns:///localhost:10000")
-                    .credentials(Arc::new(LocalChannelCredentials::new()))
-                    .build()
+                grpc::client::Channel::builder(
+                    "dns:///localhost:10000",
+                    Arc::new(LocalChannelCredentials::new()),
+                )
+                .build()
             };
             (
                 Box::new(client_protobuf::TestClient::new(channel.clone())),

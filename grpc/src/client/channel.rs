@@ -97,12 +97,26 @@ pub struct Channel {
 
 impl Channel {
     /// Creates a new channel builder for the given target.
-    pub fn builder(target: impl Into<String>) -> ChannelBuilder<MissingOpt, MissingOpt> {
+    ///# Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use grpc::client::Channel;
+    /// use grpc::credentials::LocalChannelCredentials;
+    ///
+    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+    ///     .build();
+    /// ```
+    #[cfg(feature = "_runtime-tokio")]
+    pub fn builder(
+        target: impl Into<String>,
+        credentials: Arc<dyn ChannelCredentials>,
+    ) -> ChannelBuilder {
         ChannelBuilder {
             target: target.into(),
-            credentials: MissingOpt(()),
-            runtime: MissingOpt(()),
+            credentials: credentials,
             channel_authority: None,
+            runtime: default_runtime(),
         }
     }
     // TODO: enter_idle(&self) and graceful_stop()?
@@ -139,47 +153,14 @@ impl Invoke for Channel {
     }
 }
 
-pub struct MissingOpt(());
-pub struct PresentOpt<T>(T);
-
-type PresentCredentials = PresentOpt<Arc<dyn ChannelCredentials>>;
-type PresentRuntime = PresentOpt<GrpcRuntime>;
-
-pub trait IntoCredentialConfig {
-    fn into_config(self) -> Arc<dyn ChannelCredentials>;
-}
-
-impl<C> IntoCredentialConfig for Arc<C>
-where
-    C: ChannelCredentials + Sized + 'static,
-{
-    fn into_config(self) -> Arc<dyn ChannelCredentials> {
-        self
-    }
-}
-
-impl IntoCredentialConfig for Arc<dyn ChannelCredentials> {
-    fn into_config(self) -> Arc<dyn ChannelCredentials> {
-        self
-    }
-}
-
-impl<C> IntoCredentialConfig for C
-where
-    C: ChannelCredentials + Sized + 'static,
-{
-    fn into_config(self) -> Arc<dyn ChannelCredentials> {
-        Arc::new(self)
-    }
-}
-
-pub struct ChannelBuilder<C, R> {
+pub struct ChannelBuilder {
     // Required values.
     target: String,
-    credentials: C,
-    runtime: R, // Can be defaulted w/Tokio runtime feature.
+    credentials: Arc<dyn ChannelCredentials>,
+    runtime: GrpcRuntime,
 
     // Optional values.
+    channel_authority: Option<String>,
     // TODO(nathanielford) In follow-up implement the following optional values:
     // - default_service_config
     // - http_proxy_cfg
@@ -187,72 +168,18 @@ pub struct ChannelBuilder<C, R> {
     // - idle_timeout
     // - enable_channelz
     // - keepalive_cfg
-    channel_authority: Option<String>, // TODO(nathanielford) Revisit if this is subsumed by the SecurityOpts authority.
 }
 
-// This is provided as a separate builder function to allow for the possibility
-// of satisfying the credential/security configuration through different means
-// in the future (via adding methods to this impl taking different args).
-impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
-    /// (Required) Adds channel credentials to the builder.
-    pub fn credentials(
-        self,
-        credentials: impl IntoCredentialConfig,
-    ) -> ChannelBuilder<PresentCredentials, Runtime> {
-        ChannelBuilder {
-            target: self.target,
-            credentials: PresentOpt(credentials.into_config()),
-            runtime: self.runtime,
-            channel_authority: self.channel_authority,
-        }
-    }
-}
-
-impl<C> ChannelBuilder<C, MissingOpt> {
-    /// (Required) Adds the runtime to the builder. If the Tokio runtime
-    /// feature is enabled, skipping this will cause the default Tokio runtime
-    /// to be used.
-    pub fn runtime(self, runtime: GrpcRuntime) -> ChannelBuilder<C, PresentRuntime> {
-        ChannelBuilder {
-            target: self.target,
-            credentials: self.credentials,
-            runtime: PresentOpt(runtime),
-            channel_authority: self.channel_authority,
-        }
-    }
-}
-
-impl<C, R> ChannelBuilder<C, R> {
-    /// Overrides the authority used for the channel. This will override both
-    /// any authority specified in the target or by the name resolver.
-    pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
-        self.channel_authority = Some(authority.into());
-        self
-    }
-}
-
-/// If the Tokio runtime feature is enabled, the channel builder can be built
-/// without explicitly providing a runtime, defaulting to the Tokio runtime.
-/// This does not prevent a user from providing their own runtime if they wish,
-/// and the builder will work as normal.
-#[cfg(feature = "_runtime-tokio")]
-impl ChannelBuilder<PresentCredentials, MissingOpt> {
-    /// Builds the channel with the provided configuration, using the default
-    /// Tokio runtime if no runtime was explicitly provided.
-    pub fn build(self) -> Channel {
-        self.runtime(default_runtime()).build()
-    }
-}
-
-impl ChannelBuilder<PresentCredentials, PresentRuntime> {
+impl ChannelBuilder {
     /// Builds the channel with the provided configuration.
     /// # Example
     ///
     /// ```
+    /// use std::sync::Arc;
+    /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123")
-    ///     .credentials(Arc::new(LocalChannelCredentials::new()))
+    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
     ///     .build();
     /// ```
     pub fn build(self) -> Channel {
@@ -274,7 +201,7 @@ impl ChannelBuilder<PresentCredentials, PresentRuntime> {
             .channel_authority
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
-            credentials: self.credentials.0,
+            credentials: self.credentials,
             authority: Authority::from_host_port_str(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
@@ -283,10 +210,15 @@ impl ChannelBuilder<PresentCredentials, PresentRuntime> {
                 active_channel: Mutex::default(),
                 target,
                 security_opts,
-                runtime: self.runtime.0,
+                runtime: self.runtime,
                 resolver_builder,
             }),
         }
+    }
+
+    pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
+        self.channel_authority = Some(authority.into());
+        self
     }
 }
 

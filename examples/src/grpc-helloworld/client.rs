@@ -24,9 +24,11 @@ async fn main() {
     };
 
     // Create a new gRPC channel:
-    let channel = Channel::builder("dns:///[::1]:50051")
-        .credentials(Arc::new(LocalChannelCredentials::new()))
-        .build();
+    let channel = Channel::builder(
+        "dns:///[::1]:50051",
+        Arc::new(LocalChannelCredentials::new()),
+    )
+    .build();
     let client = GreeterClient::new(channel);
 
     // Send the request and print the response:

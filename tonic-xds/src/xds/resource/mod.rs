@@ -10,8 +10,10 @@
 //!
 //! These are *validated* types containing only the fields relevant to gRPC
 
+pub(crate) mod circuit_breaking;
 pub(crate) mod cluster;
 pub(crate) mod endpoints;
+pub(crate) mod hash_policy;
 pub(crate) mod listener;
 pub(crate) mod outlier_detection;
 pub(crate) mod route_config;

@@ -1,11 +1,15 @@
 fn main() {
-    let proto = "proto/grpc/testing/test.proto";
+    println!("cargo:rerun-if-changed=build.rs");
 
-    eprintln!("{}", grpc_protobuf_build::protoc());
-    let path = std::env::var("PATH").unwrap_or_default();
-    unsafe {
-        std::env::set_var("PATH", format!("{}:{}", path, grpc_protobuf_build::bin()));
+    // Use protoc-gen-rust-grpc for tonic_prost_build when it is available
+    #[cfg(feature = "protoc-gen-rust-grpc")]
+    if protoc_gen_rust_grpc::protoc().exists() {
+        unsafe {
+            std::env::set_var("PROTOC", protoc_gen_rust_grpc::protoc());
+        }
     }
+
+    let proto = "proto/grpc/testing/test.proto";
 
     tonic_prost_build::compile_protos(proto).unwrap();
     grpc_protobuf_build::CodeGen::new()
@@ -13,7 +17,4 @@ fn main() {
         .inputs(["test.proto", "empty.proto", "messages.proto"])
         .compile()
         .unwrap();
-
-    // prevent needing to rebuild if files (or deps) haven't changed
-    println!("cargo:rerun-if-changed={proto}");
 }

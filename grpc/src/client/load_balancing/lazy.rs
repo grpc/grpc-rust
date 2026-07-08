@@ -24,6 +24,8 @@
 
 use std::mem::replace;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
@@ -35,6 +37,7 @@ use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::core::RequestHeaders;
@@ -119,9 +122,9 @@ where
         }
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
         if let Inner::Built(delegate) = &mut self.inner {
-            delegate.work(channel_controller);
+            delegate.work(data, channel_controller);
         } else {
             // The channel should only give us a work call if we asked for it
             // via the WakeUpPicker.
@@ -167,17 +170,23 @@ where
 #[derive(Debug)]
 pub struct WakeUpPicker {
     work_scheduler: Arc<dyn WorkScheduler>,
+    triggered_work: AtomicBool,
 }
 
 impl WakeUpPicker {
     fn new(work_scheduler: Arc<dyn WorkScheduler>) -> Self {
-        Self { work_scheduler }
+        Self {
+            work_scheduler,
+            triggered_work: AtomicBool::new(false),
+        }
     }
 }
 
 impl Picker for WakeUpPicker {
     fn pick(&self, request: &RequestHeaders) -> PickResult {
-        self.work_scheduler.schedule_work();
+        if !self.triggered_work.swap(true, Ordering::Relaxed) {
+            self.work_scheduler.schedule_work(None);
+        }
         PickResult::Queue
     }
 }
@@ -278,16 +287,53 @@ mod tests {
 
         // Picking should have scheduled work.
         let event = rx_events.recv().unwrap();
-        assert!(matches!(event, TestEvent::ScheduleWork));
+        assert!(matches!(event, TestEvent::ScheduleWork(None)));
 
         // Call work on lazy to honor its request.
-        lazy.work(&mut cc);
+        lazy.work(None, &mut cc);
 
         // Verify delegate was built and received the pending update.
         assert_eq!(rx.recv().unwrap(), MockEvent::Build);
         assert_eq!(rx.recv().unwrap(), MockEvent::ResolverUpdate);
         // Verify no more events.
         assert!(rx.try_recv().is_err());
+    }
+
+    // Tests that calling pick multiple times on the WakeUpPicker only schedules
+    // a single work event.
+    #[test]
+    fn test_lazy_pick_squashes_work_calls() {
+        let (builder, _rx) = MockPolicy::new();
+
+        let (tx_events, rx_events) = mpsc::channel();
+        let mut cc = TestChannelController {
+            tx_events: tx_events.clone(),
+        };
+        let options = LbPolicyOptions {
+            work_scheduler: Arc::new(TestWorkScheduler { tx_events }),
+            runtime: crate::rt::default_runtime(),
+        };
+
+        let _lazy = Lazy::new(builder, options, &mut cc);
+
+        // Get the initial picker.
+        let event = rx_events.recv().unwrap();
+        let TestEvent::UpdatePicker(lb_state) = event else {
+            panic!("expected UpdatePicker event");
+        };
+
+        // Call pick multiple times.
+        for _ in 0..10 {
+            let res = lb_state.picker.pick(&new_request_headers());
+            assert!(matches!(res, PickResult::Queue));
+        }
+
+        // We should only receive a single ScheduleWork event.
+        let event = rx_events.recv().unwrap();
+        assert!(matches!(event, TestEvent::ScheduleWork(None)));
+
+        // There should be no more events in the channel.
+        assert!(rx_events.try_recv().is_err());
     }
 
     // Tests that the delegate policy is constructed only after exit_idle is
@@ -354,10 +400,10 @@ mod tests {
 
         // Picking should have scheduled work.
         let event = rx_events.recv().unwrap();
-        assert!(matches!(event, TestEvent::ScheduleWork));
+        assert!(matches!(event, TestEvent::ScheduleWork(None)));
 
         // Call work on lazy to honor its request.
-        lazy.work(&mut cc);
+        lazy.work(None, &mut cc);
 
         // Verify delegate was built and received an exit_idle call.
         assert_eq!(rx.recv().unwrap(), MockEvent::Build);
@@ -412,7 +458,11 @@ mod tests {
         ) {
             self.tx.send(MockEvent::SubchannelUpdate).unwrap();
         }
-        fn work(&mut self, _channel_controller: &mut dyn ChannelController) {
+        fn work(
+            &mut self,
+            _work_data: Option<WorkData>,
+            _channel_controller: &mut dyn ChannelController,
+        ) {
             self.tx.send(MockEvent::Work).unwrap();
         }
         fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {

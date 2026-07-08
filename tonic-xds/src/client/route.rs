@@ -19,6 +19,12 @@ pub(crate) struct RouteInput<'a> {
 pub(crate) struct RouteDecision {
     /// The name of the cluster to which the request should be routed.
     pub cluster: String,
+    /// The request hash computed from the route's hash policies (gRFC A42),
+    /// consumed by the ring-hash LB picker. `None` when no hash policy produced
+    /// a hash, in which case the picker falls back to a random hash.
+    // Populated by the routing layer; consumed by the ring-hash picker (later PR).
+    #[allow(dead_code)]
+    pub request_hash: Option<u64>,
 }
 
 /// Trait for routing requests to clusters.
@@ -124,6 +130,7 @@ mod tests {
             Box::pin(async move {
                 Ok(RouteDecision {
                     cluster: "test-cluster".to_string(),
+                    request_hash: None,
                 })
             })
         }

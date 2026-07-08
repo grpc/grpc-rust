@@ -35,6 +35,7 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
@@ -53,7 +54,7 @@ pub(crate) struct GracefulSwitchLbConfig {
 /// graceful switch creates a "pending" child policy alongside the "active"
 /// policy.  When the pending policy leaves the CONNECTING state, or when the
 /// active policy is not READY, graceful switch will promote the pending policy
-/// to to active and tear down the previously active policy.
+/// to active and tear down the previously active policy.
 #[derive(Debug)]
 pub(crate) struct GracefulSwitchPolicy {
     child_manager: ChildManager<()>, // Child ID empty - only the name of the child LB policy matters.
@@ -114,8 +115,8 @@ impl LbPolicy for GracefulSwitchPolicy {
         self.update_picker(channel_controller);
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.child_manager.work(channel_controller);
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        self.child_manager.work(data, channel_controller);
         self.update_picker(channel_controller);
     }
 

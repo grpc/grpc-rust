@@ -38,8 +38,9 @@ esac
 
 ARG="${1:-""}"
 
-
-(cd interop && cargo build --bins)
+if [ -z "${GITHUB_ACTIONS:-}" ]; then
+  (cd interop && cargo build --bins)
+fi
 
 SERVER="interop/bin/server_${OS}_amd64${EXT}"
 

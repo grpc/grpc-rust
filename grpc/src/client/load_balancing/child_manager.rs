@@ -26,13 +26,11 @@
 //! purposes of forwarding channel updates.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
@@ -43,6 +41,7 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::WeakSubchannel;
 use crate::client::name_resolution::Address;
@@ -53,8 +52,8 @@ use crate::rt::GrpcRuntime;
 #[derive(Debug)]
 pub(crate) struct ChildManager<T: Debug> {
     subchannel_to_child_idx: HashMap<WeakSubchannel, usize>,
+    handle_to_child_idx: HashMap<ChildHandle, usize>,
     children: Vec<Child<T>>,
-    pending_work: Arc<Mutex<HashSet<usize>>>,
     runtime: GrpcRuntime,
     updated: bool, // Set when any child updates its picker; cleared when accessed.
     work_scheduler: Arc<dyn WorkScheduler>,
@@ -95,8 +94,8 @@ where
     pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
         Self {
             subchannel_to_child_idx: Default::default(),
+            handle_to_child_idx: Default::default(),
             children: Default::default(),
-            pending_work: Default::default(),
             runtime,
             work_scheduler,
             updated: false,
@@ -193,14 +192,6 @@ where
         ids_builders: impl IntoIterator<Item = (T, Arc<DynLbPolicyBuilder>)>,
         retain_only: bool,
     ) {
-        // Hold the lock to prevent new work requests during this operation and
-        // rewrite the indices.
-        let mut pending_work = self.pending_work.lock().unwrap();
-
-        // Reset pending work; we will re-add any entries it contains with the
-        // right index later.
-        let old_pending_work = mem::take(&mut *pending_work);
-
         // Replace self.children with an empty vec.
         let old_children = mem::take(&mut self.children);
 
@@ -235,20 +226,23 @@ where
             })
             .collect();
 
+        // Clear handle index map.
+        self.handle_to_child_idx.clear();
+
         // Transfer children whose identifiers appear before and after the
         // update, and create new children.  Add entries back into the
         // subchannel map.
-        for (new_idx, (identifier, builder)) in ids_builders.into_iter().enumerate() {
+        for (identifier, builder) in ids_builders {
             let k = (builder.name(), identifier);
             if let Some(old_child) = old_children.remove(&k) {
                 let old_idx = old_child.identifier;
+                let new_child_idx = self.children.len();
                 for subchannel in mem::take(&mut old_child_subchannels[old_idx]) {
-                    self.subchannel_to_child_idx.insert(subchannel, new_idx);
+                    self.subchannel_to_child_idx
+                        .insert(subchannel, new_child_idx);
                 }
-                if old_pending_work.contains(&old_idx) {
-                    pending_work.insert(new_idx);
-                }
-                *old_child.work_scheduler.idx.lock().unwrap() = Some(new_idx);
+                self.handle_to_child_idx
+                    .insert(old_child.work_scheduler.handle.clone(), new_child_idx);
                 self.children.push(Child {
                     builder,
                     identifier: k.1,
@@ -257,10 +251,13 @@ where
                     work_scheduler: old_child.work_scheduler,
                 });
             } else if !retain_only {
+                let handle = ChildHandle(Arc::new(()));
+                let new_child_idx = self.children.len();
+                self.handle_to_child_idx
+                    .insert(handle.clone(), new_child_idx);
                 let work_scheduler = Arc::new(ChildWorkScheduler {
-                    pending_work: self.pending_work.clone(),
-                    idx: Mutex::new(Some(new_idx)),
                     work_scheduler: self.work_scheduler.clone(),
+                    handle,
                 });
                 let policy = builder.build(LbPolicyOptions {
                     work_scheduler: work_scheduler.clone(),
@@ -274,11 +271,6 @@ where
                     work_scheduler,
                 });
             };
-        }
-
-        // Invalidate all deleted children's work_schedulers.
-        for (_, old_child) in old_children {
-            old_child.work_scheduler.invalidate();
         }
         // Anything left in old_children will just be Dropped and cleaned up.
     }
@@ -390,13 +382,27 @@ where
     }
 
     /// Calls work on any children that scheduled work via the work scheduler.
-    pub fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        let child_idxes = mem::take(&mut *self.pending_work.lock().unwrap());
-        for child_idx in child_idxes {
+    pub fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        let Some(data) = data else {
+            debug_assert!(false, "ChildManager::work called with None value");
+            return;
+        };
+        let child_work_item = match data.downcast::<ChildWorkItem>() {
+            Ok(item) => item,
+            Err(data) => {
+                debug_assert!(
+                    false,
+                    "ChildManager::work called with {data:?}; expected ChildWorkItem"
+                );
+                return;
+            }
+        };
+        if let Some(&child_idx) = self.handle_to_child_idx.get(&child_work_item.handle) {
+            let child = &mut self.children[child_idx];
             let mut channel_controller = WrappedController::new(channel_controller);
-            self.children[child_idx]
+            child
                 .policy
-                .work(&mut channel_controller);
+                .work(child_work_item.data, &mut channel_controller);
             self.resolve_child_controller(channel_controller, child_idx);
         }
     }
@@ -444,30 +450,42 @@ impl ChannelController for WrappedController<'_> {
     }
 }
 
-#[derive(Debug)]
-struct ChildWorkScheduler {
-    work_scheduler: Arc<dyn WorkScheduler>, // The real work scheduler of the channel.
-    pending_work: Arc<Mutex<HashSet<usize>>>, // Must be taken first for correctness
-    idx: Mutex<Option<usize>>,              // None if the child is deleted.
-}
+#[derive(Clone, Debug)]
+struct ChildHandle(Arc<()>);
 
-impl WorkScheduler for ChildWorkScheduler {
-    fn schedule_work(&self) {
-        let mut pending_work = self.pending_work.lock().unwrap();
-        // If self.idx is None then this WorkScheduler has been invalidated as
-        // it is associated with a deleted child; do nothing in that case.
-        if let Some(idx) = *self.idx.lock().unwrap() {
-            pending_work.insert(idx);
-            self.work_scheduler.schedule_work();
-        }
+impl PartialEq for ChildHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl ChildWorkScheduler {
-    // Sets the ChildWorkScheduler so that it will not honor future
-    // schedule_work requests.
-    fn invalidate(&self) {
-        *self.idx.lock().unwrap() = None;
+impl Eq for ChildHandle {}
+
+impl std::hash::Hash for ChildHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+#[derive(Debug)]
+struct ChildWorkItem {
+    handle: ChildHandle,
+    data: Option<WorkData>,
+}
+
+#[derive(Debug)]
+struct ChildWorkScheduler {
+    work_scheduler: Arc<dyn WorkScheduler>, // The real work scheduler of the channel.
+    handle: ChildHandle,
+}
+
+impl WorkScheduler for ChildWorkScheduler {
+    fn schedule_work(&self, data: Option<WorkData>) {
+        let wrapped: Option<WorkData> = Some(Box::new(ChildWorkItem {
+            handle: self.handle.clone(),
+            data,
+        }));
+        self.work_scheduler.schedule_work(wrapped);
     }
 }
 
@@ -826,7 +844,10 @@ mod test {
         requested_work: bool,
     }
 
-    fn create_funcs_for_schedule_work_tests(name: &'static str) -> StubPolicyFuncs {
+    fn create_funcs_for_schedule_work_tests(
+        name: &'static str,
+        work_called: Arc<Mutex<HashMap<&'static str, bool>>>,
+    ) -> StubPolicyFuncs {
         StubPolicyFuncs {
             resolver_update: Some(Arc::new(move |data, _update, lbcfg, _controller| {
                 if data.test_data.is_none() {
@@ -850,11 +871,11 @@ mod test {
                     .contains_key(name)
                 {
                     stubdata.requested_work = true;
-                    data.lb_policy_options.work_scheduler.schedule_work();
+                    data.lb_policy_options.work_scheduler.schedule_work(None);
                 }
                 Ok(())
             })),
-            work: Some(Arc::new(move |data, _controller| {
+            work: Some(Arc::new(move |data, _workitem, _controller| {
                 println!("work called for {name}");
                 let stubdata = data
                     .test_data
@@ -863,6 +884,7 @@ mod test {
                     .downcast_mut::<ScheduleWorkStubData>()
                     .unwrap();
                 stubdata.requested_work = false;
+                work_called.lock().unwrap().insert(name, true);
             })),
             ..Default::default()
         }
@@ -874,8 +896,16 @@ mod test {
     fn childmanager_schedule_work_works() {
         let name1 = "childmanager_schedule_work_works-one";
         let name2 = "childmanager_schedule_work_works-two";
-        test_utils::reg_stub_policy(name1, create_funcs_for_schedule_work_tests(name1));
-        test_utils::reg_stub_policy(name2, create_funcs_for_schedule_work_tests(name2));
+        let work_called = Arc::new(Mutex::new(HashMap::<&'static str, bool>::new()));
+
+        test_utils::reg_stub_policy(
+            name1,
+            create_funcs_for_schedule_work_tests(name1, work_called.clone()),
+        );
+        test_utils::reg_stub_policy(
+            name2,
+            create_funcs_for_schedule_work_tests(name2, work_called.clone()),
+        );
 
         let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
         let mut tcc = TestChannelController {
@@ -905,43 +935,79 @@ mod test {
         });
         child_manager.update(updates.clone(), &mut tcc).unwrap();
 
+        let child1_handle = child_manager.children[0].work_scheduler.handle.clone();
+        let child2_handle = child_manager.children[1].work_scheduler.handle.clone();
+
         // Confirm that child one has requested work.
-        match rx_events.recv().unwrap() {
-            TestEvent::ScheduleWork => {}
-            other => panic!("unexpected event {:?}", other),
+        let event = rx_events.recv().unwrap();
+        let TestEvent::ScheduleWork(data) = event else {
+            panic!("unexpected event {:?}", event);
         };
-        assert_eq!(child_manager.pending_work.lock().unwrap().len(), 1);
-        let idx = *child_manager
-            .pending_work
-            .lock()
-            .unwrap()
-            .iter()
-            .next()
-            .unwrap();
-        assert_eq!(child_manager.children[idx].builder.name(), name1);
+        // Validate data indicates the child to call.
+        {
+            let wrapped = data
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<super::ChildWorkItem>()
+                .unwrap();
+            assert_eq!(wrapped.handle, child1_handle);
+        }
 
-        // Perform the work call and assert the pending_work set is empty.
-        child_manager.work(&mut tcc);
-        assert_eq!(child_manager.pending_work.lock().unwrap().len(), 0);
+        // Perform the work call.
+        child_manager.work(data, &mut tcc);
+        // Validate that this call made it to the child.
+        assert!(*work_called.lock().unwrap().get(name1).unwrap_or(&false));
+        assert!(!*work_called.lock().unwrap().get(name2).unwrap_or(&false));
 
-        // Now have both children request work.
+        // Clear work_called state.
+        work_called.lock().unwrap().clear();
+
+        // Now request that both children request work.
         children.lock().unwrap().insert(name2, ());
 
         child_manager.update(updates.clone(), &mut tcc).unwrap();
 
-        // Confirm that both children requested work.
-        match rx_events.recv().unwrap() {
-            TestEvent::ScheduleWork => {}
-            other => panic!("unexpected event {:?}", other),
-        };
-        assert_eq!(child_manager.pending_work.lock().unwrap().len(), 2);
+        // Expect two ScheduleWork events. Since they both happened, let's collect them.
+        let mut works = vec![];
+        for _ in 0..2 {
+            let event = rx_events.recv().unwrap();
+            let TestEvent::ScheduleWork(data) = event else {
+                panic!("unexpected event {:?}", event);
+            };
+            works.push(data);
+        }
 
-        // Perform the work call and assert the pending_work set is empty.
-        child_manager.work(&mut tcc);
-        assert_eq!(child_manager.pending_work.lock().unwrap().len(), 0);
+        // We expect one work item for child1 and one for child2.
+        let mut child1_work = None;
+        let mut child2_work = None;
 
-        // Perform one final call to resolver_update which asserts that both
-        // child policies had their work methods called.
-        child_manager.update(updates, &mut tcc).unwrap();
+        for work in works {
+            let handle = work
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<super::ChildWorkItem>()
+                .unwrap()
+                .handle
+                .clone();
+            if handle == child1_handle {
+                child1_work = Some(work);
+            } else if handle == child2_handle {
+                child2_work = Some(work);
+            } else {
+                panic!("unexpected child handle");
+            }
+        }
+
+        let child1_work = child1_work.expect("should have scheduled work for child 1");
+        let child2_work = child2_work.expect("should have scheduled work for child 2");
+
+        // Call work for child 1.
+        child_manager.work(child1_work, &mut tcc);
+        assert!(*work_called.lock().unwrap().get(name1).unwrap_or(&false));
+        assert!(!*work_called.lock().unwrap().get(name2).unwrap_or(&false));
+
+        // Call work for child 2.
+        child_manager.work(child2_work, &mut tcc);
+        assert!(*work_called.lock().unwrap().get(name2).unwrap_or(&false));
     }
 }

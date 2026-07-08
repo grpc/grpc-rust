@@ -100,15 +100,43 @@ impl Decoder for BytesDecoder {
 #[derive(Clone, Debug)]
 pub struct TonicTransport {
     channel: Channel,
-    secure: bool,
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
 }
 
 impl TonicTransport {
+    /// Create a transport from an existing tonic [`Channel`].
+    ///
+    /// Use this when you need custom channel configuration (e.g., TLS, timeouts).
+    /// Call credentials are not supported here, since the channel's security
+    /// cannot be verified; use [`TonicTransportBuilder`] for them.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+    ///
+    /// let tls = ClientTlsConfig::new()
+    ///     .ca_certificate(Certificate::from_pem(ca_cert))
+    ///     .domain_name("xds.example.com");
+    ///
+    /// let channel = Channel::from_static("https://xds.example.com:443")
+    ///     .tls_config(tls)?
+    ///     .connect()
+    ///     .await?;
+    ///
+    /// let transport = TonicTransport::from_channel(channel);
+    /// ```
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            channel,
+            call_creds: None,
+        }
+    }
+
     /// Connect to an xDS server with default settings.
     ///
-    /// For custom configuration (TLS, a pre-built channel, call credentials), use
-    /// [`TonicTransportBuilder`].
+    /// For custom configuration (TLS, call credentials), use [`TonicTransportBuilder`];
+    /// for a pre-built channel, use [`from_channel`](Self::from_channel).
     pub async fn connect(uri: impl Into<String>) -> Result<Self> {
         let server = ServerConfig::new(uri.into());
         TonicTransportBuilder::new().build(&server).await
@@ -151,11 +179,6 @@ pub struct TonicTransportBuilder {
     #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
     tls_config: Option<tonic::transport::ClientTlsConfig>,
 
-    /// A pre-built channel and whether it is secure (TLS). When set, [`build`]
-    /// uses it as-is and ignores the server URI.
-    ///
-    /// Note: a minimal hook; the `grpc` crate provides the richer pre-built-channel pattern.
-    channel: Option<(Channel, bool)>,
     /// Per-stream call credentials for the ADS stream.
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
 }
@@ -179,33 +202,9 @@ impl TonicTransportBuilder {
     /// Set per-stream call credentials for the ADS stream (e.g. `google_default`).
     ///
     /// Attached on each (re)connect, only over a secure channel; over an insecure
-    /// channel, stream creation fails. Not refreshed mid-stream.
+    /// channel, [`build`](TransportBuilder::build) fails. Not refreshed mid-stream.
     pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
         self.call_creds = Some(creds);
-        self
-    }
-
-    /// Use a pre-built tonic [`Channel`] instead of connecting to the server URI.
-    ///
-    /// Use this for custom channel configuration (e.g. TLS, timeouts). `secure`
-    /// declares whether the channel uses TLS; call credentials that require a
-    /// secure transport are refused when it is `false`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use tonic::transport::{Channel, ClientTlsConfig};
-    /// use xds_client::TonicTransportBuilder;
-    ///
-    /// let channel = Channel::from_static("https://xds.example.com:443")
-    ///     .tls_config(ClientTlsConfig::new())?
-    ///     .connect()
-    ///     .await?;
-    ///
-    /// let builder = TonicTransportBuilder::new().with_channel(channel, true);
-    /// ```
-    pub fn with_channel(mut self, channel: Channel, secure: bool) -> Self {
-        self.channel = Some((channel, secure));
         self
     }
 
@@ -229,21 +228,22 @@ impl TransportBuilder for TonicTransportBuilder {
     type Transport = TonicTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        // Use a pre-built channel as-is; the server URI is ignored.
-        if let Some((channel, secure)) = &self.channel {
-            return Ok(TonicTransport {
-                channel: channel.clone(),
-                secure: *secure,
-                call_creds: self.call_creds.clone(),
-            });
-        }
-
         // The channel is secure only when TLS is configured; with no TLS backend
         // compiled in, it can never be secure.
         #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
         let secure = self.tls_config.is_some();
         #[cfg(not(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc")))]
         let secure = false;
+
+        // Refuse before connecting: never send credentials over an insecure channel.
+        if let Some(creds) = &self.call_creds
+            && creds.requires_secure_transport()
+            && !secure
+        {
+            return Err(Error::CallCredentials(
+                "call credentials require a secure transport".into(),
+            ));
+        }
 
         // `Endpoint::from_shared` routes `unix://` URIs to tonic's UDS connector.
         // Required for control planes like Istio's grpc-agent that ship `unix:///etc/istio/proxy/XDS`.
@@ -266,7 +266,6 @@ impl TransportBuilder for TonicTransportBuilder {
         Ok(TonicTransport {
             channel,
             call_creds: self.call_creds.clone(),
-            secure,
         })
     }
 }
@@ -275,16 +274,6 @@ impl Transport for TonicTransport {
     type Stream = TonicAdsStream;
 
     async fn new_stream(&self, initial_requests: Vec<Bytes>) -> Result<Self::Stream> {
-        // Guard before connecting: never send credentials over an insecure channel.
-        if let Some(creds) = &self.call_creds
-            && creds.requires_secure_transport()
-            && !self.secure
-        {
-            return Err(Error::CallCredentials(
-                "call credentials require a secure transport".into(),
-            ));
-        }
-
         let mut grpc = Grpc::new(self.channel.clone());
 
         grpc.ready()
@@ -492,21 +481,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_channel_secure_admits_secure_call_creds() {
-        let addr = start_mock_server(Some("Bearer secure-token")).await;
+    async fn from_channel_connects_and_streams() {
+        let addr = start_mock_server(None).await;
         let channel = Endpoint::from_shared(format!("http://{addr}"))
             .unwrap()
             .connect_lazy();
-        let creds = Arc::new(MockCreds {
-            pairs: vec![("authorization".into(), "Bearer secure-token".into())],
-            requires_secure: true,
-        });
-        let transport = TonicTransportBuilder::new()
-            .with_channel(channel, true)
-            .with_call_credentials(creds)
-            .build(&ServerConfig::new(format!("http://{addr}")))
-            .await
-            .unwrap();
+        let transport = TonicTransport::from_channel(channel);
         let request = DiscoveryRequest {
             type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
             ..Default::default()
@@ -520,17 +500,15 @@ mod tests {
 
     #[tokio::test]
     async fn call_creds_require_secure_transport() {
-        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-        let transport = TonicTransportBuilder::new()
-            .with_channel(channel, false)
+        // The check runs before connecting, so no server is needed.
+        let err = TonicTransportBuilder::new()
             .with_call_credentials(Arc::new(MockCreds {
                 pairs: vec![],
                 requires_secure: true,
             }))
             .build(&ServerConfig::new("http://127.0.0.1:1"))
             .await
-            .unwrap();
-        let err = transport.new_stream(vec![]).await.unwrap_err();
+            .unwrap_err();
         assert!(matches!(err, Error::CallCredentials(_)));
     }
 

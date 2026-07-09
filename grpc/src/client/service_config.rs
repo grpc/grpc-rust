@@ -35,4 +35,6 @@ pub enum LbPolicyType {
     #[default]
     PickFirst,
     RoundRobin,
+    // TODO: remove LeastRequest. It's here because it won't build without it.
+    LeastRequest,
 }

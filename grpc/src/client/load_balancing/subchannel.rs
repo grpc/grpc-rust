@@ -194,6 +194,12 @@ impl Display for dyn Subchannel {
 #[derive(Debug)]
 pub(crate) struct WeakSubchannel(Weak<dyn Subchannel>);
 
+impl Clone for WeakSubchannel {
+    fn clone(&self) -> Self {
+        WeakSubchannel(self.0.clone())
+    }
+}
+
 impl From<&Arc<dyn Subchannel>> for WeakSubchannel {
     fn from(subchannel: &Arc<dyn Subchannel>) -> Self {
         WeakSubchannel(Arc::downgrade(subchannel))

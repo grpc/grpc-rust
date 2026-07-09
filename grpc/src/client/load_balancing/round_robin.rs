@@ -228,13 +228,13 @@ pub(crate) fn reg() {
 }
 
 #[derive(Debug)]
-struct RoundRobinPicker {
+pub(crate) struct RoundRobinPicker {
     pickers: Vec<Arc<dyn Picker>>,
     next: AtomicUsize,
 }
 
 impl RoundRobinPicker {
-    fn new(pickers: Vec<Arc<dyn Picker>>) -> Self {
+    pub(crate) fn new(pickers: Vec<Arc<dyn Picker>>) -> Self {
         let random_index: usize = rand::random_range(..pickers.len());
         Self {
             pickers,

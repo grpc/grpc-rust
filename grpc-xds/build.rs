@@ -29,10 +29,13 @@ fn main() {
         .map(|d| third_party.join(d))
         .collect();
 
+    // Resolve protoc. Locally, `protoc-gen-rust-grpc` builds it and we use that;
+    // in CI its C++ build is skipped (`PROTOC_GEN_RUST_GRPC_NO_BUILD=1`) and a
+    // prebuilt protoc is provided on `$PATH`, so `find_protoc` falls back to it.
     // protoc's bundled include dir provides the well-known types (imported by
     // many vendored protos) plus `google/protobuf/descriptor.proto` (imported by
-    // the option-defining protos), so protoc can parse every import.
-    let protoc = protoc_gen_rust_grpc::protoc();
+    // the option-defining protos); it is the sibling `../include` of the binary.
+    let protoc = find_protoc();
     let protoc_include = protoc
         .parent()
         .and_then(|p| p.parent())
@@ -213,6 +216,36 @@ fn strip_unstable(body: &str) -> &str {
         }
         None => body,
     }
+}
+
+/// Resolves the `protoc` binary. Prefers the one built by `protoc-gen-rust-grpc`
+/// (local dev); when that build is skipped (`PROTOC_GEN_RUST_GRPC_NO_BUILD`, as
+/// in CI), falls back to `$PROTOC` or the first `protoc` on `$PATH`. Returns the
+/// full path so the sibling `../include` dir can be located.
+fn find_protoc() -> PathBuf {
+    let built = protoc_gen_rust_grpc::protoc();
+    if built.is_file() {
+        return built;
+    }
+    if let Some(p) = std::env::var_os("PROTOC").map(PathBuf::from)
+        && p.is_file()
+    {
+        return p;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["protoc", "protoc.exe"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    panic!(
+        "could not find protoc: build `protoc-gen-rust-grpc`, set $PROTOC, \
+         or put protoc on $PATH"
+    );
 }
 
 /// Recursively collects `*.proto` file paths under `dir` into `out`.

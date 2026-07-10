@@ -55,7 +55,16 @@ fn main() {
         let mut found = Vec::new();
         collect_protos(dir, &mut found);
         for p in found {
-            protos.push(p.strip_prefix(dir).unwrap().to_string_lossy().into_owned());
+            // Proto import paths are always forward-slash. Normalize here so
+            // they match protoc's input/crate-mapping expectations and our
+            // `/`-based package splitting on Windows, where `strip_prefix`
+            // yields backslashes.
+            let rel = p
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            protos.push(rel);
         }
     }
     protos.sort();

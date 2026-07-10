@@ -1,0 +1,24 @@
+[package]
+name = "grpc-xds"
+version = "0.1.0-alpha.1"
+authors = ["gRPC Authors"]
+license = "MIT"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = """
+xDS routing and load balancing for the Rust gRPC implementation.
+"""
+edition = "2024"
+rust-version.workspace = true
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = []
+
+[dependencies]
+protobuf = "4.35.1-release"
+protobuf-well-known-types = "4.35.1-release"
+
+[build-dependencies]
+protobuf-codegen = "4.35.1-release"
+protobuf-well-known-types = "4.35.1-release"
+protoc-gen-rust-grpc = { version = "0.10.0", path = "../protoc-gen-rust-grpc" }

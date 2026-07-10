@@ -24,10 +24,16 @@ fn main() {
     println!("cargo:rerun-if-changed={}", third_party.display());
 
     // The five vendored dependency roots double as protoc include paths.
-    let include_dirs: Vec<PathBuf> = ["envoy", "xds", "protoc-gen-validate", "googleapis", "cel-spec"]
-        .iter()
-        .map(|d| third_party.join(d))
-        .collect();
+    let include_dirs: Vec<PathBuf> = [
+        "envoy",
+        "xds",
+        "protoc-gen-validate",
+        "googleapis",
+        "cel-spec",
+    ]
+    .iter()
+    .map(|d| third_party.join(d))
+    .collect();
 
     // Resolve protoc. Locally, `protoc-gen-rust-grpc` builds it and we use that;
     // in CI its C++ build is skipped (`PROTOC_GEN_RUST_GRPC_NO_BUILD=1`) and a
@@ -84,7 +90,10 @@ fn main() {
     // and run one invocation per package.
     let mut packages: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for file in &protos {
-        packages.entry(package_dir(file)).or_default().push(file.clone());
+        packages
+            .entry(package_dir(file))
+            .or_default()
+            .push(file.clone());
     }
 
     for files in packages.values() {
@@ -106,7 +115,10 @@ fn main() {
             .dependency(deps)
             .generate_and_compile()
             .unwrap_or_else(|e| {
-                panic!("xDS codegen failed for package {}: {e}", package_dir(&files[0]))
+                panic!(
+                    "xDS codegen failed for package {}: {e}",
+                    package_dir(&files[0])
+                )
             });
     }
 
@@ -121,7 +133,10 @@ fn main() {
 /// Returns the package directory of an include-relative proto path, e.g.
 /// `envoy/config/route/v3/route.proto` -> `envoy/config/route/v3`.
 fn package_dir(proto_rel: &str) -> &str {
-    proto_rel.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(proto_rel)
+    proto_rel
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or(proto_rel)
 }
 
 /// Maps an include-relative proto path to its package's in-crate module path,

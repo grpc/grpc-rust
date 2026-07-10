@@ -75,6 +75,9 @@ mod tests {
     fn eds_cluster_load_assignment_round_trip() {
         let mut endpoints = ClusterLoadAssignment::new();
         endpoints.set_cluster_name("grpc-cluster");
-        assert_eq!(round_trip(&endpoints).cluster_name().as_bytes(), b"grpc-cluster");
+        assert_eq!(
+            round_trip(&endpoints).cluster_name().as_bytes(),
+            b"grpc-cluster"
+        );
     }
 }

@@ -69,9 +69,9 @@ where
     let secs: f64 = num
         .parse()
         .map_err(|_| serde::de::Error::custom(format!("invalid duration number: '{num}'")))?;
-    if secs < 0.0 {
+    if secs <= 0.0 {
         return Err(serde::de::Error::custom(format!(
-            "invalid duration '{s}': must not be negative"
+            "invalid duration '{s}': must be greater than 0"
         )));
     }
     Ok(Some(Duration::from_secs_f64(secs)))
@@ -399,16 +399,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_refresh_interval_negative() {
-        let err = serde_json::from_value::<FileWatcherConfig>(
+    fn parse_refresh_interval_must_be_greater_than_zero() {
+        for v in [
+            serde_json::json!({"refresh_interval":"0s"}),
             serde_json::json!({"refresh_interval": "-1s"}),
-        );
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err()
-                .to_string()
-                .contains("must not be negative")
-        );
+        ] {
+            let err = serde_json::from_value::<FileWatcherConfig>(v);
+            assert!(err.is_err());
+            assert!(
+                err.unwrap_err()
+                    .to_string()
+                    .contains("must be greater than 0")
+            );
+        }
     }
 
     #[tokio::test]

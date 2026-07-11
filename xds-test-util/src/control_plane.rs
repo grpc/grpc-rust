@@ -21,13 +21,19 @@
 //! 3. an ACK (same resource names already subscribed) — ignored.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
 use envoy_types::pb::envoy::service::discovery::v3::{DiscoveryRequest, DiscoveryResponse};
 use envoy_types::pb::google::protobuf::Any;
 use prost::Message;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 
 /// ADS type URL for LDS (`Listener`) resources.
 pub const ADS_TYPE_URL_LDS: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
@@ -293,6 +299,74 @@ impl XdsTestControlPlaneService {
                 )
             })
             .collect()
+    }
+
+    /// Serves the ADS control plane on an ephemeral `127.0.0.1` port in a
+    /// background task.
+    ///
+    /// Returns a [`RunningControlPlane`] that exposes the bound address via
+    /// [`addr`](RunningControlPlane::addr), derefs to this service so config
+    /// setters can be called on it directly, and shuts the server down when
+    /// dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding the ephemeral port fails.
+    pub async fn start(&self) -> std::io::Result<RunningControlPlane> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let service = self.clone();
+        let handle = tokio::spawn(
+            Server::builder()
+                .add_service(AggregatedDiscoveryServiceServer::new(service.clone()))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        Ok(RunningControlPlane {
+            service,
+            addr,
+            handle,
+        })
+    }
+}
+
+/// A running [`XdsTestControlPlaneService`] returned by
+/// [`XdsTestControlPlaneService::start`].
+///
+/// Derefs to the underlying control plane, so config setters (e.g.
+/// [`set_xds_config`](XdsTestControlPlaneService::set_xds_config)) can be called
+/// on it directly. The server task is aborted when this handle is dropped.
+#[derive(Debug)]
+pub struct RunningControlPlane {
+    service: XdsTestControlPlaneService,
+    addr: SocketAddr,
+    handle: JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl RunningControlPlane {
+    /// The address the ADS server is listening on.
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The underlying control plane service (shared state).
+    #[must_use]
+    pub fn service(&self) -> &XdsTestControlPlaneService {
+        &self.service
+    }
+}
+
+impl std::ops::Deref for RunningControlPlane {
+    type Target = XdsTestControlPlaneService;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
+impl Drop for RunningControlPlane {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 

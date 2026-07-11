@@ -29,13 +29,9 @@ use envoy_types::pb::envoy::extensions::filters::network::http_connection_manage
 };
 use envoy_types::pb::google::protobuf::Any;
 use prost::Message;
-use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
 use xds_test_util::{
-    ADS_TYPE_URL_CDS, ADS_TYPE_URL_EDS, ADS_TYPE_URL_LDS, ADS_TYPE_URL_RDS,
-    AggregatedDiscoveryServiceServer, XdsTestControlPlaneService,
+    ADS_TYPE_URL_CDS, ADS_TYPE_URL_EDS, ADS_TYPE_URL_LDS, ADS_TYPE_URL_RDS, RunningControlPlane,
+    XdsTestControlPlaneService,
 };
 
 use crate::testutil::grpc::{GreeterClient, HelloRequest, spawn_greeter_server};
@@ -156,24 +152,15 @@ fn lb_endpoint(host: &str, port: u16) -> LbEndpoint {
     }
 }
 
-/// Starts the fake ADS control plane on an ephemeral port. Returns the service
-/// handle (for injecting config), its address, and the server task handle.
-async fn start_control_plane() -> (
-    XdsTestControlPlaneService,
-    SocketAddr,
-    JoinHandle<Result<(), tonic::transport::Error>>,
-) {
-    let control_plane = XdsTestControlPlaneService::new();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let service = control_plane.clone();
-    let handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(AggregatedDiscoveryServiceServer::new(service))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    (control_plane, addr, handle)
+/// Starts the fake ADS control plane on an ephemeral port. Returns the running
+/// control plane (which injects config and shuts down on drop) and its address.
+async fn start_control_plane() -> (RunningControlPlane, SocketAddr) {
+    let running = XdsTestControlPlaneService::new()
+        .start()
+        .await
+        .expect("start control plane");
+    let addr = running.addr();
+    (running, addr)
 }
 
 /// Builds a real xDS channel whose bootstrap points at `cp_addr` and whose
@@ -224,7 +211,7 @@ async fn xds_channel_e2e_routes_to_backend() {
         .expect("spawn greeter backend");
     let backend_addr = backend.addr;
 
-    let (control_plane, cp_addr, cp_handle) = start_control_plane().await;
+    let (control_plane, cp_addr) = start_control_plane().await;
 
     // Configure LDS (inline route) -> CDS -> EDS pointing at the backend.
     control_plane.set_xds_config(
@@ -261,7 +248,6 @@ async fn xds_channel_e2e_routes_to_backend() {
     assert_eq!(counts.get(ADS_TYPE_URL_EDS), Some(&1));
 
     let _ = backend.shutdown.send(());
-    cp_handle.abort();
 }
 
 /// Analog of grpc-java's `changeClusterForRoute`: once the client is routing to
@@ -277,7 +263,7 @@ async fn xds_channel_e2e_route_update_shifts_traffic() {
         .await
         .expect("spawn backend-b");
 
-    let (control_plane, cp_addr, cp_handle) = start_control_plane().await;
+    let (control_plane, cp_addr) = start_control_plane().await;
 
     // LDS -> RDS "route-config"; both clusters and their endpoints are configured
     // up front, and the route initially targets cluster-a.
@@ -346,7 +332,6 @@ async fn xds_channel_e2e_route_update_shifts_traffic() {
 
     let _ = backend_a.shutdown.send(());
     let _ = backend_b.shutdown.send(());
-    cp_handle.abort();
 }
 
 /// P2C load balancing: with several EDS endpoints behind one cluster, traffic
@@ -372,7 +357,7 @@ async fn xds_channel_e2e_p2c_spreads_across_backends() {
         .map(|backend| (backend.addr.ip().to_string(), backend.addr.port()))
         .collect();
 
-    let (control_plane, cp_addr, cp_handle) = start_control_plane().await;
+    let (control_plane, cp_addr) = start_control_plane().await;
 
     // Configure LDS (inline route) -> CDS -> EDS with all backends in one cluster.
     control_plane.set_xds_config(
@@ -429,5 +414,4 @@ async fn xds_channel_e2e_p2c_spreads_across_backends() {
     for backend in backends {
         let _ = backend.shutdown.send(());
     }
-    cp_handle.abort();
 }

@@ -1,0 +1,23 @@
+[package]
+name = "xds-test-util"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version.workspace = true
+homepage = "https://github.com/grpc/grpc-rust"
+repository = "https://github.com/grpc/grpc-rust"
+description = """
+Test utilities for gRPC xDS implementations.
+"""
+keywords = ["grpc", "xds", "test"]
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+envoy-types = "0.7"
+prost = "0.14"
+tonic = "0.14"
+tokio = { version = "1", features = ["sync", "rt"] }
+tokio-stream = "0.1"

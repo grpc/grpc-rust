@@ -19,6 +19,7 @@ members = [
   "protoc-gen-rust-grpc",
   "xds-client",
   "tonic-xds",
+  "xds-test-util",
   "interop",
   "tests/disable_comments",
   "tests/wellknown",

@@ -61,6 +61,7 @@ workspace = true
 
 [dev-dependencies]
 xds-client = { version = "0.1.0-alpha.1", path = "../xds-client", features = ["test-util"] }
+xds-test-util = { path = "../xds-test-util" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "test-util"] }
 tonic = { version = "0.14", features = [ "server", "channel", "tls-ring" ] }
 tonic-prost = "0.14"

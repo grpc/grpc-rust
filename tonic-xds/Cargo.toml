@@ -68,6 +68,7 @@ tonic-prost-build = "0.14"
 async-stream = "0.3"
 tempfile = "3.27.0"
 rcgen = "0.14"
+google-cloud-auth = { version = "1.9", default-features = false }
 
 [features]
 testutil = ["dep:tonic-prost"]
@@ -80,6 +81,10 @@ tls-aws-lc = ["_tls-any", "tonic/tls-aws-lc", "xds-client/tonic-tls-aws-lc"]
 [[example]]
 name = "channel"
 required-features = ["testutil"]
+
+[[example]]
+name = "channel_with_google_default"
+required-features = ["testutil", "tls-ring"]
 
 [[example]]
 name = "greeter_server"

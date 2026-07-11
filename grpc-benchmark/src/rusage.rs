@@ -22,24 +22,41 @@
  *
  */
 
-#[allow(unused)]
-pub mod generated {
-    pub mod benchmark_service_grpc {
-        grpc::include_proto!("grpc/testing", "benchmark_service");
-    }
-
-    pub mod services {
-        pub mod grpc {
-            pub mod core {
-                include!(concat!(env!("OUT_DIR"), "/tonic/grpc.core.rs"));
-            }
-            pub mod testing {
-                include!(concat!(env!("OUT_DIR"), "/tonic/grpc.testing.rs"));
-            }
-        }
-    }
+#[derive(Debug)]
+pub(crate) struct Rusage {
+    user_time_ns: i64,
+    system_time_ns: i64,
 }
 
-mod rusage;
-mod server;
-pub mod worker;
+impl Rusage {
+    #[cfg(unix)]
+    pub(crate) fn now() -> Result<Self, String> {
+        use nix::sys::resource::UsageWho;
+        use nix::sys::resource::getrusage;
+        use nix::sys::time::TimeValLike;
+
+        let usage =
+            getrusage(UsageWho::RUSAGE_SELF).map_err(|e| format!("failed to get rusage: {}", e))?;
+
+        Ok(Rusage {
+            user_time_ns: usage.user_time().num_nanoseconds(),
+            system_time_ns: usage.system_time().num_nanoseconds(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn now() -> Result<Rusage, String> {
+        Ok(Rusage {
+            user_time_ns: 0,
+            system_time_ns: 0,
+        })
+    }
+
+    pub(crate) fn user_time_nanos(&self) -> i64 {
+        self.user_time_ns
+    }
+
+    pub(crate) fn system_time_nanos(&self) -> i64 {
+        self.system_time_ns
+    }
+}

@@ -78,7 +78,7 @@ pub use runtime::tokio::TokioRuntime;
 
 // Tonic transport
 #[cfg(feature = "transport-tonic")]
-pub use transport::tonic::{TonicTransport, TonicTransportBuilder};
+pub use transport::tonic::{TonicCallCredentials, TonicTransport, TonicTransportBuilder};
 
 // Prost codec
 #[cfg(feature = "codegen-prost")]

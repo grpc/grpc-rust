@@ -67,6 +67,13 @@ fn main() {
             protos.push(rel);
         }
     }
+    // Also generate `descriptor.proto` (from protoc's bundled include) as an
+    // in-crate package `crate::generated::google::protobuf`. It's imported by
+    // the option-defining protos to DEFINE custom options; generating it
+    // in-crate means their reflection metadata (`__unstable`) can reference it
+    // here instead of a symbol that doesn't exist in the external
+    // well-known-types crate. protoc finds it via the bundled include path.
+    protos.push("google/protobuf/descriptor.proto".to_string());
     protos.sort();
     protos.dedup();
 
@@ -76,18 +83,12 @@ fn main() {
     }
     std::fs::create_dir_all(&gen_dir).unwrap();
 
-    // Deps shared by every invocation: well-known types resolve to the external
-    // `protobuf_well_known_types` crate. `descriptor.proto` is imported only to
-    // DEFINE custom options (validate rules, xDS/udpa annotations); nothing
-    // references its types so we don't generate it, but protoc still calls
-    // GetCrateName on it while emitting each package's entry point and FATALs on
-    // an unmapped import — so map it benignly too.
-    let mut base_deps = protobuf_well_known_types::get_dependency("protobuf_well_known_types");
-    base_deps.push(protobuf_codegen::Dependency {
-        crate_name: "protobuf_well_known_types".to_string(),
-        proto_import_paths: vec![protoc_include.clone()],
-        proto_files: vec!["google/protobuf/descriptor.proto".to_string()],
-    });
+    // Deps shared by every invocation: the well-known types resolve to the
+    // external `protobuf_well_known_types` crate. (`descriptor.proto` is not
+    // listed here — it's generated in-crate as its own package, so the
+    // per-package loop below maps it to `crate::generated::google::protobuf`
+    // like any other vendored proto.)
+    let base_deps = protobuf_well_known_types::get_dependency("protobuf_well_known_types");
 
     let includes: Vec<PathBuf> = include_dirs
         .iter()
@@ -204,13 +205,14 @@ fn write_module_tree(dir: &Path) {
     // this module holds all of the package's messages (and intra-package
     // `super::…` refs resolve here). Its `#[path]`s are relative, which is fine
     // because this `mod.rs` is file-loaded (only the tree root is `include!`d).
-    // Strip the trailing `__unstable` reflection block — it emits cross-crate
-    // `<pkg>::__unstable::<dep>` refs (e.g. to `descriptor.proto`) that don't
-    // resolve, and nothing needs it.
+    // The trailing `__unstable` reflection block is kept verbatim: its
+    // cross-package `<pkg>::__unstable::<dep>` refs all resolve because every
+    // dependency is either generated in-crate (including `descriptor.proto`) or
+    // comes from `protobuf_well_known_types`.
     if has_entry_point {
         let entry = dir.join("generated.rs");
         let body = std::fs::read_to_string(&entry).unwrap();
-        m.push_str(strip_unstable(&body));
+        m.push_str(&body);
         if !m.ends_with('\n') {
             m.push('\n');
         }
@@ -227,19 +229,6 @@ fn write_module_tree(dir: &Path) {
     }
 
     std::fs::write(dir.join("mod.rs"), m).unwrap();
-}
-
-/// Strips the trailing `pub mod __unstable { … }` reflection block (and its
-/// decorating `#[allow(…)]` attribute) from a protoc entry-point file body.
-fn strip_unstable(body: &str) -> &str {
-    match body.find("pub mod __unstable") {
-        Some(idx) => {
-            let head = &body[..idx];
-            let cut = head.rfind("#[allow(").unwrap_or(head.len());
-            &body[..cut]
-        }
-        None => body,
-    }
 }
 
 /// Resolves the `protoc` binary. Prefers the one built by `protoc-gen-rust-grpc`

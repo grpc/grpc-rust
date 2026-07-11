@@ -1,20 +1,9 @@
-//! Generated xDS protobuf message types for gRPC.
-//!
-//! Message-only (no service stubs), generated with the Google protobuf-rust
-//! (upb kernel) toolchain from the vendored protos under `proto/`. The tree is
-//! regenerated at build time by `build.rs` into `OUT_DIR` and included below;
-//! its module layout mirrors the proto packages — one module per package, e.g.
-//! `generated::envoy::config::cluster::v3` (holding `Cluster`, etc.).
-//!
-//! The generated types are an implementation detail of this crate: they are kept
-//! `pub(crate)` (consumed only by grpc-xds's own code), so neither they nor the
-//! `protobuf` runtime types they reference appear in the public API.
+//! grpc-xds implements xDS support for Rust gRPC.
 
-/// Generated message modules, mirroring the vendored proto package tree.
-///
-/// Crate-internal: the messages are an implementation detail consumed only
-/// within grpc-xds. The blanket `allow` covers machine-generated code; the tree
-/// is built into `OUT_DIR` by `build.rs` and its root `mod.rs` is included here.
+/// Module `generated` contains the generated Protobuf messages for xDS,
+/// mirroring the vendored proto package tree. The messages are an implementation detail
+/// consumed only within grpc-xds. The blanket `allow` covers machine-generated code;
+/// the tree is built into `OUT_DIR` by `build.rs` and its root `mod.rs` is included here.
 #[allow(
     missing_docs,
     missing_debug_implementations,

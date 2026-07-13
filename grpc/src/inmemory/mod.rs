@@ -432,7 +432,7 @@ impl Resolver for InMemoryResolver {
                     crate::client::service_config::LoadBalancingConfig {
                         name: "round_robin".to_string(),
                         config: serde_json::Value::Object(serde_json::Map::new()),
-                    }
+                    },
                 ]),
                 method_config: None,
                 retry_throttling: None,

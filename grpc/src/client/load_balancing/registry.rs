@@ -43,7 +43,7 @@ use crate::client::name_resolution::ResolverUpdate;
 
 /// A registry to store and retrieve LB policies.  LB policies are indexed by
 /// their names.
-pub(crate) struct LbPolicyRegistry {
+pub struct LbPolicyRegistry {
     m: Arc<Mutex<HashMap<String, Arc<DynLbPolicyBuilder>>>>,
 }
 
@@ -54,7 +54,7 @@ impl LbPolicyRegistry {
     }
 
     /// Adds a LB policy into the registry.
-    pub(crate) fn add_builder<B: LbPolicyBuilder>(&self, builder: B) {
+    pub fn add_builder<B: LbPolicyBuilder>(&self, builder: B) {
         self.m
             .lock()
             .unwrap()
@@ -62,7 +62,7 @@ impl LbPolicyRegistry {
     }
 
     /// Adds a dynamic LB policy into the registry.
-    pub(crate) fn add_dyn_builder(&self, builder: Arc<DynLbPolicyBuilder>) {
+    pub fn add_dyn_builder(&self, builder: Arc<DynLbPolicyBuilder>) {
         self.m
             .lock()
             .unwrap()
@@ -70,7 +70,7 @@ impl LbPolicyRegistry {
     }
 
     /// Retrieves a LB policy from the registry, or None if not found.
-    pub(crate) fn get_policy(&self, name: &str) -> Option<Arc<DynLbPolicyBuilder>> {
+    pub fn get_policy(&self, name: &str) -> Option<Arc<DynLbPolicyBuilder>> {
         self.m.lock().unwrap().get(name).cloned()
     }
 }
@@ -83,8 +83,7 @@ impl Default for LbPolicyRegistry {
 
 /// The registry used if a local registry is not provided to a channel or if it
 /// does not exist in the local registry.
-pub(crate) static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> =
-    LazyLock::new(LbPolicyRegistry::new);
+pub static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> = LazyLock::new(LbPolicyRegistry::new);
 
 /// Implements DynLbPolicy and DynLbPolicyBuilder around the enclosed LbPolicy
 /// or LbPolicyBuilder, respectively.

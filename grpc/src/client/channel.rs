@@ -114,7 +114,7 @@ impl Channel {
     ) -> ChannelBuilder {
         ChannelBuilder {
             target: target.into(),
-            credentials: credentials,
+            credentials,
             channel_authority: None,
             runtime: default_runtime(),
         }
@@ -161,13 +161,6 @@ pub struct ChannelBuilder {
 
     // Optional values.
     channel_authority: Option<String>,
-    // TODO(nathanielford) In follow-up implement the following optional values:
-    // - default_service_config
-    // - http_proxy_cfg
-    // - disable_health_checks
-    // - idle_timeout
-    // - enable_channelz
-    // - keepalive_cfg
 }
 
 impl ChannelBuilder {
@@ -190,13 +183,12 @@ impl ChannelBuilder {
         // - error handling (inc. always-failing resolvers due to invalid targets))
         // - testing (inc. credential and transport configuration)
 
-        // TODO(nathanielford) Find a better place to set up default registries.
         setup_registeries();
 
+        // TODO(nathanielford): Return errors here instead of panicking.
         let target = Target::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        // TODO(nathanielford): Return errors here instead of panicking.
-        let target = name_resolution::Target::from(target);
+
         let authority = self
             .channel_authority
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());

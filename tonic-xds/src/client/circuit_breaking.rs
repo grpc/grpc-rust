@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::sync::{
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
@@ -39,8 +39,9 @@ impl Drop for ClusterCircuitBreakersInner {
         for state in self.configs.iter() {
             if let Some(previous) = state.config.swap(None) {
                 let counter_key = previous.counter_key.clone();
+                previous.counter.deactivate();
                 drop(previous);
-                self.counters.deactivate(&counter_key);
+                self.counters.cleanup_if_unused(&counter_key);
             }
         }
     }
@@ -116,6 +117,10 @@ impl ClusterCircuitBreakers {
         state: &ClusterCircuitBreakerState,
         config: CircuitBreakerRuntimeConfig,
     ) {
+        let _update_guard = state
+            .update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = state.current_config();
         if previous.as_deref() == Some(&config) {
             return;
@@ -125,9 +130,10 @@ impl ClusterCircuitBreakers {
             .as_ref()
             .is_none_or(|previous| previous.counter_key != config.counter_key);
         if counter_key_changed {
-            self.inner.counters.activate(&config.counter_key);
+            config.counter.activate();
         }
 
+        drop(previous);
         let previous = state.config.swap(Some(Arc::new(config)));
         if counter_key_changed && let Some(previous) = previous {
             self.deactivate_config(previous);
@@ -135,6 +141,10 @@ impl ClusterCircuitBreakers {
     }
 
     fn clear_state(&self, state: &ClusterCircuitBreakerState) {
+        let _update_guard = state
+            .update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(previous) = state.config.swap(None) {
             self.deactivate_config(previous);
         }
@@ -142,8 +152,9 @@ impl ClusterCircuitBreakers {
 
     fn deactivate_config(&self, config: Arc<CircuitBreakerRuntimeConfig>) {
         let counter_key = config.counter_key.clone();
+        config.counter.deactivate();
         drop(config);
-        self.inner.counters.deactivate(&counter_key);
+        self.inner.counters.cleanup_if_unused(&counter_key);
     }
 
     fn acquire(&self, cluster: &str) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
@@ -160,10 +171,7 @@ impl ClusterCircuitBreakers {
 
     #[cfg(test)]
     fn dropped_requests(&self, cluster: &str) -> u64 {
-        let breaker = self.cluster_breaker(cluster);
-        self.inner
-            .counters
-            .dropped_requests(&breaker.current_counter_key())
+        self.ensure_state(cluster).dropped_requests()
     }
 
     #[cfg(test)]
@@ -173,7 +181,8 @@ impl ClusterCircuitBreakers {
 
     #[cfg(test)]
     fn clear_cluster_config(&self, cluster: &str) {
-        if let Some((_, state)) = self.inner.configs.remove(cluster) {
+        let state = self.inner.configs.get(cluster).map(|state| state.clone());
+        if let Some(state) = state {
             self.clear_state(&state);
         }
     }
@@ -234,12 +243,18 @@ impl CounterKey {
 
 struct ClusterCircuitBreakerState {
     config: ArcSwapOption<CircuitBreakerRuntimeConfig>,
+    update_lock: Mutex<()>,
+    dropped_requests: AtomicU64,
 }
 
 impl fmt::Debug for ClusterCircuitBreakerState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClusterCircuitBreakerState")
             .field("current_config", &self.current_config())
+            .field(
+                "dropped_requests",
+                &self.dropped_requests.load(Ordering::Acquire),
+            )
             .finish()
     }
 }
@@ -248,11 +263,22 @@ impl ClusterCircuitBreakerState {
     fn new() -> Self {
         Self {
             config: ArcSwapOption::empty(),
+            update_lock: Mutex::new(()),
+            dropped_requests: AtomicU64::new(0),
         }
     }
 
     fn current_config(&self) -> Option<Arc<CircuitBreakerRuntimeConfig>> {
         self.config.load_full()
+    }
+
+    fn record_drop(&self) {
+        self.dropped_requests.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn dropped_requests(&self) -> u64 {
+        self.dropped_requests.load(Ordering::Acquire)
     }
 }
 
@@ -289,9 +315,13 @@ impl ClusterCircuitBreaker {
         max_requests: u32,
     ) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
         let limit = CircuitBreakerLimit { max_requests };
-        self.counters
-            .acquire(counter_key, counter, max_requests)
-            .ok_or(limit)
+        match self.counters.acquire(counter_key, counter, max_requests) {
+            Some(permit) => Ok(permit),
+            None => {
+                self.state.record_drop();
+                Err(limit)
+            }
+        }
     }
 
     fn current_counter_key(&self) -> CounterKey {
@@ -310,7 +340,6 @@ struct ClusterRequestCounters {
 #[derive(Debug, Default)]
 struct ClusterRequestCounterState {
     counters: DashMap<CounterKey, Arc<InFlightCounter>>,
-    active_refs: DashMap<CounterKey, Arc<AtomicUsize>>,
 }
 
 impl ClusterRequestCounters {
@@ -329,33 +358,6 @@ impl ClusterRequestCounters {
         }
     }
 
-    fn activate(&self, counter_key: &CounterKey) {
-        self.inner
-            .active_refs
-            .entry(counter_key.clone())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn deactivate(&self, counter_key: &CounterKey) {
-        let should_cleanup = self
-            .inner
-            .active_refs
-            .get(counter_key)
-            .and_then(|active_refs| {
-                active_refs
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                        count.checked_sub(1)
-                    })
-                    .ok()
-            })
-            .is_some_and(|previous| previous <= 1);
-
-        if should_cleanup {
-            self.cleanup_if_unused(counter_key);
-        }
-    }
-
     fn acquire(
         &self,
         counter_key: CounterKey,
@@ -369,8 +371,11 @@ impl ClusterRequestCounters {
                 counters: self.clone(),
             })
         } else {
-            counter.record_drop();
-            self.cleanup_if_unused(&counter_key);
+            let should_cleanup = counter.is_unused();
+            drop(counter);
+            if should_cleanup {
+                self.cleanup_if_unused(&counter_key);
+            }
             None
         }
     }
@@ -384,25 +389,9 @@ impl ClusterRequestCounters {
     }
 
     fn cleanup_if_unused(&self, counter_key: &CounterKey) {
-        let active_refs = self.active_refs(counter_key);
-        if active_refs != 0 {
-            return;
-        }
-
         self.inner.counters.remove_if(counter_key, |_, counter| {
-            counter.in_flight() == 0 && Arc::strong_count(counter) == 1
+            counter.is_unused() && Arc::strong_count(counter) == 1
         });
-        self.inner
-            .active_refs
-            .remove_if(counter_key, |_, refs| refs.load(Ordering::Acquire) == 0);
-    }
-
-    fn active_refs(&self, counter_key: &CounterKey) -> usize {
-        self.inner
-            .active_refs
-            .get(counter_key)
-            .map(|refs| refs.load(Ordering::Acquire))
-            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -415,15 +404,6 @@ impl ClusterRequestCounters {
     }
 
     #[cfg(test)]
-    fn dropped_requests(&self, counter_key: &CounterKey) -> u64 {
-        self.inner
-            .counters
-            .get(counter_key)
-            .map(|counter| counter.dropped_requests())
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
     fn counter_count(&self) -> usize {
         self.inner.counters.len()
     }
@@ -432,12 +412,26 @@ impl ClusterRequestCounters {
 #[derive(Debug, Default)]
 struct InFlightCounter {
     in_flight: AtomicU32,
-    /// Local A32 drop accounting, kept with the global counter so future LRS
-    /// support can export `total_dropped_requests` without changing enforcement.
-    dropped_requests: AtomicU64,
+    active_refs: AtomicUsize,
 }
 
 impl InFlightCounter {
+    fn activate(&self) {
+        self.active_refs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn deactivate(&self) {
+        let result = self
+            .active_refs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+        assert!(
+            result.is_ok(),
+            "attempted to deactivate an inactive circuit breaker counter"
+        );
+    }
+
     fn try_acquire(&self, limit: u32) -> bool {
         loop {
             let current = self.in_flight.load(Ordering::Acquire);
@@ -459,13 +453,16 @@ impl InFlightCounter {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    fn record_drop(&self) {
-        self.dropped_requests.fetch_add(1, Ordering::AcqRel);
+    fn release(&self) {
+        let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous > 0,
+            "attempted to release an inactive circuit breaker permit"
+        );
     }
 
-    #[cfg(test)]
-    fn dropped_requests(&self) -> u64 {
-        self.dropped_requests.load(Ordering::Acquire)
+    fn is_unused(&self) -> bool {
+        self.in_flight() == 0 && self.active_refs.load(Ordering::Acquire) == 0
     }
 }
 
@@ -479,13 +476,20 @@ struct CircuitBreakerPermit {
 impl Drop for CircuitBreakerPermit {
     fn drop(&mut self) {
         if let Some(counter) = self.counter.take() {
-            counter.in_flight.fetch_sub(1, Ordering::AcqRel);
+            counter.release();
+            let should_cleanup = counter.is_unused();
+            drop(counter);
+            if should_cleanup {
+                self.counters.cleanup_if_unused(&self.counter_key);
+            }
         }
-        self.counters.cleanup_if_unused(&self.counter_key);
     }
 }
 
 /// Tower layer that enforces A32 max in-flight requests per xDS cluster.
+///
+/// This layer must wrap the ready per-cluster dispatch service inside retries so
+/// each admitted call represents one upstream attempt rather than queued work.
 #[derive(Clone)]
 pub(crate) struct CircuitBreakingLayer {
     circuit_breakers: ClusterCircuitBreakers,
@@ -565,8 +569,8 @@ where
     type Error = BoxError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
@@ -583,17 +587,18 @@ where
         };
 
         let breaker = self.breaker_for_cluster(cluster);
+        let permit = match breaker.acquire() {
+            Ok(permit) => permit,
+            Err(limit) => {
+                return Box::pin(std::future::ready(Ok(limit_exceeded_response(
+                    &breaker.cluster,
+                    limit,
+                ))));
+            }
+        };
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
-            let permit = match breaker.acquire() {
-                Ok(permit) => permit,
-                Err(limit) => return Ok(limit_exceeded_response(&breaker.cluster, limit)),
-            };
-
-            std::future::poll_fn(|cx| inner.poll_ready(cx))
-                .await
-                .map_err(Into::into)?;
             let response = inner.call(request).await.map_err(Into::into)?;
             Ok(response.map(|body| TonicBody::new(PermitBody::new(body, permit))))
         })
@@ -606,11 +611,23 @@ enum CircuitBreakingError {
     NoRoutingDecision,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LocalCircuitBreakerDrop;
+
+pub(crate) fn is_local_circuit_breaker_drop<B>(response: &Response<B>) -> bool {
+    response
+        .extensions()
+        .get::<LocalCircuitBreakerDrop>()
+        .is_some()
+}
+
 fn limit_exceeded_response(cluster: &str, limit: CircuitBreakerLimit) -> Response<TonicBody> {
-    status_response(tonic::Status::unavailable(format!(
+    let mut response = status_response(tonic::Status::unavailable(format!(
         "circuit breaker open for cluster '{cluster}': max_requests limit {} reached",
         limit.max_requests,
-    )))
+    )));
+    response.extensions_mut().insert(LocalCircuitBreakerDrop);
+    response
 }
 
 fn status_response(status: tonic::Status) -> Response<TonicBody> {
@@ -683,6 +700,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use http::{HeaderMap, Request, Response};
@@ -690,10 +708,11 @@ mod tests {
     use tonic::Code;
     use tower::Layer;
     use tower::ServiceExt;
-    use tower::retry::Policy;
     use tower::service_fn;
 
-    use crate::client::retry::RetryLayer;
+    use crate::client::retry::{
+        GrpcRetryBackoffConfig, GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer,
+    };
 
     use super::*;
 
@@ -761,6 +780,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_service_applies_live_limit_updates_without_resetting_in_flight() {
+        let breakers = configured_breakers(2);
+        let calls = Arc::new(AtomicU32::new(0));
+        let call_counter = calls.clone();
+        let service = service_fn(move |_request: Request<TonicBody>| {
+            call_counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, BoxError>(Response::new(TonicBody::new(PendingBody))) }
+        });
+        let mut service = CircuitBreakingLayer::new(breakers.clone()).layer(service);
+
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        let second = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(breakers.in_flight(CLUSTER), 2);
+
+        breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
+
+        let third = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(
+            tonic::Status::from_header_map(third.headers())
+                .unwrap()
+                .code(),
+            Code::Unavailable
+        );
+
+        drop(first);
+        assert_eq!(breakers.in_flight(CLUSTER), 1);
+        let fourth = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(
+            tonic::Status::from_header_map(fourth.headers())
+                .unwrap()
+                .code(),
+            Code::Unavailable
+        );
+
+        drop(second);
+        assert_eq!(breakers.in_flight(CLUSTER), 0);
+        let _fifth = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(breakers.dropped_requests(CLUSTER), 2);
+    }
+
+    #[tokio::test]
     async fn releases_permit_when_response_body_reaches_trailers() {
         let breakers = configured_breakers(1);
         let service = service_fn(|_request: Request<TonicBody>| async {
@@ -786,6 +877,29 @@ mod tests {
 
         let trailers_frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
         assert!(trailers_frame.unwrap().unwrap().is_trailers());
+        assert_eq!(breakers.in_flight(CLUSTER), 0);
+    }
+
+    #[tokio::test]
+    async fn releases_permit_when_response_body_returns_error() {
+        let breakers = configured_breakers(1);
+        let service = service_fn(|_request: Request<TonicBody>| async {
+            Ok::<_, BoxError>(Response::new(TonicBody::new(ErrorBody { emitted: false })))
+        });
+        let mut service = CircuitBreakingLayer::new(breakers.clone()).layer(service);
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(breakers.in_flight(CLUSTER), 1);
+
+        let mut body = response.into_body();
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(frame.unwrap().is_err());
         assert_eq!(breakers.in_flight(CLUSTER), 0);
     }
 
@@ -830,41 +944,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oneshot_honors_config_after_consuming_service() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let call_counter = calls.clone();
+        let service = service_fn(move |_request: Request<TonicBody>| {
+            call_counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, BoxError>(Response::new(TonicBody::empty())) }
+        });
+        let service = CircuitBreakingLayer::new(configured_breakers(0)).layer(service);
+
+        let response = service.oneshot(request()).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers()).unwrap();
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn limit_responses_do_not_enter_retry_policy() {
-        let breakers = configured_breakers(1);
-        let retry_observations = Arc::new(AtomicU32::new(0));
-        let policy = CountingUnavailablePolicy {
-            retry_observations: retry_observations.clone(),
-        };
+        let breakers = configured_breakers(0);
+        let policy = GrpcRetryPolicy::new(
+            GrpcRetryPolicyConfig::new()
+                .retry_on(vec![Code::Unavailable])
+                .num_retries(4)
+                .retry_backoff(
+                    GrpcRetryBackoffConfig::new(Duration::from_millis(1))
+                        .max_interval(Duration::from_millis(1)),
+                ),
+        );
+        let calls = Arc::new(AtomicU32::new(0));
+        let call_counter = calls.clone();
 
         let service = service_fn(
-            |_request: Request<shared_http_body::SharedBody<TonicBody>>| async {
-                Ok::<_, BoxError>(Response::new(TonicBody::new(PendingBody)))
+            move |_request: Request<shared_http_body::SharedBody<TonicBody>>| {
+                call_counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, BoxError>(Response::new(TonicBody::empty())) }
             },
         );
         let mut service = tower::ServiceBuilder::new()
-            .layer(CircuitBreakingLayer::new(breakers))
             .layer(RetryLayer::new(policy))
+            .layer(CircuitBreakingLayer::new(breakers.clone()))
             .service(service);
 
-        let _first = service
+        let response = service
             .ready()
             .await
             .unwrap()
             .call(request())
             .await
             .unwrap();
-        let second = service
-            .ready()
-            .await
-            .unwrap()
-            .call(request())
-            .await
-            .unwrap();
-        let status = tonic::Status::from_header_map(second.headers()).unwrap();
+        let status = tonic::Status::from_header_map(response.headers()).unwrap();
 
         assert_eq!(status.code(), Code::Unavailable);
-        assert_eq!(retry_observations.load(Ordering::SeqCst), 0);
+        assert_eq!(breakers.dropped_requests(CLUSTER), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn shared_counters_enforce_process_limit_with_per_channel_drop_counts() {
+        let counters = ClusterRequestCounters::isolated();
+        let first_breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        let second_breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        first_breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
+        second_breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
+
+        let first = first_breakers.acquire(CLUSTER).unwrap();
+        assert!(second_breakers.acquire(CLUSTER).is_err());
+        assert_eq!(first_breakers.dropped_requests(CLUSTER), 0);
+        assert_eq!(second_breakers.dropped_requests(CLUSTER), 1);
+
+        drop(first);
+        let second = second_breakers.acquire(CLUSTER).unwrap();
+        drop(second);
+        drop(first_breakers);
+        drop(second_breakers);
+        assert_eq!(counters.counter_count(), 0);
+    }
+
+    #[test]
+    fn default_limit_rejects_the_1025th_request() {
+        let breakers = ClusterCircuitBreakers::new_for_test();
+        let breaker = breakers.cluster_breaker(CLUSTER);
+        let permits: Vec<_> = (0..DEFAULT_MAX_REQUESTS)
+            .map(|_| breaker.acquire().unwrap())
+            .collect();
+
+        assert!(breaker.acquire().is_err());
+        assert_eq!(breakers.dropped_requests(CLUSTER), 1);
+
+        drop(permits);
+        assert_eq!(breakers.counter_count(), 0);
     }
 
     #[test]
@@ -887,6 +1056,20 @@ mod tests {
     }
 
     #[test]
+    fn idle_eds_service_name_change_cleans_up_previous_counter() {
+        let counters = ClusterRequestCounters::isolated();
+        let breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        breakers.set_cluster_config(CLUSTER, "eds-a", CircuitBreakingConfig { max_requests: 1 });
+        assert_eq!(counters.counter_count(), 1);
+
+        breakers.set_cluster_config(CLUSTER, "eds-b", CircuitBreakingConfig { max_requests: 1 });
+        assert_eq!(counters.counter_count(), 1);
+
+        drop(breakers);
+        assert_eq!(counters.counter_count(), 0);
+    }
+
+    #[test]
     fn cluster_removal_cleans_up_counter_after_in_flight_requests_finish() {
         let breakers = configured_breakers(1);
         let permit = breakers.acquire(CLUSTER).unwrap();
@@ -897,6 +1080,41 @@ mod tests {
 
         drop(permit);
         assert_eq!(breakers.counter_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_breaker_observes_cluster_removal_and_recreation() {
+        let breakers = configured_breakers(1);
+        let calls = Arc::new(AtomicU32::new(0));
+        let call_counter = calls.clone();
+        let service = service_fn(move |_request: Request<TonicBody>| {
+            call_counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, BoxError>(Response::new(TonicBody::empty())) }
+        });
+        let mut service = CircuitBreakingLayer::new(breakers.clone()).layer(service);
+
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        drop(first);
+
+        breakers.clear_cluster_config(CLUSTER);
+        breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 0 });
+
+        let second = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        let status = tonic::Status::from_header_map(second.headers()).unwrap();
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -954,69 +1172,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_over_limit_without_waiting_for_inner_ready() {
+    async fn waiting_for_inner_readiness_does_not_acquire_permit() {
         let breakers = configured_breakers(1);
         let calls = Arc::new(AtomicU32::new(0));
         let service = BackpressuredService {
-            ready_budget: Arc::new(AtomicU32::new(1)),
+            ready_budget: Arc::new(AtomicU32::new(0)),
             calls: calls.clone(),
         };
         let mut service = CircuitBreakingLayer::new(breakers.clone()).layer(service);
 
-        let first = service
-            .ready()
-            .await
-            .unwrap()
-            .call(request())
-            .await
-            .unwrap();
-        assert_eq!(breakers.in_flight(CLUSTER), 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut ready = Box::pin(service.ready());
+        std::future::poll_fn(|cx| match ready.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("inner service should remain backpressured"),
+        })
+        .await;
 
-        let second = tokio::time::timeout(
-            tokio::time::Duration::from_millis(50),
-            service.ready().await.unwrap().call(request()),
-        )
-        .await
-        .expect("over-limit request should not wait for inner readiness")
-        .unwrap();
-        let status = tonic::Status::from_header_map(second.headers()).unwrap();
-        assert_eq!(status.code(), Code::Unavailable);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        drop(first);
-    }
-
-    #[derive(Clone, Debug)]
-    struct CountingUnavailablePolicy {
-        retry_observations: Arc<AtomicU32>,
-    }
-
-    impl Policy<Request<shared_http_body::SharedBody<TonicBody>>, Response<TonicBody>, BoxError>
-        for CountingUnavailablePolicy
-    {
-        type Future = std::future::Ready<()>;
-
-        fn retry(
-            &mut self,
-            _req: &mut Request<shared_http_body::SharedBody<TonicBody>>,
-            result: &mut Result<Response<TonicBody>, BoxError>,
-        ) -> Option<Self::Future> {
-            if let Ok(response) = result
-                && tonic::Status::from_header_map(response.headers())
-                    .is_some_and(|status| status.code() == Code::Unavailable)
-            {
-                self.retry_observations.fetch_add(1, Ordering::SeqCst);
-            }
-            None
-        }
-
-        fn clone_request(
-            &mut self,
-            req: &Request<shared_http_body::SharedBody<TonicBody>>,
-        ) -> Option<Request<shared_http_body::SharedBody<TonicBody>>> {
-            Some(req.clone())
-        }
+        assert_eq!(breakers.in_flight(CLUSTER), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Clone, Debug)]
@@ -1062,6 +1235,28 @@ mod tests {
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Pending
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorBody {
+        emitted: bool,
+    }
+
+    impl Body for ErrorBody {
+        type Data = Bytes;
+        type Error = tonic::Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.emitted {
+                Poll::Ready(None)
+            } else {
+                self.emitted = true;
+                Poll::Ready(Some(Err(tonic::Status::internal("body failed"))))
+            }
         }
     }
 

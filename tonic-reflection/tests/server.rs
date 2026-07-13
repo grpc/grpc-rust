@@ -155,6 +155,7 @@ async fn test_custom_options_are_preserved() {
     ] {
         let response = make_test_reflection_request_for(
             encoded_set.clone(),
+            None,
             ServerReflectionRequest {
                 host: "".to_string(),
                 message_request: Some(message_request),
@@ -176,12 +177,53 @@ async fn test_custom_options_are_preserved() {
     }
 }
 
+#[tokio::test]
+async fn test_encoded_bytes_win_over_decoded_duplicate() {
+    // The same file is registered in both forms: as raw bytes carrying a custom
+    // option, and as an already-decoded `FileDescriptorSet` (which cannot carry
+    // the option). The lossless raw bytes must take precedence.
+    let raw_file = file_descriptor_with_custom_option();
+    let encoded_set = wrap_in_file_descriptor_set(&raw_file);
+
+    let decoded_dup = prost_types::FileDescriptorSet {
+        file: vec![
+            prost_types::FileDescriptorProto::decode(raw_file.as_slice())
+                .expect("decode file descriptor"),
+        ],
+    };
+
+    let response = make_test_reflection_request_for(
+        encoded_set,
+        Some(decoded_dup),
+        ServerReflectionRequest {
+            host: "".to_string(),
+            message_request: Some(MessageRequest::FileByFilename(
+                "custom_option.proto".to_string(),
+            )),
+        },
+    )
+    .await;
+
+    let MessageResponse::FileDescriptorResponse(descriptor) = response else {
+        panic!("Expected a FileDescriptorResponse variant");
+    };
+    let served = descriptor
+        .file_descriptor_proto
+        .first()
+        .expect("descriptor");
+    assert_eq!(
+        served, &raw_file,
+        "the option-preserving encoded bytes must win over a decoded duplicate"
+    );
+}
+
 async fn make_test_reflection_request(request: ServerReflectionRequest) -> MessageResponse {
-    make_test_reflection_request_for(FILE_DESCRIPTOR_SET.to_vec(), request).await
+    make_test_reflection_request_for(FILE_DESCRIPTOR_SET.to_vec(), None, request).await
 }
 
 async fn make_test_reflection_request_for(
     encoded_fds: Vec<u8>,
+    decoded_fds: Option<prost_types::FileDescriptorSet>,
     request: ServerReflectionRequest,
 ) -> MessageResponse {
     // Run a test server
@@ -191,10 +233,11 @@ async fn make_test_reflection_request_for(
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     let local_addr = format!("http://{}", listener.local_addr().expect("local address"));
     let jh = tokio::spawn(async move {
-        let service = Builder::configure()
-            .register_encoded_file_descriptor_set(&encoded_fds)
-            .build_v1()
-            .unwrap();
+        let mut builder = Builder::configure().register_encoded_file_descriptor_set(&encoded_fds);
+        if let Some(decoded) = decoded_fds {
+            builder = builder.register_file_descriptor_set(decoded);
+        }
+        let service = builder.build_v1().unwrap();
 
         Server::builder()
             .add_service(service)

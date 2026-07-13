@@ -137,22 +137,35 @@ impl ReflectionServiceState {
             symbols: HashMap::new(),
         };
 
-        // Sets provided already-decoded have no original bytes to preserve, so
-        // re-encode each file (custom options may already have been dropped when
-        // the caller decoded the set into `prost_types`).
-        for fds in file_descriptor_sets {
-            for fd in fds.file {
-                let raw = fd.encode_to_vec();
+        // The builder accepts descriptor sets in two forms: raw bytes (via
+        // `register_encoded_file_descriptor_set`) and already-decoded
+        // `prost_types::FileDescriptorSet`s (via `register_file_descriptor_set`).
+        //
+        // The encoded sets are registered first, on purpose: `register_file`
+        // keeps the first entry seen for a given file name (see below), and the
+        // encoded form is the one that faithfully preserves custom options. So
+        // if the same file arrives in both forms, the lossless bytes win.
+        //
+        // Each encoded set is split into its per-file byte ranges without
+        // decoding the inner message, so the original bytes (including custom
+        // options such as `google.api.http`) are retained and served unchanged.
+        for encoded in encoded_file_descriptor_sets {
+            for raw in split_file_descriptor_set(encoded)? {
+                let fd = FileDescriptorProto::decode(raw.as_slice())?;
                 state.register_file(&fd, Arc::from(raw), use_all_service_names)?;
             }
         }
 
-        // Encoded sets are split into their per-file byte ranges without
-        // decoding the inner message, so the original bytes (including custom
-        // options) are retained and served unchanged.
-        for encoded in encoded_file_descriptor_sets {
-            for raw in split_file_descriptor_set(encoded)? {
-                let fd = FileDescriptorProto::decode(raw.as_slice())?;
+        // Already-decoded sets carry no original bytes, so each file has to be
+        // re-encoded. This is lossy for custom options, but unavoidable: those
+        // options were already dropped when the caller decoded the set into
+        // `prost_types` (which has no field to hold them). Callers that need
+        // custom options preserved should use `register_encoded_file_descriptor_set`
+        // instead. Registered second, as a fallback for files not already
+        // supplied in encoded form above.
+        for fds in file_descriptor_sets {
+            for fd in fds.file {
+                let raw = fd.encode_to_vec();
                 state.register_file(&fd, Arc::from(raw), use_all_service_names)?;
             }
         }
@@ -173,6 +186,9 @@ impl ReflectionServiceState {
             Some(n) => n,
         };
 
+        // First registration for a file name wins; later duplicates are ignored.
+        // `new` registers the option-preserving encoded sets before the
+        // re-encoded ones, so a file present in both keeps its original bytes.
         if self.files.contains_key(&name) {
             return Ok(());
         }

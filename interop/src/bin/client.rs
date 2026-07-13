@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;
                 grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
-                    .channel_authority("test.test.google.fr")
+                    .authority("test.test.google.fr")
                     .build()
             } else {
                 grpc::client::Channel::builder(

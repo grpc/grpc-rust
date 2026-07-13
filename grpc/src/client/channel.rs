@@ -96,7 +96,27 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Creates a new channel builder for the given target.
+    /// Creates a new channel builder for the given target. Target and
+    /// credentials are required to build a channel.
+    ///
+    /// The [target name](https://github.com/grpc/grpc/blob/master/doc/naming.md)
+    /// is a fully qualified, self contained URI defined by [rfc3986](https://datatracker.ietf.org/doc/html/rfc3986).
+    /// The target's scheme determines the name resolver used. If none is
+    /// detected the default name resolver ("dns") is used, unless overridden
+    /// by the user. Valid examples of target names include:
+    ///
+    /// "foo.googleapis.com:8080"
+    /// "dns:///foo.googleapis.com:8080"
+    /// "dns:///foo.googleapis.com"
+    /// "dns:///10.0.0.213:8080"
+    /// "dns:///%5B2001:db8:85a3:8d3:1319:8a2e:370:7348%5D:443"
+    /// "dns://8.8.8.8/foo.googleapis.com:8080"
+    /// "dns://8.8.8.8/foo.googleapis.com"
+    /// "zookeeper://zk.example.com:9900/example_service"
+    ///
+    /// Credentials must implement the [`ChannelCredentials`] trait.
+    ///
+    ///
     ///# Example
     ///
     /// ```
@@ -115,7 +135,7 @@ impl Channel {
         ChannelBuilder {
             target: target.into(),
             credentials,
-            channel_authority: None,
+            authority: None,
             runtime: default_runtime(),
         }
     }
@@ -160,7 +180,7 @@ pub struct ChannelBuilder {
     runtime: GrpcRuntime,
 
     // Optional values.
-    channel_authority: Option<String>,
+    authority: Option<String>,
 }
 
 impl ChannelBuilder {
@@ -190,7 +210,7 @@ impl ChannelBuilder {
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
 
         let authority = self
-            .channel_authority
+            .authority
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
             credentials: self.credentials,
@@ -208,8 +228,12 @@ impl ChannelBuilder {
         }
     }
 
-    pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
-        self.channel_authority = Some(authority.into());
+    /// Sets the channel's authority value, to be used as the :authority
+    /// pseudo-header and the server name in authentication handshakes. This
+    /// overrides all other ways of setting authority on the channel, but can be
+    /// overridden by per-call authority values.
+    pub fn authority(mut self, authority: impl Into<String>) -> Self {
+        self.authority = Some(authority.into());
         self
     }
 }
@@ -283,8 +307,10 @@ impl ActiveChannel {
 
         let work_scheduler = Arc::new(ResolverWorkScheduler { wqtx });
         let resolver_opts = name_resolution::ResolverOptions {
-            // authority: persistent_channel.security_opts.authority.clone(),
-            authority: "ignored".to_string(), // TODO(nathanielford) currently, this option is always ignored.
+            authority: persistent_channel
+                .security_opts
+                .authority
+                .host_port_string(),
             work_scheduler,
             runtime: runtime.clone(),
         };

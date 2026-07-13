@@ -139,7 +139,6 @@ impl Channel {
             runtime: default_runtime(),
         }
     }
-    // TODO: enter_idle(&self) and graceful_stop()?
 
     /// Returns the current state of the channel. If `connect` is true and the
     /// state was [`Idle`](ConnectivityState::Idle), the channel will attempt to

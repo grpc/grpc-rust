@@ -1,3 +1,4 @@
+use http::{header::HeaderName, HeaderValue};
 use integration_tests::pb::{test_client::TestClient, test_server, Input, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,6 +7,7 @@ use tonic::{
     transport::{server::TcpIncoming, Endpoint, Server},
     Code, Request, Response, Status,
 };
+use tower_http::set_header::SetRequestHeaderLayer;
 
 struct Svc(Arc<Mutex<Option<oneshot::Sender<()>>>>);
 
@@ -66,6 +68,63 @@ async fn connect_returns_err_via_call_after_connected() {
     let err = res.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable);
 
+    jh.await.unwrap();
+}
+
+#[tokio::test]
+async fn endpoint_layer_stacks_and_applies_to_requests() {
+    struct HeaderSvc;
+
+    #[tonic::async_trait]
+    impl test_server::Test for HeaderSvc {
+        async fn unary_call(&self, req: Request<Input>) -> Result<Response<Output>, Status> {
+            // Both layers must have been applied for this to succeed, proving the
+            // layers stack rather than the second `layer` call replacing the first.
+            match (
+                req.metadata().get("x-first"),
+                req.metadata().get("x-second"),
+            ) {
+                (Some(_), Some(_)) => Ok(Response::new(Output {})),
+                _ => Err(Status::internal("a header set by a layer is missing")),
+            }
+        }
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let svc = test_server::TestServer::new(HeaderSvc);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+
+    let jh = tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async { drop(rx.await) })
+            .await
+            .unwrap();
+    });
+
+    // The layers are configured directly on the `Endpoint`, so no type
+    // parameters leak onto the resulting `Channel`.
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .layer(SetRequestHeaderLayer::overriding(
+            HeaderName::from_static("x-first"),
+            HeaderValue::from_static("first"),
+        ))
+        .layer(SetRequestHeaderLayer::overriding(
+            HeaderName::from_static("x-second"),
+            HeaderValue::from_static("second"),
+        ))
+        .connect_lazy();
+
+    let mut client = TestClient::new(channel);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.unary_call(Request::new(Input {})).await.unwrap();
+
+    tx.send(()).unwrap();
     jh.await.unwrap();
 }
 

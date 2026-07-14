@@ -80,9 +80,13 @@ impl Connection {
 
         let conn = Reconnect::new(make_service, endpoint.uri().clone(), is_lazy);
 
-        Self {
-            inner: BoxService::new(stack.layer(conn)),
-        }
+        let inner = BoxService::new(stack.layer(conn));
+        let inner = match &endpoint.layer {
+            Some(layer) => layer.layer(inner),
+            None => inner,
+        };
+
+        Self { inner }
     }
 
     pub(crate) async fn connect<C>(

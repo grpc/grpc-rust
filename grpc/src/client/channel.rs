@@ -249,7 +249,7 @@ impl PersistentChannel {
         // TODO(nathanielford): Return errors here instead of panicking.
         let target = Target::from_str(&target.into()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        let resolver_builder = Arc::new(proxy_resolver::Builder::new(resolver_builder));
+        let resolver_builder = proxy_resolver::Builder::new_arc(resolver_builder);
         let authority = options
             .channel_authority
             .clone()

@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Error type for the xDS client.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Failed to connect to the xDS server.
     #[error("failed to connect: {0}")]
@@ -13,6 +14,10 @@ pub enum Error {
     #[cfg(feature = "transport-tonic")]
     #[error("stream error: {0}")]
     Stream(#[from] tonic::Status),
+
+    /// Call credentials failed, or require a secure transport.
+    #[error("call credentials error: {0}")]
+    CallCredentials(String),
 
     /// The stream was closed unexpectedly.
     #[error("stream closed unexpectedly")]

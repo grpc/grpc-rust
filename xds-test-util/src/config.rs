@@ -1,4 +1,3 @@
-
 //! Helper functions for building xDS configuration resources for testing.
 
 use envoy_types::pb::envoy::config::cluster::v3::Cluster;

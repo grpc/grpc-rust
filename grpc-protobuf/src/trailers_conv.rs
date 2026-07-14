@@ -62,7 +62,7 @@ pub(crate) fn status_from_trailers(mut t: Trailers) -> Status {
                         return Err(StatusError::new(
                             StatusCodeError::Internal,
                             format!(
-                                "RPC status code mismatch: gRPC code {:?}, RPC code {:?}",
+                                "RPC status code mismatch: gRPC code {:?}, google.rpc.Code {:?}",
                                 expected_code,
                                 rpc_status_err.code()
                             ),
@@ -348,7 +348,7 @@ mod tests {
         assert_eq!(err.code(), StatusCodeError::Internal);
         assert_eq!(
             err.message(),
-            "RPC status code mismatch: gRPC code PermissionDenied, RPC code NotFound"
+            "RPC status code mismatch: gRPC code PermissionDenied, google.rpc.Code NotFound"
         );
     }
 

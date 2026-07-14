@@ -25,9 +25,6 @@
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use crate::Status;
-use crate::StatusOr;
-use crate::trailers_conv::status_from_trailers;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RecvStream;
@@ -46,7 +43,10 @@ use protobuf::MessageView;
 use crate::CallBuilder;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::Status;
+use crate::StatusOr;
 use crate::client::Internal;
+use crate::trailers_conv::status_from_trailers;
 
 /// Configures a client-streaming call for gRPC Protobuf.  Implements
 /// [`IntoFuture`] which begins the call and resolves to a

@@ -26,8 +26,6 @@ use std::marker::PhantomData;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::Status;
-use crate::trailers_conv::status_from_trailers;
 use bytes::Buf;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
@@ -49,7 +47,9 @@ use protobuf::MessageView;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::Status;
 use crate::private::Internal;
+use crate::trailers_conv::status_from_trailers;
 
 pub(crate) mod bidi;
 pub(crate) mod client_streaming;

@@ -246,8 +246,8 @@ impl XdsTestControlPlaneService {
             subscribers,
             ..
         } = &mut *state;
-        let type_resources = resources.get(&type_url);
-        if let Some(streams) = subscribers.get_mut(&type_url) {
+        let type_resources = resources.get(type_url);
+        if let Some(streams) = subscribers.get_mut(type_url) {
             for sub in streams.values_mut() {
                 sub.nonce += 1;
                 let response = build_response(

@@ -1,62 +1,32 @@
-//! A fake xDS ADS control plane for tests.
+//! `XdsTestControlPlaneService` is a fake xDS ADS control plane for gRPC tests.
 //!
-//! Rust port of grpc-java's `XdsTestControlPlaneService`. It is a bidi-stream
-//! service that acts as a local xDS control plane. Config is injected through
+//! The xDS config resources are injected through
 //! [`set_xds_config`](XdsTestControlPlaneService::set_xds_config).
 //!
-//! The service maintains, per ADS resource type:
-//! - a resources table (resource name to packed protobuf `Any`),
-//! - a subscriber table (each active stream to its subscribed resource names),
-//! - a version counter (bumped on every config set), and
-//! - a per-stream nonce counter.
-//!
-//! All resource types are treated as state-of-the-world: whenever any resource
-//! of a type changes, every subscriber to that type receives all of its
-//! subscribed resources of that type.
-//!
-//! Incoming ADS requests share the same proto message but represent different
-//! phases, which the service distinguishes:
-//! 1. an initial request (new or changed subscription) — answered with a response,
-//! 2. a NACK (carries `error_detail`) — logged and ignored,
-//! 3. an ACK (same resource names already subscribed) — ignored.
+//! The xDS config resources are served by ADS (Aggregated Discovery Service) protocol and
+//! State-of-the-world (SOTW): whenever any resource of a type changes, every subscriber to
+//! that type receives all of its subscribed resources of that type.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
-use envoy_types::pb::envoy::service::discovery::v3::{DiscoveryRequest, DiscoveryResponse};
+use crate::config::*;
+use envoy_types::pb::envoy::service::discovery::v3::{
+    DiscoveryRequest, DiscoveryResponse,
+    aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
+};
 use envoy_types::pb::google::protobuf::Any;
 use prost::Message;
+use strum::IntoEnumIterator;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-/// ADS type URL for LDS (`Listener`) resources.
-pub const ADS_TYPE_URL_LDS: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
-/// ADS type URL for RDS (`RouteConfiguration`) resources.
-pub const ADS_TYPE_URL_RDS: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
-/// ADS type URL for CDS (`Cluster`) resources.
-pub const ADS_TYPE_URL_CDS: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
-/// ADS type URL for EDS (`ClusterLoadAssignment`) resources.
-pub const ADS_TYPE_URL_EDS: &str =
-    "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
-
-/// The ADS resource types tracked by the control plane.
-const ADS_TYPE_URLS: [&str; 4] = [
-    ADS_TYPE_URL_LDS,
-    ADS_TYPE_URL_RDS,
-    ADS_TYPE_URL_CDS,
-    ADS_TYPE_URL_EDS,
-];
-
 /// Sender half of a stream's outbound `DiscoveryResponse` channel.
-///
-/// The channel carries bare `DiscoveryResponse`s; the (framework-specific)
-/// serving adapter wraps them in the transport's success type.
 type ResponseSender = mpsc::UnboundedSender<DiscoveryResponse>;
 
 /// Per-(type, stream) subscription bookkeeping.
@@ -73,21 +43,21 @@ struct Subscription {
 /// Mutable control-plane state, guarded by a single mutex.
 #[derive(Debug)]
 struct State {
-    /// `type_url` to (resource name to packed `Any`).
-    resources: HashMap<String, HashMap<String, Any>>,
-    /// `type_url` to latest version (starts at 1, bumped on each config set).
-    versions: HashMap<String, u64>,
-    /// `type_url` to (stream id to subscription).
-    subscribers: HashMap<String, HashMap<u64, Subscription>>,
+    /// xDS resources keyed by their names, organized by type URL.
+    resources: HashMap<AdsTypeUrl, HashMap<String, Any>>,
+    /// Latest version number for each xDS resource type (starts at 1, bumped on each config set).
+    versions: HashMap<AdsTypeUrl, u64>,
+    /// Active subscribers for each xDS resource type, keyed by stream ID.
+    subscribers: HashMap<AdsTypeUrl, HashMap<u64, Subscription>>,
 }
 
 impl State {
     fn new() -> Self {
         let mut versions = HashMap::new();
         let mut subscribers = HashMap::new();
-        for type_url in ADS_TYPE_URLS {
-            versions.insert(type_url.to_string(), 1);
-            subscribers.insert(type_url.to_string(), HashMap::new());
+        for type_url in AdsTypeUrl::iter() {
+            versions.insert(type_url.clone(), 1);
+            subscribers.insert(type_url.clone(), HashMap::new());
         }
         Self {
             resources: HashMap::new(),
@@ -111,13 +81,24 @@ impl Inner {
 
         // NACK: a request carrying an error detail rejects the last response.
         if req.error_detail.is_some() {
+            tracing::warn!(
+                "Received NACK for stream {}: {:?}",
+                stream_id,
+                req.error_detail
+            );
             return;
         }
 
-        let type_url = req.type_url;
-        if type_url.is_empty() {
-            return;
-        }
+        let type_url: AdsTypeUrl = match req.type_url.parse() {
+            Ok(url) => url,
+            Err(_) => {
+                tracing::error!(
+                    "Received request with empty or invalid type_url for stream {}",
+                    stream_id
+                );
+                return;
+            }
+        };
 
         // Nonce check: if the request carries a response nonce, it must match
         // the last nonce we sent on this (type, stream); otherwise ignore it.
@@ -128,9 +109,20 @@ impl Inner {
                 .and_then(|streams| streams.get(&stream_id))
                 .is_some_and(|sub| sub.nonce.to_string() == req.response_nonce);
             if !matches {
+                tracing::warn!(
+                    "Received request with mismatched nonce for stream {}: {}",
+                    stream_id,
+                    req.response_nonce
+                );
                 return;
             }
         }
+        tracing::debug!(
+            "Received ACK {} for stream {} with type_url {}",
+            req.response_nonce,
+            stream_id,
+            type_url
+        );
 
         let requested: HashSet<String> = req.resource_names.into_iter().collect();
 
@@ -141,6 +133,11 @@ impl Inner {
             .and_then(|streams| streams.get(&stream_id))
             && sub.resource_names == requested
         {
+            tracing::debug!(
+                "Received identical subscription for stream {} with type_url {}",
+                stream_id,
+                type_url
+            );
             return;
         }
 
@@ -178,7 +175,7 @@ impl Inner {
     }
 }
 
-/// A bidi-stream service that acts as a local xDS control plane for tests.
+/// XdsTestControlPlaneService is a bidi-stream service that acts as a local xDS control plane for tests.
 ///
 /// Clone freely: all clones share the same underlying state, so config injected
 /// through one clone is served by another. Inject config with
@@ -215,7 +212,7 @@ impl XdsTestControlPlaneService {
     ///
     /// Each resource is packed into a protobuf `Any` tagged with `type_url`.
     /// Resource types are treated as state-of-the-world.
-    pub fn set_xds_config<M: Message>(&self, type_url: &str, resources: HashMap<String, M>) {
+    pub fn set_xds_config<M: Message>(&self, type_url: &AdsTypeUrl, resources: HashMap<String, M>) {
         let packed: HashMap<String, Any> = resources
             .into_iter()
             .map(|(name, msg)| {
@@ -229,12 +226,16 @@ impl XdsTestControlPlaneService {
             })
             .collect();
 
-        let mut state = self.inner.state.lock().expect("control plane state poisoned");
-        state.resources.insert(type_url.to_string(), packed);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("control plane state poisoned");
+        state.resources.insert(type_url.clone(), packed);
 
         // getAndIncrement: the pushed response carries the pre-increment version.
         let version = {
-            let counter = state.versions.entry(type_url.to_string()).or_insert(1);
+            let counter = state.versions.entry(type_url.clone()).or_insert(1);
             let current = *counter;
             *counter += 1;
             current
@@ -245,12 +246,17 @@ impl XdsTestControlPlaneService {
             subscribers,
             ..
         } = &mut *state;
-        let type_resources = resources.get(type_url);
-        if let Some(streams) = subscribers.get_mut(type_url) {
+        let type_resources = resources.get(&type_url);
+        if let Some(streams) = subscribers.get_mut(&type_url) {
             for sub in streams.values_mut() {
                 sub.nonce += 1;
-                let response =
-                    build_response(type_url, version, sub.nonce, &sub.resource_names, type_resources);
+                let response = build_response(
+                    type_url,
+                    version,
+                    sub.nonce,
+                    &sub.resource_names,
+                    type_resources,
+                );
                 let _ = sub.sender.send(response);
             }
         }
@@ -262,8 +268,12 @@ impl XdsTestControlPlaneService {
     /// For a protobuf-free view suitable for assertions, use
     /// [`resource_names`](Self::resource_names).
     #[must_use]
-    pub fn get_current_config(&self, type_url: &str) -> HashMap<String, Any> {
-        let state = self.inner.state.lock().expect("control plane state poisoned");
+    pub fn get_current_config(&self, type_url: &AdsTypeUrl) -> HashMap<String, Any> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("control plane state poisoned");
         state.resources.get(type_url).cloned().unwrap_or_default()
     }
 
@@ -273,8 +283,12 @@ impl XdsTestControlPlaneService {
     /// This is a protocol-agnostic view of what the control plane is serving,
     /// suitable for assertions without depending on protobuf types.
     #[must_use]
-    pub fn resource_names(&self, type_url: &str) -> Vec<String> {
-        let state = self.inner.state.lock().expect("control plane state poisoned");
+    pub fn resource_names(&self, type_url: &AdsTypeUrl) -> Vec<String> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("control plane state poisoned");
         state
             .resources
             .get(type_url)
@@ -288,14 +302,20 @@ impl XdsTestControlPlaneService {
 
     /// Returns the number of active subscribers per ADS resource type.
     #[must_use]
-    pub fn get_subscriber_counts(&self) -> HashMap<String, usize> {
-        let state = self.inner.state.lock().expect("control plane state poisoned");
-        ADS_TYPE_URLS
-            .iter()
+    pub fn get_subscriber_counts(&self) -> HashMap<AdsTypeUrl, usize> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("control plane state poisoned");
+
+        state
+            .subscribers
+            .keys()
             .map(|type_url| {
                 (
-                    (*type_url).to_string(),
-                    state.subscribers.get(*type_url).map_or(0, HashMap::len),
+                    type_url.clone(),
+                    state.subscribers.get(type_url).map_or(0, HashMap::len),
                 )
             })
             .collect()
@@ -351,15 +371,7 @@ impl RunningControlPlane {
 
     /// The underlying control plane service (shared state).
     #[must_use]
-    pub fn service(&self) -> &XdsTestControlPlaneService {
-        &self.service
-    }
-}
-
-impl std::ops::Deref for RunningControlPlane {
-    type Target = XdsTestControlPlaneService;
-
-    fn deref(&self) -> &Self::Target {
+    pub fn get_service(&self) -> &XdsTestControlPlaneService {
         &self.service
     }
 }
@@ -403,9 +415,13 @@ mod tonic_service {
                 while let Some(item) = inbound.next().await {
                     match item {
                         Ok(req) => inner.handle_request(stream_id, &tx, req),
-                        Err(_) => break,
+                        Err(err) => {
+                            tracing::error!("Error receiving request: {:?}", err);
+                            break;
+                        }
                     }
                 }
+                tracing::info!("Stream {} closed", stream_id);
                 inner.remove_stream(stream_id);
             });
 
@@ -429,7 +445,7 @@ mod tonic_service {
 
 /// Builds a `DiscoveryResponse` containing the requested resources that exist.
 fn build_response(
-    type_url: &str,
+    type_url: &AdsTypeUrl,
     version: u64,
     nonce: u64,
     resource_names: &HashSet<String>,
@@ -468,19 +484,23 @@ mod tests {
                 ..Default::default()
             },
         );
-        control_plane.set_xds_config(ADS_TYPE_URL_LDS, listeners);
+        control_plane.set_xds_config(&AdsTypeUrl::Lds, listeners);
 
-        let config = control_plane.get_current_config(ADS_TYPE_URL_LDS);
+        let config = control_plane.get_current_config(&AdsTypeUrl::Lds);
         assert_eq!(config.len(), 1);
         let packed = config.get("my-listener").expect("listener present");
-        assert_eq!(packed.type_url, ADS_TYPE_URL_LDS);
+        assert_eq!(packed.type_url, AdsTypeUrl::Lds.to_string());
 
         // No streams have connected yet.
         let counts = control_plane.get_subscriber_counts();
-        assert_eq!(counts.len(), 4);
-        assert_eq!(counts.get(ADS_TYPE_URL_LDS), Some(&0));
+        assert_eq!(counts.len(), AdsTypeUrl::iter().count());
+        assert_eq!(counts.get(&AdsTypeUrl::Lds), Some(&0));
 
         // A type that was never configured has no resources.
-        assert!(control_plane.get_current_config(ADS_TYPE_URL_CDS).is_empty());
+        assert!(
+            control_plane
+                .get_current_config(&AdsTypeUrl::Cds)
+                .is_empty()
+        );
     }
 }

@@ -9,4 +9,4 @@ pub(crate) mod retry;
 pub(crate) mod route;
 
 #[cfg(test)]
-mod xds_e2e_test;
+mod xds_e2e;

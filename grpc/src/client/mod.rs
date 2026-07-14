@@ -56,17 +56,18 @@ use crate::core::SendMessage;
 use crate::core::Trailers;
 
 mod channel;
-pub mod interceptor;
-pub mod metadata_utils;
-pub(crate) mod service_config;
-pub mod stream_util;
-
 pub use channel::Channel;
 pub use channel::ChannelOptions;
 
+mod subchannel;
+
+pub mod interceptor;
+pub mod metadata_utils;
+pub mod stream_util;
+
 pub(crate) mod load_balancing;
 pub(crate) mod name_resolution;
-mod subchannel;
+pub(crate) mod service_config;
 pub(crate) mod transport;
 
 #[cfg(test)]

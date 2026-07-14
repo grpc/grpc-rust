@@ -49,7 +49,7 @@ use crate::core::RequestHeaders;
 /// Note that Lazy can only properly wrap a policy whose config is Clone, as it
 /// needs to store the config until the child is built.
 #[derive(Debug)]
-pub(crate) struct Lazy<T: LbPolicyBuilder> {
+pub struct Lazy<T: LbPolicyBuilder> {
     inner: Inner<T>,
 }
 

@@ -92,6 +92,7 @@ pub(crate) struct ChannelCredentialConfig {
 pub(crate) enum ChannelCredentialType {
     Insecure,
     Tls,
+    GoogleDefault,
     #[serde(untagged)]
     Unsupported(String),
 }
@@ -269,14 +270,19 @@ impl BootstrapConfig {
             .find(|t| {
                 matches!(
                     t,
-                    ChannelCredentialType::Insecure | ChannelCredentialType::Tls
+                    ChannelCredentialType::Insecure
+                        | ChannelCredentialType::Tls
+                        | ChannelCredentialType::GoogleDefault
                 )
             })
     }
 
     /// Returns `true` if the first server's selected credential is TLS.
     pub(crate) fn use_tls(&self) -> bool {
-        self.selected_credential() == Some(&ChannelCredentialType::Tls)
+        matches!(
+            self.selected_credential(),
+            Some(ChannelCredentialType::Tls | ChannelCredentialType::GoogleDefault)
+        )
     }
 }
 
@@ -363,7 +369,7 @@ mod tests {
         assert_eq!(config.xds_servers[0].channel_creds.len(), 3);
         assert!(matches!(
             config.xds_servers[0].channel_creds[0].cred_type,
-            ChannelCredentialType::Unsupported(_)
+            ChannelCredentialType::GoogleDefault
         ));
         assert_eq!(config.xds_servers[0].server_features, vec!["xds_v3"]);
         assert_eq!(config.node.id, "projects/123/nodes/456");
@@ -401,10 +407,9 @@ mod tests {
     #[test]
     fn selected_credential_first_supported_wins() {
         let config = BootstrapConfig::from_json(full_json()).unwrap();
-        // google_default skipped, tls is first supported
         assert_eq!(
             config.selected_credential(),
-            Some(&ChannelCredentialType::Tls)
+            Some(&ChannelCredentialType::GoogleDefault)
         );
     }
 
@@ -429,11 +434,15 @@ mod tests {
         let json = r#"{
             "xds_servers": [{
                 "server_uri": "localhost:5000",
-                "channel_creds": [{"type": "google_default"}]
+                "channel_creds": [{"type": "some_future_type"}]
             }],
             "node": {"id": "n1"}
         }"#;
         let config = BootstrapConfig::from_json(json).unwrap();
+        assert!(matches!(
+            config.xds_servers[0].channel_creds[0].cred_type,
+            ChannelCredentialType::Unsupported(_)
+        ));
         assert_eq!(config.selected_credential(), None);
     }
 
@@ -617,6 +626,27 @@ mod tests {
     fn missing_certificate_providers_defaults_to_empty() {
         let config = BootstrapConfig::from_json(minimal_json()).unwrap();
         assert!(config.certificate_providers.is_empty());
+    }
+
+    #[test]
+    fn parse_google_default() {
+        let json = r#"{
+            "xds_servers": [{
+                "server_uri": "xds.example.com:443",
+                "channel_creds": [{"type": "google_default"}]
+            }],
+            "node": {"id": "n1"}
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
+        assert_eq!(
+            config.xds_servers[0].channel_creds[0].cred_type,
+            ChannelCredentialType::GoogleDefault
+        );
+        assert!(config.use_tls());
+        assert_eq!(
+            config.selected_credential(),
+            Some(&ChannelCredentialType::GoogleDefault)
+        );
     }
 
     #[test]

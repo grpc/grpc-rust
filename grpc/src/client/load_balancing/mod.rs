@@ -40,23 +40,23 @@ use crate::core::RequestHeaders;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
-pub(crate) mod child_manager;
-pub(crate) mod graceful_switch;
-pub(crate) mod lazy;
-pub(crate) mod pick_first;
-pub(crate) mod round_robin;
-pub(crate) mod subchannel;
 pub(crate) mod subchannel_sharing;
+
+pub mod child_manager;
+pub mod graceful_switch;
+pub mod lazy;
+pub mod pick_first;
+pub mod registry;
+pub mod round_robin;
+pub mod subchannel;
+pub use registry::GLOBAL_LB_REGISTRY;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-pub(crate) mod registry;
-pub(crate) use registry::GLOBAL_LB_REGISTRY;
-
 /// An LB policy factory that produces LbPolicy instances used by the channel
 /// to manage connections and pick connections for RPCs.
-pub(crate) trait LbPolicyBuilder: Send + Sync + Debug + 'static {
+pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     type LbPolicy: LbPolicy;
 
     /// Builds and returns a new LB policy instance.
@@ -88,7 +88,7 @@ pub(crate) trait LbPolicyBuilder: Send + Sync + Debug + 'static {
 /// LB policies are responsible for creating connections (modeled as
 /// Subchannels) and producing Picker instances for picking connections for
 /// RPCs.
-pub(crate) trait LbPolicy: Send + Sync + Debug + 'static {
+pub trait LbPolicy: Send + Sync + Debug + 'static {
     type LbConfig: Any + Send + Sync + Debug + 'static;
 
     /// Called by the channel when the name resolver produces a new set of
@@ -121,7 +121,7 @@ pub(crate) trait LbPolicy: Send + Sync + Debug + 'static {
 /// A collection of data configured on the channel that is constructing this
 /// LbPolicy.
 #[derive(Debug)]
-pub(crate) struct LbPolicyOptions {
+pub struct LbPolicyOptions {
     /// A hook into the channel's work scheduler that allows the LbPolicy to
     /// request the ability to perform operations on the ChannelController.
     pub work_scheduler: Arc<dyn WorkScheduler>,
@@ -132,13 +132,13 @@ pub(crate) struct LbPolicyOptions {
 /// to be printed more readily.  Blanket implemented on all types that are Any +
 /// Send + Debug.  `dyn WorkDataTrait` also implements downcast methods like
 /// [`Any`] for convenience.
-pub(crate) trait WorkDataTrait: Any + Send + Debug {}
+pub trait WorkDataTrait: Any + Send + Debug {}
 
 impl<T: Any + Send + Debug> WorkDataTrait for T {}
 
 impl dyn WorkDataTrait {
     /// Like [`Box<dyn Any>::downcast`] but for this wrapper trait.
-    pub(crate) fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
+    pub fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
         // If we directly call downcast then we can't return `Self` anymore
         // (only a Box<dyn Any + Send>), so we first have to check `is` and only
         // downcast when we know it will succeed.
@@ -152,26 +152,26 @@ impl dyn WorkDataTrait {
     /// Like
     /// [`downcast_ref`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_ref)
     /// implemented on [`dyn Any`](Any), but for this wrapper trait.
-    pub(crate) fn downcast_ref<T: Any>(&self) -> Option<&T> {
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         (self as &(dyn Any + Send)).downcast_ref::<T>()
     }
 
     /// Like
     /// [`downcast_mut`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_mut)
     /// implemented on [`dyn Any`](Any), but for this wrapper trait.
-    pub(crate) fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
+    pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
         (self as &mut (dyn Any + Send)).downcast_mut::<T>()
     }
 }
 
 /// A dynamic payload passed between [`WorkScheduler::schedule_work`] and its
 /// associated policy's [`work`](LbPolicy::work) method.
-pub(crate) type WorkData = Box<dyn WorkDataTrait>;
+pub type WorkData = Box<dyn WorkDataTrait>;
 
 /// Used to asynchronously request a call into the LbPolicy's work method if
 /// the LbPolicy needs to provide an update without waiting for an update
 /// from the channel first.
-pub(crate) trait WorkScheduler: Send + Sync + Debug {
+pub trait WorkScheduler: Send + Sync + Debug {
     // Schedules a call into the LbPolicy's work method.  If there is already a
     // pending work call that has not yet started, this may not schedule another
     // call.
@@ -182,7 +182,7 @@ pub(crate) trait WorkScheduler: Send + Sync + Debug {
 /// JSON.  Hides internal storage details and includes a method to deserialize
 /// the JSON into a concrete policy struct.
 #[derive(Debug)]
-pub(crate) struct ParsedJsonLbConfig {
+pub struct ParsedJsonLbConfig {
     value: serde_json::Value,
 }
 
@@ -195,7 +195,7 @@ impl ParsedJsonLbConfig {
         }
     }
 
-    pub(crate) fn from_value(value: serde_json::Value) -> Self {
+    pub fn from_value(value: serde_json::Value) -> Self {
         Self { value }
     }
 
@@ -218,7 +218,7 @@ impl ParsedJsonLbConfig {
 }
 
 /// Controls channel behaviors.
-pub(crate) trait ChannelController: Send + Sync {
+pub trait ChannelController: Send + Sync {
     /// Creates a new subchannel and returns its current state.
     fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState);
 
@@ -252,7 +252,7 @@ pub(crate) trait ChannelController: Send + Sync {
 ///
 /// If the ConnectivityState is TransientFailure, the Picker should return an
 /// Err with an error that describes why connections are failing.
-pub(crate) trait Picker: Send + Sync + Debug {
+pub trait Picker: Send + Sync + Debug {
     /// Picks a connection to use for the request.
     ///
     /// This function should not block.  If the Picker needs to do blocking or
@@ -263,7 +263,7 @@ pub(crate) trait Picker: Send + Sync + Debug {
 }
 
 #[derive(Debug)]
-pub(crate) enum PickResult {
+pub enum PickResult {
     /// Indicates the Subchannel in the Pick should be used for the request.
     Pick(Pick),
     /// Indicates the LbPolicy is attempting to connect to a server to use for
@@ -326,7 +326,7 @@ impl Display for PickResult {
 
 /// State provided by the LB policy to the channel.
 #[derive(Clone, Debug)]
-pub(crate) struct LbState {
+pub struct LbState {
     pub connectivity_state: super::ConnectivityState,
     pub picker: Arc<dyn Picker>,
 }
@@ -358,10 +358,10 @@ impl LbState {
 }
 
 /// Type alias for the completion callback function.
-pub(crate) type CompletionCallback = Box<dyn Fn() + Send + Sync>;
+pub type CompletionCallback = Box<dyn Fn() + Send + Sync>;
 
 /// A collection of data used by the channel for routing a request.
-pub(crate) struct Pick {
+pub struct Pick {
     /// The Subchannel for the request.
     pub subchannel: Arc<dyn Subchannel>,
     // Metadata to be added to existing outgoing metadata.

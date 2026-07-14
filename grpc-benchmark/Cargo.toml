@@ -6,13 +6,19 @@ license = "MIT"
 rust-version = { workspace = true }
 
 [dependencies]
+async-stream = "0.3"
 grpc = { path = "../grpc" }
 grpc-protobuf = { path = "../grpc-protobuf" }
 prost = "0.14"
 prost-types = "0.14"
 protobuf = { version = "4.35.1-release" }
-tonic = { path = "../tonic" }
+tokio = { version = "1.37.0", features = ["sync", "macros"] }
+tokio-stream = "0.1.18"
+tonic = { path = "../tonic", features = ["tls-aws-lc"] }
 tonic-prost = { path = "../tonic-prost" }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["resource"] }
 
 [build-dependencies]
 tonic-prost-build = { path = "../tonic-prost-build" }

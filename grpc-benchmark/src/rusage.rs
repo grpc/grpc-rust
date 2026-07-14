@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -22,17 +22,41 @@
  *
  */
 
-/// An in-memory representation of a service config, usually provided to gRPC as
-/// a JSON object.
-// TODO: complete this and ensure it meets all our requirements.
-#[derive(Debug, Default, Clone)]
-pub struct ServiceConfig {
-    pub(crate) load_balancing_policy: Option<LbPolicyType>,
+#[derive(Debug)]
+pub(crate) struct Rusage {
+    user_time_ns: i64,
+    system_time_ns: i64,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub enum LbPolicyType {
-    #[default]
-    PickFirst,
-    RoundRobin,
+impl Rusage {
+    #[cfg(unix)]
+    pub(crate) fn now() -> Result<Self, String> {
+        use nix::sys::resource::UsageWho;
+        use nix::sys::resource::getrusage;
+        use nix::sys::time::TimeValLike;
+
+        let usage =
+            getrusage(UsageWho::RUSAGE_SELF).map_err(|e| format!("failed to get rusage: {}", e))?;
+
+        Ok(Rusage {
+            user_time_ns: usage.user_time().num_nanoseconds(),
+            system_time_ns: usage.system_time().num_nanoseconds(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn now() -> Result<Rusage, String> {
+        Ok(Rusage {
+            user_time_ns: 0,
+            system_time_ns: 0,
+        })
+    }
+
+    pub(crate) fn user_time_nanos(&self) -> i64 {
+        self.user_time_ns
+    }
+
+    pub(crate) fn system_time_nanos(&self) -> i64 {
+        self.system_time_ns
+    }
 }

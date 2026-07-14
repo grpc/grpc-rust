@@ -49,9 +49,9 @@ use crate::credentials::rustls::client::RustlsChannelCredendials;
 use crate::credentials::rustls::server::RustlsServerCredendials;
 use crate::credentials::rustls::server::ServerTlsConfig;
 use crate::private;
-use crate::rt::AsyncIoAdapter;
+use crate::rt::EndpointIoStream;
 use crate::rt::GrpcRuntime;
-use crate::rt::TokioIoStream;
+use crate::rt::StreamEndpoint;
 use crate::rt::tokio::TokioRuntime;
 
 static INIT: Once = Once::new();
@@ -85,14 +85,14 @@ async fn test_proxy_success_no_auth() {
 
     let server_handle = tokio::spawn(async move {
         let (stream, _) = server_listener.accept().await.unwrap();
-        let stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
         let runtime = GrpcRuntime::new(TokioRuntime::default());
         let handshake_res = server_creds
             .accept(stream, runtime, private::Internal)
             .await
             .unwrap();
 
-        let mut tls_stream = AsyncIoAdapter::new(handshake_res.endpoint);
+        let mut tls_stream = EndpointIoStream::new(handshake_res.endpoint);
         let mut buf = vec![0u8; 5];
         tls_stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, b"hello");
@@ -119,7 +119,7 @@ async fn test_proxy_success_no_auth() {
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
@@ -137,7 +137,7 @@ async fn test_proxy_success_no_auth() {
         .unwrap();
 
     // Verify we can read/write to the TLS stream.
-    let mut client_stream = AsyncIoAdapter::new(handshake_output.endpoint);
+    let mut client_stream = EndpointIoStream::new(handshake_output.endpoint);
     client_stream.write_all(b"hello").await.unwrap();
     let mut buf = vec![0u8; 5];
     client_stream.read_exact(&mut buf).await.unwrap();
@@ -170,14 +170,14 @@ async fn test_proxy_success_with_auth() {
 
     let server_handle = tokio::spawn(async move {
         let (stream, _) = server_listener.accept().await.unwrap();
-        let stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
         let runtime = GrpcRuntime::new(TokioRuntime::default());
         let handshake_res = server_creds
             .accept(stream, runtime, private::Internal)
             .await
             .unwrap();
 
-        let mut tls_stream = AsyncIoAdapter::new(handshake_res.endpoint);
+        let mut tls_stream = EndpointIoStream::new(handshake_res.endpoint);
         let mut buf = vec![0u8; 5];
         tls_stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, b"hello");
@@ -206,7 +206,7 @@ async fn test_proxy_success_with_auth() {
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
@@ -224,7 +224,7 @@ async fn test_proxy_success_with_auth() {
         .unwrap();
 
     // Verify we can read/write to the TLS stream.
-    let mut client_stream = AsyncIoAdapter::new(handshake_output.endpoint);
+    let mut client_stream = EndpointIoStream::new(handshake_output.endpoint);
     client_stream.write_all(b"hello").await.unwrap();
     let mut buf = vec![0u8; 5];
     client_stream.read_exact(&mut buf).await.unwrap();
@@ -254,7 +254,7 @@ async fn test_proxy_failure_large_header() {
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
@@ -302,7 +302,7 @@ async fn test_proxy_failure_invalid_response() {
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
@@ -350,7 +350,7 @@ async fn test_proxy_failure_bad_status() {
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
     let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
@@ -412,7 +412,7 @@ async fn test_proxy_success_local_rewind_batched() {
 
     // Connect Client via Proxy.
     let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = TokioIoStream::new_from_tcp(source).unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
@@ -429,7 +429,7 @@ async fn test_proxy_success_local_rewind_batched() {
         .await
         .unwrap();
 
-    let mut proxied_stream = AsyncIoAdapter::new(handshake_output.endpoint);
+    let mut proxied_stream = EndpointIoStream::new(handshake_output.endpoint);
 
     // Verify we can read BOTH the batched initial_bytes and the subsequent
     // later_bytes.

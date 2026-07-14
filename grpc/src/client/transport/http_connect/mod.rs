@@ -38,11 +38,11 @@ use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
-use crate::rt::AsyncIoAdapter;
 use crate::rt::BoxEndpoint;
+use crate::rt::EndpointIoStream;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
-use crate::rt::TokioIoStream;
+use crate::rt::StreamEndpoint;
 
 mod rewind;
 
@@ -55,7 +55,7 @@ async fn do_connect_handshake<I: GrpcEndpoint>(
     input: I,
     opts: &ProxyOptions,
 ) -> Result<ProxyStream<I>, String> {
-    let mut io = AsyncIoAdapter::new(input);
+    let mut io = EndpointIoStream::new(input);
 
     let mut req = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\n",
@@ -116,7 +116,7 @@ async fn do_connect_handshake<I: GrpcEndpoint>(
                 } else {
                     Rewind::new_unbuffered(io)
                 };
-                return Ok(TokioIoStream::new(
+                return Ok(StreamEndpoint::new(
                     endpoint,
                     local_addr,
                     peer_addr,
@@ -153,7 +153,7 @@ impl HttpConnectHandshaker {
 }
 
 /// The I/O stream wrapper returned after the HTTP CONNECT handshake succeeds.
-type ProxyStream<I> = TokioIoStream<Rewind<AsyncIoAdapter<I>>>;
+type ProxyStream<I> = StreamEndpoint<Rewind<EndpointIoStream<I>>>;
 
 #[async_trait]
 impl ChannelCredentials for HttpConnectHandshaker {

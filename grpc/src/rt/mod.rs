@@ -195,11 +195,11 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
 /// An adapter that exposes `AsyncRead` and `AsyncWrite` functionality for
 /// interfacing with `hyper` and `rustls`. This type is kept private to avoid
 /// exposing its read and write methods to external crates.
-pub(crate) struct AsyncIoAdapter<T> {
+pub(crate) struct EndpointIoStream<T> {
     inner: T,
 }
 
-impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> EndpointIoStream<T> {
     pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
@@ -209,7 +209,7 @@ impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
     }
 }
 
-impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> AsyncRead for EndpointIoStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -219,7 +219,7 @@ impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {
     }
 }
 
-impl<T: GrpcEndpoint> AsyncWrite for AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> AsyncWrite for EndpointIoStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -249,16 +249,15 @@ impl<T: GrpcEndpoint> AsyncWrite for AsyncIoAdapter<T> {
     }
 }
 
-/// A wrapper around an asynchronous I/O stream that implements
-/// [GrpcEndpoint].
-pub(crate) struct TokioIoStream<T> {
+/// A wrapper that implements [GrpcEndpoint] for an asynchronous I/O stream.
+pub(crate) struct StreamEndpoint<T> {
     inner: T,
     peer_addr: Box<str>,
     local_addr: Box<str>,
     network_type: &'static str,
 }
 
-impl<T> TokioIoStream<T> {
+impl<T> StreamEndpoint<T> {
     pub(crate) fn new(
         inner: T,
         local_addr: Box<str>,
@@ -274,7 +273,7 @@ impl<T> TokioIoStream<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for TokioIoStream<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for StreamEndpoint<T> {
     fn get_local_address(&self) -> &str {
         &self.local_addr
     }

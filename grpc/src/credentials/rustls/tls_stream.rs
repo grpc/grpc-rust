@@ -33,11 +33,11 @@ use tokio::io::ReadBuf;
 use tokio_rustls::TlsStream as RustlsStream;
 
 use crate::private;
-use crate::rt::AsyncIoAdapter;
+use crate::rt::EndpointIoStream;
 use crate::rt::GrpcEndpoint;
 
 pub struct TlsStream<T> {
-    inner: RustlsStream<AsyncIoAdapter<T>>,
+    inner: RustlsStream<EndpointIoStream<T>>,
 }
 
 impl<T> GrpcEndpoint for TlsStream<T>
@@ -119,11 +119,11 @@ where
 }
 
 impl<T: GrpcEndpoint> TlsStream<T> {
-    pub(crate) fn new(inner: RustlsStream<AsyncIoAdapter<T>>) -> Self {
+    pub(crate) fn new(inner: RustlsStream<EndpointIoStream<T>>) -> Self {
         Self { inner }
     }
 
-    pub(crate) fn inner(&self) -> &RustlsStream<AsyncIoAdapter<T>> {
+    pub(crate) fn inner(&self) -> &RustlsStream<EndpointIoStream<T>> {
         &self.inner
     }
 }

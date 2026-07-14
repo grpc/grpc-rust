@@ -39,9 +39,9 @@ use crate::rt::DnsResolver;
 use crate::rt::ResolverOptions;
 use crate::rt::Runtime;
 use crate::rt::Sleep;
+use crate::rt::StreamEndpoint;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
-use crate::rt::TokioIoStream;
 
 #[cfg(feature = "dns")]
 mod hickory_resolver;
@@ -123,7 +123,7 @@ impl Runtime for TokioRuntime {
                     .map_err(|err| err.to_string())?;
             }
             let stream: Box<dyn super::GrpcEndpoint> =
-                Box::new(TokioIoStream::new_from_tcp(stream)?);
+                Box::new(StreamEndpoint::new_from_tcp(stream)?);
             Ok(stream)
         })
     }
@@ -145,7 +145,7 @@ impl Runtime for TokioRuntime {
             let peer_addr = stream.peer_addr().map_err(|err| err.to_string())?;
             let local_addr = stream.local_addr().map_err(|err| err.to_string())?;
 
-            let stream: Box<dyn super::GrpcEndpoint> = Box::new(TokioIoStream {
+            let stream: Box<dyn super::GrpcEndpoint> = Box::new(StreamEndpoint {
                 peer_addr: format!("{peer_addr:?}").into_boxed_str(),
                 local_addr: format!("{local_addr:?}").into_boxed_str(),
                 network_type: UNIX_NETWORK_TYPE,
@@ -164,9 +164,9 @@ impl TokioDefaultDnsResolver {
         Ok(TokioDefaultDnsResolver { _priv: () })
     }
 }
-impl TokioIoStream<TcpStream> {
+impl StreamEndpoint<TcpStream> {
     pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
-        Ok(TokioIoStream {
+        Ok(StreamEndpoint {
             local_addr: stream
                 .local_addr()
                 .map_err(|err| err.to_string())?

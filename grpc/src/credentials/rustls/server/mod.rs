@@ -55,7 +55,7 @@ use crate::credentials::rustls::tls_stream::TlsStream;
 use crate::credentials::server::HandshakeOutput;
 use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
-use crate::rt::AsyncIoAdapter;
+use crate::rt::EndpointIoStream;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
@@ -347,7 +347,7 @@ impl ServerCredentials for RustlsServerCredendials {
         _runtime: GrpcRuntime,
         _token: private::Internal,
     ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
-        let input_io = AsyncIoAdapter::new(source);
+        let input_io = EndpointIoStream::new(source);
         let tls_stream = self
             .acceptor
             .accept(input_io)

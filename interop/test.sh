@@ -67,7 +67,13 @@ if [ -z "${GITHUB_ACTIONS:-}" ]; then
   (cd interop && cargo build --bins)
 fi
 
-SERVER="interop/bin/server_${OS}_amd64${EXT}"
+ARCH=$(go env GOARCH)
+SERVER="interop/bin/server_${OS}_${ARCH}${EXT}"
+
+if [ ! -f "$SERVER" ]; then
+    echo "Go interop binaries not found. Building them now..."
+    (cd interop && ./update_binaries.sh)
+fi
 
 TLS_CA="interop/data/ca.pem"
 TLS_CRT="interop/data/server1.pem"

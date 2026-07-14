@@ -36,16 +36,20 @@ func (s *testServer) CacheableUnaryCall(ctx context.Context, in *testpb.SimpleRe
 }
 EOF
 
-PLATFORMS="darwin linux windows"
+case "$OSTYPE" in
+  darwin*)  OS="darwin"; EXT="" ;;
+  linux*)   OS="linux"; EXT="" ;;
+  cygwin*)  OS="windows"; EXT=".exe" ;;
+  msys*)    OS="windows"; EXT=".exe" ;;
+  *)        echo "Unsupported OS"; exit 2 ;;
+esac
+
 ROLES="client server"
-ARCH=amd64
+ARCH=$(go env GOARCH)
 
 for ROLE in $ROLES; do
-  for OS in $PLATFORMS; do
-    FILENAME="${ROLE}_${OS}_${ARCH}"
-    if [[ "${OS}" == "windows" ]]; then FILENAME="${FILENAME}.exe"; fi
-    GOOS=$OS GOARCH=$ARCH go build -o "../bin/$FILENAME" "./interop/$ROLE"
-  done
+  FILENAME="${ROLE}_${OS}_${ARCH}${EXT}"
+  go build -o "../bin/$FILENAME" "./interop/$ROLE"
 done
 
 rm -rf ../grpc-go

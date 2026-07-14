@@ -18,8 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 //
-// Note: This file contains modifications by the gRPC authors; see revision
-// history for details.
+// Note: This file contains modifications by the gRPC authors.
+// See git revision history for subsequent changes and details.
+// Original source: https://github.com/hyperium/hyper-util/blob/911d0f256342fa6740721104418c6102dc7d1d0b/src/common/rewind.rs
+//
+// Modifications:
+// - Add a constructor for creating objects without a buffer.
+// - Format imports.
 
 use std::cmp;
 use std::io;

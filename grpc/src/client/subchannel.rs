@@ -313,7 +313,6 @@ impl InternalSubchannel {
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
         let address_string = address.address.to_string();
-        let transport_options = TransportOptions::default();
         if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {
             security_opts.credentials = Arc::new(HttpConnectHandshaker::new(
                 security_opts.credentials,

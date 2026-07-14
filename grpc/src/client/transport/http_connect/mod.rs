@@ -143,7 +143,7 @@ pub(crate) struct HttpConnectHandshaker {
 }
 
 impl HttpConnectHandshaker {
-    /// Constructs a new `ProxyChannelCredentials` wrapping the inner credentials.
+    /// Constructs a new `HttpConnectHandshaker` wrapping the inner credentials.
     pub(crate) fn new(inner: Arc<dyn ChannelCredentials>, options: &ProxyOptions) -> Self {
         Self {
             inner,

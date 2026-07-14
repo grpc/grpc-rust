@@ -264,10 +264,8 @@ mod tests {
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
     use crate::client::name_resolution::Address;
-    use crate::client::name_resolution::global_registry;
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
-    use crate::client::name_resolution::unix;
     use crate::rt;
     use crate::rt::GrpcEndpoint;
     use crate::rt::GrpcRuntime;
@@ -506,10 +504,11 @@ mod tests {
         assert!(err.contains("invalid target host in URL"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn unix_path_bypass() {
-        unix::reg();
-        let unix_builder = global_registry()
+        crate::client::name_resolution::unix::reg();
+        let unix_builder = crate::client::name_resolution::global_registry()
             .get("unix")
             .expect("unix resolver not registered");
         let proxy_builder = Builder::new_arc(unix_builder.clone());

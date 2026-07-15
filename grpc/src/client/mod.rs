@@ -57,7 +57,6 @@ use crate::core::Trailers;
 
 mod channel;
 pub use channel::Channel;
-pub use channel::ChannelOptions;
 
 mod subchannel;
 

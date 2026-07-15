@@ -2,7 +2,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grpc::client::ChannelOptions;
 use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
 use grpc::credentials::rustls::StaticProvider;
@@ -99,21 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     GrpcClientTlsConfig::new()
                         .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;
-                let channel_options =
-                    ChannelOptions::default().override_authority("test.test.google.fr");
-                grpc::client::Channel::new(
-                    "dns:///localhost:10000",
-                    Arc::new(creds),
-                    channel_options,
-                )
+                grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
+                    .authority("test.test.google.fr")
+                    .build()
             } else {
-                grpc::client::Channel::new(
+                grpc::client::Channel::builder(
                     "dns:///localhost:10000",
                     Arc::new(LocalChannelCredentials::new()),
-                    ChannelOptions::default(),
                 )
+                .build()
             };
-
             (
                 Box::new(client_protobuf::TestClient::new(channel.clone())),
                 Box::new(client_protobuf::UnimplementedClient::new(channel)),

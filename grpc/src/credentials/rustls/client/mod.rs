@@ -135,7 +135,7 @@ pub struct RustlsChannelCredentials {
 pub type RustlsChannelCredendials = RustlsChannelCredentials;
 
 impl RustlsChannelCredentials {
-    /// Constructs a new `ClientTlsCredentials` instance from the provided
+    /// Constructs a new [RustlsChannelCredentials] instance from the provided
     /// configuration.
     pub fn new(config: ClientTlsConfig) -> Result<RustlsChannelCredentials, String> {
         let provider = if let Some(p) = CryptoProvider::get_default() {

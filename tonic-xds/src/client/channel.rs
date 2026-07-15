@@ -1,4 +1,3 @@
-use crate::XdsUri;
 use crate::client::cluster::ClusterClientRegistryGrpc;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
@@ -10,13 +9,16 @@ use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
+use crate::{TonicCallCredentials, XdsUri};
 use http::Request;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
 use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
-use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient};
+use xds_client::{
+    ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
+};
 
 use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 
@@ -25,6 +27,7 @@ use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 pub struct XdsChannelConfig {
     target_uri: XdsUri,
     bootstrap: Option<BootstrapConfig>,
+    call_creds: Option<Arc<dyn TonicCallCredentials>>,
 }
 
 impl XdsChannelConfig {
@@ -34,6 +37,7 @@ impl XdsChannelConfig {
         Self {
             target_uri,
             bootstrap: None,
+            call_creds: None,
         }
     }
 
@@ -58,6 +62,15 @@ impl XdsChannelConfig {
     pub fn with_bootstrap_from_env(mut self) -> Result<Self, BootstrapError> {
         self.bootstrap = Some(BootstrapConfig::from_env()?);
         Ok(self)
+    }
+
+    /// Set per-stream call credentials for the ADS stream (e.g. `google_default`).
+    ///
+    /// Attached on each (re)connect, only over a secure channel; over an insecure
+    /// channel, stream creation fails. Not refreshed mid-stream.
+    pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
+        self.call_creds = Some(creds);
+        self
     }
 }
 
@@ -151,9 +164,25 @@ const _: fn() = || {
 };
 
 /// Builder for creating an [`XdsChannel`] or [`XdsChannelGrpc`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+}
+
+impl Debug for XdsChannelBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XdsChannelBuilder")
+            .field("config", &self.config)
+            .field(
+                "recorder",
+                &self
+                    .recorder
+                    .as_deref()
+                    .map_or("None", |r| std::any::type_name_of_val(r)),
+            )
+            .finish()
+    }
 }
 
 impl XdsChannelBuilder {
@@ -162,7 +191,34 @@ impl XdsChannelBuilder {
     pub fn new(config: XdsChannelConfig) -> Self {
         Self {
             config: Arc::new(config),
+            recorder: None,
         }
+    }
+
+    /// Sets the [`MetricsRecorder`] backend that receives the gRFC A78 xDS
+    /// client metrics emitted by the underlying [`XdsClient`].
+    ///
+    /// By default no recorder is configured and metric emission is skipped.
+    /// With the `otel` feature, `with_otel_metrics` provides a one-call
+    /// OpenTelemetry setup.
+    #[must_use]
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Emits the gRFC A78 xDS client metrics through an OpenTelemetry `Meter`.
+    ///
+    /// Convenience wrapper over
+    /// [`with_metrics_recorder`](Self::with_metrics_recorder) that installs an
+    /// [`OtelMetricsRecorder`](xds_client_opentelemetry::OtelMetricsRecorder) from
+    /// the companion `xds-client-opentelemetry` crate. Requires the `otel` feature.
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn with_otel_metrics(self, meter: opentelemetry::metrics::Meter) -> Self {
+        self.with_metrics_recorder(Arc::new(
+            xds_client_opentelemetry::OtelMetricsRecorder::new(meter),
+        ))
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
@@ -191,6 +247,10 @@ impl XdsChannelBuilder {
             )));
         }
 
+        if let Some(creds) = self.config.call_creds.clone() {
+            transport_builder = transport_builder.with_call_credentials(creds);
+        }
+
         #[cfg(feature = "_tls-any")]
         let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
             &bootstrap.certificate_providers,
@@ -199,8 +259,12 @@ impl XdsChannelBuilder {
         let node = Node::try_from(bootstrap.node)?;
         let client_config =
             ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
-        let xds_client =
-            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime).build();
+        let mut client_builder =
+            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
+        if let Some(recorder) = self.recorder.clone() {
+            client_builder = client_builder.with_metrics_recorder(recorder);
+        }
+        let xds_client = client_builder.build();
 
         let cache = Arc::new(XdsCache::new());
         let resource_manager =
@@ -721,6 +785,24 @@ mod tests {
             let _ = server.shutdown.send(());
             let _ = server.handle.await;
         }
+    }
+
+    #[test]
+    fn config_stores_call_credentials() {
+        #[derive(Debug)]
+        struct DummyCreds;
+        #[tonic::async_trait]
+        impl crate::TonicCallCredentials for DummyCreds {
+            async fn get_request_metadata(
+                &self,
+                _metadata: &mut tonic::metadata::MetadataMap,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+        let config = XdsChannelConfig::new(XdsUri::parse("xds:///svc").unwrap())
+            .with_call_credentials(std::sync::Arc::new(DummyCreds));
+        assert!(config.call_creds.is_some());
     }
 
     /// Smoke test: verifies builder wiring with a disconnected XdsClient

@@ -55,6 +55,8 @@ tonic-prost = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 x509-parser = { version = "0.17", optional = true }
+opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["metrics"] }
+xds-client-opentelemetry = { version = "0.1.0-alpha.1", path = "../xds-client-opentelemetry", optional = true }
 
 [lints]
 workspace = true
@@ -68,9 +70,15 @@ tonic-prost-build = "0.14"
 async-stream = "0.3"
 tempfile = "3.27.0"
 rcgen = "0.14"
+google-cloud-auth = { version = "1.9", default-features = false }
 
 [features]
 testutil = ["dep:tonic-prost"]
+
+# Bundled OpenTelemetry metrics recorder for the gRFC A78 xDS client metrics.
+# The recorder lives in the companion `xds-client-opentelemetry` crate so its
+# OpenTelemetry version is decoupled from the core crates.
+otel = ["dep:opentelemetry", "dep:xds-client-opentelemetry"]
 
 # TLS crypto backend — pick exactly one.
 _tls-any = ["dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]
@@ -80,6 +88,10 @@ tls-aws-lc = ["_tls-any", "tonic/tls-aws-lc", "xds-client/tonic-tls-aws-lc"]
 [[example]]
 name = "channel"
 required-features = ["testutil"]
+
+[[example]]
+name = "channel_with_google_default"
+required-features = ["testutil", "tls-ring"]
 
 [[example]]
 name = "greeter_server"

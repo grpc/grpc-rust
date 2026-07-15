@@ -55,18 +55,18 @@ use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 
-pub(crate) static POLICY_NAME: &str = "pick_first";
+pub static POLICY_NAME: &str = "pick_first";
 
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
 #[derive(Debug, serde::Deserialize, Clone)]
-pub(crate) struct PickFirstConfig {
+pub struct PickFirstConfig {
     #[serde(rename = "shuffleAddressList")]
     pub shuffle_address_list: bool,
 }
 
 #[derive(Debug)]
-struct PickFirstBuilder {}
+pub struct PickFirstBuilder {}
 
 impl LbPolicyBuilder for PickFirstBuilder {
     type LbPolicy = PickFirstPolicy;
@@ -101,7 +101,7 @@ pub(crate) fn reg() {
     super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {})
 }
 
-pub(crate) struct PickFirstPolicy {
+pub struct PickFirstPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
     connectivity_state: ConnectivityState,

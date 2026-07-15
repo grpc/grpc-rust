@@ -43,7 +43,7 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::rt::GrpcRuntime;
 
 #[derive(Debug)]
-pub(crate) struct GracefulSwitchLbConfig {
+pub struct GracefulSwitchLbConfig {
     child_builder: Arc<DynLbPolicyBuilder>,
     child_config: Option<DynLbConfig>,
 }
@@ -54,9 +54,9 @@ pub(crate) struct GracefulSwitchLbConfig {
 /// graceful switch creates a "pending" child policy alongside the "active"
 /// policy.  When the pending policy leaves the CONNECTING state, or when the
 /// active policy is not READY, graceful switch will promote the pending policy
-/// to to active and tear down the previously active policy.
+/// to active and tear down the previously active policy.
 #[derive(Debug)]
-pub(crate) struct GracefulSwitchPolicy {
+pub struct GracefulSwitchPolicy {
     child_manager: ChildManager<()>, // Child ID empty - only the name of the child LB policy matters.
     last_update: Option<LbState>, // Saves the last output LbState to determine if an update is needed.
     active_child_builder: Option<Arc<DynLbPolicyBuilder>>,

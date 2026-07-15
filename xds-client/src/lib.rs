@@ -68,6 +68,7 @@ pub use codec::XdsCodec;
 pub use error::{Error, Result};
 pub use message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Locality, Node, ResourceAny};
 pub use metrics::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
+
 pub use resource::{DecodeResult, DecodedResource, Resource};
 pub use runtime::Runtime;
 pub use transport::{Transport, TransportBuilder, TransportStream};
@@ -78,7 +79,7 @@ pub use runtime::tokio::TokioRuntime;
 
 // Tonic transport
 #[cfg(feature = "transport-tonic")]
-pub use transport::tonic::{TonicTransport, TonicTransportBuilder};
+pub use transport::tonic::{TonicCallCredentials, TonicTransport, TonicTransportBuilder};
 
 // Prost codec
 #[cfg(feature = "codegen-prost")]

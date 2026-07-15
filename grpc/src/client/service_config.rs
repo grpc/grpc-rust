@@ -24,10 +24,10 @@
 
 /// An in-memory representation of a service config, usually provided to gRPC as
 /// a JSON object.
-// TODO: this shouldn't be public; users should set with JSON instead.
+// TODO: complete this and ensure it meets all our requirements.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct ServiceConfig {
-    pub load_balancing_policy: Option<LbPolicyType>,
+pub struct ServiceConfig {
+    pub(crate) load_balancing_policy: Option<LbPolicyType>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

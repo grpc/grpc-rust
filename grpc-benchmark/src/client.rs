@@ -139,8 +139,10 @@ impl BenchmarkClient {
                 tls_config = tls_config.with_root_certificates_provider(
                     StaticRootCertificatesProvider::new(RootCertificates::from_pem(CA_PEM)),
                 );
-                authority = Some(params.server_host_override.to_string());
             };
+            if !params.server_host_override.is_empty() {
+                authority = Some(params.server_host_override.clone());
+            }
             let tls_creds = RustlsChannelCredentials::new(tls_config).map_err(|err| {
                 Status::internal(format!("failed to create TLS credentials: {err}"))
             })?;

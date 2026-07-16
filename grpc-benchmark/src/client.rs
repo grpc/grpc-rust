@@ -34,7 +34,7 @@ use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
 use grpc::credentials::rustls::StaticRootCertificatesProvider;
 use grpc::credentials::rustls::client::ClientTlsConfig;
-use grpc::credentials::rustls::client::RustlsChannelCredendials;
+use grpc::credentials::rustls::client::RustlsChannelCredentials;
 use hdrhistogram::Histogram;
 use protobuf::proto;
 use tonic::Status;
@@ -141,7 +141,7 @@ impl BenchmarkClient {
                 );
                 authority = Some(params.server_host_override.to_string());
             };
-            let tls_creds = RustlsChannelCredendials::new(tls_config).map_err(|err| {
+            let tls_creds = RustlsChannelCredentials::new(tls_config).map_err(|err| {
                 Status::internal(format!("failed to create TLS credentials: {err}"))
             })?;
             Arc::new(tls_creds) as Arc<dyn ChannelCredentials>

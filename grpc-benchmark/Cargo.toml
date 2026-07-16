@@ -13,8 +13,9 @@ hdrhistogram = { version = "7.5", default-features = false }
 prost = "0.14"
 prost-types = "0.14"
 protobuf = { version = "4.35.1-release" }
+protobuf-well-known-types = { version = "4.35.1-release" }
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
-tokio-stream = "0.1.18"
+tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 tonic = { path = "../tonic", features = ["tls-aws-lc"] }
 tonic-prost = { path = "../tonic-prost" }
 
@@ -24,3 +25,4 @@ nix = { version = "0.31.3", features = ["resource"] }
 [build-dependencies]
 tonic-prost-build = { path = "../tonic-prost-build" }
 grpc-protobuf-build = { path = "../grpc-protobuf-build" }
+protobuf-well-known-types = { version = "4.35.1-release" }

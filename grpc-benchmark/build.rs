@@ -27,12 +27,23 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let dependencies = protobuf_well_known_types::get_dependency("protobuf_well_known_types")
+        .into_iter()
+        .map(|d| d.into())
+        .collect();
+
     grpc_protobuf_build::CodeGen::new()
         .include("proto")
         .inputs([
             "grpc/testing/benchmark_service.proto",
             "grpc/testing/messages.proto",
+            "grpc/testing/worker_service.proto",
+            "grpc/testing/control.proto",
+            "grpc/testing/payloads.proto",
+            "grpc/testing/stats.proto",
+            "grpc/core/stats.proto",
         ])
+        .dependencies(dependencies)
         .client_only()
         .compile()
         .unwrap();

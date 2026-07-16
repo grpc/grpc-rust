@@ -39,11 +39,11 @@ use hdrhistogram::Histogram;
 use protobuf::proto;
 use tonic::Status;
 
-use crate::generated::benchmark_service_grpc::Payload;
-use crate::generated::benchmark_service_grpc::PayloadType;
-use crate::generated::benchmark_service_grpc::SimpleRequest;
-use crate::generated::benchmark_service_grpc::SimpleResponse;
-use crate::generated::benchmark_service_grpc::benchmark_service_client::BenchmarkServiceClient;
+use crate::generated::grpc::testing::Payload;
+use crate::generated::grpc::testing::PayloadType;
+use crate::generated::grpc::testing::SimpleRequest;
+use crate::generated::grpc::testing::SimpleResponse;
+use crate::generated::grpc::testing::benchmark_service_client::BenchmarkServiceClient;
 use crate::generated::services::grpc::testing::ClientConfig;
 use crate::generated::services::grpc::testing::ClientStats;
 use crate::generated::services::grpc::testing::ClientType;

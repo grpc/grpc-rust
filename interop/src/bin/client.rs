@@ -6,7 +6,7 @@ use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
 use grpc::credentials::rustls::StaticProvider;
 use grpc::credentials::rustls::client::ClientTlsConfig as GrpcClientTlsConfig;
-use grpc::credentials::rustls::client::RustlsChannelCredendials;
+use grpc::credentials::rustls::client::RustlsChannelCredentials;
 use interop::client::InteropTest;
 use interop::client::InteropTestUnimplemented;
 use interop::client_prost;
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let pem = std::fs::read_to_string("interop/data/ca.pem")?;
                 let root_certs = RootCertificates::from_pem(pem);
-                let creds = RustlsChannelCredendials::new(
+                let creds = RustlsChannelCredentials::new(
                     GrpcClientTlsConfig::new()
                         .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;

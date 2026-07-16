@@ -36,7 +36,7 @@ use generated::api::publisher_client::PublisherClient;
 use grpc::client::Channel;
 use grpc::credentials::CompositeChannelCredentials;
 use grpc::credentials::rustls::client::ClientTlsConfig;
-use grpc::credentials::rustls::client::RustlsChannelCredendials;
+use grpc::credentials::rustls::client::RustlsChannelCredentials;
 use grpc_google::GcpCallCredentials;
 use protobuf::proto;
 
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| "Expected a project name as the first argument.".to_string())?;
 
     let call_creds = GcpCallCredentials::new_application_default()?;
-    let tls = RustlsChannelCredendials::new(ClientTlsConfig::new())?;
+    let tls = RustlsChannelCredentials::new(ClientTlsConfig::new())?;
     let channel_creds = CompositeChannelCredentials::new(tls, Arc::new(call_creds));
 
     let channel = Channel::builder(ENDPOINT, Arc::new(channel_creds)).build();

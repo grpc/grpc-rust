@@ -9,6 +9,7 @@ rust-version = { workspace = true }
 async-stream = "0.3"
 grpc = { path = "../grpc" }
 grpc-protobuf = { path = "../grpc-protobuf" }
+hdrhistogram = { version = "7.5", default-features = false }
 prost = "0.14"
 prost-types = "0.14"
 protobuf = { version = "4.35.1-release" }

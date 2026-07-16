@@ -40,6 +40,7 @@ pub mod generated {
     }
 }
 
+mod client;
 mod rusage;
 mod server;
 pub mod worker;

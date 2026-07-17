@@ -16,6 +16,7 @@ members = [
   "grpc-google",
   "grpc-protobuf",
   "grpc-protobuf-build",
+  "grpc-xds",
   "protoc-gen-rust-grpc",
   "xds-client",
   "xds-client-opentelemetry",

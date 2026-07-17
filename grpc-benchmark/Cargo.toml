@@ -5,6 +5,10 @@ authors = ["gRPC Authors"]
 license = "MIT"
 rust-version = { workspace = true }
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 async-stream = "0.3"
 grpc = { path = "../grpc" }
@@ -18,6 +22,8 @@ tokio = { version = "1.37.0", features = ["sync", "macros"] }
 tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 tonic = { path = "../tonic", features = ["tls-aws-lc"] }
 tonic-prost = { path = "../tonic-prost" }
+pico-args = "0.5"
+
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["resource"] }

@@ -162,9 +162,10 @@ fn raw_ident(seg: &str) -> String {
 /// Builds the module tree under `dir`: each package directory's protoc entry
 /// point (`generated.rs`) becomes that directory's `mod.rs` (re-exporting the
 /// package's messages), and every directory declares `pub mod` for each of its
-/// subdirectories with an ABSOLUTE `#[path]` — the root `mod.rs` is `include!`d
-/// into `src/lib.rs` from `OUT_DIR`, so relative child paths would otherwise
-/// resolve against `src/` instead of the output tree.
+/// subdirectories with an ABSOLUTE `#[path]`. The root `mod.rs` is `include!`d
+/// into `src/lib.rs` from `OUT_DIR`, so the generated tree is fully reachable as
+/// `crate::generated::<pkg>::...`. For example,
+/// `crate::generated::envoy::config::route::v3::RouteConfiguration`.
 fn write_module_tree(dir: &Path) {
     const HEADER: &str = "// @generated at build time by grpc-xds/build.rs. Do not edit.";
 

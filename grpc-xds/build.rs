@@ -38,15 +38,7 @@ fn main() {
     // Resolve protoc. Locally, `protoc-gen-rust-grpc` builds it and we use that;
     // in CI its C++ build is skipped (`PROTOC_GEN_RUST_GRPC_NO_BUILD=1`) and a
     // prebuilt protoc is provided on `$PATH`, so `find_protoc` falls back to it.
-    // protoc's bundled include dir provides the well-known types (imported by
-    // many vendored protos) plus `google/protobuf/descriptor.proto` (imported by
-    // the option-defining protos); it is the sibling `../include` of the binary.
     let protoc = find_protoc();
-    let protoc_include = protoc
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("include"))
-        .expect("could not derive protoc include dir");
 
     // Collect every vendored proto as an include-relative import path, e.g.
     // "envoy/config/route/v3/route.proto".
@@ -90,12 +82,6 @@ fn main() {
     // like any other vendored proto.)
     let base_deps = protobuf_well_known_types::get_dependency("protobuf_well_known_types");
 
-    let includes: Vec<PathBuf> = include_dirs
-        .iter()
-        .cloned()
-        .chain(std::iter::once(protoc_include.clone()))
-        .collect();
-
     // Group protos by package directory (each leaf dir is exactly one package)
     // and run one invocation per package.
     let mut packages: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -120,7 +106,7 @@ fn main() {
         protobuf_codegen::CodeGen::new()
             .protoc_path(&protoc)
             .inputs(files.iter())
-            .includes(includes.iter())
+            .includes(include_dirs.iter())
             .output_dir(&gen_dir)
             .dependency(deps)
             .generate_and_compile()

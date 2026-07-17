@@ -23,9 +23,9 @@
  */
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use grpc::client::Channel;
@@ -37,6 +37,8 @@ use grpc::credentials::rustls::client::ClientTlsConfig;
 use grpc::credentials::rustls::client::RustlsChannelCredentials;
 use hdrhistogram::Histogram;
 use protobuf::proto;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tonic::Status;
 
 use crate::generated::grpc::testing::Payload;
@@ -58,11 +60,13 @@ use crate::rusage::Rusage;
 const CA_PEM: &[u8] = include_bytes!("../data/tls/ca.pem");
 
 pub struct BenchmarkClient {
-    histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
     histogram_params: HistogramParams,
+    histogram_count: usize,
     last_reset_time: Instant,
     last_rusage: Rusage,
     cancellation_requested: Arc<AtomicBool>,
+    stats_response_rx: mpsc::Receiver<Histogram<u64>>,
+    stats_request_tx: watch::Sender<StatsRequestStatus>,
 }
 
 impl BenchmarkClient {
@@ -159,7 +163,6 @@ impl BenchmarkClient {
             _ => return Err(Status::invalid_argument("invalid rpc_type")),
         };
 
-        let mut histograms = Vec::with_capacity(channel_count * rpc_count_per_conn);
         let cancellation_requested = Arc::new(AtomicBool::new(false));
 
         if config.server_targets.is_empty() {
@@ -170,6 +173,9 @@ impl BenchmarkClient {
             .iter()
             .map(|s| format!("dns:///{s}"))
             .cycle();
+        let num_tasks = channel_count * rpc_count_per_conn;
+        let (stats_response_tx, stats_response_rx) = mpsc::channel(num_tasks);
+        let (stats_request_tx, stats_request_rx) = watch::channel(StatsRequestStatus::Waiting);
 
         for _ in 0..channel_count {
             let target = server_targets.next().unwrap(); // cyclic, non-empty iterator.
@@ -179,73 +185,63 @@ impl BenchmarkClient {
             }
             let channel = builder.build();
 
-            // Create one histogram per client RPC to minimise contention for
-            // the lock. These histograms will be merged when querying stats.
-            let mut channel_histograms = Vec::with_capacity(rpc_count_per_conn);
-
-            for _ in 0..rpc_count_per_conn {
-                let histogram = Histogram::new_with_max(histogram_params.max_possible as u64, 3)
-                    .map_err(|err| {
-                        Status::invalid_argument(format!(
-                            "failed to build histogram with given max_possible value: {}",
-                            err
-                        ))
-                    })?;
-                let histogram = Arc::new(Mutex::new(histogram));
-                channel_histograms.push(histogram.clone());
-                histograms.push(histogram);
-            }
+            let histogram = Histogram::new_with_max(histogram_params.max_possible as u64, 3)
+                .map_err(|err| {
+                    Status::invalid_argument(format!(
+                        "failed to build histogram with given max_possible value: {}",
+                        err
+                    ))
+                })?;
             let args = TestOptions {
-                histograms: channel_histograms,
                 rpc_opts: RpcOptions {
                     payload_req_size,
                     payload_resp_size,
                     client: BenchmarkServiceClient::new(channel),
+                    histogram,
+                    stats_response_tx: stats_response_tx.clone(),
+                    stats_request_rx: stats_request_rx.clone(),
+                    cancellation_requested: cancellation_requested.clone(),
                 },
                 rpc_count_per_conn,
                 rpc_type,
             };
-            start_rpcs(args, cancellation_requested.clone());
+            start_rpcs(args);
         }
 
         Ok(BenchmarkClient {
-            histograms,
             histogram_params,
+            histogram_count: num_tasks,
             last_reset_time: Instant::now(),
             cancellation_requested,
             last_rusage: Rusage::now().map_err(|err| {
                 Status::internal(format!("failed to query system resource usage: {err}"))
             })?,
+            stats_response_rx,
+            stats_request_tx,
         })
     }
 
-    pub fn get_stats(&mut self, reset: bool) -> Result<ClientStats, Status> {
+    pub async fn get_stats(&mut self, reset: bool) -> Result<ClientStats, Status> {
         let mut aggregated = Histogram::new_with_max(self.histogram_params.max_possible as u64, 3)
             .map_err(|err| Status::internal(format!("failed to configure histogram: {err}")))?;
 
-        if reset {
-            // Merging histogram may take some time.
-            // Put all histograms aside and merge later.
-            for histogram in self.histograms.iter() {
-                let new = Histogram::new_with_max(self.histogram_params.max_possible as u64, 3)
-                    .map_err(|err| {
-                        Status::internal(format!("failed to configure histogram: {err}"))
-                    })?;
-                let mut lock = histogram.lock().unwrap();
-                let old = std::mem::replace(&mut *lock, new);
-                drop(lock);
-                aggregated.add(old).map_err(|err| {
-                    Status::internal(format!("error while merging histograms: {}", err))
-                })?;
-            }
-        } else {
-            // Merge only, don't reset.
-            for histogram in self.histograms.iter() {
-                let lock = histogram.lock().unwrap();
-                aggregated.add(&*lock).map_err(|err| {
-                    Status::internal(format!("error while merging histograms: {}", err))
-                })?;
-            }
+        // Signal tasks to report tasks.
+        let req = StatsRequestStatus::Requested(reset);
+        self.stats_request_tx
+            .send(req)
+            .map_err(|_| Status::internal("client tasks exited unexpectedly"))?;
+
+        // Wait for all the histograms.
+        for _ in 0..self.histogram_count {
+            let histogram =
+                tokio::time::timeout(Duration::from_secs(2), self.stats_response_rx.recv())
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("timeout waiting for stats"))?
+                    .ok_or(Status::internal("client tasks exited unexpectedly"))?;
+
+            aggregated.add(histogram).map_err(|err| {
+                Status::internal(format!("error while merging histograms: {}", err))
+            })?;
         }
 
         let now = Instant::now();
@@ -313,7 +309,6 @@ impl Drop for BenchmarkClient {
 }
 
 struct TestOptions {
-    histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
     rpc_count_per_conn: usize,
     rpc_type: RPCType,
     rpc_opts: RpcOptions,
@@ -324,27 +319,23 @@ struct RpcOptions {
     payload_req_size: usize,
     payload_resp_size: usize,
     client: BenchmarkServiceClient<Channel>,
+    stats_request_rx: watch::Receiver<StatsRequestStatus>,
+    histogram: Histogram<u64>,
+    stats_response_tx: mpsc::Sender<Histogram<u64>>,
+    cancellation_requested: Arc<AtomicBool>,
 }
 
-fn start_rpcs(test_opts: TestOptions, cancellation_requested: Arc<AtomicBool>) {
-    for i in 0..test_opts.rpc_count_per_conn {
-        let histogram = test_opts.histograms[i].clone();
-        let cancel_copy = cancellation_requested.clone();
+fn start_rpcs(test_opts: TestOptions) {
+    for _ in 0..test_opts.rpc_count_per_conn {
         let rpc_opts = test_opts.rpc_opts.clone();
         match test_opts.rpc_type {
-            RPCType::Streaming => {
-                tokio::spawn(blocking_streaming(rpc_opts, histogram, cancel_copy))
-            }
-            RPCType::Unary => tokio::spawn(blocking_unary(rpc_opts, histogram, cancel_copy)),
+            RPCType::Streaming => tokio::spawn(blocking_streaming(rpc_opts)),
+            RPCType::Unary => tokio::spawn(blocking_unary(rpc_opts)),
         };
     }
 }
 
-async fn blocking_unary(
-    opts: RpcOptions,
-    histogram: Arc<Mutex<Histogram<u64>>>,
-    cancellation_requested: Arc<AtomicBool>,
-) {
+async fn blocking_unary(mut opts: RpcOptions) {
     let req = proto!(SimpleRequest {
         response_type: PayloadType::Compressable,
         response_size: opts.payload_resp_size as i32,
@@ -354,28 +345,43 @@ async fn blocking_unary(
         },
     });
     let client = opts.client;
+    let mut histogram = opts.histogram;
 
     loop {
-        if cancellation_requested.load(Ordering::Relaxed) {
+        if opts.cancellation_requested.load(Ordering::Relaxed) {
             return;
         }
+        if opts
+            .stats_request_rx
+            .has_changed()
+            .is_ok_and(|changed| changed)
+        {
+            let req_type = *opts.stats_request_rx.borrow_and_update();
+            if let StatsRequestStatus::Requested(reset) = req_type {
+                let res = opts.stats_response_tx.send(histogram.clone()).await;
+                if reset {
+                    histogram.reset();
+                }
+                if res.is_err() {
+                    // Client dropped, cancel the task.
+                    return;
+                }
+            }
+        }
+
         let start = Instant::now();
         let res = client.unary_call(req.as_view()).await;
         if res.is_err() {
             continue;
         }
         let elapsed = Instant::now().duration_since(start);
-        if let Err(e) = histogram.lock().unwrap().record(elapsed.as_nanos() as u64) {
+        if let Err(e) = histogram.record(elapsed.as_nanos() as u64) {
             eprintln!("Recorded value greater than configured maximum: {e}");
         }
     }
 }
 
-async fn blocking_streaming(
-    opts: RpcOptions,
-    histogram: Arc<Mutex<Histogram<u64>>>,
-    cancellation_requested: Arc<AtomicBool>,
-) {
+async fn blocking_streaming(mut opts: RpcOptions) {
     let req = proto!(SimpleRequest {
         response_type: PayloadType::Compressable,
         response_size: opts.payload_resp_size as i32,
@@ -384,13 +390,31 @@ async fn blocking_streaming(
             body: vec![0; opts.payload_req_size],
         },
     });
+    let mut histogram = opts.histogram;
     let client = opts.client;
     let (mut tx, mut rx) = client.streaming_call().await;
     let mut resp = SimpleResponse::default();
 
     loop {
-        if cancellation_requested.load(Ordering::Relaxed) {
+        if opts.cancellation_requested.load(Ordering::Relaxed) {
             return;
+        }
+        if opts
+            .stats_request_rx
+            .has_changed()
+            .is_ok_and(|changed| changed)
+        {
+            let req_type = *opts.stats_request_rx.borrow_and_update();
+            if let StatsRequestStatus::Requested(reset) = req_type {
+                let res = opts.stats_response_tx.send(histogram.clone()).await;
+                if reset {
+                    histogram.reset();
+                }
+                if res.is_err() {
+                    // Client dropped, cancel the task.
+                    return;
+                }
+            }
         }
         let start = Instant::now();
         // Perform a single ping-pong.
@@ -404,7 +428,7 @@ async fn blocking_streaming(
             return;
         };
         let elapsed = Instant::now().duration_since(start);
-        if let Err(e) = histogram.lock().unwrap().record(elapsed.as_nanos() as u64) {
+        if let Err(e) = histogram.record(elapsed.as_nanos() as u64) {
             eprintln!("Recorded value greater than configured maximum: {e}");
         }
     }
@@ -414,4 +438,13 @@ async fn blocking_streaming(
 enum RPCType {
     Streaming,
     Unary,
+}
+
+#[derive(Clone, Copy)]
+enum StatsRequestStatus {
+    /// Waiting for the first stats request.
+    Waiting,
+    /// Stats requested. The boolean indicates if accumulated stats should be
+    /// dropped after responding.
+    Requested(bool),
 }

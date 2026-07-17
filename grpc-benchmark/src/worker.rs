@@ -167,7 +167,7 @@ impl WorkerService for WorkerServer {
                         reset_stats = mark.reset;
                     }
                 };
-                let stats = benchmark_client.as_mut().unwrap().get_stats(reset_stats)?;
+                let stats = benchmark_client.as_mut().unwrap().get_stats(reset_stats).await?;
                 yield ClientStatus {
                     stats: Some(stats),
                 };

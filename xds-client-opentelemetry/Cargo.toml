@@ -1,0 +1,28 @@
+[package]
+name = "xds-client-opentelemetry"
+description = "OpenTelemetry metrics recorder for xds-client (gRFC A78 XdsClient metrics)"
+version = "0.1.0-alpha.1"
+edition = "2024"
+homepage = "https://github.com/grpc/grpc-rust"
+repository = "https://github.com/grpc/grpc-rust"
+license = "MIT"
+rust-version = { workspace = true }
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+xds-client = { version = "0.1.0-alpha.1", path = "../xds-client" }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # The recorder accepts an OpenTelemetry `Meter` and implements the
+    # `xds-client` `MetricsRecorder` trait, so both appear in its public API.
+    "opentelemetry::*",
+    "xds_client::*",
+]

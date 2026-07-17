@@ -49,11 +49,11 @@ use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::core::RequestHeaders;
 
-pub(crate) static POLICY_NAME: &str = "round_robin";
+pub static POLICY_NAME: &str = "round_robin";
 static START: Once = Once::new();
 
 #[derive(Debug)]
-pub(crate) struct RoundRobinBuilder {}
+pub struct RoundRobinBuilder {}
 
 impl LbPolicyBuilder for RoundRobinBuilder {
     type LbPolicy = RoundRobinPolicy;
@@ -78,7 +78,7 @@ impl LbPolicyBuilder for RoundRobinBuilder {
 }
 
 #[derive(Debug)]
-pub(crate) struct RoundRobinPolicy {
+pub struct RoundRobinPolicy {
     child_manager: ChildManager<Endpoint>,
     pick_first_builder: Arc<DynLbPolicyBuilder>,
 }

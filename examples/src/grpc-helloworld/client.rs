@@ -11,7 +11,6 @@ use std::sync::Arc;
 use generated::helloworld::HelloRequest;
 use generated::helloworld::greeter_client::GreeterClient;
 use grpc::client::Channel;
-use grpc::client::ChannelOptions;
 use grpc::credentials::LocalChannelCredentials;
 use protobuf::proto;
 
@@ -25,11 +24,11 @@ async fn main() {
     };
 
     // Create a new gRPC channel:
-    let channel = Channel::new(
+    let channel = Channel::builder(
         "dns:///[::1]:50051",
         Arc::new(LocalChannelCredentials::new()),
-        ChannelOptions::default(),
-    );
+    )
+    .build();
     let client = GreeterClient::new(channel);
 
     // Send the request and print the response:

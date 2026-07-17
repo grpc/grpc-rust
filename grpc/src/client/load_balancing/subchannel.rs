@@ -37,38 +37,38 @@ use crate::client::name_resolution::Address;
 
 /// Represents the current state of a Subchannel.
 #[derive(Debug, Clone)]
-pub(crate) struct SubchannelState {
+pub struct SubchannelState {
     /// The connectivity state of the subchannel.  See SubChannel for a
     /// description of the various states and their valid transitions.
-    pub(crate) connectivity_state: ConnectivityState,
+    pub connectivity_state: ConnectivityState,
     // Set if connectivity state is TransientFailure to describe the most recent
     // connection error.  None for any other connectivity_state value.
     pub last_connection_error: Option<String>,
 }
 
 impl SubchannelState {
-    pub(crate) fn idle() -> Self {
+    pub fn idle() -> Self {
         Self {
             connectivity_state: ConnectivityState::Idle,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn ready() -> Self {
+    pub fn ready() -> Self {
         Self {
             connectivity_state: ConnectivityState::Ready,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn connecting() -> Self {
+    pub fn connecting() -> Self {
         Self {
             connectivity_state: ConnectivityState::Connecting,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn transient_failure(last_connection_error: impl Into<String>) -> Self {
+    pub fn transient_failure(last_connection_error: impl Into<String>) -> Self {
         Self {
             connectivity_state: ConnectivityState::TransientFailure,
             last_connection_error: Some(last_connection_error.into()),
@@ -86,7 +86,7 @@ impl Display for SubchannelState {
     }
 }
 
-pub(crate) trait DynHash {
+pub trait DynHash {
     #[allow(clippy::redundant_allocation)]
     fn dyn_hash(&self, state: &mut Box<&mut dyn Hasher>);
 }
@@ -97,7 +97,7 @@ impl<T: Hash> DynHash for T {
     }
 }
 
-pub(crate) trait DynPartialEq {
+pub trait DynPartialEq {
     fn dyn_eq(&self, other: &&dyn Any) -> bool;
 }
 
@@ -131,9 +131,7 @@ pub(crate) mod private {
 ///
 /// When a Subchannel is dropped, it is disconnected automatically, and no
 /// subsequent state updates will be provided for it to the LB policy.
-pub(crate) trait Subchannel:
-    private::Sealed + DynHash + DynPartialEq + Any + Send + Sync
-{
+pub trait Subchannel: private::Sealed + DynHash + DynPartialEq + Any + Send + Sync {
     /// Returns the address of the Subchannel.
     /// TODO: Consider whether this should really be public.
     fn address(&self) -> Address;
@@ -192,7 +190,7 @@ impl Display for dyn Subchannel {
 }
 
 #[derive(Debug)]
-pub(crate) struct WeakSubchannel(Weak<dyn Subchannel>);
+pub struct WeakSubchannel(Weak<dyn Subchannel>);
 
 impl From<&Arc<dyn Subchannel>> for WeakSubchannel {
     fn from(subchannel: &Arc<dyn Subchannel>) -> Self {
@@ -228,7 +226,7 @@ impl PartialEq for WeakSubchannel {
 
 impl Eq for WeakSubchannel {}
 
-pub(crate) trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
+pub trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
     fn delegate(&self) -> &Arc<dyn Subchannel>;
 
     fn address(&self) -> Address {

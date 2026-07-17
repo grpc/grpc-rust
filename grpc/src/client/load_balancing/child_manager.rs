@@ -50,7 +50,7 @@ use crate::rt::GrpcRuntime;
 
 // An LbPolicy implementation that manages multiple children.
 #[derive(Debug)]
-pub(crate) struct ChildManager<T: Debug> {
+pub struct ChildManager<T: Debug> {
     subchannel_to_child_idx: HashMap<WeakSubchannel, usize>,
     handle_to_child_idx: HashMap<ChildHandle, usize>,
     children: Vec<Child<T>>,
@@ -61,7 +61,7 @@ pub(crate) struct ChildManager<T: Debug> {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub(crate) struct Child<T> {
+pub struct Child<T> {
     pub identifier: T,
     pub builder: Arc<DynLbPolicyBuilder>,
     pub state: LbState,
@@ -70,7 +70,7 @@ pub(crate) struct Child<T> {
 }
 
 /// A collection of data sent to a child of the ChildManager.
-pub(crate) struct ChildUpdate<'a, T> {
+pub struct ChildUpdate<'a, T> {
     /// The identifier the ChildManager should use for this child.
     pub child_identifier: T,
     /// The builder the ChildManager should use to create this child if it does

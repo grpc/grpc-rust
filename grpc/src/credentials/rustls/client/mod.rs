@@ -127,14 +127,17 @@ impl Default for ClientTlsConfig {
 
 /// gRPC TLS [`ChannelCredentials`] based on [`rustls`].
 #[derive(Clone)]
-pub struct RustlsChannelCredendials {
+pub struct RustlsChannelCredentials {
     connector: TlsConnector,
 }
 
-impl RustlsChannelCredendials {
-    /// Constructs a new `ClientTlsCredendials` instance from the provided
+#[deprecated(since = "0.10.0", note = "typo: use RustlsChannelCredentials instead")]
+pub type RustlsChannelCredendials = RustlsChannelCredentials;
+
+impl RustlsChannelCredentials {
+    /// Constructs a new [RustlsChannelCredentials] instance from the provided
     /// configuration.
-    pub fn new(config: ClientTlsConfig) -> Result<RustlsChannelCredendials, String> {
+    pub fn new(config: ClientTlsConfig) -> Result<RustlsChannelCredentials, String> {
         let provider = if let Some(p) = CryptoProvider::get_default() {
             p.as_ref().clone()
         } else {
@@ -150,7 +153,7 @@ impl RustlsChannelCredendials {
     fn new_impl(
         mut config: ClientTlsConfig,
         provider: CryptoProvider,
-    ) -> Result<RustlsChannelCredendials, String> {
+    ) -> Result<RustlsChannelCredentials, String> {
         let provider = sanitize_crypto_provider(provider)?;
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
@@ -189,7 +192,7 @@ impl RustlsChannelCredendials {
             client_config.key_log = Arc::new(KeyLogFile::new(&path))
         }
 
-        Ok(RustlsChannelCredendials {
+        Ok(RustlsChannelCredentials {
             connector: TlsConnector::from(Arc::new(client_config)),
         })
     }
@@ -264,7 +267,7 @@ impl ChannelSecurityContext for ClientTlsSecurityContext {
 }
 
 #[async_trait]
-impl ChannelCredentials for RustlsChannelCredendials {
+impl ChannelCredentials for RustlsChannelCredentials {
     async fn connect(
         &self,
         authority: &Authority,

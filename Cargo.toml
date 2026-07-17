@@ -19,6 +19,7 @@ members = [
   "grpc-xds",
   "protoc-gen-rust-grpc",
   "xds-client",
+  "xds-client-opentelemetry",
   "tonic-xds",
   "interop",
   "tests/disable_comments",

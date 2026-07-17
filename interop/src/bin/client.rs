@@ -2,12 +2,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grpc::client::ChannelOptions;
 use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
 use grpc::credentials::rustls::StaticProvider;
 use grpc::credentials::rustls::client::ClientTlsConfig as GrpcClientTlsConfig;
-use grpc::credentials::rustls::client::RustlsChannelCredendials;
+use grpc::credentials::rustls::client::RustlsChannelCredentials;
 use interop::client::InteropTest;
 use interop::client::InteropTestUnimplemented;
 use interop::client_prost;
@@ -95,25 +94,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let pem = std::fs::read_to_string("interop/data/ca.pem")?;
                 let root_certs = RootCertificates::from_pem(pem);
-                let creds = RustlsChannelCredendials::new(
+                let creds = RustlsChannelCredentials::new(
                     GrpcClientTlsConfig::new()
                         .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;
-                let channel_options =
-                    ChannelOptions::default().override_authority("test.test.google.fr");
-                grpc::client::Channel::new(
-                    "dns:///localhost:10000",
-                    Arc::new(creds),
-                    channel_options,
-                )
+                grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
+                    .authority("test.test.google.fr")
+                    .build()
             } else {
-                grpc::client::Channel::new(
+                grpc::client::Channel::builder(
                     "dns:///localhost:10000",
                     Arc::new(LocalChannelCredentials::new()),
-                    ChannelOptions::default(),
                 )
+                .build()
             };
-
             (
                 Box::new(client_protobuf::TestClient::new(channel.clone())),
                 Box::new(client_protobuf::UnimplementedClient::new(channel)),

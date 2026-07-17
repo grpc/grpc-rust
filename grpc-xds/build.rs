@@ -66,8 +66,6 @@ fn main() {
     // here instead of a symbol that doesn't exist in the external
     // well-known-types crate. protoc finds it via the bundled include path.
     protos.push("google/protobuf/descriptor.proto".to_string());
-    protos.sort();
-    protos.dedup();
 
     // Fresh output tree.
     if gen_dir.exists() {

@@ -25,4 +25,3 @@ protobuf-well-known-types = "4.35.1-release"
 protobuf-codegen = "4.35.1-release"
 protobuf-well-known-types = "4.35.1-release"
 protoc-gen-rust-grpc = { version = "0.10.0", path = "../protoc-gen-rust-grpc" }
-which = "8.0.5"

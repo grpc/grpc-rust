@@ -222,6 +222,7 @@ fn write_module_tree(dir: &Path) {
 /// in CI), falls back to `$PROTOC` or the first `protoc` on `$PATH`. Returns the
 /// full path so the sibling `../include` dir can be located.
 fn find_protoc() -> PathBuf {
+    const PROTOC_NAME: &str = "protoc";
     // Prefer to use the protoc built by `protoc-gen-rust-grpc`.
     let built = protoc_gen_rust_grpc::protoc();
     if built.is_file() {
@@ -233,8 +234,8 @@ fn find_protoc() -> PathBuf {
     {
         return p;
     }
-    // Fall back to the protoc on `$PATH`.
-    which::which("protoc").expect("could not find protoc on $PATH")
+    // Fall back to $PATH resolution.
+    PROTOC_NAME.into()
 }
 
 /// Recursively collects `*.proto` file paths under `dir` into `out`.

@@ -143,10 +143,11 @@ where
     T: Encoder<Error = Status>,
 {
     let offset = buf.len();
+    let mut buf = EncodeItemGuard::new(buf, offset);
 
-    buf.reserve(HEADER_SIZE);
+    buf.buf.reserve(HEADER_SIZE);
     unsafe {
-        buf.advance_mut(HEADER_SIZE);
+        buf.buf.advance_mut(HEADER_SIZE);
     }
 
     if let Some(encoding) = compression_encoding {
@@ -164,18 +165,52 @@ where
                 buffer_growth_interval: buffer_settings.buffer_size,
             },
             uncompression_buf,
-            buf,
+            buf.buf,
             uncompressed_len,
         )
         .map_err(|err| Status::internal(format!("Error compressing: {err}")))?;
     } else {
         encoder
-            .encode(item, &mut EncodeBuf::new(buf))
+            .encode(item, &mut EncodeBuf::new(buf.buf))
             .map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
     }
 
     // now that we know length, we can write the header
-    finish_encoding(compression_encoding, max_message_size, &mut buf[offset..])
+    finish_encoding(
+        compression_encoding,
+        max_message_size,
+        &mut buf.buf[offset..],
+    )?;
+    buf.disarm();
+    Ok(())
+}
+
+struct EncodeItemGuard<'a> {
+    buf: &'a mut BytesMut,
+    offset: usize,
+    armed: bool,
+}
+
+impl<'a> EncodeItemGuard<'a> {
+    fn new(buf: &'a mut BytesMut, offset: usize) -> Self {
+        Self {
+            buf,
+            offset,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EncodeItemGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.buf.truncate(self.offset);
+        }
+    }
 }
 
 fn finish_encoding(
@@ -296,6 +331,143 @@ impl EncodeState {
                 Some(status.to_header_map())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    struct PanicEncoder;
+
+    impl Encoder for PanicEncoder {
+        type Item = ();
+        type Error = Status;
+
+        fn encode(&mut self, _: Self::Item, _: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            panic!("encoding failed")
+        }
+    }
+
+    struct ErrorEncoder;
+
+    impl Encoder for ErrorEncoder {
+        type Item = ();
+        type Error = Status;
+
+        fn encode(&mut self, _: Self::Item, _: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            Err(Status::internal("encoding failed"))
+        }
+    }
+
+    struct BytesEncoder;
+
+    impl Encoder for BytesEncoder {
+        type Item = &'static [u8];
+        type Error = Status;
+
+        fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            dst.put_slice(item);
+            Ok(())
+        }
+    }
+
+    fn assert_panicking_encode_restores_buffer(compression_encoding: Option<CompressionEncoding>) {
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        let offset = buf.len();
+        let mut uncompression_buf = BytesMut::new();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            encode_item(
+                &mut PanicEncoder,
+                &mut buf,
+                &mut uncompression_buf,
+                compression_encoding,
+                None,
+                BufferSettings::default(),
+                (),
+            )
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(buf.len(), offset);
+    }
+
+    fn assert_erroring_encode_restores_buffer(compression_encoding: Option<CompressionEncoding>) {
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        let offset = buf.len();
+        let mut uncompression_buf = BytesMut::new();
+
+        let result = encode_item(
+            &mut ErrorEncoder,
+            &mut buf,
+            &mut uncompression_buf,
+            compression_encoding,
+            None,
+            BufferSettings::default(),
+            (),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(buf.len(), offset);
+    }
+
+    #[test]
+    fn encode_item_restores_buffer_after_encoder_panic() {
+        assert_panicking_encode_restores_buffer(None);
+    }
+
+    #[test]
+    fn encode_item_restores_buffer_after_encoder_error() {
+        assert_erroring_encode_restores_buffer(None);
+    }
+
+    #[test]
+    fn encode_item_restores_buffer_after_finish_encoding_error() {
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        let offset = buf.len();
+        let mut uncompression_buf = BytesMut::new();
+
+        let result = encode_item(
+            &mut BytesEncoder,
+            &mut buf,
+            &mut uncompression_buf,
+            None,
+            Some(0),
+            BufferSettings::default(),
+            b"hello",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(buf.len(), offset);
+    }
+
+    #[test]
+    fn encode_item_writes_header_and_payload() {
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        let mut uncompression_buf = BytesMut::new();
+
+        encode_item(
+            &mut BytesEncoder,
+            &mut buf,
+            &mut uncompression_buf,
+            None,
+            None,
+            BufferSettings::default(),
+            b"hello",
+        )
+        .unwrap();
+
+        assert_eq!(&buf[..], b"prefix\0\0\0\0\x05hello");
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn encode_item_restores_buffer_after_compressed_encoder_failures() {
+        let compression_encoding = Some(CompressionEncoding::Gzip);
+        assert_panicking_encode_restores_buffer(compression_encoding);
+        assert_erroring_encode_restores_buffer(compression_encoding);
     }
 }
 

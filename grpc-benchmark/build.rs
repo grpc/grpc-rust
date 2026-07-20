@@ -51,6 +51,9 @@ fn main() {
     let services_tonic = out_dir.join("tonic");
 
     // TODO: Use gRPC servers when available.
+    let protoc_path = protoc_gen_rust_grpc::protoc();
+    unsafe { env::set_var("PROTOC", &protoc_path) };
+
     let _ = std::fs::create_dir(services_tonic.clone());
     tonic_prost_build::configure()
         .out_dir(services_tonic)

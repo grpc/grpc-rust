@@ -1,30 +1,20 @@
 //! Per-cluster [`Connector`] construction from validated CDS resources.
 //!
 //! `build_connector` maps a cluster's security config to a concrete
-//! connector: no security yields a plaintext connector; security under a TLS
-//! feature yields a TLS connector; security without a TLS feature is an
-//! error. This construction is shared by both load-balancer discovery paths
-//! (`tower-lb` and `tonic-xds-lb`).
-
-use std::sync::Arc;
-
-use tonic::transport::{Channel, Endpoint};
+//! connector, which creates a [`EndpointChannel`] for sending requests to an [`Endpoint`].
 
 use crate::client::endpoint::{Connector, EndpointAddress, EndpointChannel};
 use crate::common::async_util::BoxFuture;
-#[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::verifier::XdsServerCertVerifier;
-#[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
 use crate::xds::resource::ClusterResource;
 #[cfg(feature = "_tls-any")]
-use crate::xds::resource::security::ClusterSecurityConfig;
+use crate::xds::{
+    cert_provider::CertProviderRegistry, cert_provider::CertificateProvider,
+    cert_provider::verifier::XdsServerCertVerifier, resource::security::ClusterSecurityConfig,
+};
+use std::sync::Arc;
+use tonic::transport::{Channel, Endpoint};
 
 /// Build a [`Connector`] for the given cluster.
-///
-/// - `cluster.security == None` → [`PlaintextConnector`].
-/// - `cluster.security == Some(_)` under a TLS feature → [`TlsConnector`].
-/// - `cluster.security == Some(_)` without a TLS feature → error.
 pub(crate) fn build_connector(
     cluster: &ClusterResource,
     #[cfg(feature = "_tls-any")] registry: &CertProviderRegistry,

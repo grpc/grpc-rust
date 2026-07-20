@@ -12,8 +12,11 @@
 //!    future, the connector is handed to the LB synchronously and resolves the
 //!    cluster's CDS security config *inside* that future via
 //!    [`build_connector`]. If CDS has not arrived yet (or a CDS update fails
-//!    validation), the connect future parks until a valid config is available
-//!    — mirroring the `tower-lb` behavior.
+//!    validation), the connect future parks until a valid config is available.
+//! 
+//! TODO: handle the case where the cluster is removed from the cache while a connect future is pending.
+//! Currently, the future will park forever, it should instead try to re-establish the cluster watch and
+//! only fail-fast when the client is closed.
 
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -46,8 +49,7 @@ pub(crate) type EndpointDiscover =
     Pin<Box<dyn Stream<Item = Result<Change<EndpointAddress, IdleChannel>, BoxError>> + Send>>;
 
 // Compile-time assertion that `EndpointDiscover` satisfies the bounds the
-// `LoadBalancer` requires from its discovery: a `Discover` keyed by
-// `EndpointAddress` that yields `IdleChannel`s, and `Unpin`.
+// `LoadBalancer` requires from its discovery.
 const _: fn() = || {
     fn assert_discover<D>()
     where
@@ -107,8 +109,6 @@ async fn diff_loop(
 /// [`build_connector`]. This lets the connector be constructed synchronously
 /// (before CDS/EDS resolve) while the returned future waits for a valid
 /// config.
-///
-/// [`ClusterResource`]: crate::xds::resource::ClusterResource
 pub(crate) struct XdsLbConnector {
     cache: Arc<XdsCache>,
     cluster_name: String,

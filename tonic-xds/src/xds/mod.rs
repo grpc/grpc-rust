@@ -3,16 +3,14 @@ pub(crate) mod cache;
 #[cfg(feature = "_tls-any")]
 pub(crate) mod cert_provider;
 pub(crate) mod connector;
-
-cfg_tower_lb! {
-    pub(crate) mod cluster_discovery;
-    pub(crate) mod endpoint_manager;
-}
-
-cfg_tonic_xds_lb! {
-    pub(crate) mod lb_discovery;
-}
 pub(crate) mod resource;
 pub(crate) mod resource_manager;
 pub(crate) mod routing;
 pub(crate) mod uri;
+cfg_tower_lb! {
+    pub(crate) mod cluster_discovery;
+    pub(crate) mod endpoint_manager;
+}
+cfg_tonic_xds_lb! {
+    pub(crate) mod lb_discovery;
+}

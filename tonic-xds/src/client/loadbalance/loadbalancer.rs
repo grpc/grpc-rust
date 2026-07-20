@@ -13,7 +13,7 @@
 //! `watch` channel each time the set changes; the LB consumes the
 //! latest snapshot, consumes the matching [`ReadyChannel`] via
 //! [`ReadyChannel::eject`], and tracks the resulting
-//! [`EjectedChannel`] in [`Self::ejected`]. When the timer fires, the
+//! [`EjectedChannel`] in `ejected`. When the timer fires, the
 //! resolved [`UnejectedChannel`] is routed back into `ready` or
 //! `connecting`.
 //!
@@ -93,7 +93,7 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// ring stays stable across connection flaps and ejections.
     members: IndexSet<EndpointAddress>,
     /// Currently-ejected channels. Each entry is an
-    /// [`EjectedChannel`] whose `Sleep` fires when the ejection
+    /// `EjectedChannel` whose `Sleep` fires when the ejection
     /// window expires.
     ejected: KeyedFutures<EndpointAddress, UnejectedChannel<C::Service>>,
     /// Per-LB outlier-detection plumbing. Always present; the

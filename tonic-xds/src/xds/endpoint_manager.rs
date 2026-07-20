@@ -2,7 +2,7 @@
 //! [`Change`] streams for Tower's load balancing infrastructure.
 //!
 //! The resource manager writes [`EndpointsResource`] snapshots into the
-//! [`XdsCache`]; this module diffs consecutive snapshots and produces
+//! `XdsCache`; this module diffs consecutive snapshots and produces
 //! `Change::Insert` / `Change::Remove` events that Tower's P2C balancer
 //! (or any other `Discover`-based balancer) can consume.
 

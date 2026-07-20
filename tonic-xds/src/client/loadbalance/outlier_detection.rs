@@ -2,7 +2,7 @@
 //!
 //! Work is split across three sites:
 //!
-//! - **Data path** ([`ReadyChannel::record_outcome`]): runs inline per
+//! - **Data path** (`ReadyChannel::record_outcome`): runs inline per
 //!   RPC. Updates per-channel counters only; ejection decisions are
 //!   deferred to the sweep.
 //! - **Load balancer**: drains the ejected-set snapshot broadcast by

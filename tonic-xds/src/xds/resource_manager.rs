@@ -1,7 +1,7 @@
 //! xDS resource manager: LDS -> RDS -> CDS -> EDS cascade.
 //!
 //! The [`XdsResourceManager`] bridges the xDS client (ADS protocol layer) to the
-//! [`XdsCache`](super::cache::XdsCache). It watches resources via
+//! [`XdsCache`]. It watches resources via
 //! [`XdsClient::watch()`] and writes validated resources into the cache for
 //! downstream consumers (routing layer, endpoint manager).
 //!

@@ -9,6 +9,10 @@ rust-version = { workspace = true }
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
 [dependencies]
 async-stream = "0.3"
 grpc = { path = "../grpc" }

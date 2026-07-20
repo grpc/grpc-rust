@@ -7,7 +7,7 @@ use crate::xds::cache::XdsCache;
 use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
-use crate::{TonicCallCredentials, XdsUri};
+use crate::TonicCallCredentials;
 use http::Request;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -575,6 +575,7 @@ mod tests {
     use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig};
     use crate::testutil::grpc::{GreeterClient, HelloRequest};
     use crate::xds::cache::XdsCache;
+    use crate::{XdsChannelConfig, XdsUri};
     use std::sync::Arc;
 
     /// A cache-backed channel constructor for a specific LB backend.

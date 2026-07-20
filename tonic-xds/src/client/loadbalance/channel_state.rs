@@ -80,6 +80,7 @@ impl EndpointCounters {
 /// can update registry-level counters exactly once per transition.
 #[derive(Debug)]
 pub(crate) struct OutlierChannelState {
+    #[allow(dead_code)]
     addr: EndpointAddress,
     counters: EndpointCounters,
     /// Bumped on each ejection; decremented (saturating) on each
@@ -104,6 +105,7 @@ impl OutlierChannelState {
     }
 
     /// Endpoint address this state belongs to.
+    #[allow(dead_code)]
     pub(crate) fn addr(&self) -> &EndpointAddress {
         &self.addr
     }
@@ -363,6 +365,7 @@ impl<S> ReadyChannel<S> {
     /// Drop the connection and start a fresh connect for the same
     /// address. The outlier state is re-attached from `registry`
     /// when the new connect resolves.
+    #[allow(dead_code)]
     pub(crate) fn reconnect<C: Connector<Service = S>>(
         self,
         connector: Arc<C>,

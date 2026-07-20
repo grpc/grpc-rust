@@ -1,11 +1,18 @@
+use crate::XdsUri;
+#[cfg(feature = "tower-lb")]
 use crate::client::cluster::ClusterClientRegistryGrpc;
+#[cfg(feature = "tower-lb")]
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+#[cfg(feature = "tower-lb")]
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
+#[cfg(feature = "tonic-xds-lb")]
+use crate::client::loadbalance::service::XdsLoadBalanceService;
 use crate::client::route::{Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
+#[cfg(feature = "tower-lb")]
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
@@ -14,7 +21,9 @@ use http::Request;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
+#[cfg(feature = "tower-lb")]
+use tonic::transport::channel::Channel;
+use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
 use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
@@ -291,14 +300,28 @@ impl XdsChannelBuilder {
         resource_manager: XdsResourceManager,
     ) -> XdsChannelGrpc {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
-        #[cfg(feature = "_tls-any")]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, cert_provider_registry));
-        #[cfg(not(feature = "_tls-any"))]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache));
+
+        #[cfg(feature = "tower-lb")]
+        let lb_service = {
+            #[cfg(feature = "_tls-any")]
+            let discovery: Arc<
+                dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
+            > = Arc::new(XdsClusterDiscovery::new(cache, cert_provider_registry));
+            #[cfg(not(feature = "_tls-any"))]
+            let discovery: Arc<
+                dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
+            > = Arc::new(XdsClusterDiscovery::new(cache));
+            let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
+            XdsLbService::new(cluster_registry, discovery)
+        };
+
+        #[cfg(feature = "tonic-xds-lb")]
+        let lb_service = XdsLoadBalanceService::new(
+            cache,
+            #[cfg(feature = "_tls-any")]
+            cert_provider_registry,
+        );
+
         let retry_policy = GrpcRetryPolicy::new(GrpcRetryPolicyConfig::default());
 
         let resources = Arc::new(XdsChannelResources {
@@ -308,8 +331,6 @@ impl XdsChannelBuilder {
 
         let routing_layer = XdsRoutingLayer::new(router, self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
@@ -333,7 +354,7 @@ impl XdsChannelBuilder {
     }
 
     /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, and retry policy.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tower-lb"))]
     pub(crate) fn build_grpc_channel_from_parts(
         &self,
         router: Arc<dyn Router>,
@@ -365,7 +386,7 @@ impl XdsChannelBuilder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tower-lb"))]
 mod tests {
     use super::{XdsChannelBuilder, XdsChannelConfig};
     use crate::XdsUri;

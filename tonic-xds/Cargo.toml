@@ -81,11 +81,11 @@ testutil = ["dep:tonic-prost"]
 # OpenTelemetry version is decoupled from the core crates.
 otel = ["dep:opentelemetry", "dep:xds-client-opentelemetry"]
 
-# Load-balancer implementation — pick exactly one (mutually exclusive).
-# `tower-lb` (default) uses the tower p2c `Balance` + `Buffer` stack.
-# `tonic-xds-lb` uses the in-crate `loadbalance/` implementation
-# (`LoadBalancer` + pickers + outlier detection). Enable the latter with
-# `--no-default-features --features tonic-xds-lb`.
+# Load-balancer implementation. The default `tower-lb` stack (tower p2c
+# `Balance` + `Buffer`) is used unless `tonic-xds-lb` is enabled, which switches
+# to the in-crate `loadbalance/` implementation (`LoadBalancer` + pickers +
+# outlier detection). `tonic-xds-lb` takes precedence, so enabling both (e.g.
+# `--all-features`) is safe and selects `tonic-xds-lb`.
 tower-lb = []
 tonic-xds-lb = []
 

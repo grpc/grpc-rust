@@ -140,19 +140,33 @@
 //! [A48]: https://github.com/grpc/proposal/blob/master/A48-xds-least-request-lb-policy.md
 //! [A63]: https://github.com/grpc/proposal/blob/master/A63-xds-string-matcher-ignore-case.md
 
-// Exactly one load-balancer implementation must be selected. `tower-lb` is the
-// default; enable `tonic-xds-lb` with `--no-default-features --features tonic-xds-lb`.
-#[cfg(all(feature = "tower-lb", feature = "tonic-xds-lb"))]
-compile_error!(
-    "features `tower-lb` and `tonic-xds-lb` are mutually exclusive; enable \
-     `tonic-xds-lb` with `--no-default-features --features tonic-xds-lb`"
-);
+// Load-balancer selection. The default `tower-lb` stack is used unless the
+// `tonic-xds-lb` feature is enabled, which switches to the in-crate
+// implementation. Backend code is gated on the *absence* of `tonic-xds-lb`
+// (not on a `tower-lb` feature) so every feature combination — including the
+// per-feature checks run by `cargo hack --each-feature` — compiles with exactly
+// one backend in production.
+//
+// In test builds both backends are compiled (the `any(test, …)` arm) so the
+// channel tests can exercise each in a single run. These two macros stamp that
+// cfg onto a group of items, keeping the selection logic in one place.
 
-#[cfg(not(any(feature = "tower-lb", feature = "tonic-xds-lb")))]
-compile_error!(
-    "exactly one load-balancer feature must be enabled: `tower-lb` (default) or \
-     `tonic-xds-lb`"
-);
+/// Compiles each item for the `tower-lb` backend: selected in production when
+/// `tonic-xds-lb` is disabled (the default), and always compiled in test builds
+/// so both backends can be exercised in one test run.
+macro_rules! cfg_tower_lb {
+    ($($item:item)*) => {
+        $( #[cfg(any(test, not(feature = "tonic-xds-lb")))] $item )*
+    };
+}
+
+/// Compiles each item for the `tonic-xds-lb` backend: selected in production
+/// when its feature is enabled, and always compiled in test builds.
+macro_rules! cfg_tonic_xds_lb {
+    ($($item:item)*) => {
+        $( #[cfg(any(test, feature = "tonic-xds-lb"))] $item )*
+    };
+}
 
 pub(crate) mod client;
 pub(crate) mod common;

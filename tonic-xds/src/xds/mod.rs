@@ -2,8 +2,13 @@ pub(crate) mod bootstrap;
 pub(crate) mod cache;
 #[cfg(feature = "_tls-any")]
 pub(crate) mod cert_provider;
+#[cfg(feature = "tower-lb")]
 pub(crate) mod cluster_discovery;
+pub(crate) mod connector;
+#[cfg(feature = "tower-lb")]
 pub(crate) mod endpoint_manager;
+#[cfg(feature = "tonic-xds-lb")]
+pub(crate) mod lb_discovery;
 pub(crate) mod resource;
 pub(crate) mod resource_manager;
 pub(crate) mod routing;

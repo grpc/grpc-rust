@@ -73,12 +73,21 @@ rcgen = "0.14"
 google-cloud-auth = { version = "1.9", default-features = false }
 
 [features]
+default = ["tower-lb"]
 testutil = ["dep:tonic-prost"]
 
 # Bundled OpenTelemetry metrics recorder for the gRFC A78 xDS client metrics.
 # The recorder lives in the companion `xds-client-opentelemetry` crate so its
 # OpenTelemetry version is decoupled from the core crates.
 otel = ["dep:opentelemetry", "dep:xds-client-opentelemetry"]
+
+# Load-balancer implementation — pick exactly one (mutually exclusive).
+# `tower-lb` (default) uses the tower p2c `Balance` + `Buffer` stack.
+# `tonic-xds-lb` uses the in-crate `loadbalance/` implementation
+# (`LoadBalancer` + pickers + outlier detection). Enable the latter with
+# `--no-default-features --features tonic-xds-lb`.
+tower-lb = []
+tonic-xds-lb = []
 
 # TLS crypto backend — pick exactly one.
 _tls-any = ["dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]

@@ -140,6 +140,20 @@
 //! [A48]: https://github.com/grpc/proposal/blob/master/A48-xds-least-request-lb-policy.md
 //! [A63]: https://github.com/grpc/proposal/blob/master/A63-xds-string-matcher-ignore-case.md
 
+// Exactly one load-balancer implementation must be selected. `tower-lb` is the
+// default; enable `tonic-xds-lb` with `--no-default-features --features tonic-xds-lb`.
+#[cfg(all(feature = "tower-lb", feature = "tonic-xds-lb"))]
+compile_error!(
+    "features `tower-lb` and `tonic-xds-lb` are mutually exclusive; enable \
+     `tonic-xds-lb` with `--no-default-features --features tonic-xds-lb`"
+);
+
+#[cfg(not(any(feature = "tower-lb", feature = "tonic-xds-lb")))]
+compile_error!(
+    "exactly one load-balancer feature must be enabled: `tower-lb` (default) or \
+     `tonic-xds-lb`"
+);
+
 pub(crate) mod client;
 pub(crate) mod common;
 pub(crate) mod xds;

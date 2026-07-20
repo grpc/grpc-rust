@@ -1,140 +1,31 @@
-//! xDS-backed [`ClusterDiscovery`] implementation.
+//! Per-cluster [`Connector`] construction from validated CDS resources.
 //!
-//! Per cluster, [`XdsClusterDiscovery::discover_cluster`] spawns a task that
-//! drives two concurrent watches:
-//!
-//! 1. The cluster resource watch — produces a fresh
-//!    [`Connector`](crate::client::endpoint::Connector) on each CDS update
-//!    (e.g. when `transport_socket` changes). The connector is held inside a
-//!    [`ConnectorSwap`] so the diff loop reads the latest snapshot per
-//!    endpoint connection.
-//! 2. The endpoint watch — produces `Change::Insert` / `Change::Remove`
-//!    events forwarded to the LB layer.
-//!
-//! On a CDS update whose security config fails validation, the previous
-//! connector is kept and a warning is logged.
+//! `build_connector` maps a cluster's security config to a concrete
+//! connector: no security yields a plaintext connector; security under a TLS
+//! feature yields a TLS connector; security without a TLS feature is an
+//! error. This construction is shared by both load-balancer discovery paths
+//! (`tower-lb` and `tonic-xds-lb`).
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use tokio::sync::mpsc;
-use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
-use crate::client::endpoint::{EndpointAddress, EndpointChannel};
-use crate::client::lb::{BoxDiscover, ClusterDiscovery};
-use crate::xds::cache::XdsCache;
+use crate::client::endpoint::{Connector, EndpointAddress, EndpointChannel};
+use crate::common::async_util::BoxFuture;
 #[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::CertProviderRegistry;
-use crate::xds::connector::build_connector;
-use crate::xds::endpoint_manager::{ConnectorSwap, EndpointManager};
-
-/// Buffer capacity for the discovery channel between the spawned task and
-/// Tower's LB layer.
-const DISCOVER_CHANNEL_CAPACITY: usize = 64;
-
-/// xDS-backed cluster discovery.
-///
-/// Resolves cluster names into endpoint change streams by watching the
-/// [`XdsCache`]. Builds per-cluster [`Connector`]s based on the cluster's
-/// [`ClusterSecurityConfig`] (if any) and the bootstrap-built
-/// [`CertProviderRegistry`].
-pub(crate) struct XdsClusterDiscovery {
-    cache: Arc<XdsCache>,
-    #[cfg(feature = "_tls-any")]
-    cert_provider_registry: Arc<CertProviderRegistry>,
-}
-
-impl XdsClusterDiscovery {
-    #[cfg(feature = "_tls-any")]
-    pub(crate) fn new(cache: Arc<XdsCache>, registry: Arc<CertProviderRegistry>) -> Self {
-        Self {
-            cache,
-            cert_provider_registry: registry,
-        }
-    }
-
-    #[cfg(not(feature = "_tls-any"))]
-    pub(crate) fn new(cache: Arc<XdsCache>) -> Self {
-        Self { cache }
-    }
-}
-
-impl ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for XdsClusterDiscovery {
-    fn discover_cluster(
-        &self,
-        cluster_name: &str,
-    ) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
-        let cache = self.cache.clone();
-        let cluster_name = cluster_name.to_string();
-        #[cfg(feature = "_tls-any")]
-        let registry = self.cert_provider_registry.clone();
-
-        let (tx, rx) = mpsc::channel(DISCOVER_CHANNEL_CAPACITY);
-
-        tokio::spawn(async move {
-            let mut cluster_watch = cache.watch_cluster(&cluster_name);
-
-            let connector_swap: ConnectorSwap<EndpointChannel<Channel>> = loop {
-                let Some(cluster) = cluster_watch.next().await else {
-                    return;
-                };
-                let result = build_connector(
-                    &cluster,
-                    #[cfg(feature = "_tls-any")]
-                    &registry,
-                );
-                match result {
-                    Ok(c) => break Arc::new(ArcSwap::from_pointee(c)),
-                    Err(e) => tracing::warn!(
-                        cluster = %cluster_name,
-                        error = %e,
-                        "initial CDS update rejected; awaiting next update",
-                    ),
-                }
-            };
-
-            let manager = EndpointManager::new(Arc::clone(&connector_swap));
-            let mut endpoints = manager.discover_endpoints(cache.watch_endpoints(&cluster_name));
-
-            loop {
-                tokio::select! {
-                    Some(change) = endpoints.next() => {
-                        if tx.send(change).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some(cluster) = cluster_watch.next() => {
-                        let result = build_connector(
-                            &cluster,
-                            #[cfg(feature = "_tls-any")]
-                            &registry,
-                        );
-                        match result {
-                            Ok(new) => connector_swap.store(Arc::new(new)),
-                            Err(e) => tracing::warn!(
-                                cluster = %cluster_name,
-                                error = %e,
-                                "CDS update rejected; keeping previous connector",
-                            ),
-                        }
-                    }
-                    else => return,
-                }
-            }
-        });
-
-        Box::pin(ReceiverStream::new(rx))
-    }
-}
+use crate::xds::cert_provider::verifier::XdsServerCertVerifier;
+#[cfg(feature = "_tls-any")]
+use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
+use crate::xds::resource::ClusterResource;
+#[cfg(feature = "_tls-any")]
+use crate::xds::resource::security::ClusterSecurityConfig;
 
 /// Build a [`Connector`] for the given cluster.
 ///
 /// - `cluster.security == None` → [`PlaintextConnector`].
 /// - `cluster.security == Some(_)` under a TLS feature → [`TlsConnector`].
 /// - `cluster.security == Some(_)` without a TLS feature → error.
-fn build_connector(
+pub(crate) fn build_connector(
     cluster: &ClusterResource,
     #[cfg(feature = "_tls-any")] registry: &CertProviderRegistry,
 ) -> Result<Arc<dyn Connector<Service = EndpointChannel<Channel>> + Send + Sync>, ConnectorBuildError>
@@ -199,12 +90,14 @@ impl Connector for PlaintextConnector {
 /// - a verifier that reads CA roots from its [`CertificateProvider`] on
 ///   each handshake (so `file_watcher`-driven CA rotation is picked up
 ///   automatically), and
-/// - an optional identity provider for mTLS — fetched per `connect` call
+/// - an optional identity provider for mTLS — fetched per [`connect`] call
 ///   so identity rotation is picked up on each new connection.
 ///
 /// The connector is rebuilt by [`build_connector`] on every CDS update, so
 /// changes to `ca_instance_name` / `identity_instance_name` / SAN matchers
 /// also propagate as the cluster watch swaps the connector.
+///
+/// [`connect`]: Connector::connect
 #[cfg(feature = "_tls-any")]
 pub(crate) struct TlsConnector {
     verifier: Arc<XdsServerCertVerifier>,

@@ -1,8 +1,10 @@
 pub(crate) mod channel;
+#[cfg(feature = "tower-lb")]
 pub(crate) mod cluster;
 pub(crate) mod endpoint;
+#[cfg(feature = "tower-lb")]
 pub(crate) mod lb;
-#[allow(dead_code)]
+#[cfg(feature = "tonic-xds-lb")]
 pub(crate) mod loadbalance;
 #[allow(dead_code)]
 pub(crate) mod retry;

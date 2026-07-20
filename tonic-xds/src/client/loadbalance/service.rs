@@ -33,9 +33,9 @@ use crate::client::loadbalance::pickers::ChannelPicker;
 use crate::client::loadbalance::pickers::p2c::P2cPicker;
 use crate::client::route::RouteDecision;
 use crate::common::async_util::BoxFuture;
+use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::CertProviderRegistry;
-use crate::xds::cache::XdsCache;
 use crate::xds::lb_discovery::{XdsLbConnector, discover_endpoints};
 use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 

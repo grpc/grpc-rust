@@ -456,7 +456,8 @@ mod test_support {
     /// A `RouteConfigResource` that routes all traffic to `cluster_name`.
     pub(super) fn make_test_route_config(cluster_name: &str) -> Arc<RouteConfigResource> {
         use crate::xds::resource::route_config::{
-            PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
+            PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch,
+            VirtualHostConfig,
         };
         Arc::new(RouteConfigResource {
             name: "test-route".to_string(),

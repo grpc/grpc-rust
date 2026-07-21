@@ -1,4 +1,4 @@
-//! Routing → per-cluster load-balancing service for the `tonic-xds-lb` path.
+//! XDS cluster load-balancing service for the `tonic-xds-lb` path.
 //!
 //! [`XdsLoadBalanceService`] is the analogue of the `tower-lb`
 //! `XdsLbService`: it reads the [`RouteDecision`] attached by the routing
@@ -11,9 +11,9 @@
 //! LB's [`LbError`](crate::client::loadbalance::errors::LbError) to
 //! [`BoxError`] automatically.
 //!
-//! First-cut policy: power-of-two-choices ([`P2cPicker`]) with outlier
-//! detection disabled ([`OutlierDetectionConfig::default`]). Ring-hash
-//! selection and xDS-driven outlier config are follow-ups.
+//! TODO: only the power-of-two-choices picker ([`P2cPicker`]) is enabled;
+//! outlier detection ([`OutlierDetectionConfig::default`]) and other pickers (e.g. ring-hash)
+//! will be wired in by follow-ups.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -42,8 +42,7 @@ use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 /// Buffer capacity between callers and a cluster's `LoadBalancer` worker.
 const DEFAULT_BUFFER_CAPACITY: usize = 1024;
 
-/// The request type flowing into the LB layer (after the routing/retry layers
-/// and the `SharedBody` → `TonicBody` remap).
+/// The request type flowing into the LB layer.
 type LbRequest = Request<TonicBody>;
 /// The response type produced by an endpoint channel.
 type LbResponse = Response<TonicBody>;

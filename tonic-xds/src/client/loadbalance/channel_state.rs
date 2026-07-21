@@ -18,10 +18,10 @@
 //! manage multiple in-flight state changes and handle cancellation by key.
 //!
 //! The state types hold the raw service `S` directly. In-flight tracking and
-//! load reporting are handled separately by [`LbChannel`] at the pool level.
+//! load reporting are handled separately by [`EndpointChannel`] at the pool level.
 //!
 //! [`KeyedFutures`]: crate::client::loadbalance::keyed_futures::KeyedFutures
-//! [`LbChannel`]: crate::client::loadbalance::channel::LbChannel
+//! [`EndpointChannel`]: crate::client::endpoint::EndpointChannel
 
 use std::future::Future;
 use std::pin::Pin;

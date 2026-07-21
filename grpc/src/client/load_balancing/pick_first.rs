@@ -78,12 +78,9 @@ impl LbPolicyBuilder for PickFirstBuilder {
             connectivity_state: ConnectivityState::Idle,
             subchannels: Vec::default(),
             subchannel_states: HashMap::default(),
-            selected: None,
-            frontier_index: 0,
             last_connection_error: None,
             shuffler: build_shuffler(),
-            timer: None,
-            steady_state: None,
+            mode: PickFirstMode::start(),
         }
     }
 
@@ -109,8 +106,6 @@ pub struct PickFirstPolicy {
     // Subchannel information.
     subchannels: Vec<Arc<dyn Subchannel>>,
     subchannel_states: HashMap<Address, SubchannelState>, // Cached states for all subchannels by address.
-    selected: Option<Arc<dyn Subchannel>>,
-    frontier_index: usize,
 
     // Detailed error tracking.
     last_connection_error: Option<String>,
@@ -118,24 +113,14 @@ pub struct PickFirstPolicy {
     // Injectable shuffler for deterministic testing.
     shuffler: Arc<ShufflerFn>,
 
-    // Timer state tracks when the last connect attempt was started.
-    timer: Option<Timer>,
-
-    // Steady state tracking for continuous retries after pass exhaustion.
-    // TODO: should steady_state be a "mode" selector enum, e.g.:
-    // - FirstPass - holds the timer above
-    // - SteadyState - existing info
-    // - Ready - holds selected subchannel
-    // - Error - for zero addresses; holds no data
-    steady_state: Option<SteadyState>,
+    mode: PickFirstMode,
 }
 
 impl Debug for PickFirstPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PickFirstPolicy")
             .field("subchannels", &self.subchannels)
-            .field("selected", &self.selected)
-            .field("frontier_index", &self.frontier_index)
+            .field("mode", &self.mode)
             .field("connectivity_state", &self.connectivity_state)
             .field("last_connection_error", &self.last_connection_error)
             .finish()
@@ -196,7 +181,7 @@ impl PickFirstPolicy {
     /// Call when the selected subchannel loses connection.
     // This causes the LB to go IDLE.
     fn subchannel_drop(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.selected = None;
+        self.mode = PickFirstMode::start();
         self.update_picker(
             ConnectivityState::Idle,
             Arc::new(IdlePicker::new(self.work_scheduler.clone())),
@@ -233,10 +218,10 @@ impl PickFirstPolicy {
             // Already selected; skip activation.
             return;
         }
-        self.selected = Some(subchannel.clone());
         self.subchannels = vec![subchannel.clone()]; // Keep only the winner.
-        self.steady_state = None; // Reset mode to First Pass.
-        self.timer = None; // Stop the happy eyeballs timer.
+        self.mode = PickFirstMode::Ready(Ready {
+            subchannel: subchannel.clone(),
+        });
 
         self.update_picker(
             ConnectivityState::Ready,
@@ -248,12 +233,15 @@ impl PickFirstPolicy {
     /// Starts a connection pass through the address list.
     // This clears the selected subchannel.
     fn start_connection_pass(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.selected = None;
+        let mut first_pass = FirstPass {
+            timer: Timer::start(self.runtime.clone(), self.work_scheduler.clone()),
+            frontier_index: 0,
+        };
 
         // If there is a viable subchannel at the frontier, connect to it and
         // update picker to CONNECTING.
-        if let Some(sc) = self.advance_frontier(true) {
-            self.trigger_subchannel_connection(sc, channel_controller);
+        if let Some(sc) = first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, true) {
+            self.trigger_subchannel_connection(sc, channel_controller, &mut first_pass);
 
             // TODO: avoid this update if we are in TF (i.e. sticky TF)?
             self.update_picker(
@@ -261,11 +249,10 @@ impl PickFirstPolicy {
                 Arc::new(QueuingPicker {}),
                 channel_controller,
             );
+            self.mode = PickFirstMode::FirstPass(first_pass);
         } else {
             // Otherwise all addresses are in transient failure: update picker.
-            // TODO: set the last connection error?  Is it correct to do so,
-            // e.g. if the address it came from was removed from the address
-            // list and a name resolver update triggered this connection pass?
+            self.mode = PickFirstMode::start();
             _ = self.set_transient_failure(channel_controller, None);
         }
     }
@@ -280,83 +267,71 @@ impl PickFirstPolicy {
         state: &SubchannelState,
         channel_controller: &mut dyn ChannelController,
     ) {
-        // Advance frontier if this failure is from the active frontier subchannel.
-        if let Some(attempting) = self.subchannels.get(self.frontier_index)
-            && attempting.address() == subchannel.address()
-            && state.connectivity_state == ConnectivityState::TransientFailure
-            && let Some(next_sc) = self.advance_frontier(false)
-        {
-            self.trigger_subchannel_connection(next_sc, channel_controller);
+        let mut transition_to_steady_state = false;
+        if let PickFirstMode::FirstPass(ref mut first_pass) = self.mode {
+            // Advance frontier if this failure is from the active frontier subchannel.
+            if let Some(attempting) = self.subchannels.get(first_pass.frontier_index)
+                && attempting.address() == subchannel.address()
+                && state.connectivity_state == ConnectivityState::TransientFailure
+                && let Some(next_sc) = first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, false)
+            {
+                self.subchannel_states.insert(
+                    next_sc.address(),
+                    SubchannelState {
+                        connectivity_state: ConnectivityState::Connecting,
+                        last_connection_error: None,
+                    },
+                );
+                next_sc.connect();
+                first_pass.timer = Timer::start(
+                    self.runtime.clone(),
+                    self.work_scheduler.clone(),
+                );
+            }
+
+            // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
+            if first_pass.frontier_index >= self.subchannels.len() {
+                let any_connecting = self.subchannels.iter().any(|sc| {
+                    self.subchannel_states
+                        .get(&sc.address())
+                        .is_some_and(|s| s.connectivity_state == ConnectivityState::Connecting)
+                });
+
+                if !any_connecting {
+                    transition_to_steady_state = true;
+                }
+            }
         }
 
-        // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
-        if self.frontier_index >= self.subchannels.len() {
-            let any_connecting = self.subchannels.iter().any(|sc| {
-                self.subchannel_states
+        if transition_to_steady_state {
+            // Nothing currently connecting; first pass complete. Enter
+            // steady state.
+            let error = self.last_connection_error.clone();
+            _ = self.set_transient_failure(channel_controller, error);
+            self.mode = PickFirstMode::SteadyState(SteadyState::new(self.subchannels.len()));
+
+            // Trigger connection attempts on any subchannels that
+            // transitioned to IDLE during the first pass, ensuring they
+            // don't get stuck.
+            for sc in &self.subchannels {
+                let is_idle = self
+                    .subchannel_states
                     .get(&sc.address())
-                    .is_some_and(|s| s.connectivity_state == ConnectivityState::Connecting)
-            });
-
-            if !any_connecting {
-                // Nothing currently connecting; first pass complete.  Enter
-                // steady state.
-                self.timer = None;
-                let error = self.last_connection_error.clone();
-                _ = self.set_transient_failure(channel_controller, error);
-                self.steady_state = Some(SteadyState::new(self.subchannels.len()));
-
-                // Trigger connection attempts on any subchannels that
-                // transitioned to IDLE during the first pass, ensuring they
-                // don't get stuck.
-                for sc in &self.subchannels {
-                    let is_idle = self
-                        .subchannel_states
-                        .get(&sc.address())
-                        .is_some_and(|s| s.connectivity_state == ConnectivityState::Idle);
-                    if is_idle {
-                        sc.connect();
-                    }
+                    .is_some_and(|s| s.connectivity_state == ConnectivityState::Idle);
+                if is_idle {
+                    sc.connect();
                 }
             }
         }
     }
 
-    /// Advances the frontier to the next non-TransientFailure subchannel and
-    /// returns it. If `reset` is true, starts the scan from index 0.
-    // The frontier is the latest index in which connectivity has been attempted.
-    // Returns a cloned Subchannel to avoid borrowing from self.
-    fn advance_frontier(&mut self, reset: bool) -> Option<Arc<dyn Subchannel>> {
-        if reset {
-            self.frontier_index = 0;
-        } else {
-            self.frontier_index += 1;
-        }
-
-        while self.frontier_index < self.subchannels.len() {
-            let sc = &self.subchannels[self.frontier_index];
-            let addr = sc.address();
-            let state = self
-                .subchannel_states
-                .get(&addr)
-                .map(|s| s.connectivity_state)
-                .expect("Expected non-None subchannel state");
-
-            match state {
-                // Push the frontier if sc is in TransientFailure
-                ConnectivityState::TransientFailure => self.frontier_index += 1,
-                // Otherwise return the subchannel.
-                _ => return Some(sc.clone()),
-            }
-        }
-        None
-    }
-
     /// Returns true if the given subchannel matches the currently selected
     /// active subchannel.
     fn subchannel_is_selected(&self, subchannel: &Arc<dyn Subchannel>) -> bool {
-        self.selected
-            .as_ref()
-            .is_some_and(|sel| sel.address() == subchannel.address())
+        match &self.mode {
+            PickFirstMode::Ready(ready) => ready.subchannel.address() == subchannel.address(),
+            _ => false,
+        }
     }
 
     /// Returns true if the subchannel's address is present in the most recently
@@ -377,6 +352,7 @@ impl PickFirstPolicy {
         &mut self,
         sc: Arc<dyn Subchannel>,
         channel_controller: &mut dyn ChannelController,
+        first_pass: &mut FirstPass,
     ) {
         self.subchannel_states.insert(
             sc.address(),
@@ -388,10 +364,10 @@ impl PickFirstPolicy {
         sc.connect();
 
         // Start happy eyeballs timer; replacing any pre-existing timer.
-        self.timer = Some(Timer::start(
+        first_pass.timer = Timer::start(
             self.runtime.clone(),
             self.work_scheduler.clone(),
-        ));
+        );
     }
 
     // Converts the update endpoints to an address list.
@@ -491,10 +467,9 @@ impl LbPolicy for PickFirstPolicy {
         config: Option<&Self::LbConfig>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        self.timer = None;
-
-        // Reset steady state on new update
-        self.steady_state = None;
+        if !matches!(self.mode, PickFirstMode::Ready(_)) {
+            self.mode = PickFirstMode::start();
+        }
 
         match update.endpoints {
             Ok(endpoints) => {
@@ -502,7 +477,7 @@ impl LbPolicy for PickFirstPolicy {
                 // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
                 if new_addresses.is_empty() {
                     self.subchannels.clear();
-                    self.selected = None;
+                    self.mode = PickFirstMode::start();
                     self.set_transient_failure(
                         channel_controller,
                         Some("empty address list".to_string()),
@@ -536,11 +511,7 @@ impl LbPolicy for PickFirstPolicy {
         state: &SubchannelState,
         channel_controller: &mut dyn ChannelController,
     ) {
-        if !self
-            .subchannels
-            .iter()
-            .any(|sc| sc.address() == subchannel.address())
-        {
+        if !self.subchannel_is_current(&subchannel) {
             // This update is from an outdated subchannel that is no longer in
             // the address list. Ignore it.
             return;
@@ -550,38 +521,32 @@ impl LbPolicy for PickFirstPolicy {
         self.subchannel_states
             .insert(subchannel.address(), state.clone());
 
-        match (
-            // Does the load balancer have an active subchannel already?
-            self.subchannel_is_selected(&subchannel),
-            // What is the updating subchannel's state?
-            state.connectivity_state,
-        ) {
-            (true, ConnectivityState::Ready) => {
-                // The selected subchannel is still ready; do nothing w/update.
-            }
-            (true, _) => {
+        if self.subchannel_is_selected(&subchannel) {
+            if state.connectivity_state != ConnectivityState::Ready {
                 // The selected subchannel has failed (is no longer READY);
                 // drop the connection.
                 self.subchannel_drop(channel_controller);
             }
-            (false, ConnectivityState::Ready) => {
-                // The updating subchannel is READY; activate it.
-                self.subchannel_activate(subchannel, channel_controller);
+        } else if state.connectivity_state == ConnectivityState::Ready {
+            // The updating subchannel is READY; activate it.
+            self.subchannel_activate(subchannel, channel_controller);
+        } else {
+            // Always capture freshest unselected error.
+            if state.connectivity_state == ConnectivityState::TransientFailure
+                && let Some(err) = &state.last_connection_error
+            {
+                self.last_connection_error = Some(err.clone());
             }
-            (false, _) => {
-                // Always capture freshest unselected error.
-                if state.connectivity_state == ConnectivityState::TransientFailure
-                    && let Some(err) = &state.last_connection_error
-                {
-                    self.last_connection_error = Some(err.clone());
-                }
 
-                // Track progress based on whether we are in a connection pass.
-                if let Some(steady) = self.steady_state.as_mut() {
+            // Track progress based on mode.
+            match &mut self.mode {
+                PickFirstMode::SteadyState(steady) => {
                     steady.subchannel_nonready(channel_controller, subchannel, state);
-                } else {
+                }
+                PickFirstMode::FirstPass(_) => {
                     self.update_first_pass(subchannel, state, channel_controller);
                 }
+                _ => {}
             }
         }
     }
@@ -592,16 +557,53 @@ impl LbPolicy for PickFirstPolicy {
             // TODO: is it safe to assume any call to work() while idle means we
             // should connect?
             self.exit_idle(channel_controller);
-        } else if self.timer.as_ref().is_some_and(|t| t.expired()) {
-            // Advance frontier and trigger next connection.
-            if let Some(next_sc) = self.advance_frontier(false) {
-                self.trigger_subchannel_connection(next_sc, channel_controller);
+        } else if let PickFirstMode::FirstPass(ref mut first_pass) = self.mode {
+            if first_pass.timer.expired() {
+                // Advance frontier and trigger next connection.
+                if let Some(next_sc) = first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, false) {
+                    self.subchannel_states.insert(
+                        next_sc.address(),
+                        SubchannelState {
+                            connectivity_state: ConnectivityState::Connecting,
+                            last_connection_error: None,
+                        },
+                    );
+                    next_sc.connect();
+                    first_pass.timer = Timer::start(
+                        self.runtime.clone(),
+                        self.work_scheduler.clone(),
+                    );
+                }
             }
         }
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
         self.start_connection_pass(channel_controller);
+    }
+}
+
+#[cfg(test)]
+impl PickFirstPolicy {
+    fn selected(&self) -> Option<&Arc<dyn Subchannel>> {
+        match &self.mode {
+            PickFirstMode::Ready(r) => Some(&r.subchannel),
+            _ => None,
+        }
+    }
+
+    fn timer(&self) -> Option<&Timer> {
+        match &self.mode {
+            PickFirstMode::FirstPass(fp) => Some(&fp.timer),
+            _ => None,
+        }
+    }
+
+    fn steady_state(&self) -> Option<&SteadyState> {
+        match &self.mode {
+            PickFirstMode::SteadyState(ss) => Some(ss),
+            _ => None,
+        }
     }
 }
 
@@ -683,17 +685,90 @@ fn build_shuffler() -> Arc<ShufflerFn> {
     })
 }
 
-/// Tracks a the 'steady state' pass of subchannels when looking for a ready
-/// connection. If the number of reported subchannel failures reaches the
-/// failure threshold, this will ask the Name Resolver to re-resolve.
+struct FirstPass {
+    timer: Timer,
+    frontier_index: usize,
+}
+
+impl FirstPass {
+    fn advance_frontier(
+        &mut self,
+        subchannels: &[Arc<dyn Subchannel>],
+        subchannel_states: &HashMap<Address, SubchannelState>,
+        reset: bool,
+    ) -> Option<Arc<dyn Subchannel>> {
+        if reset {
+            self.frontier_index = 0;
+        } else {
+            self.frontier_index += 1;
+        }
+
+        while self.frontier_index < subchannels.len() {
+            let sc = &subchannels[self.frontier_index];
+            let addr = sc.address();
+            let state = subchannel_states
+                .get(&addr)
+                .map(|s| s.connectivity_state)
+                .expect("Expected non-None subchannel state");
+
+            match state {
+                // Push the frontier if sc is in TransientFailure
+                ConnectivityState::TransientFailure => self.frontier_index += 1,
+                // Otherwise return the subchannel.
+                _ => return Some(sc.clone()),
+            }
+        }
+        None
+    }
+}
+
+struct Ready {
+    subchannel: Arc<dyn Subchannel>,
+}
+
+// Tracks the state machine of the Pick First LB Policy. As the policy
+// progresses through its lifecycle, it transitions between these modes.
+enum PickFirstMode {
+    StartState(StartState),
+    FirstPass(FirstPass),
+    SteadyState(SteadyState),
+    Ready(Ready),
+}
+
+impl PickFirstMode {
+    fn start() -> Self {
+        PickFirstMode::StartState(StartState {})
+    }
+}
+
+impl Debug for PickFirstMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartState(_) => f.write_str("StartState"),
+            Self::FirstPass(fp) => f
+                .debug_struct("FirstPass")
+                .field("frontier_index", &fp.frontier_index)
+                .finish(),
+            Self::SteadyState(ss) => f.debug_tuple("SteadyState").field(ss).finish(),
+            Self::Ready(r) => f
+                .debug_struct("Ready")
+                .field("subchannel", &r.subchannel)
+                .finish(),
+        }
+    }
+}
+
+// Tracks a the 'steady state' pass of subchannels when looking for a ready
+// connection. If the number of reported subchannel failures reaches the
+// failure threshold, this will ask the Name Resolver to re-resolve.
 #[derive(Debug)]
 struct SteadyState {
-    /// The number of failures before triggering a re-resolution of addresses.
-    /// This is a rough heuristic to approximate if all subchannels have failed
-    /// since we entered steady state, and can be tuned as needed.
+    // The number of failures before triggering a re-resolution of addresses.
+    // This is a rough heuristic to approximate if all subchannels have failed
+    // since we entered steady state, and can be tuned as needed.
     failure_threshold: usize,
-    /// The number of failures connecting, used to roughly approximate if a
-    /// re-resolution needs to happen.
+    // The number of failures connecting, used to roughly approximate if a
+    // re-resolution needs to happen.
     failure_count: usize,
 }
 
@@ -731,6 +806,8 @@ impl SteadyState {
         }
     }
 }
+
+struct StartState {}
 
 #[cfg(test)]
 mod test {
@@ -997,7 +1074,7 @@ mod test {
 
         assert_eq!(
             policy
-                .selected
+                .selected()
                 .as_ref()
                 .unwrap()
                 .address()
@@ -1215,7 +1292,7 @@ mod test {
 
         // Simulate timer expiration by setting the flag directly.
         policy
-            .timer
+            .timer()
             .as_ref()
             .unwrap()
             .expired
@@ -1245,7 +1322,7 @@ mod test {
         expect_request_resolution(&rx);
 
         // Ensure steady state was entered.
-        assert!(policy.steady_state.is_some());
+        assert!(policy.steady_state().is_some());
 
         // Simulate addr1 transitioning to IDLE (backoff over).
         policy.subchannel_update(
@@ -1312,7 +1389,7 @@ mod test {
         assert_eq!(addr.address.to_string(), "addr1");
 
         // Confirm LB is in steady state.
-        assert!(policy.steady_state.is_some());
+        assert!(policy.steady_state().is_some());
 
         // Simulate addr1 going IDLE again.
         policy.subchannel_update(
@@ -1493,7 +1570,7 @@ mod test {
         // 1. Simulate Happy Eyeballs timer firing to launch parallel connection
         // to addr2.
         policy
-            .timer
+            .timer()
             .as_ref()
             .unwrap()
             .expired
@@ -1549,7 +1626,7 @@ mod test {
             ConnectivityState::TransientFailure
         );
         expect_request_resolution(&rx);
-        assert!(policy.steady_state.is_some());
+        assert!(policy.steady_state().is_some());
 
         // Simulate background failure during Steady State with net-new error telemetry.
         let sc1 = policy.subchannels[0].clone();

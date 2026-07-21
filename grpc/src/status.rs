@@ -29,11 +29,7 @@ pub use status_code::StatusCodeError;
 
 /// Represents either a failing gRPC status or a successful result containing
 /// `T`.
-pub type StatusOr<T> = Result<T, StatusError>;
-
-/// The representation of a gRPC status.  OK statuses may not contain a status
-/// message, while error values may.
-pub type Status = StatusOr<()>;
+pub type Result<T> = std::result::Result<T, StatusError>;
 
 /// Represents a gRPC status.
 #[derive(Debug, Clone)]
@@ -59,6 +55,11 @@ impl StatusError {
     /// Get the message of this [`StatusError`].
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Consumes the [`StatusError`] and returns its constituent parts (code and message).
+    pub fn into_parts(self) -> (StatusCodeError, String) {
+        (self.code, self.message)
     }
 
     /// Returns whether the status includes a code restricted for control

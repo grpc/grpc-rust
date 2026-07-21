@@ -1,6 +1,6 @@
 //! Generic string matcher for xDS configuration.
 //!
-//! Mirrors [`envoy.type.matcher.v3.StringMatcher`]: a small set of string
+//! Mirrors `envoy.type.matcher.v3.StringMatcher`: a small set of string
 //! comparison modes (`exact` / `prefix` / `suffix` / `contains` / `safe_regex`)
 //! with optional ASCII case-insensitive matching on the string-literal variants.
 //!
@@ -12,7 +12,7 @@ use envoy_types::pb::envoy::r#type::matcher::v3::string_matcher::MatchPattern;
 use regex::Regex;
 use xds_client::Error;
 
-/// Validated [`envoy.type.matcher.v3.StringMatcher`].
+/// Validated `envoy.type.matcher.v3.StringMatcher`.
 #[derive(Debug, Clone)]
 pub(crate) enum StringMatcher {
     Exact { value: String, ignore_case: bool },

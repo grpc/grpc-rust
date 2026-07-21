@@ -24,5 +24,10 @@ allowed_external_types = [
 bytes = "1.11.1"
 grpc = { version = "0.10.0", path = "../grpc" }
 protobuf = "4.35.1-release"
+protobuf-well-known-types = "4.35.1-release"
 
 [dev-dependencies]
+
+[build-dependencies]
+grpc-protobuf-build = { version = "0.10.0", path = "../grpc-protobuf-build", default-features = false }
+protobuf-well-known-types = "4.35.1-release"

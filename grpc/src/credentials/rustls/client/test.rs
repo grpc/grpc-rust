@@ -47,7 +47,7 @@ use crate::credentials::rustls::Identity;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
 use crate::credentials::rustls::client::ClientTlsConfig;
-use crate::credentials::rustls::client::RustlsChannelCredendials;
+use crate::credentials::rustls::client::RustlsChannelCredentials;
 use crate::private;
 use crate::rt;
 use crate::rt::AsyncIoAdapter;
@@ -101,7 +101,7 @@ async fn test_tls_cipher_suites_secure() {
         .clone();
 
     // This should succeed as default provider usually has secure suites.
-    let creds = RustlsChannelCredendials::new_impl(config, provider);
+    let creds = RustlsChannelCredentials::new_impl(config, provider);
     assert!(
         creds.is_ok(),
         "Failed to create creds with secure provider: {:?}",
@@ -139,7 +139,7 @@ async fn test_tls_cipher_suites_insecure() {
     // Remove all cipher suites that are considered secure by our policy
     provider.cipher_suites.retain(|suite| !is_secure(suite));
 
-    let creds = RustlsChannelCredendials::new_impl(config, provider);
+    let creds = RustlsChannelCredentials::new_impl(config, provider);
     assert!(creds.err().unwrap().contains("no cipher suites matching"));
 }
 
@@ -160,7 +160,7 @@ async fn test_tls_key_log() {
         .with_root_certificates_provider(root_provider)
         .insecure_with_key_log_path(key_log_file.path());
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -210,7 +210,7 @@ async fn test_tls_handshake_wrong_server_name() {
     let root_provider = StaticProvider::new(root_certs);
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -267,7 +267,7 @@ async fn test_tls_validate_authority() {
     let root_provider = StaticProvider::new(root_certs);
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -311,7 +311,7 @@ async fn test_mtls_handshake_no_identity() {
     let config = ClientTlsConfig::new()
         .with_root_certificates_provider(StaticProvider::new(load_root_certs("ca.pem")));
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
     let runtime = rt::default_runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
@@ -366,7 +366,7 @@ async fn test_mtls_handshake_with_identitiy() {
         .with_root_certificates_provider(root_provider)
         .with_identity_provider(identity_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
     let runtime = rt::default_runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
@@ -421,7 +421,7 @@ async fn check_client_resumption_disabled(
     let root_provider = StaticProvider::new(root_certs);
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     for i in 0..2 {
         let runtime = rt::default_runtime();
@@ -588,7 +588,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
 
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime

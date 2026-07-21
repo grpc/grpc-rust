@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use prost::encoding::{WireType, decode_key, decode_varint};
 use prost::{DecodeError, Message};
 use prost_types::{
     DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorProto,
@@ -114,62 +115,102 @@ impl<'b> Builder<'b> {
 #[derive(Debug)]
 struct ReflectionServiceState {
     service_names: Vec<String>,
-    files: HashMap<String, Arc<FileDescriptorProto>>,
-    symbols: HashMap<String, Arc<FileDescriptorProto>>,
+    // The original, encoded bytes of each `FileDescriptorProto` are stored (and
+    // served) verbatim rather than a decoded `prost_types::FileDescriptorProto`.
+    // prost silently drops unknown fields on decode, so a decode/re-encode
+    // round-trip strips custom options / extensions (e.g. `google.api.http`);
+    // keeping the raw bytes preserves them for reflection consumers.
+    files: HashMap<String, Arc<[u8]>>,
+    symbols: HashMap<String, Arc<[u8]>>,
 }
 
 impl ReflectionServiceState {
     fn new(
         service_names: Vec<String>,
         encoded_file_descriptor_sets: Vec<&[u8]>,
-        mut file_descriptor_sets: Vec<FileDescriptorSet>,
+        file_descriptor_sets: Vec<FileDescriptorSet>,
         use_all_service_names: bool,
     ) -> Result<Self, Error> {
-        for encoded in encoded_file_descriptor_sets {
-            file_descriptor_sets.push(FileDescriptorSet::decode(encoded)?);
-        }
-
         let mut state = ReflectionServiceState {
             service_names,
             files: HashMap::new(),
             symbols: HashMap::new(),
         };
 
+        // The builder accepts descriptor sets in two forms: raw bytes (via
+        // `register_encoded_file_descriptor_set`) and already-decoded
+        // `prost_types::FileDescriptorSet`s (via `register_file_descriptor_set`).
+        //
+        // The encoded sets are registered first, on purpose: `register_file`
+        // keeps the first entry seen for a given file name (see below), and the
+        // encoded form is the one that faithfully preserves custom options. So
+        // if the same file arrives in both forms, the lossless bytes win.
+        //
+        // Each encoded set is split into its per-file byte ranges without
+        // decoding the inner message, so the original bytes (including custom
+        // options such as `google.api.http`) are retained and served unchanged.
+        for encoded in encoded_file_descriptor_sets {
+            for raw in split_file_descriptor_set(encoded)? {
+                let fd = FileDescriptorProto::decode(raw.as_slice())?;
+                state.register_file(&fd, Arc::from(raw), use_all_service_names)?;
+            }
+        }
+
+        // Already-decoded sets carry no original bytes, so each file has to be
+        // re-encoded. This is lossy for custom options, but unavoidable: those
+        // options were already dropped when the caller decoded the set into
+        // `prost_types` (which has no field to hold them). Callers that need
+        // custom options preserved should use `register_encoded_file_descriptor_set`
+        // instead. Registered second, as a fallback for files not already
+        // supplied in encoded form above.
         for fds in file_descriptor_sets {
             for fd in fds.file {
-                let name = match fd.name.clone() {
-                    None => {
-                        return Err(Error::InvalidFileDescriptorSet("missing name".to_string()));
-                    }
-                    Some(n) => n,
-                };
-
-                if state.files.contains_key(&name) {
-                    continue;
-                }
-
-                let fd = Arc::new(fd);
-                state.files.insert(name, fd.clone());
-                state.process_file(fd, use_all_service_names)?;
+                let raw = fd.encode_to_vec();
+                state.register_file(&fd, Arc::from(raw), use_all_service_names)?;
             }
         }
 
         Ok(state)
     }
 
+    fn register_file(
+        &mut self,
+        fd: &FileDescriptorProto,
+        raw: Arc<[u8]>,
+        use_all_service_names: bool,
+    ) -> Result<(), Error> {
+        let name = match fd.name.clone() {
+            None => {
+                return Err(Error::InvalidFileDescriptorSet("missing name".to_string()));
+            }
+            Some(n) => n,
+        };
+
+        // First registration for a file name wins; later duplicates are ignored.
+        // `new` registers the option-preserving encoded sets before the
+        // re-encoded ones, so a file present in both keeps its original bytes.
+        if self.files.contains_key(&name) {
+            return Ok(());
+        }
+
+        self.files.insert(name, raw.clone());
+        self.process_file(fd, &raw, use_all_service_names)
+    }
+
     fn process_file(
         &mut self,
-        fd: Arc<FileDescriptorProto>,
+        fd: &FileDescriptorProto,
+        raw: &Arc<[u8]>,
         use_all_service_names: bool,
     ) -> Result<(), Error> {
         let prefix = &fd.package.clone().unwrap_or_default();
 
         for msg in &fd.message_type {
-            self.process_message(fd.clone(), prefix, msg)?;
+            self.process_message(raw, prefix, msg)?;
         }
 
         for en in &fd.enum_type {
-            self.process_enum(fd.clone(), prefix, en)?;
+            self.process_enum(raw, prefix, en)?;
         }
 
         for service in &fd.service {
@@ -177,11 +218,11 @@ impl ReflectionServiceState {
             if use_all_service_names {
                 self.service_names.push(service_name.clone());
             }
-            self.symbols.insert(service_name.clone(), fd.clone());
+            self.symbols.insert(service_name.clone(), raw.clone());
 
             for method in &service.method {
                 let method_name = extract_name(&service_name, "method", method.name.as_ref())?;
-                self.symbols.insert(method_name, fd.clone());
+                self.symbols.insert(method_name, raw.clone());
             }
         }
 
@@ -190,28 +231,28 @@ impl ReflectionServiceState {
 
     fn process_message(
         &mut self,
-        fd: Arc<FileDescriptorProto>,
+        raw: &Arc<[u8]>,
         prefix: &str,
         msg: &DescriptorProto,
     ) -> Result<(), Error> {
         let message_name = extract_name(prefix, "message", msg.name.as_ref())?;
-        self.symbols.insert(message_name.clone(), fd.clone());
+        self.symbols.insert(message_name.clone(), raw.clone());
 
         for nested in &msg.nested_type {
-            self.process_message(fd.clone(), &message_name, nested)?;
+            self.process_message(raw, &message_name, nested)?;
         }
 
         for en in &msg.enum_type {
-            self.process_enum(fd.clone(), &message_name, en)?;
+            self.process_enum(raw, &message_name, en)?;
         }
 
         for field in &msg.field {
-            self.process_field(fd.clone(), &message_name, field)?;
+            self.process_field(raw, &message_name, field)?;
         }
 
         for oneof in &msg.oneof_decl {
             let oneof_name = extract_name(&message_name, "oneof", oneof.name.as_ref())?;
-            self.symbols.insert(oneof_name, fd.clone());
+            self.symbols.insert(oneof_name, raw.clone());
         }
 
         Ok(())
@@ -219,16 +260,16 @@ impl ReflectionServiceState {
 
     fn process_enum(
         &mut self,
-        fd: Arc<FileDescriptorProto>,
+        raw: &Arc<[u8]>,
         prefix: &str,
         en: &EnumDescriptorProto,
     ) -> Result<(), Error> {
         let enum_name = extract_name(prefix, "enum", en.name.as_ref())?;
-        self.symbols.insert(enum_name.clone(), fd.clone());
+        self.symbols.insert(enum_name.clone(), raw.clone());
 
         for value in &en.value {
             let value_name = extract_name(&enum_name, "enum value", value.name.as_ref())?;
-            self.symbols.insert(value_name, fd.clone());
+            self.symbols.insert(value_name, raw.clone());
         }
 
         Ok(())
@@ -236,12 +277,12 @@ impl ReflectionServiceState {
 
     fn process_field(
         &mut self,
-        fd: Arc<FileDescriptorProto>,
+        raw: &Arc<[u8]>,
         prefix: &str,
         field: &FieldDescriptorProto,
     ) -> Result<(), Error> {
         let field_name = extract_name(prefix, "field", field.name.as_ref())?;
-        self.symbols.insert(field_name, fd);
+        self.symbols.insert(field_name, raw.clone());
         Ok(())
     }
 
@@ -252,30 +293,72 @@ impl ReflectionServiceState {
     fn symbol_by_name(&self, symbol: &str) -> Result<Vec<u8>, Status> {
         match self.symbols.get(symbol) {
             None => Err(Status::not_found(format!("symbol '{symbol}' not found"))),
-            Some(fd) => {
-                let mut encoded_fd = Vec::new();
-                if fd.clone().encode(&mut encoded_fd).is_err() {
-                    return Err(Status::internal("encoding error"));
-                };
-
-                Ok(encoded_fd)
-            }
+            Some(raw) => Ok(raw.to_vec()),
         }
     }
 
     fn file_by_filename(&self, filename: &str) -> Result<Vec<u8>, Status> {
         match self.files.get(filename) {
             None => Err(Status::not_found(format!("file '{filename}' not found"))),
-            Some(fd) => {
-                let mut encoded_fd = Vec::new();
-                if fd.clone().encode(&mut encoded_fd).is_err() {
-                    return Err(Status::internal("encoding error"));
-                }
+            Some(raw) => Ok(raw.to_vec()),
+        }
+    }
+}
 
-                Ok(encoded_fd)
+/// Splits an encoded `FileDescriptorSet` into the raw, unmodified bytes of each
+/// contained `FileDescriptorProto` (wire field 1), without decoding the inner
+/// messages.
+///
+/// Serving these original bytes preserves custom options / extensions (e.g.
+/// `google.api.http`) that prost silently drops when a `FileDescriptorProto` is
+/// decoded and re-encoded.
+fn split_file_descriptor_set(mut buf: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    // Field number of `repeated FileDescriptorProto file = 1;`.
+    const FILE_FIELD_TAG: u32 = 1;
+
+    let truncated = || {
+        Error::InvalidFileDescriptorSet("unexpected end of FileDescriptorSet buffer".to_string())
+    };
+
+    let mut files = Vec::new();
+    while !buf.is_empty() {
+        let (tag, wire_type) = decode_key(&mut buf)?;
+        match wire_type {
+            WireType::LengthDelimited => {
+                let len = decode_varint(&mut buf)? as usize;
+                if len > buf.len() {
+                    return Err(truncated());
+                }
+                let (field, rest) = buf.split_at(len);
+                if tag == FILE_FIELD_TAG {
+                    files.push(field.to_vec());
+                }
+                buf = rest;
+            }
+            WireType::Varint => {
+                decode_varint(&mut buf)?;
+            }
+            WireType::ThirtyTwoBit => {
+                if buf.len() < 4 {
+                    return Err(truncated());
+                }
+                buf = &buf[4..];
+            }
+            WireType::SixtyFourBit => {
+                if buf.len() < 8 {
+                    return Err(truncated());
+                }
+                buf = &buf[8..];
+            }
+            WireType::StartGroup | WireType::EndGroup => {
+                return Err(Error::InvalidFileDescriptorSet(
+                    "unexpected group wire type in FileDescriptorSet".to_string(),
+                ));
             }
         }
     }
+
+    Ok(files)
 }
 
 fn extract_name(

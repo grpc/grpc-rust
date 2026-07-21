@@ -2,33 +2,34 @@
  *
  * Copyright 2026 gRPC authors.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
  *
  */
 
-use serde::Deserialize;
 use std::time::Duration;
 
-// See [service config format notes](https://protobuf.dev/reference/protobuf/google.protobuf/#duration)
-// for more on duration parsing. The format is a string with a number followed
-// by an optional fraction and the letter 's' for seconds. For example, "1s",
-// "1.5s", "0.000000001s" are valid durations.
+use serde::Deserialize;
+
+/// Service Config uses the [protobuf Duration format](https://protobuf.dev/reference/protobuf/google.protobuf/#duration)
+/// when parsing. The format is a string with a number followed
+/// by an optional fraction and the letter 's' for seconds. For example, "1s",
+/// "1.5s", "0.000000001s" are valid durations.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     if !s.ends_with('s') {
         return Err("duration string must end with 's'".to_string());
@@ -82,9 +83,9 @@ where
         .transpose()
 }
 
-// This included to allow deserializing both u32 and string (or "stringified")
-// representations of u32, as well as null values. This is used for the
-// `max_concurrent_streams` field in the service config.
+// This is included to allow deserializing both u32 and string (or
+// "stringified") representations of u32, as well as null values. This is used,
+// for example, for the `max_request_message_bytes` field in the service config.
 pub(crate) fn deserialize_uint32_opt<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -130,8 +131,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn test_parse_duration() {
@@ -153,6 +155,7 @@ mod test {
         assert!(parse_duration("1.s").is_err());
         assert!(parse_duration("1.0000000001s").is_err());
         assert!(parse_duration("as").is_err());
+        assert!(parse_duration(".5s").is_err());
     }
 
     #[test]

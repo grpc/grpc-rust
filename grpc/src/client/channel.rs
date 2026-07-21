@@ -2,23 +2,23 @@
  *
  * Copyright 2025 gRPC authors.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
  *
  */
 
@@ -68,7 +68,7 @@ use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::{self};
-use crate::client::service_config::ServiceConfig;
+use crate::client::service_config::ParseResult;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
 use crate::client::subchannel::NopBackoff;
@@ -268,8 +268,9 @@ impl PersistentChannel {
         }
     }
 
-    /// Returns the current state of the channel. If there is no underlying active channel,
-    /// returns Idle. If `connect` is true, will create a new active channel iff none exists.
+    /// Returns the current state of the channel. If there is no underlying
+    /// active channel, returns Idle. If `connect` is true, will create a
+    /// new active channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
         // Done this away to avoid potentially locking twice.
         let active_channel = if connect {
@@ -286,8 +287,9 @@ impl PersistentChannel {
         active_channel.lb_watcher.cur().connectivity_state
     }
 
-    /// Gets the underlying active channel. If there is no current connection, it will create one.
-    /// This cannot fail and will always return a valid active channel.
+    /// Gets the underlying active channel. If there is no current connection,
+    /// it will create one. This cannot fail and will always return a valid
+    /// active channel.
     fn get_active_channel(&self) -> Arc<ActiveChannel> {
         let mut active_channel = self.active_channel.lock().unwrap();
 
@@ -301,8 +303,10 @@ impl PersistentChannel {
 
 // A channel that is not idle (connecting, ready, or erroring).
 struct ActiveChannel {
-    abort_handle: Box<dyn rt::TaskHandle>, // Work scheduler task killed when ActiveChannel is dropped.
-    lb_watcher: Arc<Watcher<LbState>>, // For getting the channel connectivity state and pickers for RPCs.
+    abort_handle: Box<dyn rt::TaskHandle>, /* Work scheduler task killed when ActiveChannel is
+                                            * dropped. */
+    lb_watcher: Arc<Watcher<LbState>>, /* For getting the channel connectivity state and pickers
+                                        * for RPCs. */
 }
 
 impl ActiveChannel {
@@ -481,8 +485,8 @@ impl name_resolution::ChannelController for ResolverChannelController {
             .map_err(|err| err.to_string())
     }
 
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
-        Err("service configs not supported".to_string())
+    fn parse_service_config(&self, config: &str) -> ParseResult {
+        ParseResult(Err("service configs not supported".to_string()))
     }
 }
 

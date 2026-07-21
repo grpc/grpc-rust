@@ -2,142 +2,177 @@
  *
  * Copyright 2026 gRPC authors.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
  *
  */
-
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub(crate) mod json;
+pub(crate) mod serde;
 
-/// An in-memory representation of a service config, provided to gRPC as a JSON object.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+/// An in-memory representation of a service config, provided to gRPC as a JSON
+/// object.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServiceConfig {
+    pub(crate) load_balancing_policy: Option<String>,
     /// Ordered list of LB policies. The first supported one is used.
-    pub load_balancing_config: Option<Vec<LoadBalancingConfig>>,
+    pub(crate) load_balancing_config: Option<Vec<LoadBalancingConfig>>,
     /// Per-method configuration overrides.
-    pub method_config: Option<Vec<MethodConfig>>,
+    pub(crate) method_config: Option<Vec<MethodConfig>>,
     /// Global retry throttling parameters.
-    pub retry_throttling: Option<RetryThrottlingPolicy>,
+    pub(crate) retry_throttling: Option<RetryThrottlingPolicy>,
+    /// Health check configuration.
+    pub(crate) health_check_config: Option<HealthCheckConfig>,
+    /// Connection scaling configuration.
+    pub(crate) connection_scaling: Option<ConnectionScaling>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MethodConfig {
     /// List of methods this config applies to.
-    pub name: Vec<MethodName>,
-    #[serde(default, deserialize_with = "json::deserialize_duration_opt")]
-    pub timeout: Option<Duration>,
-    pub retry_policy: Option<RetryPolicy>,
-    #[serde(default, deserialize_with = "json::deserialize_uint32_opt")]
+    pub(crate) name: Vec<MethodName>,
+    pub(crate) wait_for_ready: Option<bool>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) retry_policy: Option<RetryPolicy>,
+    pub(crate) hedging_policy: Option<HedgingPolicy>,
     pub max_request_message_bytes: Option<u32>,
-    #[serde(default, deserialize_with = "json::deserialize_uint32_opt")]
-    pub max_response_message_bytes: Option<u32>,
+    pub(crate) max_response_message_bytes: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodName {
-    /// e.g., "grpc.examples.echo.Echo" or "grpc.examples.echo.Echo/Echo".
     /// The service name (fully qualified).
-    pub service: String,
+    /// e.g., for "grpc.examples.echo.Echo/Echo" this would be
+    /// "grpc.examples.echo.Echo".
+    pub(crate) service: String,
     /// If None, applies to all methods in the service.
-    pub method: Option<String>,
+    /// e.g., for "grpc.examples.echo.Echo/Echo" this would be "Echo".
+    pub(crate) method: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetryThrottlingPolicy {
-    pub max_tokens: u32,
-    pub token_ratio: f32,
+    pub(crate) max_tokens: u32,
+    pub(crate) token_ratio: f32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
-    pub max_attempts: u32,
-    #[serde(deserialize_with = "json::deserialize_duration")]
-    pub initial_backoff: Duration,
-    #[serde(deserialize_with = "json::deserialize_duration")]
-    pub max_backoff: Duration,
-    pub backoff_multiplier: f32,
-    pub retryable_status_codes: Vec<String>,
+    pub(crate) max_attempts: u32,
+    pub(crate) initial_backoff: Duration,
+    pub(crate) max_backoff: Duration,
+    pub(crate) backoff_multiplier: f32,
+    pub(crate) retryable_status_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HedgingPolicy {
+    pub(crate) max_attempts: u32,
+    pub(crate) hedging_delay: Duration,
+    pub(crate) non_fatal_status_codes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealthCheckConfig {
+    pub(crate) service_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionScaling {
+    pub(crate) max_connections_per_subchannel: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadBalancingConfig {
-    pub name: String,
-    pub config: serde_json::Value,
+    pub(crate) name: String,
+    pub(crate) config: serde_json::Value,
 }
 
-impl<'de> Deserialize<'de> for LoadBalancingConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = LoadBalancingConfig;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(
-                    "a map with a single key-value pair representing a load balancing policy",
-                )
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                if let Some(name) = map.next_key::<String>()? {
-                    let config = map.next_value::<serde_json::Value>()?;
-                    if map.next_key::<String>()?.is_some() {
-                        return Err(serde::de::Error::custom("map has more than one key"));
-                    }
-                    Ok(LoadBalancingConfig { name, config })
-                } else {
-                    Err(serde::de::Error::custom("map is empty"))
-                }
-            }
-        }
-        deserializer.deserialize_map(Visitor)
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryOrHedgingPolicy {
+    Retry(RetryPolicy),
+    Hedging(HedgingPolicy),
+}
+
+impl MethodConfig {
+    pub fn retry_or_hedging_policy(&self) -> Option<RetryOrHedgingPolicy> {
+        self.retry_policy
+            .as_ref()
+            .map(|rp| RetryOrHedgingPolicy::Retry(rp.clone()))
+            .or_else(|| {
+                self.hedging_policy
+                    .as_ref()
+                    .map(|hp| RetryOrHedgingPolicy::Hedging(hp.clone()))
+            })
     }
 }
 
-impl Serialize for LoadBalancingConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry(&self.name, &self.config)?;
-        map.end()
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseResult(pub Result<ServiceConfig, String>);
+
+impl ParseResult {
+    pub fn is_ok(&self) -> bool {
+        self.0.is_ok()
+    }
+
+    pub fn is_err(&self) -> bool {
+        self.0.is_err()
+    }
+
+    pub fn unwrap(self) -> ServiceConfig {
+        self.0.unwrap()
+    }
+
+    pub fn unwrap_err(self) -> String {
+        self.0.unwrap_err()
+    }
+
+    pub fn into_inner(self) -> Result<ServiceConfig, String> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ParseResult {
+    type Target = Result<ServiceConfig, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
 impl ServiceConfig {
     /// Parses a service configuration from a JSON string.
-    pub fn parse(config_json: &str) -> Result<Self, String> {
-        let config: Self = serde_json::from_str(config_json)
-            .map_err(|e| format!("failed to deserialize service config JSON: {}", e))?;
-        config.validate()?;
-        Ok(config)
+    pub fn parse(config_json: &str) -> ParseResult {
+        let config_serde: serde::ServiceConfigSerDe = match serde_json::from_str(config_json) {
+            Ok(c) => c,
+            Err(e) => {
+                return ParseResult(Err(format!(
+                    "failed to deserialize service config JSON: {}",
+                    e
+                )));
+            }
+        };
+        let config: Self = config_serde.into();
+        if let Err(e) = config.validate() {
+            return ParseResult(Err(e));
+        }
+        ParseResult(Ok(config))
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -153,6 +188,12 @@ impl ServiceConfig {
                             i, j
                         ));
                     }
+                }
+                if mc.retry_policy.is_some() && mc.hedging_policy.is_some() {
+                    return Err(format!(
+                        "method_config[{}] cannot have both retryPolicy and hedgingPolicy defined",
+                        i
+                    ));
                 }
                 if let Some(ref rp) = mc.retry_policy {
                     if rp.max_attempts <= 1 {
@@ -180,6 +221,14 @@ impl ServiceConfig {
                         ));
                     }
                 }
+                if let Some(ref hp) = mc.hedging_policy
+                    && hp.max_attempts <= 1
+                {
+                    return Err(format!(
+                        "method_config[{}].hedging_policy.max_attempts must be > 1",
+                        i
+                    ));
+                }
             }
         }
 
@@ -198,8 +247,9 @@ impl ServiceConfig {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn test_valid_service_config_parsing() {
@@ -224,11 +274,28 @@ mod test {
                     },
                     "maxRequestMessageBytes": 1024,
                     "maxResponseMessageBytes": "2048"
+                },
+                {
+                    "name": [
+                        { "service": "grpc.examples.echo.EchoHedging" }
+                    ],
+                    "waitForReady": true,
+                    "hedgingPolicy": {
+                        "maxAttempts": 3,
+                        "hedgingDelay": "0.5s",
+                        "nonFatalStatusCodes": ["UNAVAILABLE"]
+                    }
                 }
             ],
             "retryThrottling": {
                 "maxTokens": 100,
                 "tokenRatio": 0.1
+            },
+            "healthCheckConfig": {
+                "serviceName": "grpc.health.v1.Health"
+            },
+            "connectionScaling": {
+                "maxConnectionsPerSubchannel": 20
             }
         });
 
@@ -244,7 +311,7 @@ mod test {
 
         // Verify Method Config.
         let method_configs = sc.method_config.unwrap();
-        assert_eq!(method_configs.len(), 1);
+        assert_eq!(method_configs.len(), 2);
         let mc = &method_configs[0];
         assert_eq!(mc.name.len(), 2);
         assert_eq!(mc.name[0].service, "grpc.examples.echo.Echo");
@@ -264,10 +331,36 @@ mod test {
         assert_eq!(rp.backoff_multiplier, 2.0);
         assert_eq!(rp.retryable_status_codes, vec!["UNAVAILABLE", "INTERNAL"]);
 
+        let mc2 = &method_configs[1];
+        assert_eq!(mc2.wait_for_ready, Some(true));
+        let hp = mc2.hedging_policy.as_ref().unwrap();
+        assert_eq!(hp.max_attempts, 3);
+        assert_eq!(hp.hedging_delay, Duration::from_millis(500));
+        assert_eq!(
+            hp.non_fatal_status_codes,
+            Some(vec!["UNAVAILABLE".to_string()])
+        );
+        assert_eq!(
+            mc2.retry_or_hedging_policy(),
+            Some(RetryOrHedgingPolicy::Hedging(hp.clone()))
+        );
+
         // Verify Retry Throttling.
         let rt = sc.retry_throttling.unwrap();
         assert_eq!(rt.max_tokens, 100);
         assert_eq!(rt.token_ratio, 0.1);
+
+        assert_eq!(
+            sc.health_check_config.as_ref().unwrap().service_name,
+            Some("grpc.health.v1.Health".to_string())
+        );
+        assert_eq!(
+            sc.connection_scaling
+                .as_ref()
+                .unwrap()
+                .max_connections_per_subchannel,
+            20
+        );
     }
 
     #[test]
@@ -303,6 +396,40 @@ mod test {
         let json_data = json!({
             "methodConfig": [{
                 "name": [{ "service": "" }]
+            }]
+        });
+        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
+    }
+
+    #[test]
+    fn test_legacy_lb_policy_fallback() {
+        let json_data = json!({
+            "loadBalancingPolicy": "round_robin"
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        assert_eq!(sc.load_balancing_policy, Some("round_robin".to_string()));
+        let lb_configs = sc.load_balancing_config.unwrap();
+        assert_eq!(lb_configs.len(), 1);
+        assert_eq!(lb_configs[0].name, "round_robin");
+        assert_eq!(lb_configs[0].config, json!({}));
+    }
+
+    #[test]
+    fn test_retry_hedging_mutual_exclusivity() {
+        let json_data = json!({
+            "methodConfig": [{
+                "name": [{ "service": "foo" }],
+                "retryPolicy": {
+                    "maxAttempts": 2,
+                    "initialBackoff": "1s",
+                    "maxBackoff": "1s",
+                    "backoffMultiplier": 2.0,
+                    "retryableStatusCodes": []
+                },
+                "hedgingPolicy": {
+                    "maxAttempts": 2,
+                    "hedgingDelay": "1s"
+                }
             }]
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());

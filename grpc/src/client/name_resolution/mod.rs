@@ -2,23 +2,23 @@
  *
  * Copyright 2025 gRPC authors.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
  *
  */
 
@@ -34,14 +34,15 @@ use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use percent_encoding::AsciiSet;
-use percent_encoding::NON_ALPHANUMERIC;
 use percent_encoding::percent_decode_str;
 use percent_encoding::utf8_percent_encode;
+use percent_encoding::AsciiSet;
+use percent_encoding::NON_ALPHANUMERIC;
 use url::Url;
 
 use crate::attributes::Attributes;
 use crate::byte_str::ByteStr;
+use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
 use crate::rt::GrpcRuntime;
 
@@ -265,7 +266,7 @@ pub trait ChannelController: Send + Sync {
 
     /// Parses the provided JSON service config and returns an instance of a
     /// ParsedServiceConfig.
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String>;
+    fn parse_service_config(&self, config: &str) -> ParseResult;
 }
 
 #[derive(Clone, Debug)]
@@ -409,8 +410,8 @@ impl NopResolver {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashMap;
     use std::hash::Hash;
     use std::hash::Hasher;
 
@@ -492,11 +493,9 @@ mod test {
         let input = "dns:///foo%FFbar";
         let target: Result<Target, _> = input.parse();
         assert!(target.is_err());
-        assert!(
-            target
-                .unwrap_err()
-                .contains("invalid UTF-8 character in target path")
-        );
+        assert!(target
+            .unwrap_err()
+            .contains("invalid UTF-8 character in target path"));
     }
 
     // This test ensures that the Address struct correctly maintains its

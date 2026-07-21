@@ -84,10 +84,7 @@ otel = ["dep:opentelemetry", "dep:xds-client-opentelemetry"]
 # Load-balancer implementation. The default `tower-lb` stack (tower p2c
 # `Balance` + `Buffer`) is used unless `tonic-xds-lb` is enabled, which switches
 # to the in-crate `loadbalance/` implementation (`LoadBalancer` + pickers +
-# outlier detection). Backend selection is driven solely by `tonic-xds-lb`:
-# when it is off (the default) the tower stack is used, so there is no separate
-# `tower-lb` flag. Enabling `tonic-xds-lb` (e.g. via `--all-features`) always
-# selects the in-crate stack.
+# outlier detection).
 tonic-xds-lb = []
 
 # TLS crypto backend — pick exactly one.

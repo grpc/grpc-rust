@@ -452,7 +452,7 @@ mod test_support {
     pub(super) async fn setup_grpc_servers(count: usize) -> Vec<TestServer> {
         let mut servers = Vec::new();
         for i in 0..count {
-            let server = spawn_greeter_server(&format!("server-{i}"), None, None)
+            let server = spawn_greeter_server(&format!("server-{i}"), None)
                 .await
                 .expect("Failed to spawn gRPC server");
             servers.push(server);

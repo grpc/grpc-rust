@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
 use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
-use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient};
+use xds_client::{
+    ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
+};
 
 use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 
@@ -162,9 +164,25 @@ const _: fn() = || {
 };
 
 /// Builder for creating an [`XdsChannel`] or [`XdsChannelGrpc`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+}
+
+impl Debug for XdsChannelBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XdsChannelBuilder")
+            .field("config", &self.config)
+            .field(
+                "recorder",
+                &self
+                    .recorder
+                    .as_deref()
+                    .map_or("None", |r| std::any::type_name_of_val(r)),
+            )
+            .finish()
+    }
 }
 
 impl XdsChannelBuilder {
@@ -173,7 +191,34 @@ impl XdsChannelBuilder {
     pub fn new(config: XdsChannelConfig) -> Self {
         Self {
             config: Arc::new(config),
+            recorder: None,
         }
+    }
+
+    /// Sets the [`MetricsRecorder`] backend that receives the gRFC A78 xDS
+    /// client metrics emitted by the underlying [`XdsClient`].
+    ///
+    /// By default no recorder is configured and metric emission is skipped.
+    /// With the `otel` feature, `with_otel_metrics` provides a one-call
+    /// OpenTelemetry setup.
+    #[must_use]
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Emits the gRFC A78 xDS client metrics through an OpenTelemetry `Meter`.
+    ///
+    /// Convenience wrapper over
+    /// [`with_metrics_recorder`](Self::with_metrics_recorder) that installs an
+    /// [`OtelMetricsRecorder`](xds_client_opentelemetry::OtelMetricsRecorder) from
+    /// the companion `xds-client-opentelemetry` crate. Requires the `otel` feature.
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn with_otel_metrics(self, meter: opentelemetry::metrics::Meter) -> Self {
+        self.with_metrics_recorder(Arc::new(
+            xds_client_opentelemetry::OtelMetricsRecorder::new(meter),
+        ))
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
@@ -214,8 +259,12 @@ impl XdsChannelBuilder {
         let node = Node::try_from(bootstrap.node)?;
         let client_config =
             ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
-        let xds_client =
-            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime).build();
+        let mut client_builder =
+            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
+        if let Some(recorder) = self.recorder.clone() {
+            client_builder = client_builder.with_metrics_recorder(recorder);
+        }
+        let xds_client = client_builder.build();
 
         let cache = Arc::new(XdsCache::new());
         let resource_manager =

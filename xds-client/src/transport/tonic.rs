@@ -160,7 +160,7 @@ impl TonicTransport {
 ///
 /// # TLS
 ///
-/// Enable the `tls-ring` or `tls-aws-lc` feature and call [`with_tls_config`](Self::with_tls_config):
+/// Enable the `tls-ring` or `tls-aws-lc` feature and call `with_tls_config`:
 ///
 /// ```ignore
 /// use tonic::transport::ClientTlsConfig;

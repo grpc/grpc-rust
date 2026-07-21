@@ -151,5 +151,7 @@ pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
 pub use xds::uri::{XdsUri, XdsUriError};
 pub use xds_client::TonicCallCredentials;
 
+pub use xds_client::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
+
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;

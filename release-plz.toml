@@ -41,14 +41,18 @@ version_group = "tonic"
 name = "tonic-web"
 version_group = "tonic"
 
-# xds group (shared version)
-#[[package]]
-#name = "xds-client"
-#version_group = "xds"
+# xds crates: published manually for now
+[[package]]
+name = "xds-client"
+release = false
 
-#[[package]]
-#name = "tonic-xds"
-#version_group = "xds"
+[[package]]
+name = "tonic-xds"
+release = false
+
+[[package]]
+name = "xds-client-opentelemetry"
+release = false
 
 # grpc group (single crate)
 #[[package]]

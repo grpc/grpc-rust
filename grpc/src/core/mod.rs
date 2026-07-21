@@ -45,7 +45,6 @@ use std::any::TypeId;
 use bytes::Buf;
 
 use crate::metadata::MetadataMap;
-use crate::status::Status;
 
 /// Represents a message sent by either a client or a server.
 #[allow(unused)]
@@ -202,13 +201,13 @@ impl RequestHeaders {
 /// gRPC does not support request trailers.
 #[derive(Debug, Clone)]
 pub struct Trailers {
-    status: Status,
+    status: crate::Result<()>,
     metadata: MetadataMap,
 }
 
 impl Trailers {
     /// Returns a default [`Trailers`] instance.
-    pub fn new(status: Status) -> Self {
+    pub fn new(status: crate::Result<()>) -> Self {
         Self {
             status,
             metadata: MetadataMap::default(),
@@ -216,13 +215,13 @@ impl Trailers {
     }
 
     /// Replaces the status of self with `status`.
-    pub fn with_status(mut self, status: Status) -> Self {
+    pub fn with_status(mut self, status: crate::Result<()>) -> Self {
         self.status = status;
         self
     }
 
-    /// Returns a reference to the [`Status`] contained in these trailers.
-    pub fn status(&self) -> &Status {
+    /// Returns a reference to the status contained in these trailers.
+    pub fn status(&self) -> &crate::Result<()> {
         &self.status
     }
 
@@ -243,7 +242,7 @@ impl Trailers {
     }
 
     /// Returns the status in the [`Trailers`], consuming the entire status.
-    pub fn into_status(self) -> Status {
+    pub fn into_status(self) -> crate::Result<()> {
         self.status
     }
 }

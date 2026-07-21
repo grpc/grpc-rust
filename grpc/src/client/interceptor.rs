@@ -201,17 +201,15 @@ where
 ///
 /// ```
 /// use std::sync::Arc;
-/// use grpc::client::{Channel, ChannelOptions};
+/// use grpc::client::Channel;
 /// use grpc::credentials::LocalChannelCredentials;
 /// use grpc::client::stream_util::ResponseValidator;
 /// use grpc::client::interceptor::InvokeExt;
 ///
 /// // Create a channel:
-/// let channel = Channel::new(
-///     "dns:///localhost:123",
-///     Arc::new(LocalChannelCredentials::new()),
-///     ChannelOptions::default(),
-/// );
+/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+///     .build();
+///
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///
@@ -247,17 +245,14 @@ pub trait InvokeExt: Invoke + Sized {
 ///
 /// ```
 /// use std::sync::Arc;
-/// use grpc::client::{Channel, ChannelOptions};
+/// use grpc::client::Channel;
 /// use grpc::credentials::LocalChannelCredentials;
 /// use grpc::client::stream_util::ResponseValidator;
 /// use grpc::client::interceptor::InvokeOnceExt;
 ///
 /// // Create a channel:
-/// let channel = Channel::new(
-///     "dns:///localhost:123",
-///     Arc::new(LocalChannelCredentials::new()),
-///     ChannelOptions::default(),
-/// );
+/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+///     .build();
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///

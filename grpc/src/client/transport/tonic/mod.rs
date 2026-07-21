@@ -95,7 +95,6 @@ use crate::rt::UnixSocketOptions;
 use crate::rt::hyper_wrapper::HyperCompatExec;
 use crate::rt::hyper_wrapper::HyperCompatTimer;
 use crate::rt::hyper_wrapper::HyperStream;
-use crate::status::Status;
 
 #[cfg(test)]
 mod test;
@@ -201,7 +200,13 @@ impl Invoke for TonicTransport {
 }
 
 // Converts from a tonic status to a trailers stream item.
-fn trailers_from_tonic_status(status: &TonicStatus, md: &TonicMeta) -> ResponseStreamItem {
+fn trailers_from_tonic_status(status: &TonicStatus, mut md: TonicMeta) -> ResponseStreamItem {
+    if !status.details().is_empty() {
+        md.insert_bin(
+            "grpc-status-details-bin",
+            tonic::metadata::MetadataValue::from_bytes(status.details()),
+        );
+    }
     let status_res = match status.code() {
         Code::Ok => Ok(()),
         code => Err(StatusError::new(
@@ -209,11 +214,11 @@ fn trailers_from_tonic_status(status: &TonicStatus, md: &TonicMeta) -> ResponseS
             status.message(),
         )),
     };
-    trailers_from_status(status_res, md)
+    trailers_from_status(status_res, &md)
 }
 
 // Builds a trailers with a status
-fn trailers_from_status(status: Status, md: &TonicMeta) -> ResponseStreamItem {
+fn trailers_from_status(status: crate::Result<()>, md: &TonicMeta) -> ResponseStreamItem {
     let trailers = match md.try_into() {
         Err(e) => Trailers::new(Err(StatusError::new(
             StatusCodeError::Internal,
@@ -300,10 +305,11 @@ impl RecvStream for TonicRecvStream {
                     Err(StatusError::new(StatusCodeError::Unknown, "Task cancelled")),
                     &TonicMeta::default(),
                 ),
-                Ok(Err(status)) => {
+                Ok(Err(mut status)) => {
                     // In a Trailers-only response, the tonic status contains
                     // the metadata.
-                    trailers_from_tonic_status(&status, status.metadata())
+                    let md = std::mem::take(status.metadata_mut());
+                    trailers_from_tonic_status(&status, md)
                 }
             },
             StreamState::Streaming(mut stream) => match stream.message().await {
@@ -331,7 +337,7 @@ impl RecvStream for TonicRecvStream {
                 Err(status) => {
                     let trailers = stream.trailers().await;
                     let md = trailers.unwrap_or_default().unwrap_or_default();
-                    trailers_from_tonic_status(&status, &md)
+                    trailers_from_tonic_status(&status, md)
                 }
                 Ok(None) => {
                     let trailers = stream.trailers().await;

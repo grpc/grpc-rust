@@ -26,7 +26,7 @@ pub(crate) enum KeyedFuturesError<K: std::fmt::Debug> {
 /// A cancellable, keyed set of futures.
 ///
 /// Each future is associated with a key `K` and produces a value `T`.
-/// Futures can be cancelled individually by key. [`poll_next`] drives all
+/// Futures can be cancelled individually by key. `poll_next` drives all
 /// futures concurrently and yields `(K, T)` when one completes; cancelled
 /// futures are silently skipped.
 ///

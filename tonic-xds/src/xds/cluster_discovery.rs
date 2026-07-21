@@ -203,7 +203,7 @@ impl Connector for PlaintextConnector {
 /// - a verifier that reads CA roots from its [`CertificateProvider`] on
 ///   each handshake (so `file_watcher`-driven CA rotation is picked up
 ///   automatically), and
-/// - an optional identity provider for mTLS — fetched per [`connect`] call
+/// - an optional identity provider for mTLS — fetched per `connect` call
 ///   so identity rotation is picked up on each new connection.
 ///
 /// The connector is rebuilt by [`build_connector`] on every CDS update, so

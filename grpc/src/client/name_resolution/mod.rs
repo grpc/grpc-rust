@@ -34,10 +34,10 @@ use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use percent_encoding::percent_decode_str;
-use percent_encoding::utf8_percent_encode;
 use percent_encoding::AsciiSet;
 use percent_encoding::NON_ALPHANUMERIC;
+use percent_encoding::percent_decode_str;
+use percent_encoding::utf8_percent_encode;
 use url::Url;
 
 use crate::attributes::Attributes;
@@ -410,8 +410,8 @@ impl NopResolver {
 
 #[cfg(test)]
 mod test {
-    use std::collections::hash_map::DefaultHasher;
     use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
     use std::hash::Hash;
     use std::hash::Hasher;
 
@@ -493,9 +493,11 @@ mod test {
         let input = "dns:///foo%FFbar";
         let target: Result<Target, _> = input.parse();
         assert!(target.is_err());
-        assert!(target
-            .unwrap_err()
-            .contains("invalid UTF-8 character in target path"));
+        assert!(
+            target
+                .unwrap_err()
+                .contains("invalid UTF-8 character in target path")
+        );
     }
 
     // This test ensures that the Address struct correctly maintains its

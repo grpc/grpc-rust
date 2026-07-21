@@ -1,6 +1,7 @@
 pub(crate) mod p2c;
 // Ring-hash (gRFC A42) is implemented but not wired into the first-cut LB,
-// which selects P2C. Wired in a follow-up.
+// which selects P2C.
+// TODO: wire ring-hash into the LB.
 #[allow(dead_code)]
 pub(crate) mod ring_hash;
 

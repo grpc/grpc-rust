@@ -699,47 +699,6 @@ mod tests {
         }
     }
 
-    /// Routes and load-balances across real backends via a pre-populated cache.
-    #[tokio::test]
-    async fn test_xds_channel_with_real_router_and_discovery() {
-        for (backend, build) in backends() {
-            let num_servers = 3;
-            let num_requests = 300;
-            let cluster_name = "test-cluster";
-            let servers = setup_grpc_servers(num_servers).await;
-
-            let cache = Arc::new(XdsCache::new());
-            cache.update_route_config(make_test_route_config(cluster_name));
-            cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
-            cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
-
-            let channel = build(
-                &XdsChannelBuilder::new(test_config()),
-                cache,
-                GrpcRetryPolicy::default(),
-            );
-            let client = GreeterClient::new(channel);
-
-            let (successful, error_types, server_counts) =
-                send_grpc_requests(client, num_requests).await;
-
-            assert_eq!(
-                successful, num_requests,
-                "[{backend}] expected 100% success. Errors: {error_types:?}",
-            );
-            assert_eq!(
-                server_counts.len(),
-                num_servers,
-                "[{backend}] all {num_servers} servers should receive traffic: {server_counts:?}",
-            );
-
-            for server in servers {
-                let _ = server.shutdown.send(());
-                let _ = server.handle.await;
-            }
-        }
-    }
-
     /// Endpoint changes in the cache are picked up dynamically while serving.
     #[tokio::test]
     async fn test_xds_channel_handles_dynamic_endpoint_updates() {

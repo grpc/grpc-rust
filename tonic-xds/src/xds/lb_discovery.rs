@@ -104,7 +104,8 @@ async fn diff_loop(
 /// The [`Connector`] used by the `tonic-xds-lb` `LoadBalancer`.
 ///
 /// Resolves the cluster's CDS security config lazily, inside the connect
-/// future: on each `connect`, it reads the current [`ClusterResource`] from
+/// future: on each `connect`, it reads the current
+/// [`ClusterResource`](crate::xds::resource::ClusterResource) from
 /// the cache and builds the appropriate plaintext/TLS connector via
 /// [`build_connector`]. This lets the connector be constructed synchronously
 /// (before CDS/EDS resolve) while the returned future waits for a valid

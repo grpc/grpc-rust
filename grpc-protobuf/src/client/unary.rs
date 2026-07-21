@@ -25,8 +25,6 @@
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use grpc::Status;
-use grpc::StatusError;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RecvStream as _;
@@ -45,7 +43,10 @@ use protobuf::Proxied;
 use crate::CallBuilder;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::Status;
+use crate::StatusError;
 use crate::client::Internal;
+use crate::trailers_conv::status_from_trailers;
 
 /// Configures a unary call for gRPC Protobuf.  Implements [`IntoFuture`] which
 /// performs the call and resolves to the response as a [`Result<Res, Status>`].
@@ -96,7 +97,7 @@ where
         loop {
             let i = rx.recv(&mut res).await;
             if let ResponseStreamItem::Trailers(t) = i {
-                return t.status().clone();
+                return status_from_trailers(t);
             }
         }
     }

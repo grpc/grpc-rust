@@ -27,7 +27,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Buf;
-use grpc::Status;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RecvStream as ClientRecvStream;
@@ -48,7 +47,9 @@ use protobuf::MessageView;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::Status;
 use crate::private::Internal;
+use crate::trailers_conv::status_from_trailers;
 
 pub(crate) mod bidi;
 pub(crate) mod client_streaming;
@@ -147,7 +148,7 @@ where
             ResponseStreamItem::Headers(_) => unreachable!(),
             ResponseStreamItem::Message => Ok(()),
             ResponseStreamItem::Trailers(trailers) => {
-                self.status = Some(trailers.into_status());
+                self.status = Some(status_from_trailers(trailers));
                 Err(())
             }
             ResponseStreamItem::StreamClosed => Err(()),
@@ -176,7 +177,7 @@ where
             loop {
                 let i = self.rx.recv(&mut nop_msg).await;
                 if let ResponseStreamItem::Trailers(t) = i {
-                    return t.into_status();
+                    return status_from_trailers(t);
                 }
             }
         }

@@ -63,10 +63,9 @@ mod send_future;
 mod server;
 mod status;
 
-pub use status::Status;
+pub use status::Result;
 pub use status::StatusCodeError;
 pub use status::StatusError;
-pub use status::StatusOr;
 
 #[cfg(feature = "__unstable")]
 #[doc(hidden)]

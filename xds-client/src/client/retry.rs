@@ -27,7 +27,7 @@ pub struct RetryPolicy {
     /// Initial backoff duration for the first retry attempt.
     ///
     /// Default: 1 second.
-    pub initial_backoff: Duration,
+    initial_backoff: Duration,
 
     /// Maximum backoff duration.
     ///
@@ -35,7 +35,7 @@ pub struct RetryPolicy {
     /// retry attempts have been made.
     ///
     /// Default: 30 seconds.
-    pub max_backoff: Duration,
+    max_backoff: Duration,
 
     /// Multiplier for exponential backoff.
     ///
@@ -43,17 +43,17 @@ pub struct RetryPolicy {
     /// by this value (up to `max_backoff`).
     ///
     /// Default: 2.0 (exponential backoff).
-    pub backoff_multiplier: f64,
+    backoff_multiplier: f64,
 
     /// Maximum number of retry attempts.
     ///
     /// If `None`, retries indefinitely. If `Some(n)`, stops after `n` attempts.
     ///
     /// Default: None (infinite retries).
-    pub max_attempts: Option<usize>,
+    max_attempts: Option<usize>,
 
     /// The factor with which backoffs are randomized.
-    pub jitter: f64,
+    jitter: f64,
 }
 
 impl RetryPolicy {

@@ -264,30 +264,17 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Reconcile the `server_uri` scheme with the channel's security mode.
+    /// Prepend `https://` to a scheme-less `server_uri` on the secure path.
     ///
-    /// Secure path: bootstrap URIs like `trafficdirector.googleapis.com:443`
-    /// parse with no scheme, so `Endpoint` won't negotiate TLS. A `https://`
-    /// scheme lets it, and tonic derive SNI from `uri.host()`.
-    ///
-    /// Insecure path: bootstraps in the wild carry `https://` URIs alongside
-    /// `insecure` channel creds (e.g. `https://istiod.istio-system.svc:15010`,
-    /// istiod's plaintext port). With no TLS configured, passing the `https`
-    /// scheme through hands tonic a contradictory endpoint, so it is rewritten
-    /// to `http://` to match the creds — per xDS bootstrap semantics,
-    /// `channel_creds` decides transport security, not the URI scheme.
-    ///
-    /// Non-`http::Uri` inputs (`unix://`) are left as-is.
-    fn reconcile_server_uri(raw: &str, secure: bool) -> String {
-        if let Ok(uri) = raw.parse::<http::Uri>() {
-            if secure && uri.scheme().is_none() {
-                return format!("https://{raw}");
-            }
-            if !secure && uri.scheme_str() == Some("https") {
-                // Slice by scheme length: `http::Uri` normalizes the scheme's
-                // case, so don't assume the raw string spells it lowercase.
-                return format!("http://{}", &raw["https".len() + "://".len()..]);
-            }
+    /// Bootstrap URIs like `trafficdirector.googleapis.com:443` parse with no scheme,
+    /// so `Endpoint` won't negotiate TLS. A scheme lets it, and tonic derive SNI from
+    /// `uri.host()`. Non-`http::Uri` inputs (`unix://`) and plaintext are left as-is.
+    fn ensure_secure_server_uri(raw: &str, secure: bool) -> String {
+        if secure
+            && let Ok(uri) = raw.parse::<http::Uri>()
+            && uri.scheme().is_none()
+        {
+            return format!("https://{raw}");
         }
         raw.to_string()
     }
@@ -316,7 +303,7 @@ impl TransportBuilder for TonicTransportBuilder {
 
         // `Endpoint::from_shared` routes `unix://` URIs to tonic's UDS connector.
         // Required for control planes like Istio's grpc-agent that ship `unix:///etc/istio/proxy/XDS`.
-        let endpoint = Endpoint::from_shared(Self::reconcile_server_uri(server.uri(), secure))
+        let endpoint = Endpoint::from_shared(Self::ensure_secure_server_uri(server.uri(), secure))
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         let mut endpoint = endpoint.connect_timeout(self.connect_timeout);
@@ -590,35 +577,25 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_server_uri_matches_scheme_to_security_mode() {
+    fn ensure_secure_server_uri_adds_scheme_only_when_needed() {
         assert_eq!(
-            TonicTransportBuilder::reconcile_server_uri("trafficdirector.googleapis.com:443", true),
+            TonicTransportBuilder::ensure_secure_server_uri(
+                "trafficdirector.googleapis.com:443",
+                true
+            ),
             "https://trafficdirector.googleapis.com:443",
         );
         assert_eq!(
-            TonicTransportBuilder::reconcile_server_uri("https://xds.example.com:443", true),
+            TonicTransportBuilder::ensure_secure_server_uri("https://xds.example.com:443", true),
             "https://xds.example.com:443"
         );
         assert_eq!(
-            TonicTransportBuilder::reconcile_server_uri("unix:///etc/istio/proxy/XDS", true),
+            TonicTransportBuilder::ensure_secure_server_uri("unix:///etc/istio/proxy/XDS", true),
             "unix:///etc/istio/proxy/XDS"
         );
         assert_eq!(
-            TonicTransportBuilder::reconcile_server_uri("127.0.0.1:18000", false),
+            TonicTransportBuilder::ensure_secure_server_uri("127.0.0.1:18000", false),
             "127.0.0.1:18000"
-        );
-        // `https://` with insecure creds is rewritten to plaintext: the
-        // channel_creds decide security, not the URI scheme.
-        assert_eq!(
-            TonicTransportBuilder::reconcile_server_uri(
-                "https://istiod.istio-system.svc:15010",
-                false
-            ),
-            "http://istiod.istio-system.svc:15010"
-        );
-        assert_eq!(
-            TonicTransportBuilder::reconcile_server_uri("http://127.0.0.1:18000", false),
-            "http://127.0.0.1:18000"
         );
     }
 

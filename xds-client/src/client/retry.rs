@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use rand::RngExt;
+
 use crate::error::{Error, Result};
 
 /// Retry policy for xDS client connection attempts.
@@ -25,7 +27,7 @@ pub struct RetryPolicy {
     /// Initial backoff duration for the first retry attempt.
     ///
     /// Default: 1 second.
-    pub initial_backoff: Duration,
+    initial_backoff: Duration,
 
     /// Maximum backoff duration.
     ///
@@ -33,7 +35,7 @@ pub struct RetryPolicy {
     /// retry attempts have been made.
     ///
     /// Default: 30 seconds.
-    pub max_backoff: Duration,
+    max_backoff: Duration,
 
     /// Multiplier for exponential backoff.
     ///
@@ -41,14 +43,17 @@ pub struct RetryPolicy {
     /// by this value (up to `max_backoff`).
     ///
     /// Default: 2.0 (exponential backoff).
-    pub backoff_multiplier: f64,
+    backoff_multiplier: f64,
 
     /// Maximum number of retry attempts.
     ///
     /// If `None`, retries indefinitely. If `Some(n)`, stops after `n` attempts.
     ///
     /// Default: None (infinite retries).
-    pub max_attempts: Option<usize>,
+    max_attempts: Option<usize>,
+
+    /// The factor with which backoffs are randomized.
+    jitter: f64,
 }
 
 impl RetryPolicy {
@@ -101,7 +106,7 @@ impl RetryPolicy {
             initial_backoff,
             max_backoff,
             backoff_multiplier,
-            max_attempts: None,
+            ..Default::default()
         })
     }
 
@@ -154,6 +159,23 @@ impl RetryPolicy {
             )));
         }
         self.backoff_multiplier = multiplier;
+        Ok(self)
+    }
+
+    /// Set the jitter factor applied to each backoff delay (gRFC A6).
+    ///
+    /// `0.0` disables jitter; the default `0.2` randomizes each delay by ±20%.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `jitter` is not in the range `[0.0, 1.0]`.
+    pub fn with_jitter(mut self, jitter: f64) -> Result<Self> {
+        if !(0.0..=1.0).contains(&jitter) {
+            return Err(Error::Validation(format!(
+                "jitter must be between 0.0 and 1.0, got {jitter}"
+            )));
+        }
+        self.jitter = jitter;
         Ok(self)
     }
 
@@ -210,12 +232,14 @@ impl Default for RetryPolicy {
     /// - `max_backoff`: 30 seconds
     /// - `backoff_multiplier`: 2.0
     /// - `max_attempts`: None (infinite retries)
+    /// - `jitter`: 0.2
     fn default() -> Self {
         Self {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             backoff_multiplier: 2.0,
             max_attempts: None,
+            jitter: 0.2,
         }
     }
 }
@@ -233,15 +257,19 @@ impl Default for RetryPolicy {
 ///
 /// let mut backoff = Backoff::new(RetryPolicy::default());
 ///
-/// // First failure: get initial backoff
-/// assert_eq!(backoff.next_backoff(), Some(Duration::from_secs(1)));
+/// // Each backoff is the exponential base (1s, 2s, ...) randomized by ±20%
+/// // jitter, so it lands within [0.8x, 1.2x) of the base.
+/// let first = backoff.next_backoff().unwrap();
+/// assert!(first >= Duration::from_millis(800) && first < Duration::from_millis(1200));
 ///
-/// // Second failure: backoff doubles
-/// assert_eq!(backoff.next_backoff(), Some(Duration::from_secs(2)));
+/// // Second failure: the base doubles to 2s (again jittered ±20%).
+/// let second = backoff.next_backoff().unwrap();
+/// assert!(second >= Duration::from_millis(1600) && second < Duration::from_millis(2400));
 ///
-/// // Success: reset for next failure sequence
+/// // Success: reset for the next failure sequence (base returns to 1s).
 /// backoff.reset();
-/// assert_eq!(backoff.next_backoff(), Some(Duration::from_secs(1)));
+/// let after_reset = backoff.next_backoff().unwrap();
+/// assert!(after_reset >= Duration::from_millis(800) && after_reset < Duration::from_millis(1200));
 /// ```
 #[derive(Debug, Clone)]
 pub struct Backoff {
@@ -259,9 +287,10 @@ impl Backoff {
     ///
     /// Returns `None` if `max_attempts` is set and has been exceeded.
     pub fn next_backoff(&mut self) -> Option<Duration> {
-        let duration = self.policy.backoff_duration(self.attempt)?;
+        let base = self.policy.backoff_duration(self.attempt)?;
         self.attempt += 1;
-        Some(duration)
+        let factor = 1.0 + self.policy.jitter * rand::rng().random_range(-1.0..1.0);
+        Some(base.mul_f64(factor))
     }
 
     /// Reset the backoff after a successful operation.
@@ -270,5 +299,70 @@ impl Backoff {
     /// use the initial backoff duration.
     pub fn reset(&mut self) {
         self.attempt = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Epsilon for the float-derived duration bounds.
+    const EPSILON: f64 = 1e-9;
+
+    /// Each backoff is the exponential base randomized by ±jitter (0.2), so it
+    /// falls within `[base * 0.8, base * 1.2]` for the 1s/2s/4s schedule.
+    #[test]
+    fn next_backoff_applies_bounded_jitter() {
+        let mut backoff = Backoff::new(RetryPolicy::default()); // jitter 0.2, base 1s, mult 2
+        let msg = "next_backoff is Some while max_attempts is None";
+
+        // base 1s -> [0.8s, 1.2s]
+        let d = backoff.next_backoff().expect(msg);
+        assert!(d > Duration::from_secs_f64(0.8 - EPSILON));
+        assert!(d < Duration::from_secs_f64(1.2 + EPSILON));
+        // base 2s -> [1.6s, 2.4s]
+        let d = backoff.next_backoff().expect(msg);
+        assert!(d > Duration::from_secs_f64(1.6 - EPSILON));
+        assert!(d < Duration::from_secs_f64(2.4 + EPSILON));
+        // base 4s -> [3.2s, 4.8s]
+        let d = backoff.next_backoff().expect(msg);
+        assert!(d > Duration::from_secs_f64(3.2 - EPSILON));
+        assert!(d < Duration::from_secs_f64(4.8 + EPSILON));
+    }
+
+    /// With jitter disabled the backoff is fully deterministic: it doubles each
+    /// attempt, caps at `max_backoff`, and returns to the base after `reset`.
+    #[test]
+    fn backoff_reset_no_jitter() {
+        let policy = RetryPolicy::default()
+            .with_jitter(0.0)
+            .expect("0.0 should disabled jitter on retry policy");
+        let msg = "next_backoff is Some while max_attempts is None";
+        let mut backoff = Backoff::new(policy);
+
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(1));
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(2));
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(4));
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(8));
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(16));
+        // Capped at max_backoff (32s -> 30s).
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(30));
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(30));
+
+        backoff.reset();
+        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(1));
+    }
+
+    /// Jitter must be in `[0.0, 1.0]`; out-of-range values are rejected and a
+    /// valid value is stored verbatim.
+    #[test]
+    fn jitter_validation() {
+        for j in [-0.1, 1.5] {
+            assert!(RetryPolicy::default().with_jitter(j).is_err());
+        }
+        let policy = RetryPolicy::default()
+            .with_jitter(0.5)
+            .expect("0.5 is a valid jitter");
+        assert_eq!(policy.jitter, 0.5);
     }
 }

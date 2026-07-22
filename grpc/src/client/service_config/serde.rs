@@ -55,7 +55,9 @@ pub(crate) struct MethodConfigSerDe {
     pub(crate) timeout: Option<GrpcDuration>,
     pub(crate) retry_policy: Option<RetryPolicySerDe>,
     pub(crate) hedging_policy: Option<HedgingPolicySerDe>,
+    #[serde(default, deserialize_with = "deserialize_uint32_opt")]
     pub(crate) max_request_message_bytes: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_uint32_opt")]
     pub(crate) max_response_message_bytes: Option<u32>,
 }
 
@@ -262,4 +264,47 @@ impl From<LoadBalancingConfigSerDe> for LoadBalancingConfig {
             config: dto.config,
         }
     }
+}
+
+pub(crate) fn deserialize_uint32_opt<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptVisitor;
+    impl<'de> serde::de::Visitor<'de> for OptVisitor {
+        type Value = Option<u32>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a u32 or a string representing a u32 or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            v.try_into().map(Some).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            v.parse().map(Some).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+    }
+    deserializer.deserialize_option(OptVisitor)
 }

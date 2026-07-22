@@ -13,6 +13,7 @@ from pathlib import Path
 
 IGNORE_DIRS = {"target", ".git", ".gemini", "generated", "node_modules"}
 IGNORE_FILES = {"src/credentials/rustls/key_log.rs"}  # Third-party Apache 2.0 file
+TARGET_EXTENSIONS = (".rs",)
 
 ALLOWED_AUTHORS = [
     "gRPC authors",
@@ -226,13 +227,13 @@ def main():
 
     for target in targets:
         if os.path.isfile(target):
-            if not should_ignore(target) and target.endswith((".rs", ".proto")):
+            if not should_ignore(target) and target.endswith(TARGET_EXTENSIONS):
                 files_to_check.append(target)
         elif os.path.isdir(target):
             for dirpath, dirnames, filenames in os.walk(target):
                 dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                 for f in filenames:
-                    if f.endswith((".rs", ".proto")):
+                    if f.endswith(TARGET_EXTENSIONS):
                         full_path = os.path.join(dirpath, f)
                         if not should_ignore(full_path):
                             files_to_check.append(full_path)

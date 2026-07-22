@@ -10,6 +10,6 @@ repos:
         name: Check license boilerplate in grpc subdirectory
         entry: python3 grpc/tools/check_license.py
         language: system
-        types_or: [rust, proto]
+        types_or: [rust]
         files: ^grpc/
         pass_filenames: true

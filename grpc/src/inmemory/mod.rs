@@ -374,7 +374,8 @@ impl Transport for InMemoryTransport {
     }
 }
 
-/// An implementation of [`ClientConnectionSecurityContext`] for in-memory connections.
+/// An implementation of [`ClientConnectionSecurityContext`] for in-memory
+/// connections.
 #[derive(Debug, Clone)]
 struct InMemoryChannelecurityContext;
 
@@ -426,7 +427,6 @@ impl Resolver for InMemoryResolver {
 
         let service_config = channel_controller
             .parse_service_config(r#"{"loadBalancingConfig": [{"round_robin": {}}]}"#)
-            .into_inner()
             .map(Some);
 
         let _ = channel_controller.update(ResolverUpdate {

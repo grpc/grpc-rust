@@ -249,8 +249,9 @@ struct PersistentChannel {
 }
 
 impl PersistentChannel {
-    /// Returns the current state of the channel. If there is no underlying active channel,
-    /// returns Idle. If `connect` is true, will create a new active channel iff none exists.
+    /// Returns the current state of the channel. If there is no underlying active
+    /// channel, returns Idle. If `connect` is true, will create a new active
+    /// channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
         // Done this away to avoid potentially locking twice.
         let active_channel = if connect {
@@ -469,7 +470,7 @@ impl name_resolution::ChannelController for ResolverChannelController {
     }
 
     fn parse_service_config(&self, config: &str) -> ParseResult {
-        ParseResult(Err("service configs not supported".to_string()))
+        Err("service configs not supported".to_string())
     }
 }
 

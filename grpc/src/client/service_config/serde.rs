@@ -1,4 +1,26 @@
-use std::time::Duration;
+/*
+ *
+ * Copyright 2026 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -12,7 +34,7 @@ use super::MethodName;
 use super::RetryPolicy;
 use super::RetryThrottlingPolicy;
 use super::ServiceConfig;
-use super::json;
+use super::duration::GrpcDuration;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -30,13 +52,10 @@ pub(crate) struct ServiceConfigSerDe {
 pub(crate) struct MethodConfigSerDe {
     pub(crate) name: Vec<MethodNameSerDe>,
     pub(crate) wait_for_ready: Option<bool>,
-    #[serde(default, deserialize_with = "json::deserialize_duration_opt")]
-    pub(crate) timeout: Option<Duration>,
+    pub(crate) timeout: Option<GrpcDuration>,
     pub(crate) retry_policy: Option<RetryPolicySerDe>,
     pub(crate) hedging_policy: Option<HedgingPolicySerDe>,
-    #[serde(default, deserialize_with = "json::deserialize_uint32_opt")]
     pub(crate) max_request_message_bytes: Option<u32>,
-    #[serde(default, deserialize_with = "json::deserialize_uint32_opt")]
     pub(crate) max_response_message_bytes: Option<u32>,
 }
 
@@ -57,10 +76,8 @@ pub(crate) struct RetryThrottlingPolicySerDe {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryPolicySerDe {
     pub(crate) max_attempts: u32,
-    #[serde(deserialize_with = "json::deserialize_duration")]
-    pub(crate) initial_backoff: Duration,
-    #[serde(deserialize_with = "json::deserialize_duration")]
-    pub(crate) max_backoff: Duration,
+    pub(crate) initial_backoff: GrpcDuration,
+    pub(crate) max_backoff: GrpcDuration,
     pub(crate) backoff_multiplier: f32,
     pub(crate) retryable_status_codes: Vec<String>,
 }
@@ -69,8 +86,7 @@ pub(crate) struct RetryPolicySerDe {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HedgingPolicySerDe {
     pub(crate) max_attempts: u32,
-    #[serde(deserialize_with = "json::deserialize_duration")]
-    pub(crate) hedging_delay: Duration,
+    pub(crate) hedging_delay: GrpcDuration,
     #[serde(default)]
     pub(crate) non_fatal_status_codes: Option<Vec<String>>,
 }
@@ -174,7 +190,7 @@ impl From<MethodConfigSerDe> for MethodConfig {
         Self {
             name: dto.name.into_iter().map(Into::into).collect(),
             wait_for_ready: dto.wait_for_ready,
-            timeout: dto.timeout,
+            timeout: dto.timeout.map(Into::into),
             retry_policy: dto.retry_policy.map(Into::into),
             hedging_policy: dto.hedging_policy.map(Into::into),
             max_request_message_bytes: dto.max_request_message_bytes,

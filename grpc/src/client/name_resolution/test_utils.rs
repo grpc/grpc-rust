@@ -81,6 +81,6 @@ impl ChannelController for TestChannelController {
     }
 
     fn parse_service_config(&self, _: &str) -> ParseResult {
-        ParseResult(Err("Unimplemented".to_string()))
+        Err("Unimplemented".to_string())
     }
 }

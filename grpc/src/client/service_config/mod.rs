@@ -2,29 +2,32 @@
  *
  * Copyright 2026 gRPC authors.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
  *
  */
-use std::time::Duration;
 
-pub(crate) mod json;
+pub(crate) mod duration;
 pub(crate) mod serde;
+
+use duration::GrpcDuration;
+
+pub type ParseResult = Result<ServiceConfig, String>;
 
 /// An in-memory representation of a service config, provided to gRPC as a JSON
 /// object.
@@ -48,7 +51,7 @@ pub struct MethodConfig {
     /// List of methods this config applies to.
     pub(crate) name: Vec<MethodName>,
     pub(crate) wait_for_ready: Option<bool>,
-    pub(crate) timeout: Option<Duration>,
+    pub(crate) timeout: Option<GrpcDuration>,
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) hedging_policy: Option<HedgingPolicy>,
     pub max_request_message_bytes: Option<u32>,
@@ -75,8 +78,8 @@ pub struct RetryThrottlingPolicy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
     pub(crate) max_attempts: u32,
-    pub(crate) initial_backoff: Duration,
-    pub(crate) max_backoff: Duration,
+    pub(crate) initial_backoff: GrpcDuration,
+    pub(crate) max_backoff: GrpcDuration,
     pub(crate) backoff_multiplier: f32,
     pub(crate) retryable_status_codes: Vec<String>,
 }
@@ -84,7 +87,7 @@ pub struct RetryPolicy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HedgingPolicy {
     pub(crate) max_attempts: u32,
-    pub(crate) hedging_delay: Duration,
+    pub(crate) hedging_delay: GrpcDuration,
     pub(crate) non_fatal_status_codes: Option<Vec<String>>,
 }
 
@@ -123,56 +126,20 @@ impl MethodConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParseResult(pub Result<ServiceConfig, String>);
-
-impl ParseResult {
-    pub fn is_ok(&self) -> bool {
-        self.0.is_ok()
-    }
-
-    pub fn is_err(&self) -> bool {
-        self.0.is_err()
-    }
-
-    pub fn unwrap(self) -> ServiceConfig {
-        self.0.unwrap()
-    }
-
-    pub fn unwrap_err(self) -> String {
-        self.0.unwrap_err()
-    }
-
-    pub fn into_inner(self) -> Result<ServiceConfig, String> {
-        self.0
-    }
-}
-
-impl std::ops::Deref for ParseResult {
-    type Target = Result<ServiceConfig, String>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 impl ServiceConfig {
     /// Parses a service configuration from a JSON string.
     pub fn parse(config_json: &str) -> ParseResult {
         let config_serde: serde::ServiceConfigSerDe = match serde_json::from_str(config_json) {
             Ok(c) => c,
             Err(e) => {
-                return ParseResult(Err(format!(
-                    "failed to deserialize service config JSON: {}",
-                    e
-                )));
+                return Err(format!("failed to deserialize service config JSON: {}", e));
             }
         };
         let config: Self = config_serde.into();
         if let Err(e) = config.validate() {
-            return ParseResult(Err(e));
+            return Err(e);
         }
-        ParseResult(Ok(config))
+        Ok(config)
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -247,6 +214,8 @@ impl ServiceConfig {
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::*;
@@ -319,15 +288,21 @@ mod test {
         assert_eq!(mc.name[1].service, "grpc.examples.echo.Echo2");
         assert_eq!(mc.name[1].method, None);
 
-        assert_eq!(mc.timeout, Some(Duration::new(1, 500_000_000)));
+        assert_eq!(
+            mc.timeout,
+            Some(GrpcDuration(Duration::new(1, 500_000_000)))
+        );
         assert_eq!(mc.max_request_message_bytes, Some(1024));
         assert_eq!(mc.max_response_message_bytes, Some(2048));
 
         // Verify Retry Policy.
         let rp = mc.retry_policy.as_ref().unwrap();
         assert_eq!(rp.max_attempts, 3);
-        assert_eq!(rp.initial_backoff, Duration::new(0, 100_000_000));
-        assert_eq!(rp.max_backoff, Duration::from_secs(1));
+        assert_eq!(
+            rp.initial_backoff,
+            GrpcDuration(Duration::new(0, 100_000_000))
+        );
+        assert_eq!(rp.max_backoff, GrpcDuration(Duration::from_secs(1)));
         assert_eq!(rp.backoff_multiplier, 2.0);
         assert_eq!(rp.retryable_status_codes, vec!["UNAVAILABLE", "INTERNAL"]);
 
@@ -335,7 +310,7 @@ mod test {
         assert_eq!(mc2.wait_for_ready, Some(true));
         let hp = mc2.hedging_policy.as_ref().unwrap();
         assert_eq!(hp.max_attempts, 3);
-        assert_eq!(hp.hedging_delay, Duration::from_millis(500));
+        assert_eq!(hp.hedging_delay, GrpcDuration(Duration::from_millis(500)));
         assert_eq!(
             hp.non_fatal_status_codes,
             Some(vec!["UNAVAILABLE".to_string()])

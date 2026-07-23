@@ -24,17 +24,17 @@ static GLOBAL_COUNTERS: OnceLock<Arc<ClusterRequestCounterState>> = OnceLock::ne
 
 /// Shared circuit-breaking state for xDS clusters.
 #[derive(Clone, Debug)]
-pub(crate) struct ClusterCircuitBreakers {
-    inner: Arc<ClusterCircuitBreakersInner>,
+pub(crate) struct ClusterCircuitBreakerRegistry {
+    inner: Arc<ClusterCircuitBreakerRegistryInner>,
 }
 
 #[derive(Debug)]
-struct ClusterCircuitBreakersInner {
+struct ClusterCircuitBreakerRegistryInner {
     configs: DashMap<String, Arc<ClusterCircuitBreakerState>>,
     counters: ClusterRequestCounters,
 }
 
-impl Drop for ClusterCircuitBreakersInner {
+impl Drop for ClusterCircuitBreakerRegistryInner {
     fn drop(&mut self) {
         for state in self.configs.iter() {
             if let Some(previous) = state.config.swap(None) {
@@ -47,14 +47,14 @@ impl Drop for ClusterCircuitBreakersInner {
     }
 }
 
-impl ClusterCircuitBreakers {
+impl ClusterCircuitBreakerRegistry {
     pub(crate) fn new() -> Self {
         Self::with_counters(ClusterRequestCounters::global())
     }
 
     fn with_counters(counters: ClusterRequestCounters) -> Self {
         Self {
-            inner: Arc::new(ClusterCircuitBreakersInner {
+            inner: Arc::new(ClusterCircuitBreakerRegistryInner {
                 configs: DashMap::new(),
                 counters,
             }),
@@ -193,7 +193,7 @@ impl ClusterCircuitBreakers {
     }
 }
 
-impl Default for ClusterCircuitBreakers {
+impl Default for ClusterCircuitBreakerRegistry {
     fn default() -> Self {
         Self::new()
     }
@@ -492,12 +492,12 @@ impl Drop for CircuitBreakerPermit {
 /// each admitted call represents one upstream attempt rather than queued work.
 #[derive(Clone)]
 pub(crate) struct CircuitBreakingLayer {
-    circuit_breakers: ClusterCircuitBreakers,
+    circuit_breakers: ClusterCircuitBreakerRegistry,
     breaker_cache: Arc<DashMap<String, Arc<ClusterCircuitBreaker>>>,
 }
 
 impl CircuitBreakingLayer {
-    pub(crate) fn new(circuit_breakers: ClusterCircuitBreakers) -> Self {
+    pub(crate) fn new(circuit_breakers: ClusterCircuitBreakerRegistry) -> Self {
         Self {
             circuit_breakers,
             breaker_cache: Arc::new(DashMap::new()),
@@ -529,7 +529,7 @@ impl<S> Layer<S> for CircuitBreakingLayer {
 #[derive(Clone)]
 pub(crate) struct CircuitBreakingService<S> {
     inner: S,
-    circuit_breakers: ClusterCircuitBreakers,
+    circuit_breakers: ClusterCircuitBreakerRegistry,
     breaker_cache: Arc<DashMap<String, Arc<ClusterCircuitBreaker>>>,
 }
 
@@ -611,6 +611,10 @@ enum CircuitBreakingError {
     NoRoutingDecision,
 }
 
+/// Marks responses rejected by the local circuit breaker before reaching an endpoint.
+///
+/// The retry layer uses this extension to distinguish local `UNAVAILABLE` drops
+/// from retryable responses returned by an upstream service.
 #[derive(Clone, Copy, Debug)]
 struct LocalCircuitBreakerDrop;
 
@@ -727,8 +731,8 @@ mod tests {
         request
     }
 
-    fn configured_breakers(max_requests: u32) -> ClusterCircuitBreakers {
-        let breakers = ClusterCircuitBreakers::new_for_test();
+    fn configured_breakers(max_requests: u32) -> ClusterCircuitBreakerRegistry {
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
         breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests });
         breakers
     }
@@ -929,7 +933,7 @@ mod tests {
             Ok::<_, BoxError>(Response::new(TonicBody::empty()))
         });
         let mut service =
-            CircuitBreakingLayer::new(ClusterCircuitBreakers::new_for_test()).layer(service);
+            CircuitBreakingLayer::new(ClusterCircuitBreakerRegistry::new_for_test()).layer(service);
 
         let response = service
             .ready()
@@ -1003,8 +1007,8 @@ mod tests {
     #[test]
     fn shared_counters_enforce_process_limit_with_per_channel_drop_counts() {
         let counters = ClusterRequestCounters::isolated();
-        let first_breakers = ClusterCircuitBreakers::with_counters(counters.clone());
-        let second_breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        let first_breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
+        let second_breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
         first_breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
         second_breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
 
@@ -1023,7 +1027,7 @@ mod tests {
 
     #[test]
     fn default_limit_rejects_the_1025th_request() {
-        let breakers = ClusterCircuitBreakers::new_for_test();
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
         let breaker = breakers.cluster_breaker(CLUSTER);
         let permits: Vec<_> = (0..DEFAULT_MAX_REQUESTS)
             .map(|_| breaker.acquire().unwrap())
@@ -1038,7 +1042,7 @@ mod tests {
 
     #[test]
     fn eds_service_name_change_uses_independent_counter() {
-        let breakers = ClusterCircuitBreakers::new_for_test();
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
         breakers.set_cluster_config(CLUSTER, "eds-a", CircuitBreakingConfig { max_requests: 1 });
         let first = breakers.acquire(CLUSTER).unwrap();
         assert_eq!(breakers.in_flight(CLUSTER), 1);
@@ -1058,7 +1062,7 @@ mod tests {
     #[test]
     fn idle_eds_service_name_change_cleans_up_previous_counter() {
         let counters = ClusterRequestCounters::isolated();
-        let breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        let breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
         breakers.set_cluster_config(CLUSTER, "eds-a", CircuitBreakingConfig { max_requests: 1 });
         assert_eq!(counters.counter_count(), 1);
 
@@ -1120,7 +1124,7 @@ mod tests {
     #[test]
     fn dropping_breakers_releases_config_counter_ref() {
         let counters = ClusterRequestCounters::isolated();
-        let breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        let breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
         breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
         let permit = breakers.acquire(CLUSTER).unwrap();
         drop(permit);
@@ -1161,7 +1165,7 @@ mod tests {
     #[test]
     fn cached_cluster_breaker_does_not_pin_default_counter() {
         let counters = ClusterRequestCounters::isolated();
-        let breakers = ClusterCircuitBreakers::with_counters(counters.clone());
+        let breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
         let breaker = breakers.cluster_breaker(CLUSTER);
         let permit = breaker.acquire().unwrap();
         assert_eq!(counters.counter_count(), 1);

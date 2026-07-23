@@ -4,7 +4,7 @@ name = "tonic"
 # - Remove path dependencies
 # - Update CHANGELOG.md.
 # - Create "v0.11.x" git tag.
-authors = ["Lucio Franco <luciofranco14@gmail.com>"]
+authors = ["gRPC authors"]
 categories = ["web-programming", "network-programming", "asynchronous"]
 description = """
 A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility.

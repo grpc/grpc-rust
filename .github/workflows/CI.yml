@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
-    - run: python3 grpc/tools/check_license.py grpc
+    - run: python3 tools/check_license.py
 
   build-protoc-plugin:
     runs-on: ${{ matrix.os }}

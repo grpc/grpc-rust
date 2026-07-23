@@ -25,7 +25,7 @@ COPYRIGHT_RE = re.compile(
 
 MIT_BLOCK_TEMPLATE = """/*
  *
- * Copyright <YEAR> gRPC authors.
+ * Copyright <YEAR> gRPC authors <grpc-io@googlegroups.com>.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -160,7 +160,7 @@ def validate_file(filepath: str) -> tuple[bool, str | None]:
 
 
 def main():
-    targets = sys.argv[1:] if len(sys.argv) > 1 else ["grpc" if os.path.exists("grpc") else "."]
+    targets = sys.argv[1:] if len(sys.argv) > 1 else ["."]
     files_to_check = []
 
     for target in targets:

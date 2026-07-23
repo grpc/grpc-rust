@@ -1,6 +1,6 @@
 [package]
 name = "codegen"
-authors = ["gRPC authors"]
+authors = ["gRPC authors <grpc-io@googlegroups.com>"]
 license = "MIT"
 edition = "2024"
 rust-version = { workspace = true }

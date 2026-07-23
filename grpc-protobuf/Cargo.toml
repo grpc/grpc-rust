@@ -1,7 +1,7 @@
 [package]
 name = "grpc-protobuf"
 version = "0.10.0"
-authors = ["gRPC authors"]
+authors = ["gRPC authors <grpc-io@googlegroups.com>"]
 license = "MIT"
 homepage = "https://grpc.io"
 repository = "https://github.com/grpc/grpc-rust"

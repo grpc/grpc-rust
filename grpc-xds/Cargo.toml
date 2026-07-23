@@ -1,7 +1,7 @@
 [package]
 name = "grpc-xds"
 version = "0.1.0-alpha.1"
-authors = ["gRPC authors"]
+authors = ["gRPC authors <grpc-io@googlegroups.com>"]
 license = "MIT"
 homepage = "https://grpc.io"
 repository = "https://github.com/grpc/grpc-rust"

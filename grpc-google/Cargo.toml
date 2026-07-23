@@ -2,7 +2,7 @@
 name = "grpc-google"
 version = "0.0.0-alpha"
 edition = "2024"
-authors = ["gRPC authors"]
+authors = ["gRPC authors <grpc-io@googlegroups.com>"]
 license = "MIT"
 rust-version = { workspace = true }
 publish = false

@@ -55,10 +55,8 @@ pub(crate) struct MethodConfigSerDe {
     pub(crate) timeout: Option<GrpcDuration>,
     pub(crate) retry_policy: Option<RetryPolicySerDe>,
     pub(crate) hedging_policy: Option<HedgingPolicySerDe>,
-    #[serde(default, deserialize_with = "deserialize_uint32_opt")]
-    pub(crate) max_request_message_bytes: Option<u32>,
-    #[serde(default, deserialize_with = "deserialize_uint32_opt")]
-    pub(crate) max_response_message_bytes: Option<u32>,
+    pub(crate) max_request_message_bytes: Option<SerdeU32>,
+    pub(crate) max_response_message_bytes: Option<SerdeU32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,14 +68,14 @@ pub(crate) struct MethodNameSerDe {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryThrottlingPolicySerDe {
-    pub(crate) max_tokens: u32,
+    pub(crate) max_tokens: SerdeU32,
     pub(crate) token_ratio: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryPolicySerDe {
-    pub(crate) max_attempts: u32,
+    pub(crate) max_attempts: SerdeU32,
     pub(crate) initial_backoff: GrpcDuration,
     pub(crate) max_backoff: GrpcDuration,
     pub(crate) backoff_multiplier: f32,
@@ -87,7 +85,7 @@ pub(crate) struct RetryPolicySerDe {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HedgingPolicySerDe {
-    pub(crate) max_attempts: u32,
+    pub(crate) max_attempts: SerdeU32,
     pub(crate) hedging_delay: GrpcDuration,
     #[serde(default)]
     pub(crate) non_fatal_status_codes: Option<Vec<String>>,
@@ -104,11 +102,11 @@ pub(crate) struct HealthCheckConfigSerDe {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectionScalingSerDe {
     #[serde(default = "default_max_connections_per_subchannel")]
-    pub(crate) max_connections_per_subchannel: u32,
+    pub(crate) max_connections_per_subchannel: SerdeU32,
 }
 
-fn default_max_connections_per_subchannel() -> u32 {
-    10
+fn default_max_connections_per_subchannel() -> SerdeU32 {
+    SerdeU32(10)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,11 +190,11 @@ impl From<MethodConfigSerDe> for MethodConfig {
         Self {
             name: dto.name.into_iter().map(Into::into).collect(),
             wait_for_ready: dto.wait_for_ready,
-            timeout: dto.timeout.map(Into::into),
+            timeout: dto.timeout,
             retry_policy: dto.retry_policy.map(Into::into),
             hedging_policy: dto.hedging_policy.map(Into::into),
-            max_request_message_bytes: dto.max_request_message_bytes,
-            max_response_message_bytes: dto.max_response_message_bytes,
+            max_request_message_bytes: dto.max_request_message_bytes.map(Into::into),
+            max_response_message_bytes: dto.max_response_message_bytes.map(Into::into),
         }
     }
 }
@@ -213,7 +211,7 @@ impl From<MethodNameSerDe> for MethodName {
 impl From<RetryThrottlingPolicySerDe> for RetryThrottlingPolicy {
     fn from(dto: RetryThrottlingPolicySerDe) -> Self {
         Self {
-            max_tokens: dto.max_tokens,
+            max_tokens: dto.max_tokens.into(),
             token_ratio: dto.token_ratio,
         }
     }
@@ -222,7 +220,7 @@ impl From<RetryThrottlingPolicySerDe> for RetryThrottlingPolicy {
 impl From<RetryPolicySerDe> for RetryPolicy {
     fn from(dto: RetryPolicySerDe) -> Self {
         Self {
-            max_attempts: dto.max_attempts,
+            max_attempts: dto.max_attempts.into(),
             initial_backoff: dto.initial_backoff,
             max_backoff: dto.max_backoff,
             backoff_multiplier: dto.backoff_multiplier,
@@ -234,7 +232,7 @@ impl From<RetryPolicySerDe> for RetryPolicy {
 impl From<HedgingPolicySerDe> for HedgingPolicy {
     fn from(dto: HedgingPolicySerDe) -> Self {
         Self {
-            max_attempts: dto.max_attempts,
+            max_attempts: dto.max_attempts.into(),
             hedging_delay: dto.hedging_delay,
             non_fatal_status_codes: dto.non_fatal_status_codes,
         }
@@ -252,7 +250,7 @@ impl From<HealthCheckConfigSerDe> for HealthCheckConfig {
 impl From<ConnectionScalingSerDe> for ConnectionScaling {
     fn from(dto: ConnectionScalingSerDe) -> Self {
         Self {
-            max_connections_per_subchannel: dto.max_connections_per_subchannel,
+            max_connections_per_subchannel: dto.max_connections_per_subchannel.into(),
         }
     }
 }
@@ -266,45 +264,79 @@ impl From<LoadBalancingConfigSerDe> for LoadBalancingConfig {
     }
 }
 
-pub(crate) fn deserialize_uint32_opt<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct OptVisitor;
-    impl<'de> serde::de::Visitor<'de> for OptVisitor {
-        type Value = Option<u32>;
+// Wraps a u32 to provide custom serialization and deserialization.
+// Specifically supports the deserialization of u32 values that may be
+// represented as strings in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct SerdeU32(pub(crate) u32);
 
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a u32 or a string representing a u32 or null")
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            v.try_into().map(Some).map_err(serde::de::Error::custom)
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            v.parse().map(Some).map_err(serde::de::Error::custom)
-        }
-
-        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            deserializer.deserialize_any(self)
-        }
+impl From<SerdeU32> for u32 {
+    fn from(v: SerdeU32) -> Self {
+        v.0
     }
-    deserializer.deserialize_option(OptVisitor)
+}
+
+impl<'de> Deserialize<'de> for SerdeU32 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SerdeU32;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a u32 or a string representing a u32")
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                v.try_into().map(SerdeU32).map_err(serde::de::Error::custom)
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                v.parse().map(SerdeU32).map_err(serde::de::Error::custom)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn test_serde_u32() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct TestStruct {
+            val: Option<SerdeU32>,
+        }
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": 123 })).unwrap();
+        assert_eq!(val.val, Some(SerdeU32(123)));
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": "456" })).unwrap();
+        assert_eq!(val.val, Some(SerdeU32(456)));
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": null })).unwrap();
+        assert_eq!(val.val, None);
+
+        let val: TestStruct = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(val.val, None);
+
+        let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": "invalid" }));
+        assert!(res.is_err());
+
+        let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": -1 }));
+        assert!(res.is_err());
+    }
 }

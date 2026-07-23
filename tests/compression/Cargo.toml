@@ -1,5 +1,5 @@
 [package]
-authors = ["Lucio Franco <luciofranco14@gmail.com>"]
+authors = ["gRPC authors"]
 edition = "2021"
 license = "MIT"
 name = "compression"

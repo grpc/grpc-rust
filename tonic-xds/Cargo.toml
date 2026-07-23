@@ -8,7 +8,7 @@ repository = "https://github.com/hyperium/tonic"
 authors = [
     "Ankur Mittal <ankurmit2006@gmail.com>",
     "Jeff Jiang <guokeno0@gmail.com>",
-    "Lucio Franco <luciofranco14@gmail.com>",
+    "gRPC authors",
     "Yutao Ma <ytma98@gmail.com>"
 ]
 categories = ["web-programming", "network-programming", "asynchronous"]

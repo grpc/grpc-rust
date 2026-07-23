@@ -25,7 +25,7 @@ COPYRIGHT_RE = re.compile(
 
 MIT_BLOCK_TEMPLATE = """/*
  *
- * Copyright <YEAR> gRPC authors <grpc-io@googlegroups.com>.
+ * Copyright <YEAR> gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to

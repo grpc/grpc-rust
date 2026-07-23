@@ -5,12 +5,14 @@ use crate::client::route::{Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
+use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use crate::{TonicCallCredentials, XdsUri};
 use http::Request;
+#[cfg(feature = "_tls-any")]
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -168,20 +170,26 @@ const _: fn() = || {
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
     recorder: Option<Arc<dyn MetricsRecorder>>,
+    #[cfg(feature = "_tls-any")]
+    cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
 
 impl Debug for XdsChannelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("XdsChannelBuilder")
-            .field("config", &self.config)
-            .field(
-                "recorder",
-                &self
-                    .recorder
-                    .as_deref()
-                    .map_or("None", |r| std::any::type_name_of_val(r)),
-            )
-            .finish()
+        let mut s = f.debug_struct("XdsChannelBuilder");
+        s.field("config", &self.config).field(
+            "recorder",
+            &self
+                .recorder
+                .as_deref()
+                .map_or("None", |r| std::any::type_name_of_val(r)),
+        );
+        #[cfg(feature = "_tls-any")]
+        s.field(
+            "cert_providers",
+            &self.cert_providers.keys().collect::<Vec<_>>(),
+        );
+        s.finish()
     }
 }
 
@@ -192,6 +200,8 @@ impl XdsChannelBuilder {
         Self {
             config: Arc::new(config),
             recorder: None,
+            #[cfg(feature = "_tls-any")]
+            cert_providers: HashMap::new(),
         }
     }
 
@@ -204,6 +214,22 @@ impl XdsChannelBuilder {
     #[must_use]
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// Registers a custom [`CertificateProvider`] under an xDS certificate
+    /// provider instance name, resolved by CDS `UpstreamTlsContext` references.
+    /// Shadows a bootstrap `file_watcher` instance of the same name.
+    ///
+    /// [`CertificateProvider`]: crate::CertificateProvider
+    #[cfg(feature = "_tls-any")]
+    #[must_use]
+    pub fn with_certificate_provider(
+        mut self,
+        instance_name: impl Into<String>,
+        provider: Arc<dyn CertificateProvider>,
+    ) -> Self {
+        self.cert_providers.insert(instance_name.into(), provider);
         self
     }
 
@@ -254,6 +280,7 @@ impl XdsChannelBuilder {
         #[cfg(feature = "_tls-any")]
         let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
             &bootstrap.certificate_providers,
+            self.cert_providers.clone(),
         )?);
 
         let node = Node::try_from(bootstrap.node)?;
@@ -688,8 +715,10 @@ mod tests {
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             Arc::new(XdsClusterDiscovery::new(cache, registry))
         };
         #[cfg(not(feature = "_tls-any"))]
@@ -821,8 +850,10 @@ mod tests {
         #[cfg(feature = "_tls-any")]
         let _channel = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             builder.build_from_cache(cache, registry, xds_client, resource_manager)
         };
         #[cfg(not(feature = "_tls-any"))]

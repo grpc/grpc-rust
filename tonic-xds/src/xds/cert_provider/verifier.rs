@@ -12,18 +12,30 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
+
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::ParsedCertificate;
-use rustls::{CertificateError, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use rustls::{
+    CertificateError, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME;
 use x509_parser::prelude::FromDer;
 
-use crate::xds::cert_provider::CertificateProvider;
+use crate::xds::cert_provider::{CertificateData, CertificateProvider};
 use crate::xds::resource::san_matcher::{SanEntry, SanMatcher};
+
+/// Parsed CA roots cached against the [`CertificateData`] they were parsed
+/// from. A provider returns the same `Arc` until it rotates, so an
+/// `Arc::ptr_eq` check lets us skip re-parsing the PEM on every handshake.
+struct CachedRoots {
+    data: Arc<CertificateData>,
+    store: Arc<RootCertStore>,
+}
 
 /// Verifier that chain-validates the peer cert and enforces gRFC A29 SAN
 /// matching. Sources CA roots from a [`CertificateProvider`] per handshake
@@ -32,6 +44,7 @@ pub(crate) struct XdsServerCertVerifier {
     ca_provider: Arc<dyn CertificateProvider>,
     supported_algs: WebPkiSupportedAlgorithms,
     san_matchers: Vec<SanMatcher>,
+    roots_cache: ArcSwapOption<CachedRoots>,
 }
 
 impl std::fmt::Debug for XdsServerCertVerifier {
@@ -52,7 +65,32 @@ impl XdsServerCertVerifier {
             ca_provider,
             supported_algs: provider.signature_verification_algorithms,
             san_matchers,
+            roots_cache: ArcSwapOption::empty(),
         }
+    }
+
+    /// Return the parsed CA [`RootCertStore`] for `data`, reusing the cached
+    /// parse unless the provider has rotated to a new `Arc`.
+    fn root_store(&self, data: &Arc<CertificateData>) -> Result<Arc<RootCertStore>, RustlsError> {
+        let cached = self.roots_cache.load();
+        if let Some(cached) = cached.as_ref() {
+            if Arc::ptr_eq(&cached.data, data) {
+                return Ok(Arc::clone(&cached.store));
+            }
+        }
+
+        let roots_pem = data
+            .roots()
+            .ok_or_else(|| RustlsError::General("CA provider has no roots".into()))?;
+        let store = Arc::new(
+            parse_root_store(roots_pem)
+                .map_err(|e| RustlsError::General(format!("failed to parse CA roots: {e}")))?,
+        );
+        self.roots_cache.store(Some(Arc::new(CachedRoots {
+            data: Arc::clone(data),
+            store: Arc::clone(&store),
+        })));
+        Ok(store)
     }
 }
 
@@ -85,14 +123,12 @@ impl ServerCertVerifier for XdsServerCertVerifier {
             .ca_provider
             .fetch()
             .map_err(|e| RustlsError::General(format!("CA provider fetch failed: {e}")))?;
-        let roots = data
-            .roots()
-            .ok_or_else(|| RustlsError::General("CA provider has no roots".into()))?;
+        let roots = self.root_store(&data)?;
 
         let cert = ParsedCertificate::try_from(end_entity)?;
         verify_server_cert_signed_by_trust_anchor(
             &cert,
-            roots,
+            &roots,
             intermediates,
             now,
             self.supported_algs.all,
@@ -134,6 +170,20 @@ impl ServerCertVerifier for XdsServerCertVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.supported_algs.supported_schemes()
     }
+}
+
+/// Parse a PEM CA trust bundle into a rustls [`RootCertStore`].
+fn parse_root_store(pem: &[u8]) -> Result<RootCertStore, String> {
+    let mut reader = std::io::Cursor::new(pem);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut store = RootCertStore::empty();
+    let (added, _) = store.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err("no usable certificates in CA PEM".into());
+    }
+    Ok(store)
 }
 
 /// Extract SAN entries from an X.509 cert's subjectAltName extension.
@@ -196,7 +246,6 @@ mod tests {
     use super::*;
     use crate::xds::cert_provider::{CertProviderError, CertificateData, Identity};
     use rcgen::{CertificateParams, SanType as RcgenSanType};
-    use rustls::RootCertStore;
 
     /// Generate a self-signed DER cert carrying the given SANs.
     fn gen_cert_with_sans(sans: Vec<RcgenSanType>) -> CertificateDer<'static> {
@@ -290,10 +339,8 @@ mod tests {
     }
 
     /// Build a small chain: a self-signed CA and a leaf signed by it that
-    /// carries only a `URI` SAN (SPIFFE-style). Returns `(ca_der, leaf_der)`.
-    fn build_chain_with_spiffe_leaf(
-        spiffe_uri: &str,
-    ) -> (CertificateDer<'static>, CertificateDer<'static>) {
+    /// carries only a `URI` SAN (SPIFFE-style). Returns `(ca_pem, leaf_der)`.
+    fn build_chain_with_spiffe_leaf(spiffe_uri: &str) -> (Vec<u8>, CertificateDer<'static>) {
         use rcgen::{BasicConstraints, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 
         let ca_key = KeyPair::generate().unwrap();
@@ -301,7 +348,7 @@ mod tests {
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-        let ca_der = ca_cert.der().clone();
+        let ca_pem = ca_cert.pem().into_bytes();
 
         let leaf_key = KeyPair::generate().unwrap();
         let mut leaf_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -310,13 +357,7 @@ mod tests {
         let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
         let leaf_der = leaf_cert.der().clone();
 
-        (ca_der, leaf_der)
-    }
-
-    fn root_store_with(ca_der: CertificateDer<'static>) -> RootCertStore {
-        let mut store = RootCertStore::empty();
-        store.add(ca_der).unwrap();
-        store
+        (ca_pem, leaf_der)
     }
 
     /// Test shim: a [`CertificateProvider`] that returns a fixed snapshot.
@@ -328,9 +369,9 @@ mod tests {
         }
     }
 
-    fn provider_with_roots(store: RootCertStore) -> Arc<dyn CertificateProvider> {
+    fn provider_with_roots(roots_pem: Vec<u8>) -> Arc<dyn CertificateProvider> {
         Arc::new(StaticProvider(Arc::new(CertificateData::RootsOnly {
-            roots: Arc::new(store),
+            roots: roots_pem,
         })))
     }
 
@@ -353,9 +394,9 @@ mod tests {
 
     #[test]
     fn spiffe_uri_only_cert_with_matching_uri_matcher_passes() {
-        let (ca_der, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
+        let (ca_pem, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
         let verifier = XdsServerCertVerifier::new(
-            provider_with_roots(root_store_with(ca_der)),
+            provider_with_roots(ca_pem),
             vec![uri_matcher("spiffe://td/ns/prod/sa/api")],
         );
 
@@ -367,9 +408,9 @@ mod tests {
 
     #[test]
     fn spiffe_uri_only_cert_with_non_matching_matcher_fails() {
-        let (ca_der, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
+        let (ca_pem, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
         let verifier = XdsServerCertVerifier::new(
-            provider_with_roots(root_store_with(ca_der)),
+            provider_with_roots(ca_pem),
             vec![uri_matcher("spiffe://td/ns/prod/sa/other")],
         );
 
@@ -386,9 +427,8 @@ mod tests {
     #[test]
     fn spiffe_uri_only_cert_with_empty_matchers_passes_ca_only() {
         // per gRFC A29 §'Server Authorization': an empty matcher list passes
-        let (ca_der, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
-        let verifier =
-            XdsServerCertVerifier::new(provider_with_roots(root_store_with(ca_der)), vec![]);
+        let (ca_pem, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
+        let verifier = XdsServerCertVerifier::new(provider_with_roots(ca_pem), vec![]);
 
         let server_name = ServerName::try_from("any.connect.hostname").unwrap();
         let result =
@@ -398,13 +438,10 @@ mod tests {
 
     #[test]
     fn verify_fails_when_provider_has_no_roots() {
-        let (_ca_der, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
+        let (_ca_pem, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
         let provider: Arc<dyn CertificateProvider> =
             Arc::new(StaticProvider(Arc::new(CertificateData::IdentityOnly {
-                identity: Identity {
-                    cert_chain: b"chain".to_vec(),
-                    key: b"key".to_vec(),
-                },
+                identity: Identity::new(b"chain".to_vec(), b"key".to_vec()),
             })));
         let verifier = XdsServerCertVerifier::new(provider, vec![]);
 
@@ -415,6 +452,55 @@ mod tests {
         assert!(
             matches!(err, RustlsError::General(ref msg) if msg.contains("no roots")),
             "expected General(\"...no roots...\"), got {err:?}",
+        );
+    }
+
+    /// Test shim whose snapshot can be swapped at runtime, to exercise the
+    /// verifier's root-store cache across a provider rotation.
+    struct SwappableProvider(arc_swap::ArcSwap<CertificateData>);
+
+    impl CertificateProvider for SwappableProvider {
+        fn fetch(&self) -> Result<Arc<CertificateData>, CertProviderError> {
+            Ok(self.0.load_full())
+        }
+    }
+
+    #[test]
+    fn cached_roots_reused_then_invalidated_on_rotation() {
+        // `leaf_der` is signed by CA1; CA2 is an unrelated root.
+        let (ca1_pem, leaf_der) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
+        let (ca2_pem, _) = build_chain_with_spiffe_leaf("spiffe://td/ns/prod/sa/api");
+
+        let provider = Arc::new(SwappableProvider(arc_swap::ArcSwap::from_pointee(
+            CertificateData::RootsOnly { roots: ca1_pem },
+        )));
+        let verifier = XdsServerCertVerifier::new(
+            provider.clone(),
+            vec![uri_matcher("spiffe://td/ns/prod/sa/api")],
+        );
+        let server_name = ServerName::try_from("any.connect.hostname").unwrap();
+
+        // First call parses and caches CA1; the second hits the cache (same
+        // `Arc`). Both pass.
+        for _ in 0..2 {
+            assert!(
+                verifier
+                    .verify_server_cert(&leaf_der, &[], &server_name, &[], UnixTime::now())
+                    .is_ok()
+            );
+        }
+
+        // Rotate to an unrelated CA (a new `Arc`): the cache must invalidate and
+        // re-parse, so the leaf no longer chains to a trusted root.
+        provider
+            .0
+            .store(Arc::new(CertificateData::RootsOnly { roots: ca2_pem }));
+        let err = verifier
+            .verify_server_cert(&leaf_der, &[], &server_name, &[], UnixTime::now())
+            .unwrap_err();
+        assert!(
+            matches!(err, RustlsError::InvalidCertificate(_)),
+            "expected chain validation failure after rotation, got {err:?}",
         );
     }
 }

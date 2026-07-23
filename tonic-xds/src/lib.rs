@@ -151,6 +151,9 @@ pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
 pub use xds::uri::{XdsUri, XdsUriError};
 pub use xds_client::TonicCallCredentials;
 
+#[cfg(feature = "_tls-any")]
+pub use xds::cert_provider::{CertProviderError, CertificateData, CertificateProvider, Identity};
+
 pub use xds_client::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
 
 #[cfg(any(test, feature = "testutil"))]

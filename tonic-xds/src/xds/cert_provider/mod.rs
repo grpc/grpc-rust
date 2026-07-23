@@ -14,24 +14,52 @@ pub(crate) mod verifier;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustls::RootCertStore;
 use serde::Deserialize;
 
 use crate::xds::bootstrap::CertProviderPluginConfig;
 
 /// PEM-encoded identity (a cert chain paired with its private key).
-#[derive(Debug, Clone)]
-pub(crate) struct Identity {
-    pub(crate) cert_chain: Vec<u8>,
-    pub(crate) key: Vec<u8>,
+#[derive(Clone)]
+pub struct Identity {
+    cert_chain: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl Identity {
+    /// Creates an identity from a PEM certificate chain and PEM private key.
+    pub fn new(cert_chain: Vec<u8>, key: Vec<u8>) -> Self {
+        Self { cert_chain, key }
+    }
+
+    /// PEM-encoded certificate chain.
+    pub fn cert_chain(&self) -> &[u8] {
+        &self.cert_chain
+    }
+
+    /// PEM-encoded private key.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+}
+
+// Manual `Debug` keeps the private key out of logs.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field(
+                "cert_chain",
+                &format_args!("{} bytes", self.cert_chain.len()),
+            )
+            .field("key", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 /// Certificate material returned by a [`CertificateProvider`] plugin.
 ///
-/// CA roots are pre-parsed into an [`Arc<RootCertStore>`] so consumers reach
-/// for it on every TLS handshake without paying parse cost. Identity material
-/// stays as PEM bytes since [`tonic::transport::Identity::from_pem`] is
-/// itself bytes-only.
+/// Both the CA trust bundle and the identity are carried as PEM bytes; the
+/// consumer parses them (e.g. into a rustls `RootCertStore`) at the point of
+/// use.
 ///
 /// The variants encode two invariants from gRFC A29 and A65 at the type level:
 ///
@@ -47,26 +75,34 @@ pub(crate) struct Identity {
 ///   ("in the file-watcher certificate provider, at least one of the
 ///   `certificate_file` or `ca_certificate_file` fields must be specified")
 #[derive(Debug, Clone)]
-pub(crate) enum CertificateData {
+pub enum CertificateData {
     /// CA trust bundle only — used by TLS clients that don't present an
     /// identity.
-    RootsOnly { roots: Arc<RootCertStore> },
+    RootsOnly {
+        /// PEM-encoded CA trust anchors.
+        roots: Vec<u8>,
+    },
     /// Identity only — used by TLS servers that don't validate peers
     /// (non-mTLS). Peer validation falls back to system roots at the
     /// consumer layer if needed.
-    IdentityOnly { identity: Identity },
+    IdentityOnly {
+        /// Local certificate chain and private key.
+        identity: Identity,
+    },
     /// Both roots and identity — used for mTLS on either end.
     Both {
-        roots: Arc<RootCertStore>,
+        /// PEM-encoded CA trust anchors.
+        roots: Vec<u8>,
+        /// Local certificate chain and private key.
         identity: Identity,
     },
 }
 
 impl CertificateData {
-    /// Parsed CA trust bundle, if present.
-    pub(crate) fn roots(&self) -> Option<&Arc<RootCertStore>> {
+    /// PEM-encoded CA trust bundle, if present.
+    pub(crate) fn roots(&self) -> Option<&[u8]> {
         match self {
-            Self::RootsOnly { roots } | Self::Both { roots, .. } => Some(roots),
+            Self::RootsOnly { roots } | Self::Both { roots, .. } => Some(roots.as_slice()),
             Self::IdentityOnly { .. } => None,
         }
     }
@@ -82,31 +118,50 @@ impl CertificateData {
 
 /// Errors from certificate provider operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CertProviderError {
+    /// A certificate file could not be read.
     #[error("failed to read certificate file '{path}': {source}")]
     FileRead {
+        /// Path that failed to read.
         path: String,
+        /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// A certificate file was not valid PEM.
     #[error("failed to parse PEM in '{path}': {reason}")]
-    PemParse { path: String, reason: String },
+    PemParse {
+        /// Path that failed to parse.
+        path: String,
+        /// Parse failure reason.
+        reason: String,
+    },
+    /// The bootstrap named a plugin that is not built in.
     #[error("unknown certificate provider plugin: {0}")]
     UnknownPlugin(String),
+    /// A plugin's bootstrap config failed to deserialize.
     #[error("invalid config for plugin '{plugin}': {source}")]
     InvalidPluginConfig {
+        /// Plugin name.
         plugin: String,
+        /// Underlying deserialization error.
         source: serde_json::Error,
     },
+    /// `certificate_file` and `private_key_file` must both be set or unset.
     #[error(
         "invalid file_watcher config: 'certificate_file' and 'private_key_file' must both be \
          set or both be unset"
     )]
     UnpairedCertKey,
+    /// Neither an identity nor a CA bundle was configured.
     #[error(
         "invalid file_watcher config: at least one of 'certificate_file' or \
          'ca_certificate_file' must be specified"
     )]
     EmptyConfig,
+    /// Catch-all for errors raised by out-of-crate provider implementations.
+    #[error("certificate provider error: {0}")]
+    Other(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 /// A certificate provider plugin.
@@ -114,7 +169,7 @@ pub enum CertProviderError {
 /// Implementations obtain certificates from some source (local files, remote CA,
 /// etc.) and deliver them to consumers. Providers cache their last successful
 /// result and may refresh periodically.
-pub(crate) trait CertificateProvider: Send + Sync {
+pub trait CertificateProvider: Send + Sync {
     /// Fetch the current certificate data.
     ///
     /// Returns the most recently cached certificate material. This is called
@@ -141,21 +196,26 @@ impl std::fmt::Debug for CertProviderRegistry {
 }
 
 impl CertProviderRegistry {
-    /// Build a registry from the bootstrap `certificate_providers` map.
-    ///
-    /// Dispatches on `plugin_name` and deserializes the opaque `config`
-    /// into the appropriate plugin-specific type. Unknown plugin names
-    /// are rejected here.
+    /// Builds a registry from the bootstrap `certificate_providers` map,
+    /// dispatching on `plugin_name`, and merges in externally supplied provider
+    /// instances that shadow bootstrap instances of the same name.
     pub(crate) fn from_bootstrap(
         configs: &HashMap<String, CertProviderPluginConfig>,
+        injected: HashMap<String, Arc<dyn CertificateProvider>>,
     ) -> Result<Self, CertProviderError> {
         let mut providers: HashMap<String, Arc<dyn CertificateProvider>> =
-            HashMap::with_capacity(configs.len());
+            HashMap::with_capacity(configs.len() + injected.len());
 
         for (instance_name, entry) in configs {
+            // Injected providers shadow bootstrap instances of the same name.
+            if injected.contains_key(instance_name) {
+                continue;
+            }
             let provider = Self::create_provider(entry)?;
             providers.insert(instance_name.clone(), provider);
         }
+
+        providers.extend(injected);
 
         Ok(Self { providers })
     }
@@ -190,7 +250,7 @@ mod tests {
     #[test]
     fn empty_bootstrap_creates_empty_registry() {
         let configs = HashMap::new();
-        let registry = CertProviderRegistry::from_bootstrap(&configs).unwrap();
+        let registry = CertProviderRegistry::from_bootstrap(&configs, HashMap::new()).unwrap();
         assert!(registry.get("anything").is_none());
     }
 
@@ -206,14 +266,72 @@ mod tests {
             }
         }"#;
         let config = crate::xds::bootstrap::BootstrapConfig::from_json(json).unwrap();
-        let err = CertProviderRegistry::from_bootstrap(&config.certificate_providers);
+        let err =
+            CertProviderRegistry::from_bootstrap(&config.certificate_providers, HashMap::new());
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("unknown_plugin"));
     }
 
     #[test]
     fn get_returns_none_for_missing_instance() {
-        let registry = CertProviderRegistry::from_bootstrap(&HashMap::new()).unwrap();
+        let registry =
+            CertProviderRegistry::from_bootstrap(&HashMap::new(), HashMap::new()).unwrap();
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    struct StaticProvider(Arc<CertificateData>);
+
+    impl CertificateProvider for StaticProvider {
+        fn fetch(&self) -> Result<Arc<CertificateData>, CertProviderError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn injected_provider_is_resolvable_by_instance_name() {
+        let provider: Arc<dyn CertificateProvider> =
+            Arc::new(StaticProvider(Arc::new(CertificateData::RootsOnly {
+                roots: Vec::new(),
+            })));
+        let mut injected: HashMap<String, Arc<dyn CertificateProvider>> = HashMap::new();
+        injected.insert("dv".to_string(), provider);
+
+        let registry = CertProviderRegistry::from_bootstrap(&HashMap::new(), injected).unwrap();
+
+        assert!(registry.get("dv").is_some());
+        assert!(registry.get("missing").is_none());
+    }
+
+    #[test]
+    fn injected_provider_overrides_bootstrap_instance_of_same_name() {
+        // The bootstrap "shared" instance points at a missing file, so it would
+        // fail to build; the injected "shared" must shadow it entirely.
+        let mut configs = HashMap::new();
+        configs.insert(
+            "shared".to_string(),
+            CertProviderPluginConfig {
+                plugin_name: file_watcher::PLUGIN_NAME.to_string(),
+                config: serde_json::json!({
+                    "ca_certificate_file": "/nonexistent/ca.pem",
+                }),
+            },
+        );
+
+        let injected_data = Arc::new(CertificateData::IdentityOnly {
+            identity: Identity::new(b"injected-cert".to_vec(), b"injected-key".to_vec()),
+        });
+        let mut injected: HashMap<String, Arc<dyn CertificateProvider>> = HashMap::new();
+        injected.insert(
+            "shared".to_string(),
+            Arc::new(StaticProvider(injected_data)),
+        );
+
+        let registry = CertProviderRegistry::from_bootstrap(&configs, injected).unwrap();
+
+        let data = registry.get("shared").unwrap().fetch().unwrap();
+        assert!(
+            matches!(*data, CertificateData::IdentityOnly { .. }),
+            "expected the injected provider to win over the bootstrap instance",
+        );
     }
 }

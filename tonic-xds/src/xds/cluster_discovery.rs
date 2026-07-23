@@ -268,7 +268,7 @@ impl Connector for TlsConnector {
             .and_then(|p| match p.fetch() {
                 Ok(data) => data
                     .identity()
-                    .map(|id| tonic::transport::Identity::from_pem(&id.cert_chain, &id.key)),
+                    .map(|id| tonic::transport::Identity::from_pem(id.cert_chain(), id.key())),
                 Err(e) => {
                     tracing::error!(
                         error = %e,
@@ -325,7 +325,7 @@ mod tests {
     #[cfg(feature = "_tls-any")]
     fn empty_registry() -> CertProviderRegistry {
         use std::collections::HashMap;
-        CertProviderRegistry::from_bootstrap(&HashMap::new()).unwrap()
+        CertProviderRegistry::from_bootstrap(&HashMap::new(), HashMap::new()).unwrap()
     }
 
     /// Plaintext dispatch under TLS feature.
@@ -374,7 +374,6 @@ mod tests {
         use crate::xds::cert_provider::{
             CertProviderError, CertificateData, CertificateProvider, Identity,
         };
-        use rustls::RootCertStore;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CountingIdentity {
@@ -397,15 +396,12 @@ mod tests {
 
         let ca_provider: Arc<dyn CertificateProvider> =
             Arc::new(StaticCa(Arc::new(CertificateData::RootsOnly {
-                roots: Arc::new(RootCertStore::empty()),
+                roots: Vec::new(),
             })));
         let verifier = Arc::new(XdsServerCertVerifier::new(ca_provider, vec![]));
 
         let identity_data = Arc::new(CertificateData::IdentityOnly {
-            identity: Identity {
-                cert_chain: b"cert".to_vec(),
-                key: b"key".to_vec(),
-            },
+            identity: Identity::new(b"cert".to_vec(), b"key".to_vec()),
         });
         let counter = Arc::new(CountingIdentity {
             count: AtomicUsize::new(0),

@@ -15,20 +15,17 @@ IGNORE_DIRS = {"target", ".git", ".gemini", "generated", "node_modules"}
 IGNORE_FILES = {"src/credentials/rustls/key_log.rs"}  # Third-party Apache 2.0 file
 TARGET_EXTENSIONS = (".rs",)
 
-ALLOWED_AUTHORS = [
-    "gRPC authors",
-]
 MIN_YEAR = 2025
 
-# Regex to capture: (prefix) Copyright [(c)] (year_spec) (author)
+# Regex to capture: (prefix) Copyright [(c)] (year_spec)
 COPYRIGHT_RE = re.compile(
-    r"^(\s*(?:/\*|\*|//)\s*)Copyright\s+(?:\(c\)\s+)?([\d\-,]+)\s+(.+)$",
+    r"^(\s*(?:/\*|\*|//)\s*)Copyright\s+(?:\(c\)\s+)?([\d\-,]+)\b",
     re.IGNORECASE,
 )
 
 MIT_BLOCK_TEMPLATE = """/*
  *
- * Copyright <YEAR> <AUTHOR>
+ * Copyright <YEAR> gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -49,46 +46,6 @@ MIT_BLOCK_TEMPLATE = """/*
  * IN THE SOFTWARE.
  *
  */""".splitlines()
-
-APACHE_BLOCK_TEMPLATE = """/*
- *
- * Copyright <YEAR> <AUTHOR>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */""".splitlines()
-
-APACHE_LINE_TEMPLATE = """// Copyright <YEAR> <AUTHOR>
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Note: This file contains modifications by the gRPC authors; see revision history for details.""".splitlines()
-
-TEMPLATES = [
-    ("MIT License (Block)", MIT_BLOCK_TEMPLATE),
-    ("Apache 2.0 License (Block)", APACHE_BLOCK_TEMPLATE),
-    ("Apache 2.0 License (Line Comment)", APACHE_LINE_TEMPLATE),
-]
 
 
 def should_ignore(filepath: str) -> bool:
@@ -139,31 +96,19 @@ def validate_copyright_years(year_spec: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def validate_copyright_author(author_str: str) -> tuple[bool, str | None]:
-    clean_author = author_str.rstrip(".").strip()
-    if clean_author not in ALLOWED_AUTHORS:
-        return False, f"Author '{clean_author}' not in allowed list: {ALLOWED_AUTHORS}"
-    return True, None
-
-
 def validate_copyright(header_lines: list[str]) -> tuple[bool, str | None]:
     for line in header_lines:
         match = COPYRIGHT_RE.match(line)
         if match:
             year_spec = match.group(2).strip()
-            author_str = match.group(3).strip()
 
             valid_years, year_err = validate_copyright_years(year_spec)
             if not valid_years:
                 return False, f"Copyright year validation failed on line {repr(line.strip())}: {year_err}"
 
-            valid_author, author_err = validate_copyright_author(author_str)
-            if not valid_author:
-                return False, f"Copyright author validation failed on line {repr(line.strip())}: {author_err}"
-
             return True, None
 
-    return False, "No valid 'Copyright <years> <author>' line found in header block"
+    return False, "No valid 'Copyright <years>' line found in header block"
 
 
 def normalize_header(header_lines: list[str]) -> list[str]:
@@ -171,35 +116,28 @@ def normalize_header(header_lines: list[str]) -> list[str]:
     for line in header_lines:
         match = COPYRIGHT_RE.match(line)
         if match:
-            prefix = match.group(1).rstrip()
-            norm_header.append(f"{prefix} Copyright <YEAR> <AUTHOR>")
+            norm_line = line[:match.start(2)] + "<YEAR>" + line[match.end(2):]
+            norm_header.append(norm_line.rstrip())
         else:
             norm_header.append(line.rstrip())
     return norm_header
 
 
 def check_diff(norm_header: list[str], filepath: str) -> tuple[bool, str | None]:
-    best_diff: list[str] | None = None
-    min_diff_len: int | None = None
-
-    for name, template in TEMPLATES:
-        diff = list(
-            difflib.unified_diff(
-                template,
-                norm_header,
-                fromfile=f"Expected {name}",
-                tofile=filepath,
-                lineterm="",
-            )
+    diff = list(
+        difflib.unified_diff(
+            MIT_BLOCK_TEMPLATE,
+            norm_header,
+            fromfile="Expected MIT License (Block)",
+            tofile=filepath,
+            lineterm="",
         )
-        if len(diff) == 0:
-            return True, None
-        if min_diff_len is None or len(diff) < min_diff_len:
-            min_diff_len = len(diff)
-            best_diff = diff
+    )
+    if not diff:
+        return True, None
 
-    diff_str = "\n".join(best_diff) if best_diff else "No matching template structure found."
-    return False, f"Boilerplate mismatch (diff against closest template):\n{diff_str}"
+    diff_str = "\n".join(diff)
+    return False, f"Boilerplate mismatch:\n{diff_str}"
 
 
 def validate_file(filepath: str) -> tuple[bool, str | None]:
@@ -254,7 +192,7 @@ def main():
             print(f"{reason}\n")
         sys.exit(1)
     else:
-        print("SUCCESS: All checked files contain exact MIT or Apache 2.0 boilerplate.")
+        print("SUCCESS: All checked files contain exact MIT license boilerplate.")
         sys.exit(0)
 
 

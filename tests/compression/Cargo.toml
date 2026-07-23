@@ -1,5 +1,5 @@
 [package]
-authors = ["gRPC authors <grpc-io@googlegroups.com>"]
+authors = ["gRPC authors"]
 edition = "2021"
 license = "MIT"
 name = "compression"

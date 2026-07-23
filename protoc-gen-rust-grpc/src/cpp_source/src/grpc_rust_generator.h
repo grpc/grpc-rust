@@ -1,4 +1,4 @@
-// Copyright 2025 gRPC authors <grpc-io@googlegroups.com>.
+// Copyright 2025 gRPC authors.
 //
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy

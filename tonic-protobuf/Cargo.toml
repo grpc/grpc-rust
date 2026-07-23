@@ -2,7 +2,7 @@
 name = "tonic-protobuf"
 version = "0.14.0"
 edition = "2024"
-authors = ["gRPC authors <grpc-io@googlegroups.com>"]
+authors = ["gRPC authors"]
 license = "MIT"
 publish = false
 rust-version = { workspace = true }

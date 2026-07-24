@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use crate::client::cluster::ClusterClientRegistryGrpc;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
@@ -5,18 +29,22 @@ use crate::client::route::{Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
+use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use crate::{TonicCallCredentials, XdsUri};
 use http::Request;
+#[cfg(feature = "_tls-any")]
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
 use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
-use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient};
+use xds_client::{
+    ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
+};
 
 use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
 
@@ -162,9 +190,31 @@ const _: fn() = || {
 };
 
 /// Builder for creating an [`XdsChannel`] or [`XdsChannelGrpc`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+    #[cfg(feature = "_tls-any")]
+    cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
+}
+
+impl Debug for XdsChannelBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("XdsChannelBuilder");
+        s.field("config", &self.config).field(
+            "recorder",
+            &self
+                .recorder
+                .as_deref()
+                .map_or("None", |r| std::any::type_name_of_val(r)),
+        );
+        #[cfg(feature = "_tls-any")]
+        s.field(
+            "cert_providers",
+            &self.cert_providers.keys().collect::<Vec<_>>(),
+        );
+        s.finish()
+    }
 }
 
 impl XdsChannelBuilder {
@@ -173,7 +223,52 @@ impl XdsChannelBuilder {
     pub fn new(config: XdsChannelConfig) -> Self {
         Self {
             config: Arc::new(config),
+            recorder: None,
+            #[cfg(feature = "_tls-any")]
+            cert_providers: HashMap::new(),
         }
+    }
+
+    /// Sets the [`MetricsRecorder`] backend that receives the gRFC A78 xDS
+    /// client metrics emitted by the underlying [`XdsClient`].
+    ///
+    /// By default no recorder is configured and metric emission is skipped.
+    /// With the `otel` feature, `with_otel_metrics` provides a one-call
+    /// OpenTelemetry setup.
+    #[must_use]
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Registers a custom [`CertificateProvider`] under an xDS certificate
+    /// provider instance name, resolved by CDS `UpstreamTlsContext` references.
+    /// Shadows a bootstrap `file_watcher` instance of the same name.
+    ///
+    /// [`CertificateProvider`]: crate::CertificateProvider
+    #[cfg(feature = "_tls-any")]
+    #[must_use]
+    pub fn with_certificate_provider(
+        mut self,
+        instance_name: impl Into<String>,
+        provider: Arc<dyn CertificateProvider>,
+    ) -> Self {
+        self.cert_providers.insert(instance_name.into(), provider);
+        self
+    }
+
+    /// Emits the gRFC A78 xDS client metrics through an OpenTelemetry `Meter`.
+    ///
+    /// Convenience wrapper over
+    /// [`with_metrics_recorder`](Self::with_metrics_recorder) that installs an
+    /// [`OtelMetricsRecorder`](xds_client_opentelemetry::OtelMetricsRecorder) from
+    /// the companion `xds-client-opentelemetry` crate. Requires the `otel` feature.
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn with_otel_metrics(self, meter: opentelemetry::metrics::Meter) -> Self {
+        self.with_metrics_recorder(Arc::new(
+            xds_client_opentelemetry::OtelMetricsRecorder::new(meter),
+        ))
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
@@ -209,13 +304,18 @@ impl XdsChannelBuilder {
         #[cfg(feature = "_tls-any")]
         let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
             &bootstrap.certificate_providers,
+            self.cert_providers.clone(),
         )?);
 
         let node = Node::try_from(bootstrap.node)?;
         let client_config =
             ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
-        let xds_client =
-            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime).build();
+        let mut client_builder =
+            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
+        if let Some(recorder) = self.recorder.clone() {
+            client_builder = client_builder.with_metrics_recorder(recorder);
+        }
+        let xds_client = client_builder.build();
 
         let cache = Arc::new(XdsCache::new());
         let resource_manager =
@@ -639,8 +739,10 @@ mod tests {
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             Arc::new(XdsClusterDiscovery::new(cache, registry))
         };
         #[cfg(not(feature = "_tls-any"))]
@@ -772,8 +874,10 @@ mod tests {
         #[cfg(feature = "_tls-any")]
         let _channel = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             builder.build_from_cache(cache, registry, xds_client, resource_manager)
         };
         #[cfg(not(feature = "_tls-any"))]

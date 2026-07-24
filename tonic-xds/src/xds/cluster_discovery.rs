@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! xDS-backed [`ClusterDiscovery`] implementation.
 //!
 //! Per cluster, [`XdsClusterDiscovery::discover_cluster`] spawns a task that
@@ -203,7 +227,7 @@ impl Connector for PlaintextConnector {
 /// - a verifier that reads CA roots from its [`CertificateProvider`] on
 ///   each handshake (so `file_watcher`-driven CA rotation is picked up
 ///   automatically), and
-/// - an optional identity provider for mTLS — fetched per [`connect`] call
+/// - an optional identity provider for mTLS — fetched per `connect` call
 ///   so identity rotation is picked up on each new connection.
 ///
 /// The connector is rebuilt by [`build_connector`] on every CDS update, so
@@ -268,7 +292,7 @@ impl Connector for TlsConnector {
             .and_then(|p| match p.fetch() {
                 Ok(data) => data
                     .identity()
-                    .map(|id| tonic::transport::Identity::from_pem(&id.cert_chain, &id.key)),
+                    .map(|id| tonic::transport::Identity::from_pem(id.cert_chain(), id.key())),
                 Err(e) => {
                     tracing::error!(
                         error = %e,
@@ -325,7 +349,7 @@ mod tests {
     #[cfg(feature = "_tls-any")]
     fn empty_registry() -> CertProviderRegistry {
         use std::collections::HashMap;
-        CertProviderRegistry::from_bootstrap(&HashMap::new()).unwrap()
+        CertProviderRegistry::from_bootstrap(&HashMap::new(), HashMap::new()).unwrap()
     }
 
     /// Plaintext dispatch under TLS feature.
@@ -374,7 +398,6 @@ mod tests {
         use crate::xds::cert_provider::{
             CertProviderError, CertificateData, CertificateProvider, Identity,
         };
-        use rustls::RootCertStore;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CountingIdentity {
@@ -397,15 +420,12 @@ mod tests {
 
         let ca_provider: Arc<dyn CertificateProvider> =
             Arc::new(StaticCa(Arc::new(CertificateData::RootsOnly {
-                roots: Arc::new(RootCertStore::empty()),
+                roots: Vec::new(),
             })));
         let verifier = Arc::new(XdsServerCertVerifier::new(ca_provider, vec![]));
 
         let identity_data = Arc::new(CertificateData::IdentityOnly {
-            identity: Identity {
-                cert_chain: b"cert".to_vec(),
-                key: b"key".to_vec(),
-            },
+            identity: Identity::new(b"cert".to_vec(), b"key".to_vec()),
         });
         let counter = Arc::new(CountingIdentity {
             count: AtomicUsize::new(0),

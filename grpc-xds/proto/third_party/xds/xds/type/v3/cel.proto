@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package xds.type.v3;
+
+import "google/api/expr/v1alpha1/checked.proto";
+import "google/api/expr/v1alpha1/syntax.proto";
+import "cel/expr/checked.proto";
+import "cel/expr/syntax.proto";
+import "google/protobuf/wrappers.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "validate/validate.proto";
+
+option java_package = "com.github.xds.type.v3";
+option java_outer_classname = "CelProto";
+option java_multiple_files = true;
+option go_package = "github.com/cncf/xds/go/xds/type/v3";
+
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: Common Expression Language (CEL)]
+
+// Either parsed or checked representation of the `Common Expression Language
+// <https://github.com/google/cel-spec>`_ (CEL) program.
+message CelExpression {
+  oneof expr_specifier {
+    // Parsed expression in abstract syntax tree (AST) form.
+    //
+    // Deprecated -- use ``cel_expr_parsed`` field instead.
+    // If ``cel_expr_parsed`` or ``cel_expr_checked`` is set, this field is not used.
+    google.api.expr.v1alpha1.ParsedExpr parsed_expr = 1  [deprecated = true];
+
+    // Parsed expression in abstract syntax tree (AST) form that has been successfully type checked.
+    //
+    // Deprecated -- use ``cel_expr_checked`` field instead.
+    // If ``cel_expr_parsed`` or ``cel_expr_checked`` is set, this field is not used.
+    google.api.expr.v1alpha1.CheckedExpr checked_expr = 2  [deprecated = true];
+  }
+
+  // Parsed expression in abstract syntax tree (AST) form.
+  //
+  // If ``cel_expr_checked`` is set, this field is not used.
+  cel.expr.ParsedExpr cel_expr_parsed = 3;
+
+  // Parsed expression in abstract syntax tree (AST) form that has been successfully type checked.
+  //
+  // If set, takes precedence over ``cel_expr_parsed``.
+  cel.expr.CheckedExpr cel_expr_checked = 4;
+
+  // Unparsed expression in string form. For example, ``request.headers['x-env'] == 'prod'`` will
+  // get ``x-env`` header value and compare it with ``prod``.
+  // Check the `Common Expression Language <https://github.com/google/cel-spec>`_ for more details.
+  //
+  // If set, takes precedence over ``cel_expr_parsed`` and ``cel_expr_checked``.
+  string cel_expr_string = 5;
+}
+
+// Extracts a string by evaluating a `Common Expression Language
+// <https://github.com/google/cel-spec>`_ (CEL) expression against the standardized set of
+// :ref:`HTTP attributes <arch_overview_attributes>`.
+//
+// .. attention::
+//
+//   Besides CEL evaluation raising an error explicitly, CEL program returning a type other than
+//   the ``string``, or not returning anything, are considered an error as well.
+//
+// [#comment:TODO(sergiitk): When implemented, add the extension tag.]
+message CelExtractString {
+  // The CEL expression used to extract a string from the CEL environment.
+  // the "subject string") that should be replaced.
+  CelExpression expr_extract = 1 [(validate.rules).message = {required: true}];
+
+  // If CEL expression evaluates to an error, this value is be returned to the caller.
+  // If not set, the error is propagated to the caller.
+  google.protobuf.StringValue default_value = 2;
+}

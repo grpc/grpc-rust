@@ -47,8 +47,8 @@ use crate::credentials::rustls::Identity;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
 use crate::credentials::rustls::client::ClientTlsConfig;
-use crate::credentials::rustls::client::RustlsChannelCredendials;
-use crate::credentials::rustls::server::RustlsServerCredendials;
+use crate::credentials::rustls::client::RustlsChannelCredentials;
+use crate::credentials::rustls::server::RustlsServerCredentials;
 use crate::credentials::rustls::server::ServerTlsConfig;
 use crate::private;
 use crate::rt::EndpointIoStream;
@@ -64,7 +64,7 @@ fn init_provider() {
     });
 }
 
-fn tls_credentials() -> (RustlsServerCredendials, RustlsChannelCredendials) {
+fn tls_credentials() -> (RustlsServerCredentials, RustlsChannelCredentials) {
     init_provider();
 
     let certs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -79,17 +79,17 @@ fn tls_credentials() -> (RustlsServerCredendials, RustlsChannelCredendials) {
     let identity = Identity::from_pem(server_cert, server_key);
     let identity_provider = StaticProvider::new(vec![identity]);
     let server_tls_config = ServerTlsConfig::new(identity_provider);
-    let server_creds = RustlsServerCredendials::new(server_tls_config).unwrap();
+    let server_creds = RustlsServerCredentials::new(server_tls_config).unwrap();
 
     let root_certs = RootCertificates::from_pem(ca_cert);
     let root_provider = StaticProvider::new(root_certs);
     let tls_client_config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
-    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+    let rustls_creds = RustlsChannelCredentials::new(tls_client_config).unwrap();
 
     (server_creds, rustls_creds)
 }
 
-async fn run_mock_tls_server(listener: TcpListener, creds: RustlsServerCredendials) {
+async fn run_mock_tls_server(listener: TcpListener, creds: RustlsServerCredentials) {
     let (stream, _) = listener.accept().await.unwrap();
     let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
     let runtime = GrpcRuntime::new(TokioRuntime::default());

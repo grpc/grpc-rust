@@ -98,7 +98,7 @@ impl ResolvesServerCert for SniResolver {
 }
 
 /// Settings for client certificate requests which may be made by
-/// [`RustlsServerCredendials`].
+/// [`RustlsServerCredentials`].
 #[non_exhaustive]
 pub enum TlsClientCertificateRequestType<R = StaticRootCertificatesProvider> {
     /// Server does not request client certificate.
@@ -174,9 +174,12 @@ impl From<TlsClientCertificateRequestType> for InnerClientCertificateRequestType
 
 /// gRPC TLS [`ServerCredentials`] based on [`rustls`].
 #[derive(Clone)]
-pub struct RustlsServerCredendials {
+pub struct RustlsServerCredentials {
     acceptor: TlsAcceptor,
 }
+
+#[deprecated(since = "0.10.0", note = "typo: use RustlsServerCredentials instead")]
+pub type RustlsServerCredendials = RustlsServerCredentials;
 
 /// Configuration for server-side TLS settings.
 pub struct ServerTlsConfig {
@@ -221,10 +224,10 @@ impl ServerTlsConfig {
     }
 }
 
-impl RustlsServerCredendials {
+impl RustlsServerCredentials {
     /// Constructs a new `RustlsServerCredentials` instance from the provided
     /// configuration.
-    pub fn new(config: ServerTlsConfig) -> Result<RustlsServerCredendials, String> {
+    pub fn new(config: ServerTlsConfig) -> Result<RustlsServerCredentials, String> {
         let provider = if let Some(p) = CryptoProvider::get_default() {
             p.as_ref().clone()
         } else {
@@ -240,7 +243,7 @@ impl RustlsServerCredendials {
     fn new_impl(
         mut config: ServerTlsConfig,
         provider: CryptoProvider,
-    ) -> Result<RustlsServerCredendials, String> {
+    ) -> Result<RustlsServerCredentials, String> {
         let provider = sanitize_crypto_provider(provider)?;
         let id_list = config.identities_provider.borrow_and_update().clone();
         if id_list.is_empty() {
@@ -313,7 +316,7 @@ impl RustlsServerCredendials {
         // Install a dummy ticketer that refuses to issue tickets.
         server_config.ticketer = Arc::new(NoTicketer);
 
-        Ok(RustlsServerCredendials {
+        Ok(RustlsServerCredentials {
             acceptor: TlsAcceptor::from(Arc::new(server_config)),
         })
     }
@@ -338,7 +341,7 @@ impl ProducesTickets for NoTicketer {
     }
 }
 
-impl ServerCredentials for RustlsServerCredendials {
+impl ServerCredentials for RustlsServerCredentials {
     type Output<Input> = TlsStream<Input>;
 
     async fn accept<Input: GrpcEndpoint>(

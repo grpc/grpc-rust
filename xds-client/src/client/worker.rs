@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! ADS worker that manages the xDS stream.
 //!
 //! The worker runs as a background task, managing:
@@ -78,6 +102,11 @@ impl ClientAttrs {
 pub(crate) struct RecorderHandle {
     recorder: Option<Arc<dyn MetricsRecorder>>,
     attrs: ClientAttrs,
+    /// Last-emitted `grpc.xds_client.resources` gauge value per
+    /// `resource_type -> cache_state`. Used to diff against the live
+    /// cache snapshot so we only push buckets whose count changed; the cache in
+    /// the worker remains the single source of truth.
+    resource_counts: HashMap<Arc<str>, HashMap<&'static str, i64>>,
 }
 
 impl RecorderHandle {
@@ -88,6 +117,7 @@ impl RecorderHandle {
                 target,
                 server: Arc::from(""),
             },
+            resource_counts: HashMap::new(),
         }
     }
 
@@ -146,49 +176,46 @@ impl RecorderHandle {
         }
     }
 
-    /// `grpc.xds_client.resources` — up-down-counter deltas for a state transition.
-    /// `prev` is `None` when the resource is being inserted into the cache for the first time.
-    fn record_resource_transition(
-        &self,
-        type_url: &Arc<str>,
-        prev: Option<&ResourceState>,
-        new: &ResourceState,
-    ) {
+    /// Reconcile the `grpc.xds_client.resources` gauge for `type_url` against an
+    /// authoritative cache snapshot (`cache_state` label -> current count).
+    ///
+    /// The worker's resource cache is the single source of truth; this only
+    /// diffs the snapshot against the values last emitted for `type_url` and
+    /// pushes the buckets that changed. Buckets that dropped out of the snapshot
+    /// are pushed as `0`, because a push gauge would otherwise retain a stale
+    /// non-zero reading for a bucket that has emptied. Idempotent: calling it
+    /// with an unchanged snapshot emits nothing.
+    fn sync_resource_counts(&mut self, type_url: &Arc<str>, counts: &HashMap<&'static str, i64>) {
         let Some(recorder) = &self.recorder else {
             return;
         };
-        let new_label = new.cache_state_label();
-        let prev_label = prev.map(ResourceState::cache_state_label);
-        if prev_label == Some(new_label) {
-            return;
-        }
-        if let Some(prev) = prev_label {
-            recorder.add_up_down_counter_i64(
-                &metrics::instruments::XDS_CLIENT_RESOURCES,
-                -1,
-                &self.attrs.cache_state_attrs(type_url, prev),
-            );
-        }
-        recorder.add_up_down_counter_i64(
-            &metrics::instruments::XDS_CLIENT_RESOURCES,
-            1,
-            &self.attrs.cache_state_attrs(type_url, new_label),
-        );
-    }
+        let last = self
+            .resource_counts
+            .entry(Arc::clone(type_url))
+            .or_default();
 
-    /// `grpc.xds_client.resources` — emit a `-1` delta for a resource
-    /// that is leaving the cache without any successor state.
-    fn record_resource_removal(&self, type_url: &Arc<str>, prev: &ResourceState) {
-        let Some(recorder) = &self.recorder else {
-            return;
-        };
-        recorder.add_up_down_counter_i64(
-            &metrics::instruments::XDS_CLIENT_RESOURCES,
-            -1,
-            &self
-                .attrs
-                .cache_state_attrs(type_url, prev.cache_state_label()),
-        );
+        // New or changed buckets.
+        for (&state, &count) in counts {
+            if last.get(&state) != Some(&count) {
+                recorder.record_gauge_i64(
+                    &metrics::instruments::XDS_CLIENT_RESOURCES,
+                    count,
+                    &self.attrs.cache_state_attrs(type_url, state),
+                );
+            }
+        }
+        // Buckets that emptied since the last snapshot — reset to 0.
+        for &state in last.keys() {
+            if !counts.contains_key(&state) {
+                recorder.record_gauge_i64(
+                    &metrics::instruments::XDS_CLIENT_RESOURCES,
+                    0,
+                    &self.attrs.cache_state_attrs(type_url, state),
+                );
+            }
+        }
+
+        *last = counts.clone();
     }
 }
 
@@ -458,6 +485,17 @@ impl TypeState {
             .filter(|e| e.subscription.matches(name))
             .map(|e| e.event_tx.clone())
             .collect()
+    }
+
+    /// Current number of cached resources in each `grpc.xds.cache_state`, keyed
+    /// by the canonical state label. States with no resources are omitted; this
+    /// is the authoritative snapshot for the `grpc.xds_client.resources` gauge.
+    fn resource_state_counts(&self) -> HashMap<&'static str, i64> {
+        let mut counts: HashMap<&'static str, i64> = HashMap::new();
+        for cached in self.cache.values() {
+            *counts.entry(cached.state.cache_state_label()).or_insert(0) += 1;
+        }
+        counts
     }
 }
 
@@ -859,13 +897,11 @@ where
 
         let subscriptions_changed = type_state.subscription != old_subscription;
 
-        // Emit resources gauge transition for newly-inserted cache entry.
+        // Reconcile the resources gauge from the updated cache.
         if was_new {
-            self.recorder.record_resource_transition(
-                &type_state.type_url,
-                None,
-                &ResourceState::Requested,
-            );
+            let counts = type_state.resource_state_counts();
+            self.recorder
+                .sync_resource_counts(&type_state.type_url, &counts);
         }
 
         // Start timer if resource is in Requested state
@@ -897,11 +933,11 @@ where
         let subscriptions_changed = type_state.subscription != old_subscription;
 
         if type_state.watchers.is_empty() {
-            for cached in type_state.cache.values() {
-                self.recorder
-                    .record_resource_removal(&type_state.type_url, &cached.state);
-            }
+            let type_url_arc = Arc::clone(&type_state.type_url);
             self.type_states.remove(&type_url);
+            // The type is gone — reset all of its resource buckets to zero.
+            self.recorder
+                .sync_resource_counts(&type_url_arc, &HashMap::new());
             // Cancel all pending resource timers for this type.
             self.resource_timers.retain(|key, _| key.0 != type_url);
         }
@@ -1059,16 +1095,13 @@ where
             Some(s) => {
                 for resource in &resources {
                     let resource_name = resource.name().to_string();
-                    let prev = s.cache.insert(
+                    s.cache.insert(
                         resource_name,
                         CachedResource::received(Arc::new(resource.clone())),
                     );
-                    self.recorder.record_resource_transition(
-                        &s.type_url,
-                        prev.as_ref().map(|c| &c.state),
-                        &ResourceState::Received,
-                    );
                 }
+                let counts = s.resource_state_counts();
+                self.recorder.sync_resource_counts(&s.type_url, &counts);
                 s.watchers
                     .iter()
                     .map(|(id, entry)| (*id, entry.event_tx.clone(), entry.subscription.clone()))
@@ -1115,15 +1148,13 @@ where
             None => return,
         };
 
-        let prev = type_state.cache.insert(
+        type_state.cache.insert(
             resource_name.to_string(),
             CachedResource::nacked(error.to_string()),
         );
-        self.recorder.record_resource_transition(
-            &type_state.type_url,
-            prev.as_ref().map(|c| &c.state),
-            &ResourceState::NACKed(error.to_string()),
-        );
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
 
         // Cancel the resource timer (gRFC A57).
         self.resource_timers
@@ -1170,14 +1201,9 @@ where
             .collect();
 
         for name in deleted_names {
-            let prev = type_state
+            type_state
                 .cache
                 .insert(name.clone(), CachedResource::does_not_exist());
-            self.recorder.record_resource_transition(
-                &type_state.type_url,
-                prev.as_ref().map(|c| &c.state),
-                &ResourceState::DoesNotExist,
-            );
 
             for event_tx in type_state.matching_watchers(&name) {
                 let (done, rx) = ProcessingDone::channel();
@@ -1189,6 +1215,11 @@ where
                 processing_done_futures.push(rx);
             }
         }
+
+        // Reconcile the resources gauge once from the updated cache.
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
 
         processing_done_futures
     }
@@ -1305,14 +1336,12 @@ where
             return;
         }
 
-        let prev = type_state
+        type_state
             .cache
             .insert(name.to_string(), CachedResource::does_not_exist());
-        self.recorder.record_resource_transition(
-            &type_state.type_url,
-            prev.as_ref().map(|c| &c.state),
-            &ResourceState::DoesNotExist,
-        );
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
 
         for event_tx in type_state.matching_watchers(name) {
             let (done, _rx) = ProcessingDone::channel();
@@ -1438,90 +1467,87 @@ mod tests {
         Arc::from("envoy.config.listener.v3.Listener")
     }
 
-    #[test]
-    fn transition_from_none_emits_only_increment() {
-        let (recorder, handle) = test_handle();
-        let type_url = test_type_url();
-        handle.record_resource_transition(&type_url, None, &ResourceState::Requested);
-
-        let events = recorder.take();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].instrument, "grpc.xds_client.resources");
-        assert_eq!(events[0].kind, Measurement::UpDownI64(1));
-        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("requested"));
-        assert_eq!(
-            attr(&events[0], "grpc.xds.resource_type"),
-            Some("envoy.config.listener.v3.Listener")
-        );
-        assert_eq!(attr(&events[0], "grpc.target"), Some("xds:///my-service"));
-        assert_eq!(attr(&events[0], "grpc.xds.authority"), Some("#old"));
-        assert_eq!(attr(&events[0], "grpc.xds.server"), None);
+    /// Value of the `resources` gauge emitted for a given `cache_state`, if any.
+    fn gauge_for(events: &[Recorded], cache_state: &str) -> Option<i64> {
+        events.iter().find_map(|e| {
+            if attr(e, "grpc.xds.cache_state") == Some(cache_state) {
+                match e.kind {
+                    Measurement::Gauge(v) => Some(v),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
     }
 
     #[test]
-    fn transition_emits_decrement_then_increment() {
-        let (recorder, handle) = test_handle();
+    fn first_sync_emits_each_bucket_with_attrs() {
+        let (recorder, mut handle) = test_handle();
         let type_url = test_type_url();
-        handle.record_resource_transition(
-            &type_url,
-            Some(&ResourceState::Received),
-            &ResourceState::NACKed("validation failed".into()),
-        );
+        let counts: HashMap<&'static str, i64> = HashMap::from([("acked", 2), ("requested", 1)]);
+        handle.sync_resource_counts(&type_url, &counts);
 
         let events = recorder.take();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, Measurement::UpDownI64(-1));
-        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("acked"));
-        assert_eq!(events[1].kind, Measurement::UpDownI64(1));
-        assert_eq!(attr(&events[1], "grpc.xds.cache_state"), Some("nacked"));
+        assert_eq!(gauge_for(&events, "acked"), Some(2));
+        assert_eq!(gauge_for(&events, "requested"), Some(1));
+
+        let acked = events
+            .iter()
+            .find(|e| attr(e, "grpc.xds.cache_state") == Some("acked"))
+            .expect("acked bucket emitted");
+        assert_eq!(acked.instrument, "grpc.xds_client.resources");
+        assert_eq!(
+            attr(acked, "grpc.xds.resource_type"),
+            Some("envoy.config.listener.v3.Listener")
+        );
+        assert_eq!(attr(acked, "grpc.target"), Some("xds:///my-service"));
+        assert_eq!(attr(acked, "grpc.xds.authority"), Some("#old"));
+        assert_eq!(attr(acked, "grpc.xds.server"), None);
     }
 
     #[test]
-    fn transition_to_same_state_is_a_no_op() {
-        let (recorder, handle) = test_handle();
+    fn unchanged_sync_is_idempotent() {
+        let (recorder, mut handle) = test_handle();
         let type_url = test_type_url();
-        handle.record_resource_transition(
-            &type_url,
-            Some(&ResourceState::NACKed("first".into())),
-            &ResourceState::NACKed("second".into()),
-        );
+        let counts: HashMap<&'static str, i64> = HashMap::from([("acked", 2)]);
+        handle.sync_resource_counts(&type_url, &counts);
+        let _ = recorder.take();
 
+        handle.sync_resource_counts(&type_url, &counts);
         assert!(recorder.take().is_empty());
     }
 
     #[test]
-    fn removal_emits_single_decrement_against_prev_state() {
-        let (recorder, handle) = test_handle();
+    fn sync_emits_only_changed_buckets() {
+        let (recorder, mut handle) = test_handle();
         let type_url = test_type_url();
-        handle.record_resource_removal(&type_url, &ResourceState::Received);
+        handle.sync_resource_counts(&type_url, &HashMap::from([("acked", 2)]));
+        let _ = recorder.take();
+
+        // `acked` drops to 1 and a new `nacked` bucket appears.
+        handle.sync_resource_counts(&type_url, &HashMap::from([("acked", 1), ("nacked", 1)]));
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 2);
+        assert_eq!(gauge_for(&events, "acked"), Some(1));
+        assert_eq!(gauge_for(&events, "nacked"), Some(1));
+    }
+
+    #[test]
+    fn emptied_bucket_is_reset_to_zero() {
+        let (recorder, mut handle) = test_handle();
+        let type_url = test_type_url();
+        handle.sync_resource_counts(&type_url, &HashMap::from([("acked", 1)]));
+        let _ = recorder.take();
+
+        // The whole type empties (e.g. all resources removed).
+        handle.sync_resource_counts(&type_url, &HashMap::new());
 
         let events = recorder.take();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].instrument, "grpc.xds_client.resources");
-        assert_eq!(events[0].kind, Measurement::UpDownI64(-1));
-        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("acked"));
-        assert_eq!(
-            attr(&events[0], "grpc.xds.resource_type"),
-            Some("envoy.config.listener.v3.Listener")
-        );
-    }
-
-    #[test]
-    fn add_then_remove_balances_to_zero() {
-        let (recorder, handle) = test_handle();
-        let type_url = test_type_url();
-        handle.record_resource_transition(&type_url, None, &ResourceState::Received);
-        handle.record_resource_removal(&type_url, &ResourceState::Received);
-
-        let events = recorder.take();
-        assert_eq!(events.len(), 2);
-        let net: i64 = events
-            .iter()
-            .map(|e| match e.kind {
-                Measurement::UpDownI64(v) => v,
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(net, 0);
+        assert_eq!(gauge_for(&events, "acked"), Some(0));
     }
 }

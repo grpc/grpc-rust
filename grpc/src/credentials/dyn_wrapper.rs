@@ -79,8 +79,8 @@ mod tests {
     use crate::credentials::LocalServerCredentials;
     use crate::credentials::SecurityLevel;
     use crate::rt;
-    use crate::rt::AsyncIoAdapter;
-    use crate::rt::tokio::TokioIoStream;
+    use crate::rt::EndpointIoStream;
+    use crate::rt::StreamEndpoint;
 
     #[tokio::test]
     async fn test_dyn_server_credential_dispatch() {
@@ -106,7 +106,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let server_stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
 
         let result = dyn_creds
             .dyn_accept(Box::new(server_stream) as Box<dyn GrpcEndpoint>, runtime)
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
 
         let mut buf = vec![0u8; 25];
-        AsyncIoAdapter::new(endpoint)
+        EndpointIoStream::new(endpoint)
             .read_exact(&mut buf)
             .await
             .unwrap();

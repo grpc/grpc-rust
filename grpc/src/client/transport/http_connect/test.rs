@@ -28,18 +28,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
 
+use http::HeaderValue;
 use rustls::crypto::ring;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
-use super::HttpConnectHandshaker;
 use crate::client::transport::ProxyOptions;
+use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
 use crate::credentials::ServerCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
+use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::Identity;
 use crate::credentials::rustls::RootCertificates;
@@ -62,8 +64,7 @@ fn init_provider() {
     });
 }
 
-#[tokio::test]
-async fn test_proxy_success_no_auth() {
+fn tls_credentials() -> (RustlsServerCredendials, RustlsChannelCredendials) {
     init_provider();
 
     let certs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,24 +81,87 @@ async fn test_proxy_success_no_auth() {
     let server_tls_config = ServerTlsConfig::new(identity_provider);
     let server_creds = RustlsServerCredendials::new(server_tls_config).unwrap();
 
+    let root_certs = RootCertificates::from_pem(ca_cert);
+    let root_provider = StaticProvider::new(root_certs);
+    let tls_client_config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
+    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
+
+    (server_creds, rustls_creds)
+}
+
+async fn run_mock_tls_server(listener: TcpListener, creds: RustlsServerCredendials) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let handshake_res = creds
+        .accept(stream, runtime, private::Internal)
+        .await
+        .unwrap();
+
+    let mut tls_stream = EndpointIoStream::new(handshake_res.endpoint);
+    let mut buf = vec![0u8; 5];
+    tls_stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, b"hello");
+    tls_stream.write_all(b"world").await.unwrap();
+}
+
+async fn perform_handshake(
+    handshaker: &HttpConnectHandshaker,
+    proxy_addr: SocketAddr,
+    target_port: u16,
+) -> Result<HandshakeOutput, String> {
+    let source = TcpStream::connect(proxy_addr).await.unwrap();
+    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
+
+    let info = ClientHandshakeInfo::default();
+    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let authority = Authority::new("localhost".to_string(), Some(target_port));
+
+    handshaker
+        .connect(
+            &authority,
+            Box::new(endpoint),
+            &info,
+            &runtime,
+            private::Internal,
+        )
+        .await
+}
+
+async fn verify_client_handshake(
+    handshaker: &HttpConnectHandshaker,
+    proxy_addr: SocketAddr,
+    server_port: u16,
+) {
+    let handshake_output = perform_handshake(handshaker, proxy_addr, server_port)
+        .await
+        .unwrap();
+
+    let mut client_stream = EndpointIoStream::new(handshake_output.endpoint);
+    client_stream.write_all(b"hello").await.unwrap();
+    let mut buf = vec![0u8; 5];
+    client_stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, b"world");
+}
+
+async fn run_client_handshake_fail(
+    handshaker: &HttpConnectHandshaker,
+    proxy_addr: SocketAddr,
+) -> String {
+    match perform_handshake(handshaker, proxy_addr, 12345).await {
+        Ok(_) => panic!("Expected connection failure"),
+        Err(e) => e,
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_success_no_auth() {
+    let (server_creds, rustls_creds) = tls_credentials();
+
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let server_handle = tokio::spawn(async move {
-        let (stream, _) = server_listener.accept().await.unwrap();
-        let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
-        let runtime = GrpcRuntime::new(TokioRuntime::default());
-        let handshake_res = server_creds
-            .accept(stream, runtime, private::Internal)
-            .await
-            .unwrap();
-
-        let mut tls_stream = EndpointIoStream::new(handshake_res.endpoint);
-        let mut buf = vec![0u8; 5];
-        tls_stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf, b"hello");
-        tls_stream.write_all(b"world").await.unwrap();
-    });
+    let server_handle = tokio::spawn(run_mock_tls_server(server_listener, server_creds));
 
     // Start Proxy
     let target_host = format!("localhost:{}", server_addr.port());
@@ -110,79 +174,21 @@ async fn test_proxy_success_no_auth() {
     .await;
 
     // Connect Client via Proxy using HttpConnectHandshaker directly.
-    let root_certs = RootCertificates::from_pem(ca_cert);
-    let root_provider = StaticProvider::new(root_certs);
-    let tls_client_config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
-    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
-
     let proxy_options = ProxyOptions::new(target_host, None);
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
-    let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
-
-    let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
-    let authority = Authority::new("localhost".to_string(), Some(server_addr.port()));
-
-    let handshake_output = handshaker
-        .connect(
-            &authority,
-            Box::new(endpoint),
-            &info,
-            &runtime,
-            private::Internal,
-        )
-        .await
-        .unwrap();
-
-    // Verify we can read/write to the TLS stream.
-    let mut client_stream = EndpointIoStream::new(handshake_output.endpoint);
-    client_stream.write_all(b"hello").await.unwrap();
-    let mut buf = vec![0u8; 5];
-    client_stream.read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf, b"world");
-
+    verify_client_handshake(&handshaker, proxy_addr, server_addr.port()).await;
     server_handle.await.unwrap();
 }
 
 #[tokio::test]
 async fn test_proxy_success_with_auth() {
-    init_provider();
-
-    // Start TLS Server using RustlsServerCredendials.
-    let certs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples/data/tls");
-
-    let server_cert = fs::read(certs_path.join("server.pem")).expect("failed to read server.pem");
-    let server_key = fs::read(certs_path.join("server.key")).expect("failed to read server.key");
-    let ca_cert = fs::read(certs_path.join("ca.pem")).expect("failed to read ca.pem");
-
-    let identity = Identity::from_pem(server_cert, server_key);
-    let identity_provider = StaticProvider::new(vec![identity]);
-    let server_tls_config = ServerTlsConfig::new(identity_provider);
-    let server_creds = RustlsServerCredendials::new(server_tls_config).unwrap();
+    let (server_creds, rustls_creds) = tls_credentials();
 
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let server_handle = tokio::spawn(async move {
-        let (stream, _) = server_listener.accept().await.unwrap();
-        let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
-        let runtime = GrpcRuntime::new(TokioRuntime::default());
-        let handshake_res = server_creds
-            .accept(stream, runtime, private::Internal)
-            .await
-            .unwrap();
-
-        let mut tls_stream = EndpointIoStream::new(handshake_res.endpoint);
-        let mut buf = vec![0u8; 5];
-        tls_stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf, b"hello");
-        tls_stream.write_all(b"world").await.unwrap();
-    });
+    let server_handle = tokio::spawn(run_mock_tls_server(server_listener, server_creds));
 
     // Start Proxy (expects Basic auth).
     let target_host = format!("localhost:{}", server_addr.port());
@@ -196,46 +202,17 @@ async fn test_proxy_success_with_auth() {
     .await;
 
     // Connect Client via Proxy with Auth Header.
-    let root_certs = RootCertificates::from_pem(ca_cert);
-    let root_provider = StaticProvider::new(root_certs);
-    let tls_client_config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
-    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
-
-    let auth_header = http::HeaderValue::from_str(expected_auth).unwrap();
+    let auth_header = HeaderValue::from_str(expected_auth).unwrap();
     let proxy_options = ProxyOptions::new(target_host, Some(auth_header));
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
-    let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
-
-    let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
-    let authority = Authority::new("localhost".to_string(), Some(server_addr.port()));
-
-    let handshake_output = handshaker
-        .connect(
-            &authority,
-            Box::new(endpoint),
-            &info,
-            &runtime,
-            private::Internal,
-        )
-        .await
-        .unwrap();
-
-    // Verify we can read/write to the TLS stream.
-    let mut client_stream = EndpointIoStream::new(handshake_output.endpoint);
-    client_stream.write_all(b"hello").await.unwrap();
-    let mut buf = vec![0u8; 5];
-    client_stream.read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf, b"world");
-
+    verify_client_handshake(&handshaker, proxy_addr, server_addr.port()).await;
     server_handle.await.unwrap();
 }
 
 #[tokio::test]
 async fn test_proxy_failure_large_header() {
-    init_provider();
+    let (_, rustls_creds) = tls_credentials();
 
     let target_host = "localhost:12345".to_string();
     let proxy_addr = spawn_proxy(ProxyConfig {
@@ -246,34 +223,10 @@ async fn test_proxy_failure_large_header() {
     })
     .await;
 
-    let tls_client_config = ClientTlsConfig::new()
-        .with_root_certificates_provider(StaticProvider::new(RootCertificates::from_pem(vec![])));
-    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
-
     let proxy_options = ProxyOptions::new(target_host, None);
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
-    let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
-
-    let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
-    let authority = Authority::new("localhost".to_string(), Some(12345));
-
-    let handshake_result = handshaker
-        .connect(
-            &authority,
-            Box::new(endpoint),
-            &info,
-            &runtime,
-            private::Internal,
-        )
-        .await;
-
-    let err_msg = match handshake_result {
-        Ok(_) => panic!("Expected connection failure"),
-        Err(e) => e,
-    };
+    let err_msg = run_client_handshake_fail(&handshaker, proxy_addr).await;
     assert!(
         err_msg.contains("Response too large"),
         "Expected 'Response too large', got: {}",
@@ -283,7 +236,7 @@ async fn test_proxy_failure_large_header() {
 
 #[tokio::test]
 async fn test_proxy_failure_invalid_response() {
-    init_provider();
+    let (_, rustls_creds) = tls_credentials();
 
     let target_host = "localhost:12345".to_string();
     let proxy_addr = spawn_proxy(ProxyConfig {
@@ -294,34 +247,10 @@ async fn test_proxy_failure_invalid_response() {
     })
     .await;
 
-    let tls_client_config = ClientTlsConfig::new()
-        .with_root_certificates_provider(StaticProvider::new(RootCertificates::from_pem(vec![])));
-    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
-
     let proxy_options = ProxyOptions::new(target_host, None);
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
-    let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
-
-    let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
-    let authority = Authority::new("localhost".to_string(), Some(12345));
-
-    let handshake_result = handshaker
-        .connect(
-            &authority,
-            Box::new(endpoint),
-            &info,
-            &runtime,
-            private::Internal,
-        )
-        .await;
-
-    let err_msg = match handshake_result {
-        Ok(_) => panic!("Expected connection failure"),
-        Err(e) => e,
-    };
+    let err_msg = run_client_handshake_fail(&handshaker, proxy_addr).await;
     assert!(
         err_msg.contains("Failed to parse HTTP response"),
         "Expected parse error, got: {}",
@@ -331,7 +260,7 @@ async fn test_proxy_failure_invalid_response() {
 
 #[tokio::test]
 async fn test_proxy_failure_bad_status() {
-    init_provider();
+    let (_, rustls_creds) = tls_credentials();
 
     let target_host = "localhost:12345".to_string();
     let proxy_addr = spawn_proxy(ProxyConfig {
@@ -342,34 +271,10 @@ async fn test_proxy_failure_bad_status() {
     })
     .await;
 
-    let tls_client_config = ClientTlsConfig::new()
-        .with_root_certificates_provider(StaticProvider::new(RootCertificates::from_pem(vec![])));
-    let rustls_creds = RustlsChannelCredendials::new(tls_client_config).unwrap();
-
     let proxy_options = ProxyOptions::new(target_host, None);
     let handshaker = HttpConnectHandshaker::new(Arc::new(rustls_creds), &proxy_options);
 
-    let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
-
-    let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
-    let authority = Authority::new("localhost".to_string(), Some(12345));
-
-    let handshake_result = handshaker
-        .connect(
-            &authority,
-            Box::new(endpoint),
-            &info,
-            &runtime,
-            private::Internal,
-        )
-        .await;
-
-    let err_msg = match handshake_result {
-        Ok(_) => panic!("Expected connection failure"),
-        Err(e) => e,
-    };
+    let err_msg = run_client_handshake_fail(&handshaker, proxy_addr).await;
     assert!(
         err_msg.contains("Proxy returned status 502"),
         "Expected 'Proxy returned status 502', got: {}",
@@ -411,21 +316,7 @@ async fn test_proxy_success_local_rewind_batched() {
     .await;
 
     // Connect Client via Proxy.
-    let source = TcpStream::connect(proxy_addr).await.unwrap();
-    let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
-
-    let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
-    let authority = Authority::new("localhost".to_string(), Some(target_addr.port()));
-
-    let handshake_output = handshaker
-        .connect(
-            &authority,
-            Box::new(endpoint),
-            &info,
-            &runtime,
-            private::Internal,
-        )
+    let handshake_output = perform_handshake(&handshaker, proxy_addr, target_addr.port())
         .await
         .unwrap();
 

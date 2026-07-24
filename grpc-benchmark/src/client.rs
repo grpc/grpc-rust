@@ -176,6 +176,13 @@ impl BenchmarkClient {
         let num_tasks = channel_count * rpc_count_per_conn;
         let (stats_response_tx, stats_response_rx) = mpsc::channel(num_tasks);
         let (stats_request_tx, stats_request_rx) = watch::channel(StatsRequestStatus::Waiting);
+        let histogram =
+            Histogram::new_with_max(histogram_params.max_possible as u64, 3).map_err(|err| {
+                Status::invalid_argument(format!(
+                    "failed to build histogram with given max_possible value: {}",
+                    err
+                ))
+            })?;
 
         for _ in 0..channel_count {
             let target = server_targets.next().unwrap(); // cyclic, non-empty iterator.
@@ -185,19 +192,12 @@ impl BenchmarkClient {
             }
             let channel = builder.build();
 
-            let histogram = Histogram::new_with_max(histogram_params.max_possible as u64, 3)
-                .map_err(|err| {
-                    Status::invalid_argument(format!(
-                        "failed to build histogram with given max_possible value: {}",
-                        err
-                    ))
-                })?;
             let args = TestOptions {
                 rpc_opts: RpcOptions {
                     payload_req_size,
                     payload_resp_size,
                     client: BenchmarkServiceClient::new(channel),
-                    histogram,
+                    histogram: histogram.clone(),
                     stats_response_tx: stats_response_tx.clone(),
                     stats_request_rx: stats_request_rx.clone(),
                     cancellation_requested: cancellation_requested.clone(),

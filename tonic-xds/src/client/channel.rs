@@ -46,7 +46,7 @@ use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
 
-use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
+use crate::client::retry::{GrpcRetryPolicy, RetryLayer};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -375,7 +375,7 @@ impl XdsChannelBuilder {
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = Arc::new(XdsClusterDiscovery::new(cache));
-        let retry_policy = GrpcRetryPolicy::new(GrpcRetryPolicyConfig::default());
+        let retry_policy = GrpcRetryPolicy::default();
 
         let resources = Arc::new(XdsChannelResources {
             _resource_manager: resource_manager,
@@ -662,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_once_on_unavailable() {
-        use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig};
+        use crate::client::retry::{GrpcRetryClassifier, GrpcRetryPolicy, RetryConfig};
         use crate::testutil::grpc::spawn_fail_first_n_server;
 
         // Server fails the first request with UNAVAILABLE, succeeds on retry.
@@ -674,9 +674,10 @@ mod tests {
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
         let retry_policy = GrpcRetryPolicy::new(
-            GrpcRetryPolicyConfig::new()
-                .retry_on(vec![tonic::Code::Unavailable])
-                .num_retries(1),
+            RetryConfig::new().num_retries(1),
+            GrpcRetryClassifier {
+                retry_on: vec![tonic::Code::Unavailable],
+            },
         );
 
         let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(

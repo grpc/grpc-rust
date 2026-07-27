@@ -34,6 +34,7 @@ use crate::transport::{Transport, TransportBuilder, TransportStream};
 use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tonic::client::Grpc;
@@ -65,6 +66,23 @@ const ADS_PATH: &str =
     "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
 
 const ADS_CHANNEL_BUFFER_SIZE: usize = 16;
+
+/// Default timeout for establishing the TCP/TLS connection to the xDS server.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default HTTP/2 keepalive PING interval on the ADS channel.
+///
+/// The ADS stream is mostly idle from the client's perspective (the server
+/// only pushes on resource changes), so without keepalives a half-open
+/// connection — e.g. after an xDS server restart where the RST/GOAWAY was
+/// lost, or a dropped conntrack/NAT entry — is undetectable: `recv()` on the
+/// stream pends forever and the client keeps serving its last known
+/// resources. Keepalives surface such connections as transport errors, which
+/// triggers the worker's reconnect + re-subscribe path.
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default time to wait for a keepalive PING ack before closing the connection.
+const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A codec that passes bytes through without serialization.
 ///
@@ -193,11 +211,9 @@ impl TonicTransport {
 /// let builder = TonicTransportBuilder::new()
 ///     .with_tls_config(ClientTlsConfig::new().with_enabled_roots());
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TonicTransportBuilder {
     // Future extensions:
-    // - Connection timeout settings
-    // - Keep-alive configuration
     // - Connection pooling settings
     // - Per-server credential overrides (via ServerConfig.extensions)
     #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
@@ -205,12 +221,52 @@ pub struct TonicTransportBuilder {
 
     /// Per-stream call credentials for the ADS stream.
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
+
+    /// Timeout for establishing the connection to the xDS server.
+    connect_timeout: Duration,
+
+    /// HTTP/2 keepalive PING interval; `None` disables keepalives.
+    keep_alive_interval: Option<Duration>,
+
+    /// Time to wait for a keepalive PING ack before closing the connection.
+    keep_alive_timeout: Duration,
+}
+
+impl Default for TonicTransportBuilder {
+    fn default() -> Self {
+        Self {
+            #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
+            tls_config: None,
+            call_creds: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
+            keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
+        }
+    }
 }
 
 impl TonicTransportBuilder {
     /// Create a new transport builder with default (plaintext) settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the timeout for establishing the connection to the xDS server.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Configure HTTP/2 keepalives on the ADS channel.
+    ///
+    /// A PING is sent every `interval` (even while the stream is idle); if no
+    /// ack arrives within `timeout` the connection is closed, surfacing a
+    /// transport error that triggers reconnect + re-subscription. Pass
+    /// `interval = None` to disable keepalives.
+    pub fn with_keep_alive(mut self, interval: Option<Duration>, timeout: Duration) -> Self {
+        self.keep_alive_interval = interval;
+        self.keep_alive_timeout = timeout;
+        self
     }
 
     /// Set the TLS configuration for connections to the xDS server.
@@ -273,6 +329,14 @@ impl TransportBuilder for TonicTransportBuilder {
         // Required for control planes like Istio's grpc-agent that ship `unix:///etc/istio/proxy/XDS`.
         let endpoint = Endpoint::from_shared(Self::ensure_secure_server_uri(server.uri(), secure))
             .map_err(|e| Error::Connection(e.to_string()))?;
+
+        let mut endpoint = endpoint.connect_timeout(self.connect_timeout);
+        if let Some(interval) = self.keep_alive_interval {
+            endpoint = endpoint
+                .http2_keep_alive_interval(interval)
+                .keep_alive_timeout(self.keep_alive_timeout)
+                .keep_alive_while_idle(true);
+        }
 
         #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
         let endpoint = match &self.tls_config {

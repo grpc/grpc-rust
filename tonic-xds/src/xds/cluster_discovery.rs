@@ -38,6 +38,7 @@
 //! connector is kept and a warning is logged.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
@@ -61,6 +62,33 @@ use crate::xds::resource::security::ClusterSecurityConfig;
 /// Buffer capacity for the discovery channel between the spawned task and
 /// Tower's LB layer.
 const DISCOVER_CHANNEL_CAPACITY: usize = 64;
+
+/// Timeout for establishing a connection to an endpoint.
+const ENDPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HTTP/2 keepalive PING interval for endpoint connections.
+const ENDPOINT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Time to wait for a keepalive PING ack before closing the connection.
+const ENDPOINT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Apply connection-liveness settings to a per-endpoint `Endpoint`.
+///
+/// Endpoint channels are created with `connect_lazy`, so a tonic `Channel`
+/// reports readiness independently of TCP connectivity. Without these
+/// settings a request routed to a black-holed address (e.g. a deleted pod IP,
+/// which Kubernetes drops without a RST) hangs on unanswered SYNs, and an
+/// established connection to a dead peer is never torn down — either way the
+/// endpoint stays "ready" to the LB and requests only die by the caller's
+/// deadline. The connect timeout and keepalives turn both cases into prompt
+/// transport errors instead.
+fn with_liveness_settings(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .connect_timeout(ENDPOINT_CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(ENDPOINT_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(ENDPOINT_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+}
 
 /// xDS-backed cluster discovery.
 ///
@@ -213,9 +241,9 @@ impl Connector for PlaintextConnector {
         // EndpointAddress only holds validated Ipv4/Ipv6/Hostname + u16 port,
         // and its Display impl produces "ip:port" or "hostname:port". Prefixing
         // with "http://" always yields a valid URI, so from_shared cannot fail.
-        let channel = Endpoint::from_shared(format!("http://{addr}"))
-            .expect("EndpointAddress Display guarantees valid URI")
-            .connect_lazy();
+        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+            .expect("EndpointAddress Display guarantees valid URI");
+        let channel = with_liveness_settings(endpoint).connect_lazy();
         let svc = EndpointChannel::new(channel);
         Box::pin(async move { svc })
     }
@@ -308,8 +336,10 @@ impl Connector for TlsConnector {
         }
 
         let uri = format!("https://{addr}");
-        let endpoint = Endpoint::from_shared(uri.clone())
-            .expect("EndpointAddress Display guarantees valid URI");
+        let endpoint = with_liveness_settings(
+            Endpoint::from_shared(uri.clone())
+                .expect("EndpointAddress Display guarantees valid URI"),
+        );
 
         let channel = match endpoint.tls_config_with_verifier(tls_config, verifier) {
             Ok(ep) => ep.connect_lazy(),
@@ -322,9 +352,11 @@ impl Connector for TlsConnector {
                     error = %e, address = %addr,
                     "tls_config_with_verifier failed; non-TLS lazy fallback",
                 );
-                Endpoint::from_shared(uri)
-                    .expect("EndpointAddress Display guarantees valid URI")
-                    .connect_lazy()
+                with_liveness_settings(
+                    Endpoint::from_shared(uri)
+                        .expect("EndpointAddress Display guarantees valid URI"),
+                )
+                .connect_lazy()
             }
         };
         let svc = EndpointChannel::new(channel);

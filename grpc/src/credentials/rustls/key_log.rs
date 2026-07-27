@@ -1,19 +1,28 @@
-// Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Note: This file contains modifications by the gRPC authors; see revision
-//history for details.
+/*
+ * Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ * NOTE: This file contains modifications by the gRPC authors; see revision
+ * history for details.
+ *
+ */
 
 use core::fmt::Debug;
 use core::fmt::Formatter;
@@ -37,7 +46,7 @@ impl KeyLogFileInner {
         let file = match OpenOptions::new().append(true).create(true).open(path) {
             Ok(f) => Some(f),
             Err(e) => {
-                eprintln!("unable to create key log file {path:?}: {e}");
+                eprintln!("unable to create key log file {}: {e}", path.display());
                 None
             }
         };
@@ -55,11 +64,11 @@ impl KeyLogFileInner {
 
         self.buf.truncate(0);
         write!(self.buf, "{label} ")?;
-        for b in client_random.iter() {
+        for b in client_random {
             write!(self.buf, "{b:02x}")?;
         }
         write!(self.buf, " ")?;
-        for b in secret.iter() {
+        for b in secret {
             write!(self.buf, "{b:02x}")?;
         }
         writeln!(self.buf)?;

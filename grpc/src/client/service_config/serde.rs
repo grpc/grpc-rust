@@ -38,43 +38,45 @@ use super::duration::GrpcDuration;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ServiceConfigSerDe {
+pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
-    pub(crate) load_balancing_config: Option<Vec<LoadBalancingConfigSerDe>>,
-    pub(crate) method_config: Option<Vec<MethodConfigSerDe>>,
-    pub(crate) retry_throttling: Option<RetryThrottlingPolicySerDe>,
-    pub(crate) health_check_config: Option<HealthCheckConfigSerDe>,
-    pub(crate) connection_scaling: Option<ConnectionScalingSerDe>,
+    pub(crate) load_balancing_config: Option<Vec<LoadBalancingConfigSerde>>,
+    pub(crate) method_config: Option<Vec<MethodConfigSerde>>,
+    pub(crate) retry_throttling: Option<RetryThrottlingPolicySerde>,
+    pub(crate) health_check_config: Option<HealthCheckConfigSerde>,
+    pub(crate) connection_scaling: Option<ConnectionScalingSerde>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MethodConfigSerDe {
-    pub(crate) name: Vec<MethodNameSerDe>,
+pub(crate) struct MethodConfigSerde {
+    #[serde(default)]
+    pub(crate) name: Vec<MethodNameSerde>,
     pub(crate) wait_for_ready: Option<bool>,
     pub(crate) timeout: Option<GrpcDuration>,
-    pub(crate) retry_policy: Option<RetryPolicySerDe>,
-    pub(crate) hedging_policy: Option<HedgingPolicySerDe>,
+    pub(crate) retry_policy: Option<RetryPolicySerde>,
+    pub(crate) hedging_policy: Option<HedgingPolicySerde>,
     pub(crate) max_request_message_bytes: Option<SerdeU32>,
     pub(crate) max_response_message_bytes: Option<SerdeU32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct MethodNameSerDe {
+pub(crate) struct MethodNameSerde {
+    #[serde(default)]
     pub(crate) service: String,
     pub(crate) method: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RetryThrottlingPolicySerDe {
+pub(crate) struct RetryThrottlingPolicySerde {
     pub(crate) max_tokens: SerdeU32,
     pub(crate) token_ratio: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RetryPolicySerDe {
+pub(crate) struct RetryPolicySerde {
     pub(crate) max_attempts: SerdeU32,
     pub(crate) initial_backoff: GrpcDuration,
     pub(crate) max_backoff: GrpcDuration,
@@ -84,7 +86,7 @@ pub(crate) struct RetryPolicySerDe {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct HedgingPolicySerDe {
+pub(crate) struct HedgingPolicySerde {
     pub(crate) max_attempts: SerdeU32,
     pub(crate) hedging_delay: GrpcDuration,
     #[serde(default)]
@@ -93,14 +95,14 @@ pub(crate) struct HedgingPolicySerDe {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct HealthCheckConfigSerDe {
+pub(crate) struct HealthCheckConfigSerde {
     #[serde(rename = "serviceName", alias = "ServiceName")]
     pub(crate) service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ConnectionScalingSerDe {
+pub(crate) struct ConnectionScalingSerde {
     #[serde(default = "default_max_connections_per_subchannel")]
     pub(crate) max_connections_per_subchannel: SerdeU32,
 }
@@ -110,19 +112,19 @@ fn default_max_connections_per_subchannel() -> SerdeU32 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LoadBalancingConfigSerDe {
+pub(crate) struct LoadBalancingConfigSerde {
     pub(crate) name: String,
     pub(crate) config: serde_json::Value,
 }
 
-impl<'de> Deserialize<'de> for LoadBalancingConfigSerDe {
+impl<'de> Deserialize<'de> for LoadBalancingConfigSerde {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = LoadBalancingConfigSerDe;
+            type Value = LoadBalancingConfigSerde;
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
                     "a map with a single key-value pair representing a load balancing policy",
@@ -137,7 +139,7 @@ impl<'de> Deserialize<'de> for LoadBalancingConfigSerDe {
                     if map.next_key::<String>()?.is_some() {
                         return Err(serde::de::Error::custom("map has more than one key"));
                     }
-                    Ok(LoadBalancingConfigSerDe { name, config })
+                    Ok(LoadBalancingConfigSerde { name, config })
                 } else {
                     Err(serde::de::Error::custom("map is empty"))
                 }
@@ -147,7 +149,7 @@ impl<'de> Deserialize<'de> for LoadBalancingConfigSerDe {
     }
 }
 
-impl Serialize for LoadBalancingConfigSerDe {
+impl Serialize for LoadBalancingConfigSerde {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -159,8 +161,8 @@ impl Serialize for LoadBalancingConfigSerDe {
     }
 }
 
-impl From<ServiceConfigSerDe> for ServiceConfig {
-    fn from(dto: ServiceConfigSerDe) -> Self {
+impl From<ServiceConfigSerde> for ServiceConfig {
+    fn from(dto: ServiceConfigSerde) -> Self {
         let mut lb_config = dto
             .load_balancing_config
             .map(|v| v.into_iter().map(Into::into).collect());
@@ -185,8 +187,8 @@ impl From<ServiceConfigSerDe> for ServiceConfig {
     }
 }
 
-impl From<MethodConfigSerDe> for MethodConfig {
-    fn from(dto: MethodConfigSerDe) -> Self {
+impl From<MethodConfigSerde> for MethodConfig {
+    fn from(dto: MethodConfigSerde) -> Self {
         Self {
             name: dto.name.into_iter().map(Into::into).collect(),
             wait_for_ready: dto.wait_for_ready,
@@ -199,8 +201,8 @@ impl From<MethodConfigSerDe> for MethodConfig {
     }
 }
 
-impl From<MethodNameSerDe> for MethodName {
-    fn from(dto: MethodNameSerDe) -> Self {
+impl From<MethodNameSerde> for MethodName {
+    fn from(dto: MethodNameSerde) -> Self {
         Self {
             service: dto.service,
             method: dto.method,
@@ -208,8 +210,8 @@ impl From<MethodNameSerDe> for MethodName {
     }
 }
 
-impl From<RetryThrottlingPolicySerDe> for RetryThrottlingPolicy {
-    fn from(dto: RetryThrottlingPolicySerDe) -> Self {
+impl From<RetryThrottlingPolicySerde> for RetryThrottlingPolicy {
+    fn from(dto: RetryThrottlingPolicySerde) -> Self {
         Self {
             max_tokens: dto.max_tokens.into(),
             token_ratio: dto.token_ratio,
@@ -217,8 +219,8 @@ impl From<RetryThrottlingPolicySerDe> for RetryThrottlingPolicy {
     }
 }
 
-impl From<RetryPolicySerDe> for RetryPolicy {
-    fn from(dto: RetryPolicySerDe) -> Self {
+impl From<RetryPolicySerde> for RetryPolicy {
+    fn from(dto: RetryPolicySerde) -> Self {
         Self {
             max_attempts: dto.max_attempts.into(),
             initial_backoff: dto.initial_backoff,
@@ -229,8 +231,8 @@ impl From<RetryPolicySerDe> for RetryPolicy {
     }
 }
 
-impl From<HedgingPolicySerDe> for HedgingPolicy {
-    fn from(dto: HedgingPolicySerDe) -> Self {
+impl From<HedgingPolicySerde> for HedgingPolicy {
+    fn from(dto: HedgingPolicySerde) -> Self {
         Self {
             max_attempts: dto.max_attempts.into(),
             hedging_delay: dto.hedging_delay,
@@ -239,24 +241,24 @@ impl From<HedgingPolicySerDe> for HedgingPolicy {
     }
 }
 
-impl From<HealthCheckConfigSerDe> for HealthCheckConfig {
-    fn from(dto: HealthCheckConfigSerDe) -> Self {
+impl From<HealthCheckConfigSerde> for HealthCheckConfig {
+    fn from(dto: HealthCheckConfigSerde) -> Self {
         Self {
             service_name: dto.service_name,
         }
     }
 }
 
-impl From<ConnectionScalingSerDe> for ConnectionScaling {
-    fn from(dto: ConnectionScalingSerDe) -> Self {
+impl From<ConnectionScalingSerde> for ConnectionScaling {
+    fn from(dto: ConnectionScalingSerde) -> Self {
         Self {
             max_connections_per_subchannel: dto.max_connections_per_subchannel.into(),
         }
     }
 }
 
-impl From<LoadBalancingConfigSerDe> for LoadBalancingConfig {
-    fn from(dto: LoadBalancingConfigSerDe) -> Self {
+impl From<LoadBalancingConfigSerde> for LoadBalancingConfig {
+    fn from(dto: LoadBalancingConfigSerde) -> Self {
         Self {
             name: dto.name,
             config: dto.config,

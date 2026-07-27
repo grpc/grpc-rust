@@ -113,6 +113,54 @@ pub enum RetryOrHedgingPolicy {
     Hedging(HedgingPolicy),
 }
 
+impl MethodName {
+    fn validate(&self) -> Result<(), String> {
+        if self.service.is_empty() && self.method.as_ref().is_some_and(|m| !m.is_empty()) {
+            return Err("has empty service name with non-empty method name".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl RetryPolicy {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_attempts <= 1 {
+            return Err("max_attempts must be > 1".to_string());
+        }
+        if self.initial_backoff.as_nanos() == 0 {
+            return Err("initial_backoff must be > 0".to_string());
+        }
+        if self.max_backoff.as_nanos() == 0 {
+            return Err("max_backoff must be > 0".to_string());
+        }
+        if self.backoff_multiplier <= 0.0 {
+            return Err("backoff_multiplier must be > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl HedgingPolicy {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_attempts <= 1 {
+            return Err("max_attempts must be > 1".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl RetryThrottlingPolicy {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_tokens == 0 || self.max_tokens > 1000 {
+            return Err("max_tokens must be between 1 and 1000".to_string());
+        }
+        if self.token_ratio <= 0.0 {
+            return Err("token_ratio must be > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl MethodConfig {
     pub fn retry_or_hedging_policy(&self) -> Option<RetryOrHedgingPolicy> {
         self.retry_policy
@@ -124,88 +172,57 @@ impl MethodConfig {
                     .map(|hp| RetryOrHedgingPolicy::Hedging(hp.clone()))
             })
     }
+
+    fn validate(&self) -> Result<(), String> {
+        for (j, name) in self.name.iter().enumerate() {
+            if let Err(e) = name.validate() {
+                return Err(format!("name[{j}] {e}"));
+            }
+        }
+        if self.retry_policy.is_some() && self.hedging_policy.is_some() {
+            return Err("cannot have both retryPolicy and hedgingPolicy defined".to_string());
+        }
+        if let Some(ref rp) = self.retry_policy
+            && let Err(e) = rp.validate()
+        {
+            return Err(format!("retry_policy.{e}"));
+        }
+        if let Some(ref hp) = self.hedging_policy
+            && let Err(e) = hp.validate()
+        {
+            return Err(format!("hedging_policy.{e}"));
+        }
+        Ok(())
+    }
 }
 
 impl ServiceConfig {
     /// Parses a service configuration from a JSON string.
     pub fn parse(config_json: &str) -> ParseResult {
-        let config_serde: serde::ServiceConfigSerDe = match serde_json::from_str(config_json) {
+        let config_serde: serde::ServiceConfigSerde = match serde_json::from_str(config_json) {
             Ok(c) => c,
             Err(e) => {
-                return Err(format!("failed to deserialize service config JSON: {}", e));
+                return Err(format!("failed to deserialize service config JSON: {e}"));
             }
         };
         let config: Self = config_serde.into();
-        if let Err(e) = config.validate() {
-            return Err(e);
-        }
+        config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<(), String> {
         if let Some(ref method_configs) = self.method_config {
             for (i, mc) in method_configs.iter().enumerate() {
-                if mc.name.is_empty() {
-                    return Err(format!("method_config[{}] has no names defined", i));
-                }
-                for (j, name) in mc.name.iter().enumerate() {
-                    if name.service.is_empty() {
-                        return Err(format!(
-                            "method_config[{}].name[{}] has empty service name",
-                            i, j
-                        ));
-                    }
-                }
-                if mc.retry_policy.is_some() && mc.hedging_policy.is_some() {
-                    return Err(format!(
-                        "method_config[{}] cannot have both retryPolicy and hedgingPolicy defined",
-                        i
-                    ));
-                }
-                if let Some(ref rp) = mc.retry_policy {
-                    if rp.max_attempts <= 1 {
-                        return Err(format!(
-                            "method_config[{}].retry_policy.max_attempts must be > 1",
-                            i
-                        ));
-                    }
-                    if rp.initial_backoff.as_nanos() == 0 {
-                        return Err(format!(
-                            "method_config[{}].retry_policy.initial_backoff must be > 0",
-                            i
-                        ));
-                    }
-                    if rp.max_backoff.as_nanos() == 0 {
-                        return Err(format!(
-                            "method_config[{}].retry_policy.max_backoff must be > 0",
-                            i
-                        ));
-                    }
-                    if rp.backoff_multiplier <= 0.0 {
-                        return Err(format!(
-                            "method_config[{}].retry_policy.backoff_multiplier must be > 0",
-                            i
-                        ));
-                    }
-                }
-                if let Some(ref hp) = mc.hedging_policy
-                    && hp.max_attempts <= 1
-                {
-                    return Err(format!(
-                        "method_config[{}].hedging_policy.max_attempts must be > 1",
-                        i
-                    ));
+                if let Err(e) = mc.validate() {
+                    return Err(format!("method_config[{i}].{e}"));
                 }
             }
         }
 
-        if let Some(ref rt) = self.retry_throttling {
-            if rt.max_tokens == 0 || rt.max_tokens > 1000 {
-                return Err("retry_throttling.max_tokens must be between 1 and 1000".to_string());
-            }
-            if rt.token_ratio <= 0.0 {
-                return Err("retry_throttling.token_ratio must be > 0".to_string());
-            }
+        if let Some(ref rt) = self.retry_throttling
+            && let Err(e) = rt.validate()
+        {
+            return Err(format!("retry_throttling.{e}"));
         }
 
         Ok(())
@@ -221,6 +238,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_valid_service_config_parsing() {
         let json_data = json!({
             "loadBalancingConfig": [
@@ -367,10 +385,10 @@ mod test {
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
 
-        // Empty method name service.
+        // Empty service name with non-empty method name.
         let json_data = json!({
             "methodConfig": [{
-                "name": [{ "service": "" }]
+                "name": [{ "service": "", "method": "Echo" }]
             }]
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
@@ -408,5 +426,84 @@ mod test {
             }]
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
+    }
+
+    #[test]
+    fn test_default_method_config_empty_name() {
+        let json_data = json!({
+            "methodConfig": [
+                {
+                    "name": [],
+                    "timeout": "5s",
+                    "waitForReady": true
+                },
+                {
+                    "name": [{}],
+                    "maxRequestMessageBytes": 4096
+                }
+            ]
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        let method_configs = sc.method_config.unwrap();
+        assert_eq!(method_configs.len(), 2);
+        assert!(method_configs[0].name.is_empty());
+        assert_eq!(
+            method_configs[0].timeout,
+            Some(GrpcDuration(Duration::from_secs(5)))
+        );
+        assert_eq!(method_configs[1].name.len(), 1);
+        assert_eq!(method_configs[1].name[0].service, "");
+        assert_eq!(method_configs[1].name[0].method, None);
+    }
+
+    #[test]
+    fn test_service_level_vs_method_level_config() {
+        let json_data = json!({
+            "methodConfig": [
+                {
+                    "name": [{ "service": "grpc.examples.echo.Echo" }],
+                    "retryPolicy": {
+                        "maxAttempts": 3,
+                        "initialBackoff": "0.1s",
+                        "maxBackoff": "1s",
+                        "backoffMultiplier": 2.0,
+                        "retryableStatusCodes": ["UNAVAILABLE"]
+                    }
+                },
+                {
+                    "name": [{ "service": "grpc.examples.echo.Echo", "method": "SpecialCall" }],
+                    "timeout": "0.5s"
+                }
+            ]
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        let method_configs = sc.method_config.unwrap();
+        assert_eq!(method_configs[0].name[0].method, None);
+        assert!(method_configs[0].retry_policy.is_some());
+        assert_eq!(
+            method_configs[1].name[0].method,
+            Some("SpecialCall".to_string())
+        );
+        assert_eq!(
+            method_configs[1].timeout,
+            Some(GrpcDuration(Duration::from_millis(500)))
+        );
+    }
+
+    #[test]
+    fn test_minimal_lb_config_only() {
+        let json_data = json!({
+            "loadBalancingConfig": [
+                { "round_robin": {} }
+            ]
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        assert!(sc.method_config.is_none());
+        assert!(sc.retry_throttling.is_none());
+        assert!(sc.health_check_config.is_none());
+        assert!(sc.connection_scaling.is_none());
+        let lb_configs = sc.load_balancing_config.unwrap();
+        assert_eq!(lb_configs.len(), 1);
+        assert_eq!(lb_configs[0].name, "round_robin");
     }
 }

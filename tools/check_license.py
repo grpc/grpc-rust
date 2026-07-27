@@ -13,7 +13,11 @@ import sys
 from pathlib import Path
 
 IGNORE_DIRS = {"target", ".git", ".gemini", "generated", "node_modules"}
-IGNORE_FILES = {"src/credentials/rustls/key_log.rs"}  # Third-party Apache 2.0 file
+# Third-party adapted files. These will hold unique authors.
+IGNORE_FILES = {
+    "src/client/transport/http_connect/rewind.rs",
+    "src/credentials/rustls/key_log.rs"
+}  
 TARGET_EXTENSIONS = (".rs",)
 
 MIN_YEAR = 2025

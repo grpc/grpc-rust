@@ -195,11 +195,11 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
 /// An adapter that exposes `AsyncRead` and `AsyncWrite` functionality for
 /// interfacing with `hyper` and `rustls`. This type is kept private to avoid
 /// exposing its read and write methods to external crates.
-pub(crate) struct AsyncIoAdapter<T> {
+pub(crate) struct EndpointIoStream<T> {
     inner: T,
 }
 
-impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> EndpointIoStream<T> {
     pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
@@ -209,7 +209,7 @@ impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
     }
 }
 
-impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> AsyncRead for EndpointIoStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -219,7 +219,7 @@ impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {
     }
 }
 
-impl<T: GrpcEndpoint> AsyncWrite for AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> AsyncWrite for EndpointIoStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -246,6 +246,91 @@ impl<T: GrpcEndpoint> AsyncWrite for AsyncIoAdapter<T> {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored_private(private::Internal)
+    }
+}
+
+/// A wrapper that implements [GrpcEndpoint] for an asynchronous I/O stream.
+pub(crate) struct StreamEndpoint<T> {
+    inner: T,
+    peer_addr: Box<str>,
+    local_addr: Box<str>,
+    network_type: &'static str,
+}
+
+impl<T> StreamEndpoint<T> {
+    pub(crate) fn new(
+        inner: T,
+        local_addr: Box<str>,
+        peer_addr: Box<str>,
+        network_type: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            peer_addr,
+            local_addr,
+            network_type,
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for StreamEndpoint<T> {
+    fn get_local_address(&self) -> &str {
+        &self.local_addr
+    }
+
+    fn get_peer_address(&self) -> &str {
+        &self.peer_addr
+    }
+
+    fn get_network_type(&self) -> &'static str {
+        self.network_type
+    }
+
+    fn poll_read_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+        _token: private::Internal,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+
+    fn poll_write_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        _token: private::Internal,
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+        _token: private::Internal,
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored_private(&self, _token: private::Internal) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _token: private::Internal,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _token: private::Internal,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

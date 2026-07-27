@@ -344,6 +344,7 @@ mod tests {
                     })
                     .collect(),
             }],
+            metadata: Default::default(),
         })
     }
 
@@ -368,6 +369,7 @@ mod tests {
                         })
                         .collect(),
                 }],
+                metadata: Default::default(),
             }),
         })
     }

@@ -57,8 +57,8 @@ use crate::credentials::rustls::parse_key;
 use crate::credentials::rustls::sanitize_crypto_provider;
 use crate::credentials::rustls::tls_stream::TlsStream;
 use crate::private;
-use crate::rt::AsyncIoAdapter;
 use crate::rt::BoxEndpoint;
+use crate::rt::EndpointIoStream;
 use crate::rt::GrpcRuntime;
 
 #[cfg(test)]
@@ -205,7 +205,7 @@ impl RustlsChannelCredentials {
         let server_name = ServerName::try_from(authority.host())
             .map_err(|e| format!("invalid authority: {}", e))?
             .to_owned();
-        let input_io = AsyncIoAdapter::new(source);
+        let input_io = EndpointIoStream::new(source);
 
         let tls_stream = self
             .connector

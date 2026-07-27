@@ -25,7 +25,7 @@
 use crate::client::cluster::ClusterClientRegistryGrpc;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
-use crate::client::route::{Router, XdsRoutingLayer};
+use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
@@ -194,6 +194,7 @@ const _: fn() = || {
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
     recorder: Option<Arc<dyn MetricsRecorder>>,
+    pre_route: Option<Arc<dyn PreRouteInterceptor>>,
     #[cfg(feature = "_tls-any")]
     cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
@@ -201,13 +202,21 @@ pub struct XdsChannelBuilder {
 impl Debug for XdsChannelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("XdsChannelBuilder");
-        s.field("config", &self.config).field(
-            "recorder",
-            &self
-                .recorder
-                .as_deref()
-                .map_or("None", |r| std::any::type_name_of_val(r)),
-        );
+        s.field("config", &self.config)
+            .field(
+                "recorder",
+                &self
+                    .recorder
+                    .as_deref()
+                    .map_or("None", |r| std::any::type_name_of_val(r)),
+            )
+            .field(
+                "pre_route",
+                &self
+                    .pre_route
+                    .as_deref()
+                    .map_or("None", |i| std::any::type_name_of_val(i)),
+            );
         #[cfg(feature = "_tls-any")]
         s.field(
             "cert_providers",
@@ -224,6 +233,7 @@ impl XdsChannelBuilder {
         Self {
             config: Arc::new(config),
             recorder: None,
+            pre_route: None,
             #[cfg(feature = "_tls-any")]
             cert_providers: HashMap::new(),
         }
@@ -238,6 +248,21 @@ impl XdsChannelBuilder {
     #[must_use]
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// Registers a [`PreRouteInterceptor`] that runs before route selection.
+    ///
+    /// The routing layer takes a `RouteConfiguration` snapshot for each request;
+    /// when an interceptor is registered, it is invoked inline against that
+    /// snapshot before matching, and may mutate request headers (using the
+    /// config's [`RouteConfigMetadata`](crate::RouteConfigMetadata)) so the
+    /// router matches on the result. This enables config-driven request
+    /// transformation such as computing a partition/shard key and injecting a
+    /// routing header. The interceptor and the router observe the same snapshot.
+    #[must_use]
+    pub fn with_pre_route_interceptor(mut self, interceptor: Arc<dyn PreRouteInterceptor>) -> Self {
+        self.pre_route = Some(interceptor);
         self
     }
 
@@ -357,7 +382,7 @@ impl XdsChannelBuilder {
             _xds_client: xds_client,
         });
 
-        let routing_layer = XdsRoutingLayer::new(router, self.authority());
+        let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
@@ -383,15 +408,17 @@ impl XdsChannelBuilder {
         self.build_tonic_grpc_channel()
     }
 
-    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, and retry policy.
+    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
+    /// policy, and optional pre-route interceptor.
     #[cfg(test)]
     pub(crate) fn build_grpc_channel_from_parts(
         &self,
         router: Arc<dyn Router>,
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
         retry_policy: GrpcRetryPolicy,
+        interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
-        let routing_layer = XdsRoutingLayer::new(router, self.authority());
+        let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
@@ -578,6 +605,7 @@ mod tests {
             xds_manager.clone(),
             xds_manager.clone(),
             GrpcRetryPolicy::default(),
+            None,
         );
 
         let client = GreeterClient::new(xds_channel);
@@ -655,6 +683,7 @@ mod tests {
             xds_manager.clone(),
             xds_manager.clone(),
             retry_policy,
+            None,
         );
 
         let mut client = GreeterClient::new(xds_channel);
@@ -701,6 +730,7 @@ mod tests {
                     action: RouteConfigAction::Cluster(cluster_name.to_string()),
                 }],
             }],
+            metadata: Default::default(),
         })
     }
 
@@ -751,7 +781,7 @@ mod tests {
         > = Arc::new(XdsClusterDiscovery::new(cache));
 
         let builder = XdsChannelBuilder::new(test_config());
-        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default())
+        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default(), None)
     }
 
     /// Tests the full xDS stack (XdsRouter + XdsClusterDiscovery) with a

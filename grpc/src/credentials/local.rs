@@ -203,10 +203,10 @@ mod test {
     use crate::credentials::client::ClientHandshakeInfo;
     use crate::credentials::common::Authority;
     use crate::rt;
-    use crate::rt::AsyncIoAdapter;
+    use crate::rt::EndpointIoStream;
     use crate::rt::GrpcEndpoint;
+    use crate::rt::StreamEndpoint;
     use crate::rt::TcpOptions;
-    use crate::rt::tokio::TokioIoStream;
 
     #[test]
     fn test_security_level_for_endpoint_success() {
@@ -281,7 +281,7 @@ mod test {
         server_stream.write_all(test_data).await.unwrap();
 
         let mut buf = vec![0u8; test_data.len()];
-        AsyncIoAdapter::new(endpoint)
+        EndpointIoStream::new(endpoint)
             .read_exact(&mut buf)
             .await
             .unwrap();
@@ -318,7 +318,7 @@ mod test {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let server_stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
 
         let output = creds
             .accept(server_stream, runtime, private::Internal)
@@ -331,7 +331,7 @@ mod test {
         assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
 
         let mut buf = vec![0u8; 10];
-        AsyncIoAdapter::new(endpoint)
+        EndpointIoStream::new(endpoint)
             .read_exact(&mut buf)
             .await
             .unwrap();

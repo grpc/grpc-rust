@@ -49,7 +49,8 @@ use crate::xds::cache::XdsCache;
 use crate::xds::resource::hash_policy::HashPolicyConfig;
 use crate::xds::resource::route_config::{
     HeaderMatchSpecifierConfig, HeaderMatcherConfig, PathSpecifierConfig, RouteConfig,
-    RouteConfigAction, RouteConfigMatch, RouteConfigResource, VirtualHostConfig, WeightedCluster,
+    RouteConfigAction, RouteConfigMatch, RouteConfigMetadata, RouteConfigResource,
+    VirtualHostConfig, WeightedCluster,
 };
 
 /// Default timeout for waiting for the initial route config (matches gRFC A57
@@ -123,6 +124,10 @@ impl Router for XdsRouter {
             let rc = route_config_ref.load_full().ok_or(RoutingError::NotReady)?;
             resolve_route(&rc, &authority, &headers)
         })
+    }
+
+    fn metadata(&self) -> Option<RouteConfigMetadata> {
+        self.route_config.load_full().map(|rc| rc.metadata.clone())
     }
 }
 
@@ -392,6 +397,7 @@ mod tests {
         RouteConfigResource {
             name: "test-rc".into(),
             virtual_hosts,
+            metadata: Default::default(),
         }
     }
 

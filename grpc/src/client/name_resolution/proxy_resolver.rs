@@ -95,8 +95,13 @@ impl ResolverBuilder for Builder {
 
 impl Builder {
     /// Creates a new `Builder` that wraps the given `child_builder`.
-    pub(crate) fn new(child_builder: Arc<dyn ResolverBuilder>) -> Self {
-        Self { child_builder }
+    pub(crate) fn new_arc(child_builder: Arc<dyn ResolverBuilder>) -> Arc<dyn ResolverBuilder> {
+        // Skip proxy lookup for non-DNS targets.
+        if child_builder.scheme() != "dns" {
+            return child_builder;
+        }
+
+        Arc::new(Self { child_builder })
     }
 
     fn new_resolver(
@@ -105,10 +110,6 @@ impl Builder {
         options: ResolverOptions,
         matcher: Option<&Matcher>,
     ) -> Box<dyn Resolver> {
-        // Skip proxy lookup for non-DNS targets.
-        if target.scheme() != "dns" {
-            return self.child_builder.build(target, options);
-        }
         // If HTTPS_PROXY is unset, avoid parsing the target as a DNS hostname.
         let Some(matcher) = matcher else {
             return self.child_builder.build(target, options);
@@ -353,7 +354,7 @@ mod tests {
         matcher: Option<&Matcher>,
         child_builder: Arc<dyn ResolverBuilder>,
     ) -> Vec<Address> {
-        let builder = Builder::new(child_builder);
+        let builder = Builder { child_builder };
 
         let target: Target = target_uri.parse().unwrap();
         let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
@@ -475,7 +476,7 @@ mod tests {
         let target_uri = "dns:///var%20/run/grpc.sock";
 
         let child_builder = Arc::new(MockResolverBuilder {});
-        let builder = Builder::new(child_builder);
+        let builder = Builder { child_builder };
 
         let target: Target = target_uri.parse().unwrap();
         let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
@@ -503,35 +504,15 @@ mod tests {
         assert!(err.contains("invalid target host in URL"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn unix_path_bypass() {
-        let matcher = Matcher::builder()
-            .https("http://proxy.example.com:8080")
-            .build();
-
-        // Proxy lookup for unix targets should be skipped.
-        let addresses = run_resolver_and_get_addresses(
-            "unix:///var%20/run/grpc.sock",
-            vec!["127.0.0.1".parse().unwrap()],
-            Some(&matcher),
-        )
-        .await;
-
-        assert_eq!(addresses.len(), 1);
-        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
-
-        // Check for abstract-unix scheme.
-        let addresses = run_resolver_and_get_addresses(
-            "unix-abstract:grpc.sock",
-            vec!["127.0.0.1".parse().unwrap()],
-            Some(&matcher),
-        )
-        .await;
-
-        assert_eq!(addresses.len(), 1);
-        assert_eq!(&*addresses[0].address, DIRECT_ADDRESS);
-        assert!(ProxyOptions::from_addr(&addresses[0]).is_none());
+        crate::client::name_resolution::unix::reg();
+        let unix_builder = crate::client::name_resolution::global_registry()
+            .get("unix")
+            .expect("unix resolver not registered");
+        let proxy_builder = Builder::new_arc(unix_builder.clone());
+        assert!(Arc::ptr_eq(&unix_builder, &proxy_builder));
     }
 
     #[tokio::test]

@@ -91,12 +91,14 @@ where
     let secs: f64 = num
         .parse()
         .map_err(|_| serde::de::Error::custom(format!("invalid duration number: '{num}'")))?;
-    if secs < 0.0 {
+    let duration = Duration::try_from_secs_f64(secs)
+        .map_err(|e| serde::de::Error::custom(format!("invalid duration '{s}': {e}")))?;
+    if duration.is_zero() {
         return Err(serde::de::Error::custom(format!(
-            "invalid duration '{s}': must not be negative"
+            "invalid duration '{s}': must be greater than 0"
         )));
     }
-    Ok(Some(Duration::from_secs_f64(secs)))
+    Ok(Some(duration))
 }
 
 /// A certificate provider that reads PEM files from disk.
@@ -397,16 +399,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_refresh_interval_negative() {
+    fn parse_refresh_interval_must_be_greater_than_zero() {
         let err = serde_json::from_value::<FileWatcherConfig>(
-            serde_json::json!({"refresh_interval": "-1s"}),
+            serde_json::json!({"refresh_interval":"0s"}),
         );
         assert!(err.is_err());
         assert!(
             err.unwrap_err()
                 .to_string()
-                .contains("must not be negative")
+                .contains("must be greater than 0")
         );
+    }
+
+    #[test]
+    fn parse_refresh_interval_rejects_invalid_floats() {
+        // Negative, NaN, and infinite all fail `Duration::try_from_secs_f64`
+        // rather than the "must be greater than 0" zero check.
+        for v in [
+            serde_json::json!({"refresh_interval": "-1s"}),
+            serde_json::json!({"refresh_interval": "NaNs"}),
+            serde_json::json!({"refresh_interval": "infs"}),
+        ] {
+            assert!(serde_json::from_value::<FileWatcherConfig>(v).is_err());
+        }
     }
 
     #[tokio::test]

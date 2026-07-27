@@ -46,7 +46,7 @@ impl KeyLogFileInner {
         let file = match OpenOptions::new().append(true).create(true).open(path) {
             Ok(f) => Some(f),
             Err(e) => {
-                eprintln!("unable to create key log file {}: {e}", path.display());
+                eprintln!("unable to create key log file {path:?}: {e}");
                 None
             }
         };

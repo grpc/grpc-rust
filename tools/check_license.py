@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Checks source files (*.rs, *.proto) for exact match against MIT or Apache 2.0 license boilerplate.
-Performs piecewise validation and unified diffing against expected boilerplate templates.
+Checks source files (*.rs, *.proto) for exact match against the MIT license 
+boilerplate. Performs piecewise validation and unified diffing against expected 
+boilerplate templates.
 """
 
 import datetime
@@ -17,9 +18,9 @@ TARGET_EXTENSIONS = (".rs",)
 
 MIN_YEAR = 2025
 
-# Regex to capture: (prefix) Copyright [(c)] (year_spec)
+# Regex to capture: (prefix) Copyright (year_spec)
 COPYRIGHT_RE = re.compile(
-    r"^(\s*(?:/\*|\*|//)\s*)Copyright\s+(?:\(c\)\s+)?([\d\-,]+)\b",
+    r"^(\s*(?:/\*|\*)\s*)Copyright\s+([\d\-,]+)\b",
     re.IGNORECASE,
 )
 
@@ -58,7 +59,7 @@ def should_ignore(filepath: str) -> bool:
 
 def extract_header_lines(lines: list[str]) -> tuple[list[str] | None, str | None]:
     if not lines:
-        return None, "File is empty; expected /* ... */ or // ... header block on line 1"
+        return None, "File is empty; expected /* ... */ header block on line 1"
 
     first_line = lines[0].strip()
     header = []
@@ -68,31 +69,23 @@ def extract_header_lines(lines: list[str]) -> tuple[list[str] | None, str | None
             if line.strip() == "*/":
                 break
         return header, None
-    elif first_line.startswith("//"):
-        for line in lines:
-            if line.strip().startswith("//"):
-                header.append(line.rstrip())
-            else:
-                break
-        return header, None
 
     return (
         None,
-        f"Expected comment header block (/* or //) on line 1, found: {repr(first_line)}",
+        f"Expected /* ... */ comment header block on line 1, found: {repr(first_line)}",
     )
 
 
 def validate_copyright_years(year_spec: str) -> tuple[bool, str | None]:
     current_year = datetime.date.today().year
-    years = [int(y) for y in re.findall(r"\b\d{4}\b", year_spec)]
-    if not years:
-        return False, f"No valid 4-digit years found in '{year_spec}'"
-    for y in years:
-        if y < MIN_YEAR or y > current_year:
-            return (
-                False,
-                f"Year {y} in '{year_spec}' is outside allowed range [{MIN_YEAR}, {current_year}]",
-            )
+    if not re.fullmatch(r"\d{4}", year_spec):
+        return False, f"Expected a single 4-digit year, found '{year_spec}'"
+    y = int(year_spec)
+    if y < MIN_YEAR or y > current_year:
+        return (
+            False,
+            f"Year {y} in '{year_spec}' is outside allowed range [{MIN_YEAR}, {current_year}]",
+        )
     return True, None
 
 
@@ -108,7 +101,7 @@ def validate_copyright(header_lines: list[str]) -> tuple[bool, str | None]:
 
             return True, None
 
-    return False, "No valid 'Copyright <years>' line found in header block"
+    return False, "No valid 'Copyright <year>' line found in header block"
 
 
 def normalize_header(header_lines: list[str]) -> list[str]:

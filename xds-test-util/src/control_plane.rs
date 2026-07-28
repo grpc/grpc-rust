@@ -1,22 +1,46 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
 //! `XdsTestControlPlaneService` is a fake xDS ADS control plane for gRPC tests.
 //!
 //! The xDS config resources are injected through
 //! [`set_xds_config`](XdsTestControlPlaneService::set_xds_config).
 //!
-//! The xDS config resources are served by ADS (Aggregated Discovery Service) protocol and
-//! State-of-the-world (SOTW): whenever any resource of a type changes, every subscriber to
-//! that type receives all of its subscribed resources of that type.
+//! The xDS config resources are served by ADS (Aggregated Discovery Service)
+//! protocol and State-of-the-world (SOTW): whenever any resource of a type
+//! changes, every subscriber to that type receives all of its subscribed
+//! resources of that type.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 
-use crate::config::*;
-use envoy_types::pb::envoy::service::discovery::v3::{
-    DiscoveryRequest, DiscoveryResponse,
-    aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
-};
+use envoy_types::pb::envoy::service::discovery::v3::DiscoveryRequest;
+use envoy_types::pb::envoy::service::discovery::v3::DiscoveryResponse;
+use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
 use envoy_types::pb::google::protobuf::Any;
 use strum::IntoEnumIterator;
 use tokio::net::TcpListener;
@@ -24,6 +48,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+
+use crate::config::*;
 
 /// Sender half of a stream's outbound `DiscoveryResponse` channel.
 type ResponseSender = mpsc::UnboundedSender<DiscoveryResponse>;
@@ -47,7 +73,8 @@ struct Subscription {
 /// set") and increases monotonically, so each distinct resource state carries a
 /// distinct version.
 mod bundle {
-    use super::{Any, HashMap};
+    use super::Any;
+    use super::HashMap;
 
     /// A versioned snapshot of the resources for a single xDS type.
     #[derive(Debug, Default)]
@@ -141,8 +168,8 @@ impl Inner {
         };
 
         // Nonce check: if the request's nonce doesn't match the last response's nonce,
-        // the management server is allowed to ignore any further DiscoveryRequests for the previous version
-        // until a DiscoveryRequest bearing the nonce.
+        // the management server is allowed to ignore any further DiscoveryRequests for
+        // the previous version until a DiscoveryRequest bearing the nonce.
         // Ref: https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/discovery/v3/discovery.proto#service-discovery-v3-discoveryresponse
         if !req.response_nonce.is_empty() {
             let matches = state
@@ -227,7 +254,8 @@ impl Inner {
     }
 }
 
-/// XdsTestControlPlaneService is a bidi-stream service that acts as a local xDS control plane for tests.
+/// XdsTestControlPlaneService is a bidi-stream service that acts as a local xDS
+/// control plane for tests.
 ///
 /// Clone freely: all clones share the same underlying state, so config injected
 /// through one clone is served by another. Inject config with
@@ -277,10 +305,12 @@ impl XdsTestControlPlaneService {
                     Any {
                         // Use the type_url from the message type instead of the AdsTypeUrl enum,
                         // so that the Any is tagged with the correct type for the message itself.
-                        // This is necessary because cached resource might be of a different type than
-                        // the AdsTypeUrl enum, e.g. the envoy.service.discovery.v3.Resource wrapper resource type.
-                        // Therefore, it's important to use the type_url from the message type to ensure that
-                        // clients can correctly decode the Any into the expected message type.
+                        // This is necessary because cached resource might be of a different type
+                        // than the AdsTypeUrl enum, e.g. the
+                        // envoy.service.discovery.v3.Resource wrapper resource type.
+                        // Therefore, it's important to use the type_url from the message type to
+                        // ensure that clients can correctly decode the Any
+                        // into the expected message type.
                         type_url: M::type_url(),
                         value: msg.encode_to_vec(),
                     },
@@ -290,8 +320,9 @@ impl XdsTestControlPlaneService {
         self.set_packed_xds_config(type_url, packed);
     }
 
-    /// Sets the full set of resources for `type_url`, replacing any previous resources of that type,
-    /// and pushes an update to every current subscriber.
+    /// Sets the full set of resources for `type_url`, replacing any previous
+    /// resources of that type, and pushes an update to every current
+    /// subscriber.
     fn set_packed_xds_config(&self, type_url: &AdsTypeUrl, packed: HashMap<String, Any>) {
         let mut state = self
             .inner
@@ -454,15 +485,21 @@ mod tonic_service {
     use std::pin::Pin;
     use std::sync::atomic::Ordering;
 
-    use envoy_types::pb::envoy::service::discovery::v3::{
-        DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
-        aggregated_discovery_service_server::AggregatedDiscoveryService,
-    };
+    use envoy_types::pb::envoy::service::discovery::v3::DeltaDiscoveryRequest;
+    use envoy_types::pb::envoy::service::discovery::v3::DeltaDiscoveryResponse;
+    use envoy_types::pb::envoy::service::discovery::v3::DiscoveryRequest;
+    use envoy_types::pb::envoy::service::discovery::v3::DiscoveryResponse;
+    use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryService;
+    use tokio_stream::Stream;
+    use tokio_stream::StreamExt;
     use tokio_stream::wrappers::UnboundedReceiverStream;
-    use tokio_stream::{Stream, StreamExt};
-    use tonic::{Request, Response, Status};
+    use tonic::Request;
+    use tonic::Response;
+    use tonic::Status;
 
-    use super::{Arc, XdsTestControlPlaneService, mpsc};
+    use super::Arc;
+    use super::XdsTestControlPlaneService;
+    use super::mpsc;
 
     #[tonic::async_trait]
     impl AggregatedDiscoveryService for XdsTestControlPlaneService {
@@ -533,8 +570,9 @@ fn build_response(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::listener::v3::Listener;
+
+    use super::*;
 
     #[test]
     fn set_and_get_config() {

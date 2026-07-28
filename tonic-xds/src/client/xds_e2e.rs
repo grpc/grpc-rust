@@ -1,3 +1,26 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
 //! End-to-end tests: a real xDS channel resolving through a fake ADS control
 //! plane to live gRPC backends.
 //!
@@ -9,14 +32,24 @@
 mod test {
     use std::collections::HashMap;
     use std::net::SocketAddr;
-    use xds_test_util::{RunningControlPlane, XdsTestControlPlaneService, config};
 
-    use crate::testutil::grpc::{GreeterClient, HelloRequest, spawn_greeter_server};
-    use crate::{BootstrapConfig, XdsChannelBuilder, XdsChannelConfig, XdsChannelGrpc, XdsUri};
     use tokio::time::Duration;
+    use xds_test_util::RunningControlPlane;
+    use xds_test_util::XdsTestControlPlaneService;
+    use xds_test_util::config;
 
-    /// Starts the fake ADS control plane on an ephemeral port. Returns the running
-    /// control plane (which injects config and shuts down on drop) and its address.
+    use crate::BootstrapConfig;
+    use crate::XdsChannelBuilder;
+    use crate::XdsChannelConfig;
+    use crate::XdsChannelGrpc;
+    use crate::XdsUri;
+    use crate::testutil::grpc::GreeterClient;
+    use crate::testutil::grpc::HelloRequest;
+    use crate::testutil::grpc::spawn_greeter_server;
+
+    /// Starts the fake ADS control plane on an ephemeral port. Returns the
+    /// running control plane (which injects config and shuts down on drop)
+    /// and its address.
     async fn start_control_plane() -> (RunningControlPlane, SocketAddr) {
         let running = XdsTestControlPlaneService::new()
             .start()
@@ -40,8 +73,8 @@ mod test {
     }
 
     /// Sends `say_hello` in a loop until a reply starting with `want_prefix` is
-    /// observed (xDS resolution and config updates are asynchronous), returning that
-    /// reply. Panics if it never arrives.
+    /// observed (xDS resolution and config updates are asynchronous), returning
+    /// that reply. Panics if it never arrives.
     async fn say_hello_until_prefix(
         client: &mut GreeterClient<XdsChannelGrpc>,
         want_prefix: &str,
@@ -69,7 +102,8 @@ mod test {
         panic!("never observed reply starting with {want_prefix:?}; last seen: {last:?}");
     }
 
-    /// End-to-end test: verifies that an xDS channel routes traffic to the correct backend.
+    /// End-to-end test: verifies that an xDS channel routes traffic to the
+    /// correct backend.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_routes_to_backend() {
         let backend = spawn_greeter_server("backend", None, None)
@@ -119,9 +153,9 @@ mod test {
     }
 
     /// The client is initially routing to
-    /// one cluster, update the RDS route to point at a different cluster and assert
-    /// traffic shifts to the new backend — exercising the control plane pushing a
-    /// live update to a connected client.
+    /// one cluster, update the RDS route to point at a different cluster and
+    /// assert traffic shifts to the new backend — exercising the control
+    /// plane pushing a live update to a connected client.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_route_update_shifts_traffic() {
         let backend_a = spawn_greeter_server("backend-a", None, None)
@@ -201,9 +235,9 @@ mod test {
     }
 
     /// P2C load balancing: with several EDS endpoints behind one cluster, traffic
-    /// should spread across all of them. tonic-xds uses power-of-two-choices as its
-    /// balancer (see the unit-level `test_xds_channel_grpc_with_p2c_lb`); this is the
-    /// full-pipeline version through the control plane.
+    /// should spread across all of them. tonic-xds uses power-of-two-choices as
+    /// its balancer (see the unit-level `test_xds_channel_grpc_with_p2c_lb`);
+    /// this is the full-pipeline version through the control plane.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_p2c_spreads_across_backends() {
         const NUM_BACKENDS: usize = 5;

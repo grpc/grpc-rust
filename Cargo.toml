@@ -21,6 +21,7 @@ members = [
   "xds-client",
   "xds-client-opentelemetry",
   "tonic-xds",
+  "xds-test-util",
   "interop",
   "tests/disable_comments",
   "tests/wellknown",

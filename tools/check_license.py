@@ -10,9 +10,6 @@ import difflib
 import os
 import re
 import sys
-from pathlib import Path
-
-IGNORE_DIRS = {"target", ".git", ".gemini", "generated", "node_modules"}
 # Third-party adapted files. These will hold unique authors.
 IGNORE_FILES = {
     "src/client/transport/http_connect/rewind.rs",
@@ -58,7 +55,7 @@ def should_ignore(filepath: str) -> bool:
     for ign_file in IGNORE_FILES:
         if normalized.endswith(ign_file):
             return True
-    return bool(IGNORE_DIRS.intersection(Path(filepath).parts))
+    return False
 
 
 def extract_header_lines(lines: list[str]) -> tuple[list[str] | None, str | None]:
@@ -157,21 +154,26 @@ def validate_file(filepath: str) -> tuple[bool, str | None]:
 
 
 def main():
-    targets = sys.argv[1:] if len(sys.argv) > 1 else ["."]
+    if len(sys.argv) > 2:
+        print("Usage: check_license.py [target_directory_or_file]", file=sys.stderr)
+        sys.exit(1)
+    target = sys.argv[1] if len(sys.argv) > 1 else "."
     files_to_check = []
 
-    for target in targets:
-        if os.path.isfile(target):
-            if not should_ignore(target) and target.endswith(TARGET_EXTENSIONS):
-                files_to_check.append(target)
-        elif os.path.isdir(target):
-            for dirpath, dirnames, filenames in os.walk(target):
-                dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-                for f in filenames:
-                    if f.endswith(TARGET_EXTENSIONS):
-                        full_path = os.path.join(dirpath, f)
-                        if not should_ignore(full_path):
-                            files_to_check.append(full_path)
+    
+    if os.path.isfile(target):
+        if not should_ignore(target) and target.endswith(TARGET_EXTENSIONS):
+            files_to_check.append(target)
+    elif os.path.isdir(target):
+        for dirpath, _, filenames in os.walk(target):
+            for f in filenames:
+                if f.endswith(TARGET_EXTENSIONS):
+                    full_path = os.path.join(dirpath, f)
+                    if not should_ignore(full_path):
+                        files_to_check.append(full_path)
+    else:
+        print(f"Error: {target} is not a valid file or directory.")
+        sys.exit(1)
 
     files_to_check.sort()
     failures = []

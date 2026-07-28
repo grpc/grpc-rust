@@ -117,6 +117,7 @@ allowed_external_types = [
 
     "tower_service::Service",
     "tower::BoxError",
+    "tower::load::Load",
     "tower::util::boxed_clone_sync::BoxCloneSyncService",
     "url::parser::ParseError",
     "serde_core::de::Deserialize",

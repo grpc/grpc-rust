@@ -1,6 +1,5 @@
 [package]
 name = "xds-test-util"
-version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 homepage = "https://github.com/grpc/grpc-rust"

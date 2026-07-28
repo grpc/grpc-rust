@@ -18,7 +18,6 @@ use envoy_types::pb::envoy::service::discovery::v3::{
     aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
 };
 use envoy_types::pb::google::protobuf::Any;
-use prost::Message;
 use strum::IntoEnumIterator;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -40,28 +39,65 @@ struct Subscription {
     nonce: u64,
 }
 
+/// A versioned snapshot of the resources for a single xDS type.
+///
+/// Kept in its own module so `version` and `resources` stay private and can only
+/// change through [`set`](VersionedResourceBundle::set), which guarantees the
+/// version is bumped on every mutation. The version starts at 0 (meaning "never
+/// set") and increases monotonically, so each distinct resource state carries a
+/// distinct version.
+mod bundle {
+    use super::{Any, HashMap};
+
+    /// A versioned snapshot of the resources for a single xDS type.
+    #[derive(Debug, Default)]
+    pub(super) struct VersionedResourceBundle {
+        /// Monotonic version of the current resource set (0 means "never set").
+        version: u64,
+        /// Resources keyed by name.
+        resources: HashMap<String, Any>,
+    }
+
+    impl VersionedResourceBundle {
+        /// Replaces the resource set and bumps the version.
+        pub(super) fn set(&mut self, resources: HashMap<String, Any>) {
+            self.resources = resources;
+            self.version += 1;
+        }
+
+        /// Returns the current version (0 means "never set").
+        pub(super) fn version(&self) -> u64 {
+            self.version
+        }
+
+        /// Returns the current resources, keyed by name.
+        pub(super) fn resources(&self) -> &HashMap<String, Any> {
+            &self.resources
+        }
+    }
+}
+
+use bundle::VersionedResourceBundle;
+
 /// Mutable control-plane state, guarded by a single mutex.
 #[derive(Debug)]
 struct State {
-    /// xDS resources keyed by their names, organized by type URL.
-    resources: HashMap<AdsTypeUrl, HashMap<String, Any>>,
-    /// Latest version number for each xDS resource type (starts at 1, bumped on each config set).
-    versions: HashMap<AdsTypeUrl, u64>,
+    /// Versioned resource bundles, keyed by xDS type URL.
+    bundles: HashMap<AdsTypeUrl, VersionedResourceBundle>,
     /// Active subscribers for each xDS resource type, keyed by stream ID.
     subscribers: HashMap<AdsTypeUrl, HashMap<u64, Subscription>>,
 }
 
 impl State {
     fn new() -> Self {
-        let mut versions = HashMap::new();
+        let mut bundles = HashMap::new();
         let mut subscribers = HashMap::new();
         for type_url in AdsTypeUrl::iter() {
-            versions.insert(type_url.clone(), 1);
+            bundles.insert(type_url.clone(), VersionedResourceBundle::default());
             subscribers.insert(type_url.clone(), HashMap::new());
         }
         Self {
-            resources: HashMap::new(),
-            versions,
+            bundles,
             subscribers,
         }
     }
@@ -77,7 +113,10 @@ struct Inner {
 impl Inner {
     /// Handles a single inbound `DiscoveryRequest` for a stream.
     fn handle_request(&self, stream_id: u64, tx: &ResponseSender, req: DiscoveryRequest) {
-        let mut state = self.state.lock().expect("control plane state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("control plane state should not be poisoned");
 
         // NACK: a request carrying an error detail rejects the last response.
         if req.error_detail.is_some() {
@@ -93,15 +132,18 @@ impl Inner {
             Ok(url) => url,
             Err(_) => {
                 tracing::error!(
-                    "Received request with empty or invalid type_url for stream {}",
-                    stream_id
+                    "Received request with empty or invalid type_url for stream {} (type_url: {})",
+                    stream_id,
+                    req.type_url
                 );
                 return;
             }
         };
 
-        // Nonce check: if the request carries a response nonce, it must match
-        // the last nonce we sent on this (type, stream); otherwise ignore it.
+        // Nonce check: if the request's nonce doesn't match the last response's nonce,
+        // the management server is allowed to ignore any further DiscoveryRequests for the previous version
+        // until a DiscoveryRequest bearing the nonce.
+        // Ref: https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/discovery/v3/discovery.proto#service-discovery-v3-discoveryresponse
         if !req.response_nonce.is_empty() {
             let matches = state
                 .subscribers
@@ -110,9 +152,10 @@ impl Inner {
                 .is_some_and(|sub| sub.nonce.to_string() == req.response_nonce);
             if !matches {
                 tracing::warn!(
-                    "Received request with mismatched nonce for stream {}: {}",
+                    "Received request with mismatched nonce for stream {}: {} (type_url={})",
                     stream_id,
-                    req.response_nonce
+                    req.response_nonce,
+                    type_url
                 );
                 return;
             }
@@ -141,16 +184,16 @@ impl Inner {
             return;
         }
 
-        let version = state.versions.get(&type_url).copied().unwrap_or(1);
-
-        // Borrow the resource and subscriber tables as disjoint fields so the
-        // response can be built from `resources` while mutating `subscribers`.
+        // Borrow the bundle and subscriber tables as disjoint fields so the
+        // response can be built from `bundles` while mutating `subscribers`.
         let State {
-            resources,
+            bundles,
             subscribers,
             ..
         } = &mut *state;
-        let type_resources = resources.get(&type_url);
+        // A type that was never configured behaves like an empty bundle at version 0.
+        let default_bundle = VersionedResourceBundle::default();
+        let bundle = bundles.get(&type_url).unwrap_or(&default_bundle);
         let sub = subscribers
             .entry(type_url.clone())
             .or_default()
@@ -161,14 +204,23 @@ impl Inner {
                 nonce: 0,
             });
         sub.nonce += 1;
-        let response = build_response(&type_url, version, sub.nonce, &requested, type_resources);
+        let response = build_response(
+            &type_url,
+            bundle.version(),
+            sub.nonce,
+            &requested,
+            bundle.resources(),
+        );
         let _ = sub.sender.send(response);
         sub.resource_names = requested;
     }
 
     /// Removes all subscriptions for a stream when it ends.
     fn remove_stream(&self, stream_id: u64) {
-        let mut state = self.state.lock().expect("control plane state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("control plane state should not be poisoned");
         for streams in state.subscribers.values_mut() {
             streams.remove(&stream_id);
         }
@@ -183,7 +235,7 @@ impl Inner {
 /// while the server runs.
 ///
 /// The service implements the ADS server trait and can be registered with a
-/// tonic server via [`AggregatedDiscoveryServiceServer`](crate::AggregatedDiscoveryServiceServer).
+/// tonic server via [`AggregatedDiscoveryServiceServer`].
 #[derive(Clone, Debug)]
 pub struct XdsTestControlPlaneService {
     inner: Arc<Inner>,
@@ -212,50 +264,61 @@ impl XdsTestControlPlaneService {
     ///
     /// Each resource is packed into a protobuf `Any` tagged with `type_url`.
     /// Resource types are treated as state-of-the-world.
-    pub fn set_xds_config<M: Message>(&self, type_url: &AdsTypeUrl, resources: HashMap<String, M>) {
+    pub fn set_xds_config<M: prost::Name>(
+        &self,
+        type_url: &AdsTypeUrl,
+        resources: HashMap<String, M>,
+    ) {
         let packed: HashMap<String, Any> = resources
             .into_iter()
             .map(|(name, msg)| {
                 (
                     name,
                     Any {
-                        type_url: type_url.to_string(),
+                        // Use the type_url from the message type instead of the AdsTypeUrl enum,
+                        // so that the Any is tagged with the correct type for the message itself.
+                        // This is necessary because cached resource might be of a different type than
+                        // the AdsTypeUrl enum, e.g. the envoy.service.discovery.v3.Resource wrapper resource type.
+                        // Therefore, it's important to use the type_url from the message type to ensure that
+                        // clients can correctly decode the Any into the expected message type.
+                        type_url: M::type_url(),
                         value: msg.encode_to_vec(),
                     },
                 )
             })
             .collect();
+        self.set_packed_xds_config(type_url, packed);
+    }
 
+    /// Sets the full set of resources for `type_url`, replacing any previous resources of that type,
+    /// and pushes an update to every current subscriber.
+    fn set_packed_xds_config(&self, type_url: &AdsTypeUrl, packed: HashMap<String, Any>) {
         let mut state = self
             .inner
             .state
             .lock()
-            .expect("control plane state poisoned");
-        state.resources.insert(type_url.clone(), packed);
-
-        // getAndIncrement: the pushed response carries the pre-increment version.
-        let version = {
-            let counter = state.versions.entry(type_url.clone()).or_insert(1);
-            let current = *counter;
-            *counter += 1;
-            current
-        };
+            .expect("control plane state should not be poisoned");
 
         let State {
-            resources,
+            bundles,
             subscribers,
             ..
         } = &mut *state;
-        let type_resources = resources.get(type_url);
+
+        // `set` stores the new resources and bumps the version, so the pushed
+        // response carries the new version and never reuses the initial 0.
+        let bundle = bundles.entry(type_url.clone()).or_default();
+        bundle.set(packed);
+
         if let Some(streams) = subscribers.get_mut(type_url) {
             for sub in streams.values_mut() {
                 sub.nonce += 1;
                 let response = build_response(
                     type_url,
-                    version,
+                    bundle.version(),
                     sub.nonce,
                     &sub.resource_names,
-                    type_resources,
+                    bundle.resources(),
                 );
                 let _ = sub.sender.send(response);
             }
@@ -273,8 +336,12 @@ impl XdsTestControlPlaneService {
             .inner
             .state
             .lock()
-            .expect("control plane state poisoned");
-        state.resources.get(type_url).cloned().unwrap_or_default()
+            .expect("control plane state should not be poisoned");
+        state
+            .bundles
+            .get(type_url)
+            .map(|bundle| bundle.resources().clone())
+            .unwrap_or_default()
     }
 
     /// Returns the names of the currently configured resources for `type_url`,
@@ -288,12 +355,12 @@ impl XdsTestControlPlaneService {
             .inner
             .state
             .lock()
-            .expect("control plane state poisoned");
+            .expect("control plane state should not be poisoned");
         state
-            .resources
+            .bundles
             .get(type_url)
-            .map(|resources| {
-                let mut names: Vec<String> = resources.keys().cloned().collect();
+            .map(|bundle| {
+                let mut names: Vec<String> = bundle.resources().keys().cloned().collect();
                 names.sort();
                 names
             })
@@ -307,7 +374,7 @@ impl XdsTestControlPlaneService {
             .inner
             .state
             .lock()
-            .expect("control plane state poisoned");
+            .expect("control plane state should not be poisoned");
 
         state
             .subscribers
@@ -449,15 +516,12 @@ fn build_response(
     version: u64,
     nonce: u64,
     resource_names: &HashSet<String>,
-    type_resources: Option<&HashMap<String, Any>>,
+    type_resources: &HashMap<String, Any>,
 ) -> DiscoveryResponse {
-    let resources = match type_resources {
-        Some(map) => resource_names
-            .iter()
-            .filter_map(|name| map.get(name).cloned())
-            .collect(),
-        None => Vec::new(),
-    };
+    let resources = resource_names
+        .iter()
+        .filter_map(|name| type_resources.get(name).cloned())
+        .collect();
     DiscoveryResponse {
         version_info: version.to_string(),
         resources,
@@ -502,5 +566,24 @@ mod tests {
                 .get_current_config(&AdsTypeUrl::Cds)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn versioned_bundle_bumps_version_on_each_set() {
+        let mut bundle = VersionedResourceBundle::default();
+
+        // Starts empty at version 0 ("never set").
+        assert_eq!(bundle.version(), 0);
+        assert!(bundle.resources().is_empty());
+
+        // Each set replaces the resources and bumps the version.
+        bundle.set(HashMap::from([("my-listener".to_string(), Any::default())]));
+        assert_eq!(bundle.version(), 1);
+        assert_eq!(bundle.resources().len(), 1);
+
+        // Setting again bumps to a distinct version, even back to empty.
+        bundle.set(HashMap::new());
+        assert_eq!(bundle.version(), 2);
+        assert!(bundle.resources().is_empty());
     }
 }

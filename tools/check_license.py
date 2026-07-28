@@ -9,6 +9,7 @@ import datetime
 import difflib
 import os
 import re
+import subprocess
 import sys
 # Third-party adapted files. These will hold unique authors.
 IGNORE_FILES = {
@@ -165,12 +166,17 @@ def main():
         if not should_ignore(target) and target.endswith(TARGET_EXTENSIONS):
             files_to_check.append(target)
     elif os.path.isdir(target):
-        for dirpath, _, filenames in os.walk(target):
-            for f in filenames:
-                if f.endswith(TARGET_EXTENSIONS):
-                    full_path = os.path.join(dirpath, f)
-                    if not should_ignore(full_path):
-                        files_to_check.append(full_path)
+        try:
+            res = subprocess.run(
+                ["git", "ls-files", "--", target],
+                capture_output=True, text=True, check=True
+            )
+            for filepath in res.stdout.splitlines():
+                if filepath.endswith(TARGET_EXTENSIONS) and not should_ignore(filepath):
+                    files_to_check.append(filepath)
+        except subprocess.CalledProcessError as e:
+            print(f"Error running git ls-files: {e}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(f"Error: {target} is not a valid file or directory.")
         sys.exit(1)

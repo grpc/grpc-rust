@@ -64,11 +64,11 @@ impl KeyLogFileInner {
 
         self.buf.truncate(0);
         write!(self.buf, "{label} ")?;
-        for b in client_random {
+        for b in client_random.iter() {
             write!(self.buf, "{b:02x}")?;
         }
         write!(self.buf, " ")?;
-        for b in secret {
+        for b in secret.iter() {
             write!(self.buf, "{b:02x}")?;
         }
         writeln!(self.buf)?;

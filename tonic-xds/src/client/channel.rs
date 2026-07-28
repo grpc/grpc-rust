@@ -1,16 +1,42 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use crate::client::cluster::ClusterClientRegistryGrpc;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
-use crate::client::route::{Router, XdsRoutingLayer};
+use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry};
+use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use crate::{TonicCallCredentials, XdsUri};
 use http::Request;
+#[cfg(feature = "_tls-any")]
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -20,7 +46,7 @@ use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
 
-use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig, RetryLayer};
+use crate::client::retry::{GrpcRetryPolicy, RetryLayer};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -168,12 +194,15 @@ const _: fn() = || {
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
     recorder: Option<Arc<dyn MetricsRecorder>>,
+    pre_route: Option<Arc<dyn PreRouteInterceptor>>,
+    #[cfg(feature = "_tls-any")]
+    cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
 
 impl Debug for XdsChannelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("XdsChannelBuilder")
-            .field("config", &self.config)
+        let mut s = f.debug_struct("XdsChannelBuilder");
+        s.field("config", &self.config)
             .field(
                 "recorder",
                 &self
@@ -181,7 +210,19 @@ impl Debug for XdsChannelBuilder {
                     .as_deref()
                     .map_or("None", |r| std::any::type_name_of_val(r)),
             )
-            .finish()
+            .field(
+                "pre_route",
+                &self
+                    .pre_route
+                    .as_deref()
+                    .map_or("None", |i| std::any::type_name_of_val(i)),
+            );
+        #[cfg(feature = "_tls-any")]
+        s.field(
+            "cert_providers",
+            &self.cert_providers.keys().collect::<Vec<_>>(),
+        );
+        s.finish()
     }
 }
 
@@ -192,6 +233,9 @@ impl XdsChannelBuilder {
         Self {
             config: Arc::new(config),
             recorder: None,
+            pre_route: None,
+            #[cfg(feature = "_tls-any")]
+            cert_providers: HashMap::new(),
         }
     }
 
@@ -204,6 +248,37 @@ impl XdsChannelBuilder {
     #[must_use]
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// Registers a [`PreRouteInterceptor`] that runs before route selection.
+    ///
+    /// The routing layer takes a `RouteConfiguration` snapshot for each request;
+    /// when an interceptor is registered, it is invoked inline against that
+    /// snapshot before matching, and may mutate request headers (using the
+    /// config's [`RouteConfigMetadata`](crate::RouteConfigMetadata)) so the
+    /// router matches on the result. This enables config-driven request
+    /// transformation such as computing a partition/shard key and injecting a
+    /// routing header. The interceptor and the router observe the same snapshot.
+    #[must_use]
+    pub fn with_pre_route_interceptor(mut self, interceptor: Arc<dyn PreRouteInterceptor>) -> Self {
+        self.pre_route = Some(interceptor);
+        self
+    }
+
+    /// Registers a custom [`CertificateProvider`] under an xDS certificate
+    /// provider instance name, resolved by CDS `UpstreamTlsContext` references.
+    /// Shadows a bootstrap `file_watcher` instance of the same name.
+    ///
+    /// [`CertificateProvider`]: crate::CertificateProvider
+    #[cfg(feature = "_tls-any")]
+    #[must_use]
+    pub fn with_certificate_provider(
+        mut self,
+        instance_name: impl Into<String>,
+        provider: Arc<dyn CertificateProvider>,
+    ) -> Self {
+        self.cert_providers.insert(instance_name.into(), provider);
         self
     }
 
@@ -254,6 +329,7 @@ impl XdsChannelBuilder {
         #[cfg(feature = "_tls-any")]
         let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
             &bootstrap.certificate_providers,
+            self.cert_providers.clone(),
         )?);
 
         let node = Node::try_from(bootstrap.node)?;
@@ -299,14 +375,14 @@ impl XdsChannelBuilder {
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = Arc::new(XdsClusterDiscovery::new(cache));
-        let retry_policy = GrpcRetryPolicy::new(GrpcRetryPolicyConfig::default());
+        let retry_policy = GrpcRetryPolicy::default();
 
         let resources = Arc::new(XdsChannelResources {
             _resource_manager: resource_manager,
             _xds_client: xds_client,
         });
 
-        let routing_layer = XdsRoutingLayer::new(router, self.authority());
+        let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
@@ -332,15 +408,17 @@ impl XdsChannelBuilder {
         self.build_tonic_grpc_channel()
     }
 
-    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, and retry policy.
+    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
+    /// policy, and optional pre-route interceptor.
     #[cfg(test)]
     pub(crate) fn build_grpc_channel_from_parts(
         &self,
         router: Arc<dyn Router>,
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
         retry_policy: GrpcRetryPolicy,
+        interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
-        let routing_layer = XdsRoutingLayer::new(router, self.authority());
+        let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
@@ -527,6 +605,7 @@ mod tests {
             xds_manager.clone(),
             xds_manager.clone(),
             GrpcRetryPolicy::default(),
+            None,
         );
 
         let client = GreeterClient::new(xds_channel);
@@ -583,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_once_on_unavailable() {
-        use crate::client::retry::{GrpcRetryPolicy, GrpcRetryPolicyConfig};
+        use crate::client::retry::{GrpcRetryClassifier, GrpcRetryPolicy, RetryConfig};
         use crate::testutil::grpc::spawn_fail_first_n_server;
 
         // Server fails the first request with UNAVAILABLE, succeeds on retry.
@@ -595,15 +674,17 @@ mod tests {
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
         let retry_policy = GrpcRetryPolicy::new(
-            GrpcRetryPolicyConfig::new()
-                .retry_on(vec![tonic::Code::Unavailable])
-                .num_retries(1),
+            RetryConfig::new().num_retries(1),
+            GrpcRetryClassifier {
+                retry_on: vec![tonic::Code::Unavailable],
+            },
         );
 
         let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(
             xds_manager.clone(),
             xds_manager.clone(),
             retry_policy,
+            None,
         );
 
         let mut client = GreeterClient::new(xds_channel);
@@ -650,6 +731,7 @@ mod tests {
                     action: RouteConfigAction::Cluster(cluster_name.to_string()),
                 }],
             }],
+            metadata: Default::default(),
         })
     }
 
@@ -688,8 +770,10 @@ mod tests {
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             Arc::new(XdsClusterDiscovery::new(cache, registry))
         };
         #[cfg(not(feature = "_tls-any"))]
@@ -698,7 +782,7 @@ mod tests {
         > = Arc::new(XdsClusterDiscovery::new(cache));
 
         let builder = XdsChannelBuilder::new(test_config());
-        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default())
+        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default(), None)
     }
 
     /// Tests the full xDS stack (XdsRouter + XdsClusterDiscovery) with a
@@ -821,8 +905,10 @@ mod tests {
         #[cfg(feature = "_tls-any")]
         let _channel = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             builder.build_from_cache(cache, registry, xds_client, resource_manager)
         };
         #[cfg(not(feature = "_tls-any"))]

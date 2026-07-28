@@ -24,8 +24,18 @@
 
 #[allow(unused)]
 pub mod generated {
-    pub mod benchmark_service_grpc {
-        grpc::include_proto!("grpc/testing", "benchmark_service");
+    pub mod grpc {
+        pub mod testing {
+            include!(concat!(env!("OUT_DIR"), "/grpc/testing/generated.rs"));
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/grpc/testing/benchmark_service_grpc.pb.rs"
+            ));
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/grpc/testing/worker_service_grpc.pb.rs"
+            ));
+        }
     }
 
     pub mod services {
@@ -40,6 +50,7 @@ pub mod generated {
     }
 }
 
+mod client;
 mod rusage;
 mod server;
 pub mod worker;

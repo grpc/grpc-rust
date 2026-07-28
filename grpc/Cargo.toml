@@ -1,7 +1,7 @@
 [package]
 name = "grpc"
 version = "0.10.0"
-authors = ["gRPC Authors"]
+authors = ["gRPC authors"]
 license = "MIT"
 homepage = "https://grpc.io"
 repository = "https://github.com/grpc/grpc-rust"
@@ -56,6 +56,7 @@ bytes = "1.10.1"
 futures = { version = "0.3", default-features = false, optional = true }
 hickory-resolver = { version = "0.26.1", optional = true }
 http = "1.1.0"
+httparse = "1.9"
 http-body = "1.0.1"
 hyper = { version = "1.6.0", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["client-proxy"] }

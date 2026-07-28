@@ -35,6 +35,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::Streaming;
 
+use crate::client::BenchmarkClient;
 use crate::generated::services::grpc::testing::ClientArgs;
 use crate::generated::services::grpc::testing::ClientStatus;
 use crate::generated::services::grpc::testing::CoreRequest;
@@ -42,6 +43,7 @@ use crate::generated::services::grpc::testing::CoreResponse;
 use crate::generated::services::grpc::testing::ServerArgs;
 use crate::generated::services::grpc::testing::ServerStatus;
 use crate::generated::services::grpc::testing::Void;
+use crate::generated::services::grpc::testing::client_args::Argtype as ClientArgType;
 use crate::generated::services::grpc::testing::server_args::Argtype;
 use crate::generated::services::grpc::testing::worker_service_server::WorkerService;
 use crate::server::BenchmarkServer;
@@ -95,7 +97,7 @@ impl WorkerService for WorkerServer {
                              Err(Status::already_exists("server already started"))?;
                         }
 
-                        let server = BenchmarkServer::start(server_config).map_err(|status| {
+                        let server = BenchmarkServer::start(server_config).await.map_err(|status| {
                             println!("Error while creating server: {:?}", status);
                             status
                         })?;
@@ -132,9 +134,47 @@ impl WorkerService for WorkerServer {
 
     async fn run_client(
         &self,
-        _request: Request<Streaming<ClientArgs>>,
+        request: Request<Streaming<ClientArgs>>,
     ) -> Result<Response<Self::RunClientStream>, Status> {
-        Err(Status::unimplemented(""))
+        println!("Handling client stream.");
+        let mut stream = request.into_inner();
+
+        let output = async_stream::try_stream! {
+            let mut benchmark_client: Option<BenchmarkClient> = None;
+            while let Some(request) = stream.next().await {
+                let request = request?;
+                let mut reset_stats = false;
+                let argtype = request.argtype
+                    .ok_or(Status::invalid_argument("missing request.argtype"))?;
+                match  argtype {
+                    ClientArgType::Setup(client_config) => {
+                        if benchmark_client.is_some() {
+                             Err(Status::already_exists("client already started"))?;
+                        }
+                        match BenchmarkClient::start(client_config) {
+                            Ok(client) => {
+                                benchmark_client = Some(client);
+                            },
+                            Err(status) => {
+                                println!("Error while creating client: {:?}", status);
+                                Err(status)?;
+                            }
+                        }
+                    },
+                    ClientArgType::Mark(mark) => {
+                        benchmark_client.as_ref()
+                            .ok_or(Status::invalid_argument("client does not exist when mark received"))?;
+                        reset_stats = mark.reset;
+                    }
+                };
+                let stats = benchmark_client.as_mut().unwrap().get_stats(reset_stats).await?;
+                yield ClientStatus {
+                    stats: Some(stats),
+                };
+            }
+        };
+
+        Ok(Response::new(Box::pin(output) as Self::RunClientStream))
     }
 
     async fn core_count(

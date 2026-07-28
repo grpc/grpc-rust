@@ -28,13 +28,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
-use crate::private;
 use crate::rt::BoxEndpoint;
 use crate::rt::BoxFuture;
 use crate::rt::BoxedTaskHandle;
@@ -42,6 +39,7 @@ use crate::rt::DnsResolver;
 use crate::rt::ResolverOptions;
 use crate::rt::Runtime;
 use crate::rt::Sleep;
+use crate::rt::StreamEndpoint;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
 
@@ -125,7 +123,7 @@ impl Runtime for TokioRuntime {
                     .map_err(|err| err.to_string())?;
             }
             let stream: Box<dyn super::GrpcEndpoint> =
-                Box::new(TokioIoStream::new_from_tcp(stream)?);
+                Box::new(StreamEndpoint::new_from_tcp(stream)?);
             Ok(stream)
         })
     }
@@ -147,7 +145,7 @@ impl Runtime for TokioRuntime {
             let peer_addr = stream.peer_addr().map_err(|err| err.to_string())?;
             let local_addr = stream.local_addr().map_err(|err| err.to_string())?;
 
-            let stream: Box<dyn super::GrpcEndpoint> = Box::new(TokioIoStream {
+            let stream: Box<dyn super::GrpcEndpoint> = Box::new(StreamEndpoint {
                 peer_addr: format!("{peer_addr:?}").into_boxed_str(),
                 local_addr: format!("{local_addr:?}").into_boxed_str(),
                 network_type: UNIX_NETWORK_TYPE,
@@ -166,17 +164,9 @@ impl TokioDefaultDnsResolver {
         Ok(TokioDefaultDnsResolver { _priv: () })
     }
 }
-
-pub(crate) struct TokioIoStream<T> {
-    inner: T,
-    peer_addr: Box<str>,
-    local_addr: Box<str>,
-    network_type: &'static str,
-}
-
-impl TokioIoStream<TcpStream> {
+impl StreamEndpoint<TcpStream> {
     pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
-        Ok(TokioIoStream {
+        Ok(StreamEndpoint {
             local_addr: stream
                 .local_addr()
                 .map_err(|err| err.to_string())?
@@ -190,67 +180,6 @@ impl TokioIoStream<TcpStream> {
             network_type: TCP_IP_NETWORK_TYPE,
             inner: stream,
         })
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> super::GrpcEndpoint for TokioIoStream<T> {
-    fn get_local_address(&self) -> &str {
-        &self.local_addr
-    }
-
-    fn get_peer_address(&self) -> &str {
-        &self.peer_addr
-    }
-
-    fn get_network_type(&self) -> &'static str {
-        self.network_type
-    }
-
-    fn poll_read_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-        _token: private::Internal,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-
-    fn poll_write_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored_private(&self, _token: private::Internal) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

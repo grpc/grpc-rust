@@ -50,7 +50,7 @@ use crate::credentials::rustls::client::ClientTlsConfig;
 use crate::credentials::rustls::client::RustlsChannelCredentials;
 use crate::private;
 use crate::rt;
-use crate::rt::AsyncIoAdapter;
+use crate::rt::EndpointIoStream;
 use crate::rt::TcpOptions;
 
 static INIT: Once = Once::new();
@@ -181,7 +181,7 @@ async fn test_tls_key_log() {
         .expect("Handshake failed");
     let stream = result.endpoint;
     let mut buf = Vec::new();
-    let _ = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+    let _ = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
     assert_eq!(buf, b"Hello world");
 
     server_task.await.unwrap();
@@ -339,7 +339,7 @@ async fn test_mtls_handshake_no_identity() {
 
     let stream = result.endpoint;
     let mut buf = Vec::new();
-    let res = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+    let res = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
     assert!(
         res.is_err(),
         "read from TLS stream should fail due to missing client identity"
@@ -387,7 +387,7 @@ async fn test_mtls_handshake_with_identitiy() {
 
     let stream = result.endpoint;
     let mut buf = Vec::new();
-    let _ = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+    let _ = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
     assert_eq!(buf, b"Hello world");
 
     server_task.await.unwrap();
@@ -449,7 +449,9 @@ async fn check_client_resumption_disabled(
         );
 
         let mut buf = Vec::new();
-        let _ = AsyncIoAdapter::new(tls_stream).read_to_end(&mut buf).await;
+        let _ = EndpointIoStream::new(tls_stream)
+            .read_to_end(&mut buf)
+            .await;
         assert_eq!(buf, b"Hello world");
     }
 
@@ -614,7 +616,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
         let stream = result.endpoint;
         let mut buf = Vec::new();
         // Ignore read errors if server closed connection abruptly (which happens in failure cases, but here we expect success)
-        let _ = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+        let _ = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
         assert_eq!(buf, b"Hello world");
     } else {
         assert!(result.is_err(), "Handshake succeeded but expected failure");

@@ -64,6 +64,7 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
+use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
 use crate::client::service_config::LbPolicyType;
 use crate::client::service_config::ServiceConfig;
@@ -207,6 +208,7 @@ impl ChannelBuilder {
         // TODO(nathanielford): Return errors here instead of panicking.
         let target = Target::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
+        let resolver_builder = proxy_resolver::Builder::new_arc(resolver_builder);
 
         let authority = self
             .authority

@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! `file_watcher` certificate provider plugin.
 //!
 //! Reads PEM-encoded certificates and keys from local files. This is the
@@ -22,8 +46,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use rustls::RootCertStore;
-use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 
 use crate::common::async_util::AbortOnDrop;
@@ -69,12 +91,14 @@ where
     let secs: f64 = num
         .parse()
         .map_err(|_| serde::de::Error::custom(format!("invalid duration number: '{num}'")))?;
-    if secs < 0.0 {
+    let duration = Duration::try_from_secs_f64(secs)
+        .map_err(|e| serde::de::Error::custom(format!("invalid duration '{s}': {e}")))?;
+    if duration.is_zero() {
         return Err(serde::de::Error::custom(format!(
-            "invalid duration '{s}': must not be negative"
+            "invalid duration '{s}': must be greater than 0"
         )));
     }
-    Ok(Some(Duration::from_secs_f64(secs)))
+    Ok(Some(duration))
 }
 
 /// A certificate provider that reads PEM files from disk.
@@ -135,13 +159,9 @@ impl CertificateProvider for FileWatcherProvider {
 
 /// Read certificate data from the files specified in the config.
 ///
-/// CA roots are parsed into [`Arc<RootCertStore>`] in this function — once per
-/// refresh — so the verifier can use them directly on every TLS handshake
-/// without re-parsing. Identity bytes are kept as PEM because
-/// [`tonic::transport::Identity::from_pem`] is bytes-only on the consumer side.
-///
-/// This function is the single validation boundary between the permissive
-/// JSON-parsed [`FileWatcherConfig`] and the invariant-enforcing
+/// CA roots and identity material are read as raw PEM bytes; parsing is left to
+/// the consumer. This function is the single validation boundary between the
+/// permissive JSON-parsed [`FileWatcherConfig`] and the invariant-enforcing
 /// [`CertificateData`]. It checks both A65 rules:
 /// - cert/key pairing (first match)
 /// - at least one of identity/roots is set (second match)
@@ -149,14 +169,13 @@ fn read_certificate_data(config: &FileWatcherConfig) -> Result<CertificateData, 
     let roots = config
         .ca_certificate_file
         .as_deref()
-        .map(read_and_parse_roots)
+        .map(read_file)
         .transpose()?;
 
     let identity = match (&config.certificate_file, &config.private_key_file) {
-        (Some(cert_path), Some(key_path)) => Some(Identity {
-            cert_chain: read_file(cert_path)?,
-            key: read_file(key_path)?,
-        }),
+        (Some(cert_path), Some(key_path)) => {
+            Some(Identity::new(read_file(cert_path)?, read_file(key_path)?))
+        }
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => return Err(CertProviderError::UnpairedCertKey),
     };
@@ -174,26 +193,6 @@ fn read_file(path: &Path) -> Result<Vec<u8>, CertProviderError> {
         path: path.display().to_string(),
         source: e,
     })
-}
-
-fn read_and_parse_roots(path: &Path) -> Result<Arc<RootCertStore>, CertProviderError> {
-    let pem = read_file(path)?;
-    let mut reader = std::io::Cursor::new(&pem);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<_, _>>()
-        .map_err(|e| CertProviderError::PemParse {
-            path: path.display().to_string(),
-            reason: e.to_string(),
-        })?;
-    let mut store = RootCertStore::empty();
-    let (added, _) = store.add_parsable_certificates(certs);
-    if added == 0 {
-        return Err(CertProviderError::PemParse {
-            path: path.display().to_string(),
-            reason: "no usable certificates in PEM".into(),
-        });
-    }
-    Ok(Arc::new(store))
 }
 
 #[cfg(test)]
@@ -229,15 +228,15 @@ mod tests {
 
     #[tokio::test]
     async fn reads_ca_certificate() {
-        let ca_file = write_temp_file(&gen_ca_pem());
+        let ca_pem = gen_ca_pem();
+        let ca_file = write_temp_file(&ca_pem);
 
         let provider =
             FileWatcherProvider::new(make_config(ca_file.path().to_str(), None, None)).unwrap();
         let data = provider.fetch().unwrap();
 
         assert!(matches!(*data, CertificateData::RootsOnly { .. }));
-        let roots = data.roots().unwrap();
-        assert_eq!(roots.len(), 1);
+        assert_eq!(data.roots().unwrap(), ca_pem.as_slice());
         assert!(data.identity().is_none());
     }
 
@@ -256,14 +255,15 @@ mod tests {
 
         assert!(matches!(*data, CertificateData::IdentityOnly { .. }));
         let identity = data.identity().unwrap();
-        assert_eq!(identity.cert_chain.as_slice(), b"cert-chain-pem");
-        assert_eq!(identity.key.as_slice(), b"private-key-pem");
+        assert_eq!(identity.cert_chain(), b"cert-chain-pem");
+        assert_eq!(identity.key(), b"private-key-pem");
         assert!(data.roots().is_none());
     }
 
     #[tokio::test]
     async fn reads_all_files() {
-        let ca_file = write_temp_file(&gen_ca_pem());
+        let ca_pem = gen_ca_pem();
+        let ca_file = write_temp_file(&ca_pem);
         let cert_file = write_temp_file(b"cert-pem");
         let key_file = write_temp_file(b"key-pem");
 
@@ -276,10 +276,10 @@ mod tests {
         let data = provider.fetch().unwrap();
 
         assert!(matches!(*data, CertificateData::Both { .. }));
-        assert_eq!(data.roots().unwrap().len(), 1);
+        assert_eq!(data.roots().unwrap(), ca_pem.as_slice());
         let identity = data.identity().unwrap();
-        assert_eq!(identity.cert_chain.as_slice(), b"cert-pem");
-        assert_eq!(identity.key.as_slice(), b"key-pem");
+        assert_eq!(identity.cert_chain(), b"cert-pem");
+        assert_eq!(identity.key(), b"key-pem");
     }
 
     #[test]
@@ -399,16 +399,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_refresh_interval_negative() {
+    fn parse_refresh_interval_must_be_greater_than_zero() {
         let err = serde_json::from_value::<FileWatcherConfig>(
-            serde_json::json!({"refresh_interval": "-1s"}),
+            serde_json::json!({"refresh_interval":"0s"}),
         );
         assert!(err.is_err());
         assert!(
             err.unwrap_err()
                 .to_string()
-                .contains("must not be negative")
+                .contains("must be greater than 0")
         );
+    }
+
+    #[test]
+    fn parse_refresh_interval_rejects_invalid_floats() {
+        // Negative, NaN, and infinite all fail `Duration::try_from_secs_f64`
+        // rather than the "must be greater than 0" zero check.
+        for v in [
+            serde_json::json!({"refresh_interval": "-1s"}),
+            serde_json::json!({"refresh_interval": "NaNs"}),
+            serde_json::json!({"refresh_interval": "infs"}),
+        ] {
+            assert!(serde_json::from_value::<FileWatcherConfig>(v).is_err());
+        }
     }
 
     #[tokio::test]
@@ -417,7 +430,8 @@ mod tests {
         use crate::xds::cert_provider::CertProviderRegistry;
         use std::collections::HashMap;
 
-        let ca_file = write_temp_file(&gen_ca_pem());
+        let ca_pem = gen_ca_pem();
+        let ca_file = write_temp_file(&ca_pem);
 
         let mut configs = HashMap::new();
         configs.insert(
@@ -430,12 +444,12 @@ mod tests {
             },
         );
 
-        let registry = CertProviderRegistry::from_bootstrap(&configs).unwrap();
+        let registry = CertProviderRegistry::from_bootstrap(&configs, HashMap::new()).unwrap();
         assert!(registry.get("my_certs").is_some());
         assert!(registry.get("other").is_none());
 
         let provider = registry.get("my_certs").unwrap();
         let data = provider.fetch().unwrap();
-        assert_eq!(data.roots().unwrap().len(), 1);
+        assert_eq!(data.roots().unwrap(), ca_pem.as_slice());
     }
 }

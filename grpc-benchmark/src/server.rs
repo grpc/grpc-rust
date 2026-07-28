@@ -32,6 +32,7 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -54,7 +55,6 @@ use crate::generated::services::grpc::testing::payload_config::Payload::ComplexP
 use crate::generated::services::grpc::testing::payload_config::Payload::SimpleParams;
 use crate::rusage::Rusage;
 
-const DEFAULT_PORT: u16 = 50055;
 const SERVER_PEM: &[u8] = include_bytes!("../data/tls/server1.pem");
 const SERVER_KEY: &[u8] = include_bytes!("../data/tls/server1.key");
 
@@ -66,7 +66,7 @@ pub struct BenchmarkServer {
 }
 
 impl BenchmarkServer {
-    pub(crate) fn start(config: ServerConfig) -> Result<Self, Status> {
+    pub(crate) async fn start(config: ServerConfig) -> Result<Self, Status> {
         println!("Starting benchmark server with config: {:?}", config);
 
         let mut server_builder = Server::builder();
@@ -105,10 +105,21 @@ impl BenchmarkServer {
         let port = if config.port > 0 {
             config.port as u16
         } else {
-            DEFAULT_PORT
+            0 // 0 means pick unused port
         };
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        tokio::spawn(router.serve_with_shutdown(addr, async move {
+
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|err| Status::internal(format!("failed to bind to address {addr}: {err}")))?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|err| Status::internal(format!("failed to get local address: {err}")))?;
+        let port = bound_addr.port();
+
+        let incoming = TcpListenerStream::new(listener);
+
+        tokio::spawn(router.serve_with_incoming_shutdown(incoming, async move {
             shutdown_notify_copy.notified().await;
             println!("BenchmarkServer is shutting down.")
         }));

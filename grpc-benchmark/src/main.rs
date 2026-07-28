@@ -48,6 +48,9 @@ pub async fn run_worker(worker_port: u16) -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("default crypto provider already set.");
     // The default Tokio runtime uses 1 thread per logical processor. While the
     // testing framework supports specifying the thread count in the test config,
     // the tests that run on k8s use specific machine sizes and don't depend on

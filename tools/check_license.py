@@ -53,9 +53,6 @@ MIT_BLOCK_TEMPLATE = """/*
 
 def should_ignore(filepath: str) -> bool:
     normalized = filepath.replace("\\", "/")
-    # 'generated' directories have codegen files that may not have boilerplate.
-    if "generated" in normalized.split("/"):
-        return True
     for ign_file in IGNORE_FILES:
         if normalized.endswith(ign_file):
             return True
@@ -158,30 +155,17 @@ def validate_file(filepath: str) -> tuple[bool, str | None]:
 
 
 def main():
-    if len(sys.argv) > 2:
-        print("Usage: check_license.py [target_directory_or_file]", file=sys.stderr)
-        sys.exit(1)
-    target = sys.argv[1] if len(sys.argv) > 1 else "."
     files_to_check = []
-
-    
-    if os.path.isfile(target):
-        if not should_ignore(target) and target.endswith(TARGET_EXTENSIONS):
-            files_to_check.append(target)
-    elif os.path.isdir(target):
-        try:
-            res = subprocess.run(
-                ["git", "ls-files", "--", target],
-                capture_output=True, text=True, check=True
-            )
-            for filepath in res.stdout.splitlines():
-                if filepath.endswith(TARGET_EXTENSIONS) and not should_ignore(filepath):
-                    files_to_check.append(filepath)
-        except subprocess.CalledProcessError as e:
-            print(f"Error running git ls-files: {e}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        print(f"Error: {target} is not a valid file or directory.")
+    try:
+        res = subprocess.run(
+            ["git", "ls-files", ":/*.rs", ":!**/generated/**"],
+            capture_output=True, text=True, check=True
+        )
+        for filepath in res.stdout.splitlines():
+            if not should_ignore(filepath):
+                files_to_check.append(filepath)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running git ls-files: {e}", file=sys.stderr)
         sys.exit(1)
 
     files_to_check.sort()

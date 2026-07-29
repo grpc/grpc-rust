@@ -53,6 +53,9 @@ MIT_BLOCK_TEMPLATE = """/*
 
 def should_ignore(filepath: str) -> bool:
     normalized = filepath.replace("\\", "/")
+    # 'generated' directories have codegen files that may not have boilerplate.
+    if "generated" in normalized.split("/"):
+        return True
     for ign_file in IGNORE_FILES:
         if normalized.endswith(ign_file):
             return True

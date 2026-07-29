@@ -175,9 +175,9 @@ mod test {
         let mc = &method_configs[0];
         assert_eq!(mc.name.len(), 2);
         assert_eq!(mc.name[0].service, "grpc.examples.echo.Echo");
-        assert_eq!(mc.name[0].method, Some("Echo".to_string()));
+        assert_eq!(mc.name[0].method, "Echo");
         assert_eq!(mc.name[1].service, "grpc.examples.echo.Echo2");
-        assert_eq!(mc.name[1].method, None);
+        assert_eq!(mc.name[1].method, "");
 
         assert_eq!(
             mc.timeout,
@@ -370,7 +370,7 @@ mod test {
         );
         assert_eq!(method_configs[1].name.len(), 1);
         assert_eq!(method_configs[1].name[0].service, "");
-        assert_eq!(method_configs[1].name[0].method, None);
+        assert_eq!(method_configs[1].name[0].method, "");
     }
 
     #[test]
@@ -395,12 +395,9 @@ mod test {
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let method_configs = sc.inner.method_config.unwrap();
-        assert_eq!(method_configs[0].name[0].method, None);
+        assert_eq!(method_configs[0].name[0].method, "");
         assert!(method_configs[0].retry_policy.is_some());
-        assert_eq!(
-            method_configs[1].name[0].method,
-            Some("SpecialCall".to_string())
-        );
+        assert_eq!(method_configs[1].name[0].method, "SpecialCall");
         assert_eq!(
             method_configs[1].timeout,
             Some(GrpcDuration(Duration::from_millis(500)))

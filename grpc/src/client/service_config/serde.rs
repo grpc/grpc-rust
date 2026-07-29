@@ -51,11 +51,12 @@ pub(crate) struct MethodConfigSerde {
     pub(crate) max_response_message_bytes: Option<SerdeU32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub(crate) struct MethodNameSerde {
     #[serde(default)]
     pub(crate) service: String,
-    pub(crate) method: Option<String>,
+    #[serde(default)]
+    pub(crate) method: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -152,7 +153,7 @@ impl Serialize for LoadBalancingConfigSerde {
 
 impl MethodNameSerde {
     fn validate(&self) -> Result<(), String> {
-        if self.service.is_empty() && self.method.as_ref().is_some_and(|m| !m.is_empty()) {
+        if self.service.is_empty() && !self.method.is_empty() {
             return Err("has empty service name with non-empty method name".to_string());
         }
         Ok(())

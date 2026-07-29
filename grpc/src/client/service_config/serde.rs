@@ -96,7 +96,6 @@ pub(crate) struct HedgingPolicySerde {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HealthCheckConfigSerde {
-    #[serde(rename = "serviceName", alias = "ServiceName")]
     pub(crate) service_name: Option<String>,
 }
 

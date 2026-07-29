@@ -47,19 +47,19 @@ pub struct ServiceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MethodConfig {
+pub(crate) struct MethodConfig {
     /// List of methods this config applies to.
     pub(crate) name: Vec<MethodName>,
     pub(crate) wait_for_ready: Option<bool>,
     pub(crate) timeout: Option<GrpcDuration>,
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) hedging_policy: Option<HedgingPolicy>,
-    pub max_request_message_bytes: Option<u32>,
+    pub(crate) max_request_message_bytes: Option<u32>,
     pub(crate) max_response_message_bytes: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MethodName {
+pub(crate) struct MethodName {
     /// The service name (fully qualified).
     /// e.g., for "grpc.examples.echo.Echo/Echo" this would be
     /// "grpc.examples.echo.Echo".
@@ -70,13 +70,13 @@ pub struct MethodName {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RetryThrottlingPolicy {
+pub(crate) struct RetryThrottlingPolicy {
     pub(crate) max_tokens: u32,
     pub(crate) token_ratio: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RetryPolicy {
+pub(crate) struct RetryPolicy {
     pub(crate) max_attempts: u32,
     pub(crate) initial_backoff: GrpcDuration,
     pub(crate) max_backoff: GrpcDuration,
@@ -85,30 +85,30 @@ pub struct RetryPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct HedgingPolicy {
+pub(crate) struct HedgingPolicy {
     pub(crate) max_attempts: u32,
     pub(crate) hedging_delay: GrpcDuration,
     pub(crate) non_fatal_status_codes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct HealthCheckConfig {
+pub(crate) struct HealthCheckConfig {
     pub(crate) service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ConnectionScaling {
+pub(crate) struct ConnectionScaling {
     pub(crate) max_connections_per_subchannel: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadBalancingConfig {
+pub(crate) struct LoadBalancingConfig {
     pub(crate) name: String,
     pub(crate) config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RetryOrHedgingPolicy {
+pub(crate) enum RetryOrHedgingPolicy {
     Retry(RetryPolicy),
     Hedging(HedgingPolicy),
 }

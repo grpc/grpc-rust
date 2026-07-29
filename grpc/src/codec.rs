@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -21,24 +21,5 @@
  * IN THE SOFTWARE.
  *
  */
-//! Test utilities for xDS implementations.
-//!
-//! This crate provides helpers for exercising xDS clients against an in-process
-//! management server. It is intended for tests only and not for production use.
-//!
-//! The main entry point is [`XdsTestControlPlaneService`], a fake Aggregated
-//! Discovery Service (ADS) control plane. It is a Rust port of grpc-java's
-//! `XdsTestControlPlaneService`.
-//!
-//! ```ignore
-//! let running = XdsTestControlPlaneService::new().start().await?;
-//! running.set_xds_config(&AdsTypeUrl::Lds, listeners);
-//! let addr = running.addr(); // point your xDS bootstrap here
-//! // `running` shuts the server down when dropped.
-//! ```
 
-pub mod config;
-mod control_plane;
-
-pub use control_plane::RunningControlPlane;
-pub use control_plane::XdsTestControlPlaneService;
+pub(crate) mod compression;

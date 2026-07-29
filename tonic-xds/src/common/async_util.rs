@@ -27,7 +27,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
-pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+/// A pinned, boxed, `Send` future.
+///
+/// This is the boxed future type surfaced by the public transport (connector)
+/// and load-balancing service interfaces (e.g. [`Connector::connect`]).
+///
+/// [`Connector::connect`]: crate::Connector::connect
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// A [`tokio::task::JoinHandle`] wrapper that aborts the task when dropped.
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);

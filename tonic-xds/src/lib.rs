@@ -171,7 +171,9 @@ pub(crate) mod xds;
 pub use client::channel::{
     BuildError, XdsChannel, XdsChannelBuilder, XdsChannelConfig, XdsChannelGrpc,
 };
+pub use client::endpoint::{Connector, EndpointAddress, EndpointChannel, MakeConnector};
 pub use client::route::PreRouteInterceptor;
+pub use common::async_util::BoxFuture;
 pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
 pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};

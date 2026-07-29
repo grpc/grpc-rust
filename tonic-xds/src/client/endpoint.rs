@@ -50,7 +50,7 @@ impl From<String> for EndpointHost {
 
 /// Represents a validated endpoint address extracted from xDS
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct EndpointAddress {
+pub struct EndpointAddress {
     /// The IP address or hostname
     host: EndpointHost,
     /// The port number
@@ -61,8 +61,7 @@ impl EndpointAddress {
     /// Creates a new `EndpointAddress` from a host string and port.
     ///
     /// Attempts to parse the host as an IP address; falls back to hostname.
-    #[allow(dead_code)]
-    pub(crate) fn new(host: impl Into<String>, port: u16) -> Self {
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
             host: EndpointHost::from(host.into()),
             port,
@@ -116,7 +115,7 @@ impl Drop for InFlightTracker {
 }
 
 /// An endpoint channel for communicating with a single gRPC endpoint, with load reporting support for load balancing.
-pub(crate) struct EndpointChannel<S> {
+pub struct EndpointChannel<S> {
     inner: S,
     in_flight: Arc<AtomicU64>,
 }
@@ -124,11 +123,19 @@ pub(crate) struct EndpointChannel<S> {
 impl<S> EndpointChannel<S> {
     /// Creates a new `EndpointChannel`.
     /// This should be used by xDS implementations to construct channels to individual endpoints.
-    pub(crate) fn new(inner: S) -> Self {
+    pub fn new(inner: S) -> Self {
         Self {
             inner,
             in_flight: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+impl<S> std::fmt::Debug for EndpointChannel<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointChannel")
+            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
     }
 }
 
@@ -183,7 +190,7 @@ impl<S> Load for EndpointChannel<S> {
 /// at construction time. The implementation handles retries and concurrency
 /// internally — the returned future resolves when a connection is established
 /// (or is cancelled by dropping).
-pub(crate) trait Connector {
+pub trait Connector {
     /// The service type produced by this connector.
     type Service;
 
@@ -202,8 +209,7 @@ pub(crate) trait Connector {
 /// Both `Service` and `Connector` are exposed as associated types so callers
 /// can reference `MC::Service` directly without chaining through
 /// `<MC::Connector as Connector>::Service`.
-#[allow(dead_code)]
-pub(crate) trait MakeConnector: Send + Sync + 'static {
+pub trait MakeConnector: Send + Sync + 'static {
     /// The service type produced by the connector.
     type Service;
     /// The connector type produced for each cluster.

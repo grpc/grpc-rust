@@ -36,9 +36,13 @@ use crate::resource::{DecodedResource, Resource};
 
 /// A signal to indicate that processing of a resource event is complete.
 ///
-/// The xDS client waits for this signal before sending ACK/NACK to the server.
-/// This allows watchers to add cascading subscriptions (e.g. LDS -> RDS -> CDS -> EDS)
-/// that will be included in the same ACK.
+/// The xDS client does not read the next response from the ADS stream until
+/// every watcher has signaled for the current one (ADS flow control, per
+/// gRFC A88). This lets watchers apply an update — including adding cascading
+/// subscriptions (e.g. LDS -> RDS -> CDS -> EDS) — before the next update can
+/// arrive. It does *not* delay the ACK/NACK, and the worker keeps processing
+/// watch/unwatch commands while waiting, so holding the token cannot deadlock
+/// the client.
 ///
 /// # Automatic Signaling
 ///

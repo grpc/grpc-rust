@@ -28,6 +28,12 @@ jobs:
         components: rustfmt
     - run: cargo fmt --all --check
 
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - run: python3 tools/check_license.py
+
   build-protoc-plugin:
     runs-on: ${{ matrix.os }}
     strategy:

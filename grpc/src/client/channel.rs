@@ -451,20 +451,17 @@ impl ResolverChannelController {
 
 impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
-        let json_config = if let Ok(Some(service_config)) = update.service_config.as_ref()
-            && service_config
-                .load_balancing_config
-                .as_ref()
-                .is_some_and(|lbc| lbc.iter().any(|c| c.name == "round_robin"))
-        {
-            json!([{round_robin::POLICY_NAME: {}}])
-        } else {
-            json!([{pick_first::POLICY_NAME: {"shuffleAddressList": true, "unknown_field": false}}])
+        let lb_json_config = match update.service_config.as_ref() {
+            Ok(Some(sc)) => sc.lb_config(),
+            _ => ParsedJsonLbConfig::from_value(json!([{
+                pick_first::POLICY_NAME: {
+                    "shuffleAddressList": true,
+                    "unknown_field": false
+                }
+            }])),
         };
 
-        // TODO: config should come from ServiceConfig.
-        let config =
-            GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig::from_value(json_config))?;
+        let config = GracefulSwitchPolicy::parse_config(&lb_json_config)?;
 
         self.lb_policy
             .resolver_update(update, Some(&config), &mut self.lb_channel_controller)

@@ -25,15 +25,6 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::ConnectionScaling;
-use super::HealthCheckConfig;
-use super::HedgingPolicy;
-use super::LoadBalancingConfig;
-use super::MethodConfig;
-use super::MethodName;
-use super::RetryPolicy;
-use super::RetryThrottlingPolicy;
-use super::ServiceConfig;
 use super::duration::GrpcDuration;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -71,7 +62,7 @@ pub(crate) struct MethodNameSerde {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryThrottlingPolicySerde {
     pub(crate) max_tokens: SerdeU32,
-    pub(crate) token_ratio: f32,
+    pub(crate) token_ratio: SerdeF32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -80,7 +71,7 @@ pub(crate) struct RetryPolicySerde {
     pub(crate) max_attempts: SerdeU32,
     pub(crate) initial_backoff: GrpcDuration,
     pub(crate) max_backoff: GrpcDuration,
-    pub(crate) backoff_multiplier: f32,
+    pub(crate) backoff_multiplier: SerdeF32,
     pub(crate) retryable_status_codes: Vec<String>,
 }
 
@@ -89,7 +80,6 @@ pub(crate) struct RetryPolicySerde {
 pub(crate) struct HedgingPolicySerde {
     pub(crate) max_attempts: SerdeU32,
     pub(crate) hedging_delay: GrpcDuration,
-    #[serde(default)]
     pub(crate) non_fatal_status_codes: Option<Vec<String>>,
 }
 
@@ -160,108 +150,115 @@ impl Serialize for LoadBalancingConfigSerde {
     }
 }
 
-impl From<ServiceConfigSerde> for ServiceConfig {
-    fn from(dto: ServiceConfigSerde) -> Self {
-        let mut lb_config = dto
-            .load_balancing_config
-            .map(|v| v.into_iter().map(Into::into).collect());
-        if lb_config.is_none()
-            && let Some(ref lb_policy) = dto.load_balancing_policy
+impl MethodNameSerde {
+    fn validate(&self) -> Result<(), String> {
+        if self.service.is_empty() && self.method.as_ref().is_some_and(|m| !m.is_empty()) {
+            return Err("has empty service name with non-empty method name".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl RetryPolicySerde {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_attempts.0 <= 1 {
+            return Err("max_attempts must be > 1".to_string());
+        }
+        if self.initial_backoff.as_nanos() == 0 {
+            return Err("initial_backoff must be > 0".to_string());
+        }
+        if self.max_backoff.as_nanos() == 0 {
+            return Err("max_backoff must be > 0".to_string());
+        }
+        if self.backoff_multiplier.0 <= 0.0 {
+            return Err("backoff_multiplier must be > 0".to_string());
+        }
+        if self.retryable_status_codes.is_empty() {
+            return Err("retryable_status_codes must be non-empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl HedgingPolicySerde {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_attempts.0 <= 1 {
+            return Err("max_attempts must be > 1".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl RetryThrottlingPolicySerde {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_tokens.0 == 0 || self.max_tokens.0 > 1000 {
+            return Err("max_tokens must be between 1 and 1000".to_string());
+        }
+        if self.token_ratio.0 <= 0.0 {
+            return Err("token_ratio must be > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RetryOrHedgingPolicySerde {
+    Retry(RetryPolicySerde),
+    Hedging(HedgingPolicySerde),
+}
+
+impl MethodConfigSerde {
+    pub(crate) fn retry_or_hedging_policy(&self) -> Option<RetryOrHedgingPolicySerde> {
+        self.retry_policy
+            .as_ref()
+            .map(|rp| RetryOrHedgingPolicySerde::Retry(rp.clone()))
+            .or_else(|| {
+                self.hedging_policy
+                    .as_ref()
+                    .map(|hp| RetryOrHedgingPolicySerde::Hedging(hp.clone()))
+            })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (j, name) in self.name.iter().enumerate() {
+            if let Err(e) = name.validate() {
+                return Err(format!("name[{j}] {e}"));
+            }
+        }
+        if self.retry_policy.is_some() && self.hedging_policy.is_some() {
+            return Err("cannot have both retryPolicy and hedgingPolicy defined".to_string());
+        }
+        if let Some(ref rp) = self.retry_policy
+            && let Err(e) = rp.validate()
         {
-            lb_config = Some(vec![LoadBalancingConfig {
-                name: lb_policy.clone(),
-                config: serde_json::Value::Object(serde_json::Map::new()),
-            }]);
+            return Err(format!("retry_policy.{e}"));
         }
-        Self {
-            load_balancing_policy: dto.load_balancing_policy,
-            load_balancing_config: lb_config,
-            method_config: dto
-                .method_config
-                .map(|v| v.into_iter().map(Into::into).collect()),
-            retry_throttling: dto.retry_throttling.map(Into::into),
-            health_check_config: dto.health_check_config.map(Into::into),
-            connection_scaling: dto.connection_scaling.map(Into::into),
+        if let Some(ref hp) = self.hedging_policy
+            && let Err(e) = hp.validate()
+        {
+            return Err(format!("hedging_policy.{e}"));
         }
+        Ok(())
     }
 }
 
-impl From<MethodConfigSerde> for MethodConfig {
-    fn from(dto: MethodConfigSerde) -> Self {
-        Self {
-            name: dto.name.into_iter().map(Into::into).collect(),
-            wait_for_ready: dto.wait_for_ready,
-            timeout: dto.timeout,
-            retry_policy: dto.retry_policy.map(Into::into),
-            hedging_policy: dto.hedging_policy.map(Into::into),
-            max_request_message_bytes: dto.max_request_message_bytes.map(Into::into),
-            max_response_message_bytes: dto.max_response_message_bytes.map(Into::into),
+impl ServiceConfigSerde {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(ref method_configs) = self.method_config {
+            for (i, mc) in method_configs.iter().enumerate() {
+                if let Err(e) = mc.validate() {
+                    return Err(format!("method_config[{i}].{e}"));
+                }
+            }
         }
-    }
-}
 
-impl From<MethodNameSerde> for MethodName {
-    fn from(dto: MethodNameSerde) -> Self {
-        Self {
-            service: dto.service,
-            method: dto.method,
+        if let Some(ref rt) = self.retry_throttling
+            && let Err(e) = rt.validate()
+        {
+            return Err(format!("retry_throttling.{e}"));
         }
-    }
-}
 
-impl From<RetryThrottlingPolicySerde> for RetryThrottlingPolicy {
-    fn from(dto: RetryThrottlingPolicySerde) -> Self {
-        Self {
-            max_tokens: dto.max_tokens.into(),
-            token_ratio: dto.token_ratio,
-        }
-    }
-}
-
-impl From<RetryPolicySerde> for RetryPolicy {
-    fn from(dto: RetryPolicySerde) -> Self {
-        Self {
-            max_attempts: dto.max_attempts.into(),
-            initial_backoff: dto.initial_backoff,
-            max_backoff: dto.max_backoff,
-            backoff_multiplier: dto.backoff_multiplier,
-            retryable_status_codes: dto.retryable_status_codes,
-        }
-    }
-}
-
-impl From<HedgingPolicySerde> for HedgingPolicy {
-    fn from(dto: HedgingPolicySerde) -> Self {
-        Self {
-            max_attempts: dto.max_attempts.into(),
-            hedging_delay: dto.hedging_delay,
-            non_fatal_status_codes: dto.non_fatal_status_codes,
-        }
-    }
-}
-
-impl From<HealthCheckConfigSerde> for HealthCheckConfig {
-    fn from(dto: HealthCheckConfigSerde) -> Self {
-        Self {
-            service_name: dto.service_name,
-        }
-    }
-}
-
-impl From<ConnectionScalingSerde> for ConnectionScaling {
-    fn from(dto: ConnectionScalingSerde) -> Self {
-        Self {
-            max_connections_per_subchannel: dto.max_connections_per_subchannel.into(),
-        }
-    }
-}
-
-impl From<LoadBalancingConfigSerde> for LoadBalancingConfig {
-    fn from(dto: LoadBalancingConfigSerde) -> Self {
-        Self {
-            name: dto.name,
-            config: dto.config,
-        }
+        Ok(())
     }
 }
 
@@ -308,6 +305,63 @@ impl<'de> Deserialize<'de> for SerdeU32 {
     }
 }
 
+// Wraps an f32 to provide custom serialization and deserialization.
+// Specifically supports the deserialization of f32 values that may be
+// represented as strings or numbers in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub(crate) struct SerdeF32(pub(crate) f32);
+
+impl From<SerdeF32> for f32 {
+    fn from(v: SerdeF32) -> Self {
+        v.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SerdeF32 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SerdeF32;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an f32 or a string representing an f32")
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SerdeF32(v as f32))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SerdeF32(v as f32))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SerdeF32(v as f32))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                v.parse().map(SerdeF32).map_err(serde::de::Error::custom)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use serde::Deserialize;
@@ -338,6 +392,29 @@ mod test {
         assert!(res.is_err());
 
         let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": -1 }));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_serde_f32() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct TestStruct {
+            val: Option<SerdeF32>,
+        }
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": 0.1 })).unwrap();
+        assert_eq!(val.val, Some(SerdeF32(0.1)));
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": "0.1" })).unwrap();
+        assert_eq!(val.val, Some(SerdeF32(0.1)));
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": 1 })).unwrap();
+        assert_eq!(val.val, Some(SerdeF32(1.0)));
+
+        let val: TestStruct = serde_json::from_value(json!({ "val": null })).unwrap();
+        assert_eq!(val.val, None);
+
+        let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": "invalid" }));
         assert!(res.is_err());
     }
 }

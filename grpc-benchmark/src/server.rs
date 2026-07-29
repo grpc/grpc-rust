@@ -117,7 +117,14 @@ impl BenchmarkServer {
             .map_err(|err| Status::internal(format!("failed to get local address: {err}")))?;
         let port = bound_addr.port();
 
-        let incoming = TcpListenerStream::new(listener);
+        let incoming = TcpListenerStream::new(listener).map(|res| {
+            if let Ok(ref stream) = res {
+                if let Err(e) = stream.set_nodelay(true) {
+                    eprintln!("failed to set nodelay: {e}");
+                }
+            }
+            res
+        });
 
         tokio::spawn(router.serve_with_incoming_shutdown(incoming, async move {
             shutdown_notify_copy.notified().await;

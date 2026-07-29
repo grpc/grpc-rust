@@ -281,6 +281,34 @@ mod test {
             }]
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
+
+        // Invalid status code in retryableStatusCodes.
+        let json_data = json!({
+            "methodConfig": [{
+                "name": [{ "service": "foo" }],
+                "retryPolicy": {
+                    "maxAttempts": 2,
+                    "initialBackoff": "1s",
+                    "maxBackoff": "1s",
+                    "backoffMultiplier": 2.0,
+                    "retryableStatusCodes": ["INVALID_STATUS_CODE_NAME"]
+                }
+            }]
+        });
+        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
+
+        // Duplicate method_config name entry across items.
+        let json_data = json!({
+            "methodConfig": [
+                {
+                    "name": [{ "service": "foo", "method": "Bar" }]
+                },
+                {
+                    "name": [{ "service": "foo", "method": "Bar" }]
+                }
+            ]
+        });
+        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
     }
 
     #[test]

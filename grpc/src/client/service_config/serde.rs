@@ -159,6 +159,35 @@ impl MethodNameSerde {
     }
 }
 
+#[rustfmt::skip]
+const VALID_STATUS_CODES: &[&str] = &[
+    "OK", "0",
+    "CANCELLED", "1",
+    "UNKNOWN", "2",
+    "INVALID_ARGUMENT", "3",
+    "DEADLINE_EXCEEDED", "4",
+    "NOT_FOUND", "5",
+    "ALREADY_EXISTS", "6",
+    "PERMISSION_DENIED", "7",
+    "RESOURCE_EXHAUSTED", "8",
+    "FAILED_PRECONDITION", "9",
+    "ABORTED", "10",
+    "OUT_OF_RANGE", "11",
+    "UNIMPLEMENTED", "12",
+    "INTERNAL", "13",
+    "UNAVAILABLE", "14",
+    "DATA_LOSS", "15",
+    "UNAUTHENTICATED", "16",
+];
+
+fn validate_status_code(code_str: &str) -> Result<(), String> {
+    if VALID_STATUS_CODES.contains(&code_str) {
+        Ok(())
+    } else {
+        Err(format!("invalid status code '{code_str}'"))
+    }
+}
+
 impl RetryPolicySerde {
     fn validate(&self) -> Result<(), String> {
         if self.max_attempts.0 <= 1 {
@@ -176,6 +205,9 @@ impl RetryPolicySerde {
         if self.retryable_status_codes.is_empty() {
             return Err("retryable_status_codes must be non-empty".to_string());
         }
+        for code in &self.retryable_status_codes {
+            validate_status_code(code)?;
+        }
         Ok(())
     }
 }
@@ -184,6 +216,11 @@ impl HedgingPolicySerde {
     fn validate(&self) -> Result<(), String> {
         if self.max_attempts.0 <= 1 {
             return Err("max_attempts must be > 1".to_string());
+        }
+        if let Some(ref codes) = self.non_fatal_status_codes {
+            for code in codes {
+                validate_status_code(code)?;
+            }
         }
         Ok(())
     }
@@ -245,9 +282,19 @@ impl MethodConfigSerde {
 impl ServiceConfigSerde {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if let Some(ref method_configs) = self.method_config {
+            let mut seen_names = std::collections::HashSet::new();
             for (i, mc) in method_configs.iter().enumerate() {
                 if let Err(e) = mc.validate() {
                     return Err(format!("method_config[{i}].{e}"));
+                }
+                for name in &mc.name {
+                    let key = (&name.service, &name.method);
+                    if !seen_names.insert(key) {
+                        return Err(format!(
+                            "duplicate method_config name entry: service='{}', method='{:?}'",
+                            name.service, name.method
+                        ));
+                    }
                 }
             }
         }
@@ -330,6 +377,9 @@ impl<'de> Deserialize<'de> for SerdeF32 {
                 formatter.write_str("an f32 or a string representing an f32")
             }
 
+            // gRPC spec specifies float (f32) precision for these fields, so precision
+            // loss/truncation from f64/integers is expected and safe.
+            #[allow(clippy::cast_possible_truncation)]
             fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
@@ -337,6 +387,9 @@ impl<'de> Deserialize<'de> for SerdeF32 {
                 Ok(SerdeF32(v as f32))
             }
 
+            // gRPC spec specifies float (f32) precision for these fields, so precision
+            // loss/truncation from f64/integers is expected and safe.
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
@@ -344,6 +397,9 @@ impl<'de> Deserialize<'de> for SerdeF32 {
                 Ok(SerdeF32(v as f32))
             }
 
+            // gRPC spec specifies float (f32) precision for these fields, so precision
+            // loss/truncation from f64/integers is expected and safe.
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
@@ -416,5 +472,15 @@ mod test {
 
         let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": "invalid" }));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_validate_status_codes() {
+        for &code in VALID_STATUS_CODES {
+            assert!(validate_status_code(code).is_ok());
+        }
+        assert!(validate_status_code("INVALID_CODE").is_err());
+        assert!(validate_status_code("17").is_err());
+        assert!(validate_status_code("-1").is_err());
     }
 }

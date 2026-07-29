@@ -118,10 +118,10 @@ impl BenchmarkServer {
         let port = bound_addr.port();
 
         let incoming = TcpListenerStream::new(listener).map(|res| {
-            if let Ok(ref stream) = res {
-                if let Err(e) = stream.set_nodelay(true) {
-                    eprintln!("failed to set nodelay: {e}");
-                }
+            if let Ok(ref stream) = res
+                && let Err(e) = stream.set_nodelay(true)
+            {
+                eprintln!("failed to set nodelay: {e}");
             }
             res
         });

@@ -69,7 +69,7 @@ impl BenchmarkServer {
     pub(crate) async fn start(config: ServerConfig) -> Result<Self, Status> {
         println!("Starting benchmark server with config: {:?}", config);
 
-        let mut server_builder = Server::builder();
+        let mut server_builder = Server::builder().http2_adaptive_window(Some(true));
         // Parse security config.
         if let Some(security_params) = config.security_params {
             let tls_config = if security_params.use_test_ca {

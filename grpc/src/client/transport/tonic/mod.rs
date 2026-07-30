@@ -393,6 +393,7 @@ impl Transport for TransportBuilder {
         })
         .initial_stream_window_size(opts.init_stream_window_size)
         .initial_connection_window_size(opts.init_connection_window_size)
+        .adaptive_window(opts.http2_adaptive_window)
         .keep_alive_interval(opts.http2_keep_alive_interval)
         .clone();
 
@@ -402,10 +403,6 @@ impl Transport for TransportBuilder {
 
         if let Some(val) = opts.http2_keep_alive_while_idle {
             settings.keep_alive_while_idle(val);
-        }
-
-        if let Some(val) = opts.http2_adaptive_window {
-            settings.adaptive_window(val);
         }
 
         if let Some(val) = opts.http2_max_header_list_size {

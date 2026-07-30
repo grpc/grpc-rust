@@ -23,10 +23,12 @@
  */
 
 use crate::common::async_util::BoxFuture;
+use crate::xds::resource::cluster::ClusterResource;
+use crate::xds::resource::security::ClusterSecurityConfig;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use std::task::{Context, Poll};
-use tower::{Service, load::Load};
+use tower::{BoxError, Service, load::Load};
 
 /// Represents the host part of an endpoint address
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -201,20 +203,65 @@ pub trait Connector {
     ) -> crate::common::async_util::BoxFuture<Self::Service>;
 }
 
+/// A read-only view of a cluster's parsed xDS configuration, handed to
+/// [`MakeConnector::make_connector`] so a factory can build a connector
+/// tailored to the cluster.
+///
+/// The view is intentionally opaque: it currently exposes only the cluster
+/// name. Read access to the parsed TLS/security settings a custom connector
+/// needs for gRFC A29 parity is exposed separately (and is not required to
+/// build a plaintext connector).
+pub struct ClusterConfig<'a> {
+    name: &'a str,
+    /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal
+    /// for now; consumed by the built-in gRPC connector factory.
+    pub(crate) security: Option<&'a ClusterSecurityConfig>,
+}
+
+impl<'a> ClusterConfig<'a> {
+    /// Builds a view over a validated [`ClusterResource`].
+    pub(crate) fn from_resource(cluster: &'a ClusterResource) -> Self {
+        Self {
+            name: &cluster.name,
+            security: cluster.security.as_ref(),
+        }
+    }
+
+    /// The cluster name.
+    pub fn name(&self) -> &str {
+        self.name
+    }
+}
+
+impl std::fmt::Debug for ClusterConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterConfig")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Factory for creating per-cluster [`Connector`]s.
 ///
-/// The implementation can use the cluster name to look up cluster-specific
-/// config (e.g., TLS settings from xDS CDS, cert providers from A29).
+/// Given a [`ClusterConfig`] view, the implementation builds a [`Connector`]
+/// tailored to that cluster (e.g. selecting TLS vs plaintext and wiring the
+/// gRFC A29 cert providers). Returning an `Err` rejects the current cluster
+/// update; the caller keeps the previously built connector.
 ///
-/// Both `Service` and `Connector` are exposed as associated types so callers
-/// can reference `MC::Service` directly without chaining through
-/// `<MC::Connector as Connector>::Service`.
+/// The connector is returned type-erased as `Arc<dyn Connector>` so an
+/// implementation can keep its concrete connector type(s) private and hand
+/// back different connectors for different clusters without wrapping them in
+/// a single enum.
 pub trait MakeConnector: Send + Sync + 'static {
-    /// The service type produced by the connector.
-    type Service;
-    /// The connector type produced for each cluster.
-    type Connector: Connector<Service = Self::Service>;
+    /// The service type produced by the connectors.
+    ///
+    /// Must be `Send + 'static` because discovery drives it from a spawned
+    /// task and streams endpoint changes carrying it across threads.
+    type Service: Send + 'static;
 
-    /// Create a connector for the given cluster.
-    fn make_connector(&self, cluster_name: &str) -> std::sync::Arc<Self::Connector>;
+    /// Build a connector for the given cluster.
+    fn make_connector(
+        &self,
+        cluster: ClusterConfig<'_>,
+    ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError>;
 }

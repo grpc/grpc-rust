@@ -52,7 +52,7 @@ use tokio::sync::oneshot;
 // TODO: The following options are specific to HTTP/2. We should
 // instead pass an `Attribute` like struct to the connect method instead which
 // can hold config relevant to a particular transport.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct TransportOptions {
     pub(crate) init_stream_window_size: Option<u32>,
     pub(crate) init_connection_window_size: Option<u32>,
@@ -60,11 +60,29 @@ pub(crate) struct TransportOptions {
     pub(crate) http2_keep_alive_timeout: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: Option<bool>,
     pub(crate) http2_max_header_list_size: Option<u32>,
-    pub(crate) http2_adaptive_window: Option<bool>,
+    pub(crate) http2_adaptive_window: bool,
     pub(crate) concurrency_limit: Option<usize>,
     pub(crate) rate_limit: Option<(u64, Duration)>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
+}
+
+impl Default for TransportOptions {
+    fn default() -> Self {
+        TransportOptions {
+            init_stream_window_size: None,
+            init_connection_window_size: None,
+            http2_keep_alive_interval: None,
+            http2_keep_alive_timeout: None,
+            http2_keep_alive_while_idle: None,
+            http2_max_header_list_size: None,
+            http2_adaptive_window: true,
+            concurrency_limit: None,
+            rate_limit: None,
+            tcp_keepalive: None,
+            tcp_nodelay: true,
+        }
+    }
 }
 
 #[trait_variant::make(Send)]

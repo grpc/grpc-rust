@@ -453,13 +453,16 @@ impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
         let lb_json_config = match update.service_config.as_ref() {
             Ok(Some(sc)) => sc.lb_config(),
-            _ => ParsedJsonLbConfig::from_value(json!([{
+            _ => None,
+        }
+        .unwrap_or_else(|| {
+            ParsedJsonLbConfig::from_value(json!([{
                 pick_first::POLICY_NAME: {
                     "shuffleAddressList": true,
                     "unknown_field": false
                 }
-            }])),
-        };
+            }]))
+        });
 
         let config = GracefulSwitchPolicy::parse_config(&lb_json_config)?;
 

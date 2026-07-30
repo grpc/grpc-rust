@@ -54,8 +54,13 @@ impl ServiceConfig {
     /// Extracts the load balancing configuration per gRPC specification rules.
     ///
     /// Evaluates `load_balancing_config` first, falling back to legacy
-    /// `load_balancing_policy`, or defaulting to `pick_first`.
-    pub fn lb_config(&self) -> ParsedJsonLbConfig {
+    /// `load_balancing_policy`.
+    // TODO: Move LB policy lookup, validation, and resolution into service
+    // config parsing (this function) so that candidate configs collapse to a single
+    // selected policy and its parsed config, sharing this logic with child LB
+    // policies. graceful_switch should handle it in the same pathway when this
+    // work is done.
+    pub fn lb_config(&self) -> Option<ParsedJsonLbConfig> {
         if let Some(ref configs) = self.inner.load_balancing_config
             && !configs.is_empty()
         {
@@ -67,7 +72,9 @@ impl ServiceConfig {
                     serde_json::Value::Object(map)
                 })
                 .collect();
-            return ParsedJsonLbConfig::from_value(serde_json::Value::Array(vec));
+            return Some(ParsedJsonLbConfig::from_value(serde_json::Value::Array(
+                vec,
+            )));
         }
 
         if let Some(ref policy) = self.inner.load_balancing_policy {
@@ -76,25 +83,12 @@ impl ServiceConfig {
                 policy.clone(),
                 serde_json::Value::Object(serde_json::Map::new()),
             );
-            return ParsedJsonLbConfig::from_value(serde_json::Value::Array(vec![
-                serde_json::Value::Object(map),
-            ]));
+            return Some(ParsedJsonLbConfig::from_value(serde_json::Value::Array(
+                vec![serde_json::Value::Object(map)],
+            )));
         }
 
-        // Default fallback per spec: pick_first
-        let mut map = serde_json::Map::new();
-        let mut pf_config = serde_json::Map::new();
-        pf_config.insert(
-            "shuffleAddressList".to_string(),
-            serde_json::Value::Bool(true),
-        );
-        map.insert(
-            "pick_first".to_string(),
-            serde_json::Value::Object(pf_config),
-        );
-        ParsedJsonLbConfig::from_value(serde_json::Value::Array(vec![serde_json::Value::Object(
-            map,
-        )]))
+        None
     }
 }
 
@@ -431,7 +425,7 @@ mod test {
             ]
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        let lb_cfg = sc.lb_config();
+        let lb_cfg = sc.lb_config().unwrap();
         let val: serde_json::Value = lb_cfg.convert_to().unwrap();
         assert_eq!(
             val,
@@ -446,18 +440,13 @@ mod test {
             "loadBalancingPolicy": "round_robin"
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        let lb_cfg = sc.lb_config();
+        let lb_cfg = sc.lb_config().unwrap();
         let val: serde_json::Value = lb_cfg.convert_to().unwrap();
         assert_eq!(val, json!([{ "round_robin": {} }]));
 
-        // 3. Default pick_first fallback
+        // 3. No LB config present
         let json_data = json!({});
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        let lb_cfg = sc.lb_config();
-        let val: serde_json::Value = lb_cfg.convert_to().unwrap();
-        assert_eq!(
-            val,
-            json!([{ "pick_first": { "shuffleAddressList": true } }])
-        );
+        assert!(sc.lb_config().is_none());
     }
 }

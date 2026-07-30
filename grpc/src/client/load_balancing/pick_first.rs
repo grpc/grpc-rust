@@ -1769,4 +1769,66 @@ mod test {
         let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
     }
+
+    // Tests that when a resolver update arrives while in FirstPass, any subchannels
+    // that have already failed (TransientFailure) preserve their state so the policy
+    // does not redundantly re-attempt them before trying remaining addresses.
+    #[tokio::test]
+    async fn test_pick_first_resolver_update_preserves_subchannel_failure_state() {
+        let (rx, mut policy, mut controller) = setup();
+
+        // 1. Initial endpoints [addr1, addr2].
+        let endpoints = create_endpoints(vec!["addr1", "addr2"], None);
+        policy
+            .resolver_update(
+                ResolverUpdate {
+                    endpoints: Ok(endpoints),
+                    ..Default::default()
+                },
+                None,
+                controller.as_mut(),
+            )
+            .unwrap();
+
+        let sc1 = expect_new_subchannel(&rx);
+        let _sc2 = expect_new_subchannel(&rx);
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr1");
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+
+        // 2. addr1 fails with TransientFailure. Frontier advances to addr2.
+        policy.subchannel_update(
+            sc1,
+            &SubchannelState {
+                connectivity_state: ConnectivityState::TransientFailure,
+                last_connection_error: Some("connection refused".to_string()),
+            },
+            controller.as_mut(),
+        );
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr2");
+
+        // 3. New resolver update [addr1, addr3]. (Retains addr1 which already failed).
+        let endpoints_new = create_endpoints(vec!["addr1", "addr3"], None);
+        policy
+            .resolver_update(
+                ResolverUpdate {
+                    endpoints: Ok(endpoints_new),
+                    ..Default::default()
+                },
+                None,
+                controller.as_mut(),
+            )
+            .unwrap();
+
+        // 4. addr3 is created as a new subchannel.
+        let _sc3 = expect_new_subchannel(&rx);
+
+        // 5. Because addr1 is already in TransientFailure, the policy should skip addr1
+        // and immediately connect addr3.
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr3");
+        assert!(rx.try_recv().is_err(), "unexpected event");
+    }
 }

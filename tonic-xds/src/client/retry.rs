@@ -46,6 +46,8 @@ use tower::retry::Policy;
 use tower::retry::Retry;
 use tower::{Layer, Service};
 
+use crate::client::circuit_breaking::is_local_circuit_breaker_drop;
+
 /// Check if an error's source chain contains a retryable connection-level error.
 ///
 /// These are errors where the request was definitely **not** sent, making it safe to retry.
@@ -213,6 +215,7 @@ impl RetryClassifier for GrpcRetryClassifier {
     fn is_retryable<Res>(&self, res: &Result<http::Response<Res>, tower::BoxError>) -> bool {
         match res {
             Err(err) => is_retryable_connection_error(err.as_ref()),
+            Ok(response) if is_local_circuit_breaker_drop(response) => false,
             Ok(response) => match tonic::Status::from_header_map(response.headers()) {
                 Some(status) => is_retryable_grpc_status_code(status.code(), &self.retry_on),
                 // No grpc-status header means success.

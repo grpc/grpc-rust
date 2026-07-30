@@ -29,9 +29,9 @@
 //! because they are connection-pool or retry specific and do not apply to gRPC's
 //! A32 request limiter.
 //!
-//! This parser intentionally stays detached from `ClusterResource` until
-//! enforcement lands; otherwise cluster validation would advertise support before
-//! requests are actually limited.
+//! Client-side limiter primitives can consume this config; production CDS wiring
+//! is added separately so validation only advertises support once enforcement is
+//! in the request path.
 //!
 //! [gRFC A32]: https://github.com/grpc/proposal/blob/master/A32-xds-circuit-breaking.md
 
@@ -46,9 +46,8 @@ pub(crate) const DEFAULT_MAX_REQUESTS: u32 = 1024;
 pub(crate) struct CircuitBreakingConfig {
     /// Maximum number of in-flight requests allowed for the upstream cluster.
     ///
-    /// This scaffolds the parsed CDS value only; enforcement is wired in a
-    /// follow-up change so request-lifetime accounting can be handled correctly
-    /// for streaming RPCs.
+    /// The client-side limiter holds requests against this threshold for the
+    /// full response-body lifetime.
     pub(crate) max_requests: u32,
 }
 

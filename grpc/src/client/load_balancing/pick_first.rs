@@ -95,6 +95,9 @@ pub(crate) fn reg() {
     super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {});
 }
 
+/// A load balancing policy that receives endpoints from the name resolver and
+/// connects to the first available backend using the [Happy Eyeballs](https://datatracker.ietf.org/doc/html/rfc8305)
+/// connection algorithm.
 pub struct PickFirstPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
@@ -110,12 +113,6 @@ impl Debug for PickFirstPolicy {
     }
 }
 
-struct PickFirstContext<'a> {
-    runtime: &'a GrpcRuntime,
-    work_scheduler: &'a Arc<dyn WorkScheduler>,
-    controller: &'a mut dyn ChannelController,
-}
-
 impl PickFirstPolicy {
     fn compile_address(
         &self,
@@ -127,20 +124,25 @@ impl PickFirstPolicy {
         }
 
         let mut seen = HashSet::new();
-        let unique_addresses: Vec<Address> = endpoints
-            .into_iter()
-            .flat_map(|ep| ep.addresses)
-            .filter(|addr| seen.insert(addr.clone()))
-            .collect();
+        let mut ipv6 = Vec::new();
+        let mut ipv4 = Vec::new();
+        let mut unknown = Vec::new();
 
-        let (tcp_addresses, unknown): (Vec<Address>, Vec<Address>) =
-            unique_addresses.into_iter().partition(|addr| {
-                addr.network_type == crate::client::name_resolution::TCP_IP_NETWORK_TYPE
-            });
-
-        let (ipv6, ipv4): (Vec<Address>, Vec<Address>) = tcp_addresses
-            .into_iter()
-            .partition(|addr| addr.address.contains(':'));
+        for ep in endpoints {
+            for addr in ep.addresses {
+                if seen.insert(addr.clone()) {
+                    if addr.network_type == crate::client::name_resolution::TCP_IP_NETWORK_TYPE {
+                        if addr.address.contains(':') {
+                            ipv6.push(addr);
+                        } else {
+                            ipv4.push(addr);
+                        }
+                    } else {
+                        unknown.push(addr);
+                    }
+                }
+            }
+        }
 
         let mut interleaved = Vec::with_capacity(ipv6.len() + ipv4.len() + unknown.len());
         let mut v6_iter = ipv6.into_iter();
@@ -176,15 +178,15 @@ impl PickFirstPolicy {
     }
 }
 
-fn set_failing_picker(ctx: &mut PickFirstContext<'_>, error: &str) {
-    ctx.controller.update_picker(LbState {
-        connectivity_state: ConnectivityState::TransientFailure,
-        picker: Arc::new(FailingPicker {
-            error: error.to_string(),
-        }),
-    });
-}
-
+// The `PickFirstPolicy` is structured as a discrete finite state machine
+// (`PickFirstState`):
+// - `Idle`: Initial state or post-disconnect state waiting for traffic to trigger
+//   resolution.
+// - `FirstPass`: Happy Eyeballs connection pass staggering connection attempts
+//   across resolved addresses.
+// - `SteadyState`: All addresses failed; holds sticky TRANSIENT_FAILURE and
+//   retries connections as backoffs expire.
+// - `Ready`: Successfully connected to a subchannel, routing all picks to it.
 impl LbPolicy for PickFirstPolicy {
     type LbConfig = PickFirstConfig;
 
@@ -208,7 +210,7 @@ impl LbPolicy for PickFirstPolicy {
                         self.state = PickFirstState::Idle(IdleState {
                             addresses: Vec::new(),
                         });
-                        set_failing_picker(&mut ctx, &e);
+                        ctx.set_failing_picker(&e);
                         ctx.controller.request_resolution();
                         return Err(e);
                     }
@@ -217,8 +219,7 @@ impl LbPolicy for PickFirstPolicy {
                 self.state = current.resolver_update(&mut ctx, addresses);
                 Ok(())
             }
-            Err(e) => {
-                let error = e.clone();
+            Err(error) => {
                 let has_addresses = match &self.state {
                     PickFirstState::Idle(s) => !s.addresses.is_empty(),
                     PickFirstState::FirstPass(s) => !s.addresses.is_empty(),
@@ -228,7 +229,7 @@ impl LbPolicy for PickFirstPolicy {
                 let is_tf = matches!(self.state, PickFirstState::SteadyState(_));
 
                 if !has_addresses || is_tf {
-                    set_failing_picker(&mut ctx, &error);
+                    ctx.set_failing_picker(&error);
                     ctx.controller.request_resolution();
                     return Err(error);
                 }
@@ -274,7 +275,24 @@ impl LbPolicy for PickFirstPolicy {
     }
 }
 
-/// State node: Idle
+struct PickFirstContext<'a> {
+    runtime: &'a GrpcRuntime,
+    work_scheduler: &'a Arc<dyn WorkScheduler>,
+    controller: &'a mut dyn ChannelController,
+}
+
+impl PickFirstContext<'_> {
+    fn set_failing_picker(&mut self, error: &str) {
+        self.controller.update_picker(LbState {
+            connectivity_state: ConnectivityState::TransientFailure,
+            picker: Arc::new(FailingPicker {
+                error: error.to_string(),
+            }),
+        });
+    }
+}
+
+// State node: Idle.
 #[derive(Debug, Default)]
 struct IdleState {
     addresses: Vec<Address>,
@@ -321,13 +339,16 @@ impl IdleState {
     }
 }
 
+// An entry associating an address, its created subchannel handle, and its cached
+// connectivity state.
 #[derive(Debug, Clone)]
 struct SubchannelEntry {
+    address: Address,
     subchannel: Arc<dyn Subchannel>,
     state: SubchannelState,
 }
 
-/// State node: `FirstPass` (Happy Eyeballs)
+// State node: FirstPass (Happy Eyeballs).
 struct FirstPassState {
     addresses: Vec<Address>,
     subchannels: Vec<SubchannelEntry>,
@@ -349,14 +370,15 @@ impl FirstPassState {
         let mut new_subchannels = Vec::with_capacity(addresses.len());
 
         for addr in &addresses {
-            let entry = if let Some(pos) = existing
-                .iter()
-                .position(|e| &e.subchannel.address() == addr)
-            {
+            let entry = if let Some(pos) = existing.iter().position(|e| &e.address == addr) {
                 existing.swap_remove(pos)
             } else {
                 let (subchannel, state) = ctx.controller.new_subchannel(addr);
-                SubchannelEntry { subchannel, state }
+                SubchannelEntry {
+                    address: addr.clone(),
+                    subchannel,
+                    state,
+                }
             };
 
             if entry.state.connectivity_state == ConnectivityState::Ready {
@@ -394,11 +416,8 @@ impl FirstPassState {
     }
 
     fn trigger_connection(&mut self, ctx: &mut PickFirstContext<'_>, sc: &Arc<dyn Subchannel>) {
-        if let Some(entry) = self
-            .subchannels
-            .iter_mut()
-            .find(|e| e.subchannel.address() == sc.address())
-        {
+        let addr = sc.address();
+        if let Some(entry) = self.subchannels.iter_mut().find(|e| e.address == addr) {
             entry.state = SubchannelState {
                 connectivity_state: ConnectivityState::Connecting,
                 last_connection_error: None,
@@ -441,11 +460,7 @@ impl FirstPassState {
     ) -> PickFirstState {
         let addr = subchannel.address();
 
-        let Some(entry) = self
-            .subchannels
-            .iter_mut()
-            .find(|e| e.subchannel.address() == addr)
-        else {
+        let Some(entry) = self.subchannels.iter_mut().find(|e| e.address == addr) else {
             return PickFirstState::FirstPass(self);
         };
 
@@ -461,7 +476,7 @@ impl FirstPassState {
             }
 
             if let Some(attempting) = self.subchannels.get(self.frontier_index)
-                && attempting.subchannel.address() == addr
+                && attempting.address == addr
                 && let Some(next_sc) = self.advance_frontier(false)
             {
                 self.trigger_connection(ctx, &next_sc);
@@ -497,7 +512,7 @@ impl FirstPassState {
     }
 }
 
-/// State node: `SteadyState` (Sticky `TRANSIENT_FAILURE`)
+// State node: SteadyState (Sticky TRANSIENT_FAILURE).
 #[derive(Debug)]
 struct SteadyState {
     addresses: Vec<Address>,
@@ -514,7 +529,7 @@ impl SteadyState {
         subchannels: Vec<SubchannelEntry>,
         last_error: String,
     ) -> PickFirstState {
-        set_failing_picker(ctx, &last_error);
+        ctx.set_failing_picker(&last_error);
         ctx.controller.request_resolution();
 
         for entry in &subchannels {
@@ -547,11 +562,7 @@ impl SteadyState {
         state: &SubchannelState,
     ) -> PickFirstState {
         let addr = subchannel.address();
-        let Some(entry) = self
-            .subchannels
-            .iter_mut()
-            .find(|e| e.subchannel.address() == addr)
-        else {
+        let Some(entry) = self.subchannels.iter_mut().find(|e| e.address == addr) else {
             return PickFirstState::SteadyState(self);
         };
         entry.state = state.clone();
@@ -565,7 +576,7 @@ impl SteadyState {
             ConnectivityState::TransientFailure => {
                 if let Some(err) = &state.last_connection_error {
                     self.last_connection_error.clone_from(err);
-                    set_failing_picker(ctx, &self.last_connection_error);
+                    ctx.set_failing_picker(&self.last_connection_error);
                 }
                 self.failure_count += 1;
                 if self.failure_count >= self.failure_threshold {
@@ -579,7 +590,7 @@ impl SteadyState {
     }
 }
 
-/// State node: Ready
+// State node: Ready.
 struct ReadyState {
     addresses: Vec<Address>,
     selected: Arc<dyn Subchannel>,
@@ -608,7 +619,8 @@ impl ReadyState {
         ctx: &mut PickFirstContext<'_>,
         addresses: Vec<Address>,
     ) -> PickFirstState {
-        if addresses.contains(&self.selected.address()) {
+        let selected_addr = self.selected.address();
+        if addresses.contains(&selected_addr) {
             self.addresses = addresses;
             return PickFirstState::Ready(self);
         }
@@ -632,7 +644,7 @@ impl ReadyState {
     }
 }
 
-/// The Pick First State Machine enum.
+// The Pick First State Machine enum.
 enum PickFirstState {
     Idle(IdleState),
     FirstPass(FirstPassState),
@@ -759,15 +771,15 @@ impl PickFirstPolicy {
     }
 }
 
-/// Implements the happy eyeballs timer task. `expired` becomes set when it
-/// fires. When dropped, the timer is cancelled.
-pub struct Timer {
+// Implements the happy eyeballs timer task. `expired` becomes set when it
+// fires. When dropped, the timer is cancelled.
+struct Timer {
     expired: Arc<AtomicBool>,
     handle: BoxedTaskHandle,
 }
 
 impl Timer {
-    /// Starts a new timer, returning it.
+    // Starts a new timer, returning it.
     fn start(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
         let expired = Arc::new(AtomicBool::new(false));
         let expired_clone = expired.clone();
@@ -779,7 +791,7 @@ impl Timer {
         Self { expired, handle }
     }
 
-    /// Returns whether the timer has expired yet.
+    // Returns whether the timer has expired yet.
     fn expired(&self) -> bool {
         self.expired.load(Ordering::SeqCst)
     }
@@ -1574,7 +1586,7 @@ mod test {
         );
     }
 
-    // Out-of-Order Failure Detection
+    // Out-of-Order Failure Detection.
     #[tokio::test]
     async fn test_pick_first_happy_eyeballs_out_of_order_failure() {
         let (rx, mut policy, mut controller) = simulate_connection(vec!["addr1", "addr2"], None);
@@ -1619,7 +1631,7 @@ mod test {
         );
     }
 
-    // Freshest Error Caching (Steady State)
+    // Freshest Error Caching (Steady State).
     #[tokio::test]
     async fn test_pick_first_steady_state_freshest_error() {
         let (rx, mut policy, mut controller) = simulate_failed_connection(vec!["addr1"], None);

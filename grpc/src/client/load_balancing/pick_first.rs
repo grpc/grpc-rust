@@ -105,7 +105,8 @@ pub struct PickFirstPolicy {
 
     // Subchannel information.
     subchannels: Vec<Arc<dyn Subchannel>>,
-    subchannel_states: HashMap<Address, SubchannelState>, // Cached states for all subchannels by address.
+    subchannel_states: HashMap<Address, SubchannelState>, /* Cached states for all subchannels
+                                                           * by address. */
 
     // Detailed error tracking.
     last_connection_error: Option<String>,
@@ -240,7 +241,9 @@ impl PickFirstPolicy {
 
         // If there is a viable subchannel at the frontier, connect to it and
         // update picker to CONNECTING.
-        if let Some(sc) = first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, true) {
+        if let Some(sc) =
+            first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, true)
+        {
             self.trigger_subchannel_connection(sc, channel_controller, &mut first_pass);
 
             // TODO: avoid this update if we are in TF (i.e. sticky TF)?
@@ -273,7 +276,8 @@ impl PickFirstPolicy {
             if let Some(attempting) = self.subchannels.get(first_pass.frontier_index)
                 && attempting.address() == subchannel.address()
                 && state.connectivity_state == ConnectivityState::TransientFailure
-                && let Some(next_sc) = first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, false)
+                && let Some(next_sc) =
+                    first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, false)
             {
                 self.subchannel_states.insert(
                     next_sc.address(),
@@ -283,13 +287,11 @@ impl PickFirstPolicy {
                     },
                 );
                 next_sc.connect();
-                first_pass.timer = Timer::start(
-                    self.runtime.clone(),
-                    self.work_scheduler.clone(),
-                );
+                first_pass.timer = Timer::start(self.runtime.clone(), self.work_scheduler.clone());
             }
 
-            // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
+            // Check if First Pass is fully exhausted (frontier exhausted AND zero
+            // connecting).
             if first_pass.frontier_index >= self.subchannels.len() {
                 let any_connecting = self.subchannels.iter().any(|sc| {
                     self.subchannel_states
@@ -364,10 +366,7 @@ impl PickFirstPolicy {
         sc.connect();
 
         // Start happy eyeballs timer; replacing any pre-existing timer.
-        first_pass.timer = Timer::start(
-            self.runtime.clone(),
-            self.work_scheduler.clone(),
-        );
+        first_pass.timer = Timer::start(self.runtime.clone(), self.work_scheduler.clone());
     }
 
     // Converts the update endpoints to an address list.
@@ -560,7 +559,9 @@ impl LbPolicy for PickFirstPolicy {
         } else if let PickFirstMode::FirstPass(ref mut first_pass) = self.mode {
             if first_pass.timer.expired() {
                 // Advance frontier and trigger next connection.
-                if let Some(next_sc) = first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, false) {
+                if let Some(next_sc) =
+                    first_pass.advance_frontier(&self.subchannels, &self.subchannel_states, false)
+                {
                     self.subchannel_states.insert(
                         next_sc.address(),
                         SubchannelState {
@@ -569,10 +570,8 @@ impl LbPolicy for PickFirstPolicy {
                         },
                     );
                     next_sc.connect();
-                    first_pass.timer = Timer::start(
-                        self.runtime.clone(),
-                        self.work_scheduler.clone(),
-                    );
+                    first_pass.timer =
+                        Timer::start(self.runtime.clone(), self.work_scheduler.clone());
                 }
             }
         }
@@ -815,9 +814,9 @@ mod test {
     use std::time::Duration;
 
     use super::*;
-    use crate::client::load_balancing::test_utils::{
-        TestChannelController, TestEvent, TestWorkScheduler,
-    };
+    use crate::client::load_balancing::test_utils::TestChannelController;
+    use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestWorkScheduler;
 
     const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 
@@ -1378,7 +1377,8 @@ mod test {
             controller.as_mut(),
         );
 
-        // Expect UpdatePicker(TransientFailure), RequestResolution, and Connect(addr1) from first pass exhaustion.
+        // Expect UpdatePicker(TransientFailure), RequestResolution, and Connect(addr1)
+        // from first pass exhaustion.
         let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
@@ -1701,5 +1701,72 @@ mod test {
         // And the picker goes to Connecting.
         let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+    }
+
+    // Tests that when connected to multi-address endpoints, if the winner drops
+    // to Idle and reconnects on RPC, the policy attempts to connect to all
+    // original addresses (falling over to addr2 if addr1 fails).
+    #[tokio::test]
+    async fn test_pick_first_disconnect_to_idle_multi_address_reconnect() {
+        let (rx, mut policy, mut controller) =
+            simulate_successful_connection(vec!["addr1", "addr2"], None);
+
+        // 1. Consume the initial Ready picker update.
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
+        let res = state.picker.pick(&RequestHeaders::default());
+        let sc1 = match res {
+            PickResult::Pick(pick) => {
+                assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
+                pick.subchannel
+            }
+            other => panic!("unexpected pick result {:?}", other),
+        };
+
+        // 2. Simulate addr1 disconnecting (transitioning to Idle).
+        policy.subchannel_update(
+            sc1.clone(),
+            &SubchannelState {
+                connectivity_state: ConnectivityState::Idle,
+                last_connection_error: None,
+            },
+            controller.as_mut(),
+        );
+
+        // 3. Verify the policy updates the picker to Idle state.
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+        let idle_picker = state.picker;
+
+        assert!(rx.try_recv().is_err(), "unexpected event");
+
+        // 4. Simulate an RPC happening.
+        let pick_result = idle_picker.pick(&RequestHeaders::default());
+        assert!(matches!(pick_result, PickResult::Queue));
+        expect_schedule_work(&rx);
+
+        // 5. Call work to execute the scheduled connection attempt.
+        policy.work(None, controller.as_mut());
+
+        // 6. Verify that the policy initiates reconnection to addr1.
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr1");
+
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+
+        // 7. Simulate addr1 failing on reconnect.
+        policy.subchannel_update(
+            sc1,
+            &SubchannelState {
+                connectivity_state: ConnectivityState::TransientFailure,
+                last_connection_error: Some("connection refused".to_string()),
+            },
+            controller.as_mut(),
+        );
+
+        // 8. Policy should failover to addr2.
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr2");
     }
 }

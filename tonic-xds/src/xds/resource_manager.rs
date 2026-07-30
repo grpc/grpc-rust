@@ -631,127 +631,34 @@ mod tests {
     /// behavior and completes under the fixed worker.
     #[tokio::test]
     async fn rds_referencing_many_clusters_reconciles_without_deadlock() {
-        use envoy_types::pb::envoy::config::route::v3::{
-            Route, RouteAction, RouteConfiguration, RouteMatch, VirtualHost, route::Action,
-            route_action::ClusterSpecifier, route_match::PathSpecifier,
-        };
-        use envoy_types::pb::envoy::service::discovery::v3::{
-            DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
-            aggregated_discovery_service_server::{
-                AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
-            },
-        };
-        use envoy_types::pb::google::protobuf::Any;
-        use prost::Message as _;
-        use std::pin::Pin;
-        use tokio_stream::{Stream, StreamExt as _};
+        use std::time::Duration;
         use xds_client::{
             ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder,
             XdsClient as RealXdsClient,
         };
+        use xds_test_util::{XdsTestControlPlaneService, config};
 
-        const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
         // Well past the worker's 64-slot command channel.
         const CLUSTER_COUNT: usize = 100;
 
-        /// ADS server that answers the first RDS subscription with one
-        /// RouteConfiguration referencing CLUSTER_COUNT clusters and ignores
-        /// everything else (ACKs, CDS subscriptions).
-        struct ManyClustersServer;
+        let control_plane = XdsTestControlPlaneService::new()
+            .start()
+            .await
+            .expect("control plane failed to start");
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Rds,
+            HashMap::from([(
+                "rc-many".to_string(),
+                config::build_route_config_with_cluster_count("rc-many", CLUSTER_COUNT),
+            )]),
+        );
 
-        #[tonic::async_trait]
-        impl AggregatedDiscoveryService for ManyClustersServer {
-            type StreamAggregatedResourcesStream =
-                Pin<Box<dyn Stream<Item = Result<DiscoveryResponse, tonic::Status>> + Send>>;
-
-            async fn stream_aggregated_resources(
-                &self,
-                request: tonic::Request<tonic::Streaming<DiscoveryRequest>>,
-            ) -> Result<tonic::Response<Self::StreamAggregatedResourcesStream>, tonic::Status>
-            {
-                let mut inbound = request.into_inner();
-                let outbound = async_stream::try_stream! {
-                    let mut sent = false;
-                    while let Some(Ok(req)) = inbound.next().await {
-                        if req.type_url == RDS_TYPE_URL && !sent {
-                            sent = true;
-                            let rc = RouteConfiguration {
-                                name: "rc-many".to_string(),
-                                virtual_hosts: vec![VirtualHost {
-                                    name: "vh".to_string(),
-                                    domains: vec!["*".to_string()],
-                                    routes: (0..CLUSTER_COUNT)
-                                        .map(|i| Route {
-                                            r#match: Some(RouteMatch {
-                                                path_specifier: Some(PathSpecifier::Prefix(
-                                                    format!("/svc-{i}"),
-                                                )),
-                                                ..Default::default()
-                                            }),
-                                            action: Some(Action::Route(RouteAction {
-                                                cluster_specifier: Some(
-                                                    ClusterSpecifier::Cluster(format!(
-                                                        "cluster-{i}"
-                                                    )),
-                                                ),
-                                                ..Default::default()
-                                            })),
-                                            ..Default::default()
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            };
-                            yield DiscoveryResponse {
-                                version_info: "1".to_string(),
-                                type_url: RDS_TYPE_URL.to_string(),
-                                nonce: "n1".to_string(),
-                                resources: vec![Any {
-                                    type_url: RDS_TYPE_URL.to_string(),
-                                    value: rc.encode_to_vec(),
-                                }],
-                                ..Default::default()
-                            };
-                        }
-                    }
-                };
-                Ok(tonic::Response::new(Box::pin(outbound)))
-            }
-
-            type DeltaAggregatedResourcesStream =
-                Pin<Box<dyn Stream<Item = Result<DeltaDiscoveryResponse, tonic::Status>> + Send>>;
-
-            async fn delta_aggregated_resources(
-                &self,
-                _request: tonic::Request<tonic::Streaming<DeltaDiscoveryRequest>>,
-            ) -> Result<tonic::Response<Self::DeltaAggregatedResourcesStream>, tonic::Status>
-            {
-                Err(tonic::Status::unimplemented("delta not supported"))
-            }
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let incoming = async_stream::stream! {
-            loop {
-                match listener.accept().await {
-                    Ok((socket, _)) => yield Ok::<_, std::io::Error>(socket),
-                    Err(_) => break,
-                }
-            }
-        };
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(AggregatedDiscoveryServiceServer::new(ManyClustersServer))
-                .serve_with_incoming(incoming)
-                .await
-                .unwrap();
-        });
-
-        let config = ClientConfig::new(Node::new("test", "0"), format!("http://{addr}"));
+        let client_config = ClientConfig::new(
+            Node::new("test", "0"),
+            format!("http://{}", control_plane.addr()),
+        );
         let xds_client: RealXdsClient = RealXdsClient::builder(
-            config,
+            client_config,
             TonicTransportBuilder::new(),
             ProstCodec,
             TokioRuntime,
@@ -759,7 +666,7 @@ mod tests {
         .build();
 
         let mut watcher = xds_client.watch::<RouteConfigResource>("rc-many").await;
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.next())
+        let event = tokio::time::timeout(Duration::from_secs(10), watcher.next())
             .await
             .expect("timed out waiting for the RDS update")
             .expect("watcher closed");
@@ -767,7 +674,7 @@ mod tests {
         let cache = test_cache();
         let mut state = CascadeState::new();
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            Duration::from_secs(10),
             state.handle_rds(event, &xds_client, &cache),
         )
         .await

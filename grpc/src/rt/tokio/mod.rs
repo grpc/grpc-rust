@@ -114,6 +114,9 @@ impl Runtime for TokioRuntime {
             let stream = TcpStream::connect(target)
                 .await
                 .map_err(|err| err.to_string())?;
+            stream
+                .set_nodelay(opts.enable_nodelay)
+                .map_err(|err| err.to_string())?;
             if let Some(duration) = opts.keepalive {
                 let sock_ref = socket2::SockRef::from(&stream);
                 let mut ka = socket2::TcpKeepalive::new();

@@ -45,8 +45,11 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
+use tower::BoxError;
 
-use crate::client::endpoint::{Connector, EndpointAddress, EndpointChannel};
+use crate::client::endpoint::{
+    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+};
 use crate::client::lb::{BoxDiscover, ClusterDiscovery};
 use crate::common::async_util::BoxFuture;
 use crate::xds::cache::XdsCache;
@@ -55,8 +58,6 @@ use crate::xds::cert_provider::verifier::XdsServerCertVerifier;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
 use crate::xds::endpoint_manager::{ConnectorSwap, EndpointManager};
-use crate::xds::resource::ClusterResource;
-#[cfg(feature = "_tls-any")]
 use crate::xds::resource::security::ClusterSecurityConfig;
 
 /// Buffer capacity for the discovery channel between the spawned task and
@@ -90,58 +91,43 @@ fn with_liveness_settings(endpoint: Endpoint) -> Endpoint {
         .keep_alive_while_idle(true)
 }
 
-/// xDS-backed cluster discovery.
+/// xDS-backed cluster discovery, generic over the connector factory `MC`.
 ///
 /// Resolves cluster names into endpoint change streams by watching the
-/// [`XdsCache`]. Builds per-cluster [`Connector`]s based on the cluster's
-/// [`ClusterSecurityConfig`] (if any) and the bootstrap-built
-/// [`CertProviderRegistry`].
-pub(crate) struct XdsClusterDiscovery {
+/// [`XdsCache`]. On each CDS update it asks `MC` to build a [`Connector`] for
+/// the cluster. The default [`GrpcMakeConnector`] produces gRPC (plaintext or
+/// TLS) connectors from the cluster's [`ClusterSecurityConfig`] (if any) and
+/// the bootstrap-built [`CertProviderRegistry`].
+pub(crate) struct XdsClusterDiscovery<MC = GrpcMakeConnector> {
     cache: Arc<XdsCache>,
-    #[cfg(feature = "_tls-any")]
-    cert_provider_registry: Arc<CertProviderRegistry>,
+    make_connector: Arc<MC>,
 }
 
-impl XdsClusterDiscovery {
-    #[cfg(feature = "_tls-any")]
-    pub(crate) fn new(cache: Arc<XdsCache>, registry: Arc<CertProviderRegistry>) -> Self {
+impl<MC> XdsClusterDiscovery<MC> {
+    pub(crate) fn new(cache: Arc<XdsCache>, make_connector: MC) -> Self {
         Self {
             cache,
-            cert_provider_registry: registry,
+            make_connector: Arc::new(make_connector),
         }
-    }
-
-    #[cfg(not(feature = "_tls-any"))]
-    pub(crate) fn new(cache: Arc<XdsCache>) -> Self {
-        Self { cache }
     }
 }
 
-impl ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for XdsClusterDiscovery {
-    fn discover_cluster(
-        &self,
-        cluster_name: &str,
-    ) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
+impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsClusterDiscovery<MC> {
+    fn discover_cluster(&self, cluster_name: &str) -> BoxDiscover<EndpointAddress, MC::Service> {
         let cache = self.cache.clone();
         let cluster_name = cluster_name.to_string();
-        #[cfg(feature = "_tls-any")]
-        let registry = self.cert_provider_registry.clone();
+        let make_connector = self.make_connector.clone();
 
         let (tx, rx) = mpsc::channel(DISCOVER_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let mut cluster_watch = cache.watch_cluster(&cluster_name);
 
-            let connector_swap: ConnectorSwap<EndpointChannel<Channel>> = loop {
+            let connector_swap: ConnectorSwap<MC::Service> = loop {
                 let Some(cluster) = cluster_watch.next().await else {
                     return;
                 };
-                let result = build_connector(
-                    &cluster,
-                    #[cfg(feature = "_tls-any")]
-                    &registry,
-                );
-                match result {
+                match make_connector.make_connector(ClusterConfig::from_resource(&cluster)) {
                     Ok(c) => break Arc::new(ArcSwap::from_pointee(c)),
                     Err(e) => tracing::warn!(
                         cluster = %cluster_name,
@@ -162,12 +148,7 @@ impl ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for XdsClusterD
                         }
                     }
                     Some(cluster) = cluster_watch.next() => {
-                        let result = build_connector(
-                            &cluster,
-                            #[cfg(feature = "_tls-any")]
-                            &registry,
-                        );
-                        match result {
+                        match make_connector.make_connector(ClusterConfig::from_resource(&cluster)) {
                             Ok(new) => connector_swap.store(Arc::new(new)),
                             Err(e) => tracing::warn!(
                                 cluster = %cluster_name,
@@ -185,17 +166,55 @@ impl ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for XdsClusterD
     }
 }
 
-/// Build a [`Connector`] for the given cluster.
+/// The default gRPC [`MakeConnector`].
 ///
-/// - `cluster.security == None` → [`PlaintextConnector`].
-/// - `cluster.security == Some(_)` under a TLS feature → [`TlsConnector`].
-/// - `cluster.security == Some(_)` without a TLS feature → error.
+/// Builds a plaintext or (under a TLS feature) TLS connector from a cluster's
+/// parsed CDS [`ClusterSecurityConfig`], resolving cert-provider instances
+/// against the bootstrap-built [`CertProviderRegistry`].
+pub(crate) struct GrpcMakeConnector {
+    #[cfg(feature = "_tls-any")]
+    registry: Arc<CertProviderRegistry>,
+}
+
+impl GrpcMakeConnector {
+    #[cfg(feature = "_tls-any")]
+    pub(crate) fn new(registry: Arc<CertProviderRegistry>) -> Self {
+        Self { registry }
+    }
+
+    #[cfg(not(feature = "_tls-any"))]
+    pub(crate) fn new() -> Self {
+        Self {}
+    }
+}
+
+impl MakeConnector for GrpcMakeConnector {
+    type Service = EndpointChannel<Channel>;
+
+    fn make_connector(
+        &self,
+        cluster: ClusterConfig<'_>,
+    ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError> {
+        build_connector(
+            cluster.security,
+            #[cfg(feature = "_tls-any")]
+            &self.registry,
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// Build a [`Connector`] for the given cluster's parsed security config.
+///
+/// - `security == None` → [`PlaintextConnector`].
+/// - `security == Some(_)` under a TLS feature → [`TlsConnector`].
+/// - `security == Some(_)` without a TLS feature → error.
 fn build_connector(
-    cluster: &ClusterResource,
+    security: Option<&ClusterSecurityConfig>,
     #[cfg(feature = "_tls-any")] registry: &CertProviderRegistry,
 ) -> Result<Arc<dyn Connector<Service = EndpointChannel<Channel>> + Send + Sync>, ConnectorBuildError>
 {
-    match &cluster.security {
+    match security {
         None => Ok(Arc::new(PlaintextConnector)),
         #[cfg(feature = "_tls-any")]
         Some(sec) => Ok(Arc::new(TlsConnector::new(registry, sec)?)),
@@ -204,7 +223,8 @@ fn build_connector(
     }
 }
 
-/// Errors building a per-cluster [`Connector`] from a [`ClusterResource`].
+/// Errors building a per-cluster gRPC [`Connector`] from a cluster's parsed
+/// security config.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConnectorBuildError {
     /// TLS connector build failed (unknown provider instance, etc.).
@@ -388,14 +408,27 @@ mod tests {
     #[cfg(feature = "_tls-any")]
     #[test]
     fn build_connector_plaintext_tls_feature_on() {
-        assert!(build_connector(&plaintext_cluster(), &empty_registry()).is_ok());
+        assert!(build_connector(plaintext_cluster().security.as_ref(), &empty_registry()).is_ok());
     }
 
     /// Plaintext dispatch without any TLS feature.
     #[cfg(not(feature = "_tls-any"))]
     #[test]
     fn build_connector_plaintext_no_tls() {
-        assert!(build_connector(&plaintext_cluster()).is_ok());
+        assert!(build_connector(plaintext_cluster().security.as_ref()).is_ok());
+    }
+
+    /// The default `GrpcMakeConnector` builds a connector from a `ClusterConfig`
+    /// view; a cluster with no security config yields a plaintext connector.
+    #[cfg(feature = "_tls-any")]
+    #[test]
+    fn grpc_make_connector_plaintext() {
+        let make = GrpcMakeConnector::new(Arc::new(empty_registry()));
+        let cluster = plaintext_cluster();
+        assert!(
+            make.make_connector(ClusterConfig::from_resource(&cluster))
+                .is_ok()
+        );
     }
 
     /// Cluster with TLS pointing at an instance not in the registry surfaces
@@ -403,15 +436,12 @@ mod tests {
     #[cfg(feature = "_tls-any")]
     #[test]
     fn build_connector_tls_unknown_ca() {
-        use crate::xds::resource::security::ClusterSecurityConfig;
-
-        let mut cluster = plaintext_cluster();
-        cluster.security = Some(ClusterSecurityConfig {
+        let security = ClusterSecurityConfig {
             ca_instance_name: "missing-ca".into(),
             identity_instance_name: None,
             san_matchers: vec![],
-        });
-        let Err(err) = build_connector(&cluster, &empty_registry()) else {
+        };
+        let Err(err) = build_connector(Some(&security), &empty_registry()) else {
             panic!("expected UnknownCaInstance error");
         };
         assert!(matches!(

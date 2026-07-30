@@ -30,7 +30,7 @@ use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
-use crate::xds::cluster_discovery::XdsClusterDiscovery;
+use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use crate::{TonicCallCredentials, XdsUri};
@@ -370,11 +370,14 @@ impl XdsChannelBuilder {
         #[cfg(feature = "_tls-any")]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, cert_provider_registry));
+        > = Arc::new(XdsClusterDiscovery::new(
+            cache,
+            GrpcMakeConnector::new(cert_provider_registry),
+        ));
         #[cfg(not(feature = "_tls-any"))]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache));
+        > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
         let retry_policy = GrpcRetryPolicy::default();
 
         let resources = Arc::new(XdsChannelResources {
@@ -760,7 +763,7 @@ mod tests {
     /// Builds an XdsChannelGrpc using real XdsRouter and XdsClusterDiscovery
     /// backed by the given cache.
     async fn build_xds_channel_from_cache(cache: Arc<XdsCache>) -> XdsChannelGrpc {
-        use crate::xds::cluster_discovery::XdsClusterDiscovery;
+        use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
         use crate::xds::routing::XdsRouter;
 
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
@@ -774,12 +777,15 @@ mod tests {
                 CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
                     .unwrap(),
             );
-            Arc::new(XdsClusterDiscovery::new(cache, registry))
+            Arc::new(XdsClusterDiscovery::new(
+                cache,
+                GrpcMakeConnector::new(registry),
+            ))
         };
         #[cfg(not(feature = "_tls-any"))]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache));
+        > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
 
         let builder = XdsChannelBuilder::new(test_config());
         builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default(), None)

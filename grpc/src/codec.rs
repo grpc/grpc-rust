@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -22,16 +22,4 @@
  *
  */
 
-pub(crate) mod channel;
-pub(crate) mod circuit_breaking;
-pub(crate) mod cluster;
-pub(crate) mod endpoint;
-pub(crate) mod lb;
-#[allow(dead_code)]
-pub(crate) mod loadbalance;
-#[allow(dead_code)]
-pub(crate) mod retry;
-pub(crate) mod route;
-
-#[cfg(test)]
-mod xds_e2e;
+pub(crate) mod compression;

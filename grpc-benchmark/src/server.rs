@@ -69,7 +69,7 @@ impl BenchmarkServer {
     pub(crate) async fn start(config: ServerConfig) -> Result<Self, Status> {
         println!("Starting benchmark server with config: {:?}", config);
 
-        let mut server_builder = Server::builder();
+        let mut server_builder = Server::builder().http2_adaptive_window(Some(true));
         // Parse security config.
         if let Some(security_params) = config.security_params {
             let tls_config = if security_params.use_test_ca {
@@ -117,7 +117,14 @@ impl BenchmarkServer {
             .map_err(|err| Status::internal(format!("failed to get local address: {err}")))?;
         let port = bound_addr.port();
 
-        let incoming = TcpListenerStream::new(listener);
+        let incoming = TcpListenerStream::new(listener).map(|res| {
+            if let Ok(ref stream) = res
+                && let Err(e) = stream.set_nodelay(true)
+            {
+                eprintln!("failed to set nodelay: {e}");
+            }
+            res
+        });
 
         tokio::spawn(router.serve_with_incoming_shutdown(incoming, async move {
             shutdown_notify_copy.notified().await;

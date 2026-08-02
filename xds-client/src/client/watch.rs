@@ -70,33 +70,33 @@ use crate::resource::{DecodedResource, Resource};
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ProcessingDone(Option<oneshot::Sender<()>>);
+pub struct ProcessingDone(Option<Arc<oneshot::Sender<()>>>);
 
 impl ProcessingDone {
-    /// Create a channel pair for signaling.
+    /// Create the shared signal for one response.
     ///
-    /// Returns the `ProcessingDone` sender and a receiver future that resolves
-    /// when the sender is dropped.
+    /// Returns a `ProcessingDone` token and a receiver future that resolves
+    /// once the token and every [`share`](Self::share) of it are dropped
+    /// (dropping the last `Arc` drops the sender, which wakes the receiver).
     pub(crate) fn channel() -> (Self, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
-        (Self(Some(tx)), rx)
+        (Self(Some(Arc::new(tx))), rx)
     }
 
-    /// Creates a no-op token that signals nothing when dropped.
+    /// Another token tied to the same response's signal.
     ///
-    /// Requires the `test-util` feature.
-    #[cfg(feature = "test-util")]
-    pub fn noop() -> Self {
-        Self(None)
+    /// All tokens for one response share a single allocation; the receiver
+    /// resolves only after every one of them is dropped.
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.clone())
     }
-}
 
-impl Drop for ProcessingDone {
-    fn drop(&mut self) {
-        // Auto-signal on drop to prevent deadlocks.
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
-        }
+    /// A token that signals nothing when dropped.
+    ///
+    /// Used internally for events that do not participate in ADS flow
+    /// control, and useful for constructing [`ResourceEvent`]s in tests.
+    pub fn detached() -> Self {
+        Self(None)
     }
 }
 

@@ -384,21 +384,21 @@ mod tests {
     fn ok_event<T>(resource: Arc<T>) -> ResourceEvent<T> {
         ResourceEvent::ResourceChanged {
             result: Ok(resource),
-            done: ProcessingDone::noop(),
+            done: ProcessingDone::detached(),
         }
     }
 
     fn err_event<T>() -> ResourceEvent<T> {
         ResourceEvent::ResourceChanged {
             result: Err(xds_client::Error::ResourceDoesNotExist),
-            done: ProcessingDone::noop(),
+            done: ProcessingDone::detached(),
         }
     }
 
     fn ambient_event<T>() -> ResourceEvent<T> {
         ResourceEvent::AmbientError {
             error: xds_client::Error::ResourceDoesNotExist,
-            done: ProcessingDone::noop(),
+            done: ProcessingDone::detached(),
         }
     }
 

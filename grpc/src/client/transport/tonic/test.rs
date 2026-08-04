@@ -1067,10 +1067,11 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
                 }
                 Some(Err(err)) => {
                     println!("Got expected error: {:?}", err);
-                    if err.is_reset() || err.reason().is_some() {
+                    if let Some(reason) = err.reason() {
+                        assert_eq!(reason, h2::Reason::CANCEL, "Expected CANCEL reason");
                         return;
                     }
-                    panic!("Expected reset, got: {:?}", err);
+                    panic!("Expected reset with reason, got: {:?}", err);
                 }
                 None => {
                     panic!("Expected RST_STREAM, got clean close (EOS)");

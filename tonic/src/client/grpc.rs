@@ -39,6 +39,8 @@ use http::{
 use http_body::Body as HttpBody;
 use std::{fmt, future, pin::pin};
 use tokio_stream::{Stream, StreamExt};
+use crate::client::cancellation::{CancellationState, CancelHandle};
+use std::sync::Arc;
 
 /// A gRPC client dispatcher.
 ///
@@ -305,7 +307,7 @@ impl<T> Grpc<T> {
     /// Send a bi-directional streaming gRPC request.
     pub async fn streaming<S, M1, M2, C>(
         &mut self,
-        request: Request<S>,
+        mut request: Request<S>,
         path: PathAndQuery,
         mut codec: C,
     ) -> Result<Response<Streaming<M2>>, Status>
@@ -318,6 +320,13 @@ impl<T> Grpc<T> {
         M1: Send + Sync + 'static,
         M2: Send + Sync + 'static,
     {
+        let cancellation_state = request
+            .extensions_mut()
+            .remove::<Arc<CancellationState>>()
+            .unwrap_or_else(|| Arc::new(CancellationState::default()));
+
+        let cancel_handle = CancelHandle::new(cancellation_state.clone());
+
         let request = request
             .map(|s| {
                 EncodeBody::new_client(
@@ -325,6 +334,7 @@ impl<T> Grpc<T> {
                     s.map(Ok),
                     self.config.send_compression_encodings,
                     self.config.max_encoding_message_size,
+                    cancellation_state,
                 )
             })
             .map(Body::new);
@@ -339,7 +349,9 @@ impl<T> Grpc<T> {
 
         let decoder = codec.decoder();
 
-        self.create_response(decoder, response)
+        let mut response = self.create_response(decoder, response)?;
+        response.extensions_mut().insert(cancel_handle);
+        Ok(response)
     }
 
     // Keeping this code in a separate function from Self::streaming lets functions that return the

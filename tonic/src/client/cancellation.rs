@@ -22,29 +22,45 @@
  *
  */
 
-//! Generic client implementation.
-//!
-//! This module contains the low level components to build a gRPC client. It
-//! provides a codec agnostic gRPC client dispatcher and a decorated tower
-//! service trait.
-//!
-//! This client is generally used by some code generation tool to provide stubs
-//! for the gRPC service. Thusly, they are a bit cumbersome to use by hand.
-//!
-//! ## Concurrent usage
-//!
-//! Upon using the your generated client, you will discover all the functions
-//! corresponding to your rpc methods take `&mut self`, making concurrent
-//! usage of the client difficult. The answer is simply to clone the client,
-//! which is cheap as all client instances will share the same channel for
-//! communication. For more details, see
-//! [transport::Channel](../transport/struct.Channel.html#multiplexing-requests).
+//! Client-side cancellation support.
 
-mod grpc;
-mod service;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use atomic_waker::AtomicWaker;
 
-pub use self::grpc::Grpc;
-pub use self::service::GrpcService;
+/// Shared state used to coordinate cancellation of an outbound request stream.
+#[derive(Default, Debug)]
+pub struct CancellationState {
+    pub(crate) cancellation_requested: AtomicBool,
+    pub(crate) poll_waker: AtomicWaker,
+}
 
-pub mod cancellation;
-pub use self::cancellation::CancelHandle;
+impl CancellationState {
+    /// Request cancellation.
+    pub fn cancel(&self) {
+        if self
+            .cancellation_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.poll_waker.wake();
+        }
+    }
+}
+
+/// A handle to cancel an outbound request stream.
+#[derive(Clone, Debug)]
+pub struct CancelHandle {
+    state: Arc<CancellationState>,
+}
+
+impl CancelHandle {
+    pub(crate) fn new(state: Arc<CancellationState>) -> Self {
+        Self { state }
+    }
+
+    /// Cancel the stream.
+    pub fn cancel(&self) {
+        self.state.cancel();
+    }
+}

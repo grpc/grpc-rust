@@ -20,6 +20,7 @@ rust-version = {workspace = true}
 exclude = ["benches-disabled"]
 
 [features]
+h2 = ["dep:h2"]
 codegen = ["dep:async-trait"]
 gzip = ["dep:flate2"]
 deflate = ["dep:flate2"]
@@ -33,7 +34,7 @@ tls-webpki-roots = ["_tls-any","channel", "dep:webpki-roots"]
 tls-connect-info = ["dep:tokio-rustls"]
 router = ["dep:axum", "dep:tower", "tower?/util"]
 server = [
-  "dep:h2",
+  "h2",
   "dep:hyper", "hyper?/server",
   "dep:hyper-util", "hyper-util?/service", "hyper-util?/server-auto",
   "dep:socket2",
@@ -42,6 +43,7 @@ server = [
   "dep:tower", "tower?/util", "tower?/limit", "tower?/load-shed",
 ]
 channel = [
+  "h2",
   "dep:hyper", "hyper?/client",
   "dep:hyper-util", "hyper-util?/client-legacy",
   "dep:tower", "tower?/balance", "tower?/buffer", "tower?/discover", "tower?/limit", "tower?/load-shed", "tower?/util",
@@ -55,6 +57,7 @@ transport = ["server", "channel"]
 # harness = false
 
 [dependencies]
+atomic-waker = "1.0"
 base64 = "0.22"
 bytes = "1.0"
 http = "1.1.0"

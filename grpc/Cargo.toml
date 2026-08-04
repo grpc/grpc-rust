@@ -35,7 +35,6 @@ _runtime-tokio = [
     "tokio/time",
     "dep:socket2",
     "dep:tower",
-    "dep:futures",
 ]
 # Used for testing with udeps as it wants this feature to exist
 # to be able to do its checks.
@@ -57,7 +56,6 @@ bytes = "1.10.1"
 flate2 = { version = "1.0", optional = true, default-features = false, features = [
     "zlib-rs",
 ] }
-futures = { version = "0.3", default-features = false, optional = true }
 hickory-resolver = { version = "0.26.1", optional = true }
 http = "1.1.0"
 httparse = "1.9"

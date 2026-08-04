@@ -67,6 +67,7 @@ use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
 use crate::client::service_config::ParseResult;
+use crate::client::service_config::ServiceConfig;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
 use crate::client::subchannel::NopBackoff;
@@ -472,7 +473,7 @@ impl name_resolution::ChannelController for ResolverChannelController {
     }
 
     fn parse_service_config(&self, config: &str) -> ParseResult {
-        Err("service configs not supported".to_string())
+        ServiceConfig::parse(config)
     }
 }
 

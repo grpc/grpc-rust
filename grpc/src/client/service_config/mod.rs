@@ -60,7 +60,7 @@ impl ServiceConfig {
     // selected policy and its parsed config, sharing this logic with child LB
     // policies. graceful_switch should handle it in the same pathway when this
     // work is done.
-    pub fn lb_config(&self) -> Option<ParsedJsonLbConfig> {
+    pub(crate) fn lb_config(&self) -> Option<ParsedJsonLbConfig> {
         if let Some(ref configs) = self.inner.load_balancing_config
             && !configs.is_empty()
         {

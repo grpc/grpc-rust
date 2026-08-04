@@ -28,16 +28,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
-use tonic::client::cancellation::CancellationState;
-
 use std::task::Context;
 use std::task::Poll;
 
 use bytes::Buf;
 use bytes::BufMut as _;
 use bytes::Bytes;
-
 use http::Request as HttpRequest;
 use http::Response as HttpResponse;
 use http::Uri;
@@ -53,6 +49,7 @@ use tonic::Request as TonicRequest;
 use tonic::Status as TonicStatus;
 use tonic::Streaming;
 use tonic::body::Body;
+use tonic::client::CancellationHandle;
 use tonic::client::Grpc;
 use tonic::client::GrpcService;
 use tonic::codec::Codec;
@@ -144,7 +141,6 @@ impl Drop for TonicTransport {
     }
 }
 
-
 impl Invoke for TonicTransport {
     type SendStream = TonicSendStream;
     type RecvStream = TonicRecvStream;
@@ -160,8 +156,7 @@ impl Invoke for TonicTransport {
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
 
-        let cancellation_state = Arc::new(CancellationState::default());
-        request.extensions_mut().insert(cancellation_state.clone());
+        let cancel_tx = CancellationHandle::new(request.extensions_mut());
 
         let Ok(path) = PathAndQuery::from_maybe_shared(method) else {
             return err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));
@@ -191,7 +186,7 @@ impl Invoke for TonicTransport {
             TonicSendStream { sender: Ok(req_tx) },
             TonicRecvStream {
                 state: StreamState::AwaitingHeaders(resp_rx),
-                cancellation_state,
+                cancel_tx: Some(cancel_tx),
             },
         )
     }
@@ -227,7 +222,6 @@ fn trailers_from_status(status: crate::Result<()>, md: &TonicMeta) -> ResponseSt
     ResponseStreamItem::Trailers(trailers)
 }
 
-
 struct TonicSendStream {
     sender: Result<mpsc::Sender<BoxBuf>, ()>,
 }
@@ -249,7 +243,7 @@ impl SendStream for TonicSendStream {
 
 struct TonicRecvStream {
     state: StreamState,
-    cancellation_state: Arc<CancellationState>,
+    cancel_tx: Option<CancellationHandle>,
 }
 
 enum StreamState {
@@ -286,7 +280,9 @@ impl RecvStream for TonicRecvStream {
                             ResponseStreamItem::Headers(ResponseHeaders::new().with_metadata(md))
                         }
                         Err(e) => {
-                            self.cancellation_state.cancel();
+                            if let Some(cancel_tx) = self.cancel_tx.take() {
+                                cancel_tx.cancel();
+                            }
                             trailers_from_status(
                                 Err(StatusError::new(
                                     StatusCodeError::Internal,
@@ -318,7 +314,9 @@ impl RecvStream for TonicRecvStream {
                         ResponseStreamItem::Message
                     }
                     Err(e) => {
-                        self.cancellation_state.cancel();
+                        if let Some(cancel_tx) = self.cancel_tx.take() {
+                            cancel_tx.cancel();
+                        }
                         trailers_from_status(
                             Err(StatusError::new(
                                 StatusCodeError::Internal,
@@ -346,7 +344,9 @@ impl RecvStream for TonicRecvStream {
 
 impl Drop for TonicRecvStream {
     fn drop(&mut self) {
-        self.cancellation_state.cancel();
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            cancel_tx.cancel();
+        }
     }
 }
 
@@ -355,7 +355,7 @@ fn err_streams(status: StatusError) -> (TonicSendStream, TonicRecvStream) {
         TonicSendStream { sender: Err(()) },
         TonicRecvStream {
             state: StreamState::Error(status),
-            cancellation_state: Arc::new(CancellationState::default()),
+            cancel_tx: None,
         },
     )
 }

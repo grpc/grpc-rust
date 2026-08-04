@@ -36,11 +36,10 @@ use std::{
     task::{Context, Poll, ready},
 };
 use tokio_stream::{Stream, StreamExt, adapters::Fuse};
-use crate::client::cancellation::CancellationState;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 #[cfg(feature = "h2")]
 use h2::{Error as H2Error, Reason as H2Reason};
+use crate::client::CancellationListener;
 
 /// Combinator for efficient encoding of messages into reasonably sized buffers.
 /// EncodedBytes encodes ready messages from its delegate stream into a BytesMut,
@@ -247,7 +246,7 @@ pub struct EncodeBody<T, U> {
     #[pin]
     inner: EncodedBytes<T, U>,
     state: EncodeState,
-    cancellation_state: Option<Arc<CancellationState>>,
+    cancellation_listener: Option<CancellationListener>,
 }
 
 #[derive(Debug)]
@@ -265,7 +264,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         source: U,
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
-        cancellation_state: Arc<CancellationState>,
+        cancellation_listener: Option<CancellationListener>,
     ) -> Self {
         Self {
             inner: EncodedBytes::new(
@@ -280,7 +279,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 role: Role::Client,
                 is_end_stream: false,
             },
-            cancellation_state: Some(cancellation_state),
+            cancellation_listener,
         }
     }
 
@@ -306,7 +305,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 role: Role::Server,
                 is_end_stream: false,
             },
-            cancellation_state: None,
+            cancellation_listener: None,
         }
     }
 }
@@ -348,18 +347,17 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let self_proj = self.project();
+        let mut self_proj = self.project();
 
-        if let Some(cancellation_state) = &self_proj.cancellation_state {
-            cancellation_state.poll_waker.register(cx.waker());
-            if cancellation_state.cancellation_requested.load(Ordering::Acquire) {
-                let mut status = Status::cancelled("client cancelled");
-                #[cfg(feature = "h2")]
-                {
-                    status.set_source(Arc::new(H2Error::from(H2Reason::CANCEL)));
-                }
-                return Poll::Ready(Some(Err(status)));
+        if let Some(cancellation_listener) = &mut self_proj.cancellation_listener
+            && cancellation_listener.update_waker(cx.waker())
+        {
+            let mut status = Status::cancelled("client cancelled");
+            #[cfg(feature = "h2")]
+            {
+                status.set_source(Arc::new(H2Error::from(H2Reason::CANCEL)));
             }
+            return Poll::Ready(Some(Err(status)));
         }
 
         match ready!(self_proj.inner.poll_next(cx)) {

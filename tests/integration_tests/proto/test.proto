@@ -6,6 +6,10 @@ service Test {
   rpc UnaryCall(Input) returns (Output);
 }
 
+service CancellationTest {
+  rpc BidiStream(stream Input) returns (stream Output);
+}
+
 message Input {}
 message Output {}
 

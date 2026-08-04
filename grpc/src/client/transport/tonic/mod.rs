@@ -29,20 +29,21 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 
 use bytes::Buf;
 use bytes::BufMut as _;
 use bytes::Bytes;
-use futures::stream::StreamExt;
+use futures::task::AtomicWaker;
 use http::Request as HttpRequest;
 use http::Response as HttpResponse;
 use http::Uri;
 use http::uri::PathAndQuery;
 use hyper::client::conn::http2::Builder;
 use hyper::client::conn::http2::SendRequest;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
@@ -100,10 +101,11 @@ use crate::rt::hyper_wrapper::HyperStream;
 mod test;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
-pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
 
+type BoxError = Box<dyn Error + Send + Sync>;
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, TonicStatus>> + Send>>;
+type BoxBuf = Box<dyn Buf + Send + Sync>;
 
 pub(crate) fn reg() {
     GLOBAL_TRANSPORT_REGISTRY.add_transport(
@@ -142,6 +144,72 @@ impl Drop for TonicTransport {
     }
 }
 
+/// A wrapper stream that allows cancellation of the outbound request stream.
+///
+/// It wraps an inner stream and monitors a shared [`CancellationState`].
+/// When cancellation is requested, it yields [`StreamItem::Cancellation`] and
+/// terminates.
+#[must_use = "streams do nothing unless polled"]
+pub struct CancellableStream<St: Stream> {
+    inner: Option<St>,
+    cancellation_state: Arc<CancellationState>,
+}
+
+/// Represents an item in the outbound stream, which can either be a regular
+/// message or a cancellation signal.
+pub enum StreamItem<T> {
+    /// Indicates that the stream should be cancelled.
+    Cancellation,
+    /// A regular message item.
+    Item(T),
+}
+
+impl<St, I> Stream for CancellableStream<St>
+where
+    St: Stream<Item = StreamItem<I>> + Unpin,
+{
+    type Item = St::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<St::Item>> {
+        self.cancellation_state.poll_waker.register(cx.waker());
+        if self
+            .cancellation_state
+            .cancellation_requested
+            .load(Ordering::Acquire)
+        {
+            if self.inner.take().is_some() {
+                // First poll after cancellation.
+                return Poll::Ready(Some(StreamItem::Cancellation));
+            } else {
+                // Cancellation signal already sent once, or stream finished
+                // naturally.
+                return Poll::Ready(None);
+            }
+        }
+        if let Some(inner) = &mut self.inner {
+            // Not yet cancelled.
+            match Pin::new(inner).poll_next(cx) {
+                Poll::Ready(None) => {
+                    self.inner = None;
+                    Poll::Ready(None)
+                }
+                pending_or_item => pending_or_item,
+            }
+        } else {
+            // Stream was already completed or cancelled.
+            Poll::Ready(None)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if let Some(inner) = &self.inner {
+            inner.size_hint()
+        } else {
+            (0, Some(0))
+        }
+    }
+}
+
 impl Invoke for TonicTransport {
     type SendStream = TonicSendStream;
     type RecvStream = TonicRecvStream;
@@ -152,15 +220,22 @@ impl Invoke for TonicTransport {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::channel(1);
-        let stop_notify = Arc::new(Notify::new());
-
         // Tonic runs the outbound request stream in a background task. It will
         // NOT automatically stop sending if the inbound response stream is
-        // dropped. We use `take_until` with this Notify to explicitly force the
-        // stream to yield `None`, which tells Tonic to cancel the stream.
-        let stop_notify_clone = stop_notify.clone();
-        let request_stream =
-            ReceiverStream::new(req_rx).take_until(stop_notify_clone.notified_owned());
+        // dropped. We use `CancellationState` to explicitly force the
+        // stream to yield an Error that the Codec passes through, which tells
+        // Tonic to cancel the stream.
+        //
+        // When the receiver is dropped, `CancellationState::cancel` is called,
+        // which wakes the request stream. The stream then yields
+        // `StreamItem::Cancellation`, causing `BufEncoder` to return an error
+        // and trigger an RST_STREAM.
+        let cancellation_state = Arc::new(CancellationState::default());
+
+        let request_stream = CancellableStream {
+            inner: Some(ReceiverStream::new(req_rx)),
+            cancellation_state: Arc::clone(&cancellation_state),
+        };
         let mut request = TonicRequest::new(Box::pin(request_stream));
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
@@ -193,7 +268,7 @@ impl Invoke for TonicTransport {
             TonicSendStream { sender: Ok(req_tx) },
             TonicRecvStream {
                 state: StreamState::AwaitingHeaders(resp_rx),
-                stop_notify: Some(stop_notify),
+                cancellation_state: Arc::clone(&cancellation_state),
             },
         )
     }
@@ -229,15 +304,37 @@ fn trailers_from_status(status: crate::Result<()>, md: &TonicMeta) -> ResponseSt
     ResponseStreamItem::Trailers(trailers)
 }
 
+/// Shared state used to coordinate cancellation between the inbound response
+/// stream and the outbound request stream.
+#[derive(Default)]
+struct CancellationState {
+    cancellation_requested: AtomicBool,
+    poll_waker: AtomicWaker,
+}
+
+impl CancellationState {
+    /// Requests cancellation and wakes up the waker associated with the request
+    /// stream.
+    fn cancel(&self) {
+        if self
+            .cancellation_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.poll_waker.wake();
+        };
+    }
+}
+
 struct TonicSendStream {
-    sender: Result<mpsc::Sender<Box<dyn Buf + Send + Sync>>, ()>,
+    sender: Result<mpsc::Sender<StreamItem<BoxBuf>>, ()>,
 }
 
 impl SendStream for TonicSendStream {
     async fn send(&mut self, msg: &dyn SendMessage, options: SendOptions) -> Result<(), ()> {
         if let Ok(tx) = &self.sender
             && let Ok(buf) = msg.encode()
-            && tx.send(buf).await.is_ok()
+            && tx.send(StreamItem::Item(buf)).await.is_ok()
         {
             if options.final_msg {
                 self.sender = Err(());
@@ -250,7 +347,7 @@ impl SendStream for TonicSendStream {
 
 struct TonicRecvStream {
     state: StreamState,
-    stop_notify: Option<Arc<Notify>>,
+    cancellation_state: Arc<CancellationState>,
 }
 
 enum StreamState {
@@ -287,9 +384,7 @@ impl RecvStream for TonicRecvStream {
                             ResponseStreamItem::Headers(ResponseHeaders::new().with_metadata(md))
                         }
                         Err(e) => {
-                            if let Some(notify) = self.stop_notify.take() {
-                                notify.notify_one();
-                            }
+                            self.cancellation_state.cancel();
                             trailers_from_status(
                                 Err(StatusError::new(
                                     StatusCodeError::Internal,
@@ -321,9 +416,7 @@ impl RecvStream for TonicRecvStream {
                         ResponseStreamItem::Message
                     }
                     Err(e) => {
-                        if let Some(notify) = self.stop_notify.take() {
-                            notify.notify_one();
-                        }
+                        self.cancellation_state.cancel();
                         trailers_from_status(
                             Err(StatusError::new(
                                 StatusCodeError::Internal,
@@ -351,9 +444,7 @@ impl RecvStream for TonicRecvStream {
 
 impl Drop for TonicRecvStream {
     fn drop(&mut self) {
-        if let Some(notify) = &self.stop_notify {
-            notify.notify_one();
-        }
+        self.cancellation_state.cancel();
     }
 }
 
@@ -362,7 +453,7 @@ fn err_streams(status: StatusError) -> (TonicSendStream, TonicRecvStream) {
         TonicSendStream { sender: Err(()) },
         TonicRecvStream {
             state: StreamState::Error(status),
-            stop_notify: None,
+            cancellation_state: Arc::new(CancellationState::default()),
         },
     )
 }
@@ -541,7 +632,7 @@ impl Future for ResponseFuture {
 pub(crate) struct BufCodec {}
 
 impl Codec for BufCodec {
-    type Encode = Box<dyn Buf + Send + Sync>;
+    type Encode = StreamItem<BoxBuf>;
     type Decode = Bytes;
     type Encoder = BufEncoder;
     type Decoder = BytesDecoder;
@@ -555,25 +646,22 @@ impl Codec for BufCodec {
     }
 }
 
-pub struct BytesEncoder {}
-
-impl Encoder for BytesEncoder {
-    type Item = Bytes;
-    type Error = TonicStatus;
-
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        dst.put_slice(&item);
-        Ok(())
-    }
-}
-
 pub struct BufEncoder {}
 
 impl Encoder for BufEncoder {
-    type Item = Box<dyn Buf + Send + Sync>;
+    type Item = StreamItem<BoxBuf>;
     type Error = TonicStatus;
 
-    fn encode(&mut self, mut item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        let mut item = match item {
+            StreamItem::Cancellation => {
+                // The status code doesn't matter. Tonic converts it into an
+                // "Internal" status which is sent out as an RST_STREAM frame
+                // with code "Internal".
+                return Err(TonicStatus::internal("receiver stream cancelled"));
+            }
+            StreamItem::Item(i) => i,
+        };
         dst.put(&mut *item);
         Ok(())
     }

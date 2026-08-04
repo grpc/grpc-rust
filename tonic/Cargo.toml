@@ -43,7 +43,6 @@ server = [
   "dep:tower", "tower?/util", "tower?/limit", "tower?/load-shed",
 ]
 channel = [
-  "h2",
   "dep:hyper", "hyper?/client",
   "dep:hyper-util", "hyper-util?/client-legacy",
   "dep:tower", "tower?/balance", "tower?/buffer", "tower?/discover", "tower?/limit", "tower?/load-shed", "tower?/util",

@@ -323,7 +323,7 @@ impl<T> Grpc<T> {
 
         let request = request
             .map(|s| {
-                EncodeBody::new_client(
+                EncodeBody::new_client_with_cancellation(
                     codec.encoder(),
                     s.map(Ok),
                     self.config.send_compression_encodings,

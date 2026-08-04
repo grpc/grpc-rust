@@ -101,7 +101,7 @@ pub struct CancellationHandle {
 /// This is used by the task responsible for sending the outbound request stream
 /// to react to cancellation requests.
 #[derive(Debug)]
-pub struct CancellationListener {
+pub(crate) struct CancellationListener {
     state: Arc<CancellationState>,
 }
 

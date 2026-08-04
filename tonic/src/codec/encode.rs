@@ -27,7 +27,10 @@ use super::compression::{
 };
 use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
 use crate::Status;
+use crate::client::CancellationListener;
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(feature = "h2")]
+use h2::{Error as H2Error, Reason as H2Reason};
 use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
@@ -36,10 +39,6 @@ use std::{
     task::{Context, Poll, ready},
 };
 use tokio_stream::{Stream, StreamExt, adapters::Fuse};
-use std::sync::Arc;
-#[cfg(feature = "h2")]
-use h2::{Error as H2Error, Reason as H2Reason};
-use crate::client::CancellationListener;
 
 /// Combinator for efficient encoding of messages into reasonably sized buffers.
 /// EncodedBytes encodes ready messages from its delegate stream into a BytesMut,
@@ -264,6 +263,21 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         source: U,
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
+    ) -> Self {
+        Self::new_client_with_cancellation(
+            encoder,
+            source,
+            compression_encoding,
+            max_message_size,
+            None,
+        )
+    }
+
+    pub(crate) fn new_client_with_cancellation(
+        encoder: T,
+        source: U,
+        compression_encoding: Option<CompressionEncoding>,
+        max_message_size: Option<usize>,
         cancellation_listener: Option<CancellationListener>,
     ) -> Self {
         Self {
@@ -355,7 +369,7 @@ where
             let mut status = Status::cancelled("client cancelled");
             #[cfg(feature = "h2")]
             {
-                status.set_source(Arc::new(H2Error::from(H2Reason::CANCEL)));
+                status.set_source(std::sync::Arc::new(H2Error::from(H2Reason::CANCEL)));
             }
             return Poll::Ready(Some(Err(status)));
         }

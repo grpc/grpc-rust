@@ -29,7 +29,7 @@ use http::HeaderValue;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
-use crate::client::name_resolution::Address;
+use crate::core::Address;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;

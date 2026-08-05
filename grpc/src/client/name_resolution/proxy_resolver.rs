@@ -263,9 +263,9 @@ mod tests {
     use super::*;
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
+    use crate::core::Address;
     use crate::rt;
     use crate::rt::GrpcEndpoint;
     use crate::rt::GrpcRuntime;

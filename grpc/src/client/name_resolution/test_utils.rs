@@ -75,7 +75,7 @@ impl TestChannelController {
 
 impl ChannelController for TestChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
-        println!("Received resolver update: {:?}", &update);
+        println!("Received resolver update: {:?}", update);
         self.update_tx.send(update).unwrap();
         self.update_result.clone()
     }

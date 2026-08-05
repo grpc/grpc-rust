@@ -59,7 +59,6 @@ use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel_sharing::SubchannelSharing;
 use crate::client::load_balancing::{self};
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
@@ -77,6 +76,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
+use crate::core::Address;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;

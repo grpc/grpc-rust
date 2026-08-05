@@ -37,8 +37,15 @@
 //!   messages.
 
 use std::any::TypeId;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::hash::Hash;
 
 use bytes::Buf;
+
+use crate::attributes::Attributes;
+use crate::byte_str::ByteStr;
 
 /// Represents a message sent by either a client or a server.
 #[allow(unused)]
@@ -110,5 +117,36 @@ impl dyn RecvMessage + '_ {
                 None
             }
         }
+    }
+}
+
+/// An Address is an identifier that indicates how to connect to a server.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Ord, PartialOrd)]
+pub struct Address {
+    /// The network type is used to identify what kind of transport to create
+    /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.
+    pub network_type: &'static str,
+
+    /// The address itself is passed to the transport in order to create a
+    /// connection to it.
+    pub address: ByteStr,
+
+    /// Attributes contains arbitrary data about this address intended for
+    /// consumption by the subchannel.
+    pub attributes: Attributes,
+}
+
+impl Hash for Address {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.network_type.hash(state);
+        self.address.hash(state);
+    }
+}
+
+impl Display for Address {
+    #[allow(clippy::to_string_in_format_args)]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}:{}", self.network_type, self.address.to_string())
     }
 }

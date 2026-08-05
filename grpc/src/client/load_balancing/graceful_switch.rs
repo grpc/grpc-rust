@@ -272,9 +272,9 @@ mod test {
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::load_balancing::test_utils::reg_stub_policy;
     use crate::client::load_balancing::test_utils::{self};
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
+    use crate::core::Address;
     use crate::metadata::MetadataMap;
     use crate::rt::default_runtime;
 

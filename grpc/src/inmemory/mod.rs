@@ -43,9 +43,12 @@ use crate::client::DynRecvStream as ClientDynRecvStream;
 use crate::client::DynSendStream as ClientDynSendStream;
 use crate::client::Invoke;
 use crate::client::RecvStream as ClientRecvStream;
+use crate::client::RequestHeaders as ClientRequestHeaders;
+use crate::client::ResponseHeaders as ClientResponseHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions as ClientSendOptions;
 use crate::client::SendStream as ClientSendStream;
+use crate::client::Trailers as ClientTrailers;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ChannelController as ResolverChannelController;
 use crate::client::name_resolution::Endpoint;
@@ -61,10 +64,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
 use crate::credentials::SecurityLevel;
 use crate::credentials::client::ChannelSecurityContext;
 use crate::credentials::client::ChannelSecurityInfo;
@@ -73,9 +73,12 @@ use crate::rt::GrpcRuntime;
 use crate::server::Call as ServerCall;
 use crate::server::Listener as ServerListener;
 use crate::server::RecvStream as ServerRecvStream;
+use crate::server::RequestHeaders as ServerRequestHeaders;
+use crate::server::ResponseHeaders as ServerResponseHeaders;
 use crate::server::ResponseStreamItem as ServerResponseStreamItem;
 use crate::server::SendOptions as ServerSendOptions;
 use crate::server::SendStream as ServerSendStream;
+use crate::server::Trailers as ServerTrailers;
 
 static LISTENERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<InMemoryServerCall>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -83,10 +86,10 @@ static LISTENERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<InMemoryServerCall
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct InMemoryServerCall {
-    headers: RequestHeaders,
+    headers: ServerRequestHeaders,
     req_rx: mpsc::UnboundedReceiver<InMemoryRequestStreamItem>,
     resp_tx: mpsc::UnboundedSender<InMemoryResponseStreamItem>,
-    trailer_tx: oneshot::Sender<Trailers>,
+    trailer_tx: oneshot::Sender<ServerTrailers>,
 }
 
 enum InMemoryRequestStreamItem {
@@ -95,7 +98,7 @@ enum InMemoryRequestStreamItem {
 }
 
 enum InMemoryResponseStreamItem {
-    Headers(ResponseHeaders),
+    Headers(ServerResponseHeaders),
     Message(Box<dyn Buf + Send + Sync>),
 }
 
@@ -241,15 +244,20 @@ impl Invoke for InMemoryConnection {
 
     async fn invoke(
         &self,
-        headers: RequestHeaders,
+        headers: ClientRequestHeaders,
         _options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::unbounded_channel::<InMemoryRequestStreamItem>();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel::<InMemoryResponseStreamItem>();
         let (trailer_tx, trailer_rx) = oneshot::channel();
 
+        let (method_name, metadata) = headers.into_parts();
+        let server_headers = ServerRequestHeaders::new()
+            .with_method_name(method_name)
+            .with_metadata(metadata);
+
         let call = InMemoryServerCall {
-            headers,
+            headers: server_headers,
             req_rx,
             resp_tx,
             trailer_tx,
@@ -304,13 +312,15 @@ impl Drop for InMemoryClientSendStream {
 
 pub struct InMemoryClientRecvStream {
     rx: mpsc::UnboundedReceiver<InMemoryResponseStreamItem>,
-    trailer_rx: Option<oneshot::Receiver<Trailers>>,
+    trailer_rx: Option<oneshot::Receiver<ServerTrailers>>,
 }
 
 impl ClientRecvStream for InMemoryClientRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         match self.rx.recv().await {
-            Some(InMemoryResponseStreamItem::Headers(h)) => ResponseStreamItem::Headers(h),
+            Some(InMemoryResponseStreamItem::Headers(h)) => ResponseStreamItem::Headers(
+                ClientResponseHeaders::new().with_metadata(h.into_metadata()),
+            ),
             Some(InMemoryResponseStreamItem::Message(mut buf)) => {
                 msg.decode(&mut buf).unwrap();
                 ResponseStreamItem::Message
@@ -318,9 +328,14 @@ impl ClientRecvStream for InMemoryClientRecvStream {
             _ => {
                 if let Some(trailer_rx) = self.trailer_rx.take() {
                     match trailer_rx.await {
-                        Ok(trailers) => return ResponseStreamItem::Trailers(trailers),
+                        Ok(trailers) => {
+                            let (status, metadata) = trailers.into_parts();
+                            return ResponseStreamItem::Trailers(
+                                ClientTrailers::new(status).with_metadata(metadata),
+                            );
+                        }
                         Err(_) => {
-                            return ResponseStreamItem::Trailers(Trailers::new(Err(
+                            return ResponseStreamItem::Trailers(ClientTrailers::new(Err(
                                 StatusError::new(
                                     StatusCodeError::Internal,
                                     "stream ended without trailers in in-memory transport",
@@ -462,7 +477,7 @@ mod tests {
         // Drop sender immediately so rx returns None
         drop(tx);
 
-        let (trailer_tx, trailer_rx) = tokio::sync::oneshot::channel::<Trailers>();
+        let (trailer_tx, trailer_rx) = tokio::sync::oneshot::channel::<ServerTrailers>();
         // Drop trailer_tx without sending to simulate failure
         drop(trailer_tx);
 

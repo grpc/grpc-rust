@@ -31,14 +31,14 @@ use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
+use crate::client::Trailers;
 use crate::client::interceptor::Intercept;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
 
 /// An interceptor that wraps the underlying invoker's [`RecvStream`] in a
 /// [`RecvStreamValidator`].
@@ -211,10 +211,10 @@ mod test {
     use std::vec;
 
     use super::*;
+    use crate::client::ResponseHeaders;
     use crate::client::interceptor::InvokeOnceExt as _;
     use crate::client::test_util::MockInvoker;
     use crate::client::test_util::NopRecvMessage;
-    use crate::core::ResponseHeaders;
 
     // Tests that an error occurs if messages are received before headers.
     #[tokio::test]

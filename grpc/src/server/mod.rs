@@ -832,12 +832,6 @@ mod tests {
         }
     }
 
-    impl std::fmt::Display for MockListenerAddress {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "mock:0")
-        }
-    }
-
     /// A mock listener that records when it is dropped via an atomic flag,
     /// and yields [`MockTransport`]s from a channel.
     struct MockListener {

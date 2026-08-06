@@ -33,7 +33,7 @@ use std::fmt;
 /// and [`downcast_ref`](Any::downcast_ref).
 ///
 /// This is analogous to Go's `net.Addr` interface.
-pub trait ListenerAddress: fmt::Display + fmt::Debug + Any + Send + Sync + 'static {
+pub trait ListenerAddress: fmt::Debug + Any + Send + Sync + 'static {
     /// Returns the network type (e.g. `"tcp"`, `"unix"`, `"inmemory"`).
     fn network(&self) -> &str;
 }
@@ -42,20 +42,14 @@ pub trait ListenerAddress: fmt::Display + fmt::Debug + Any + Send + Sync + 'stat
 // TcpAddress (Scheme-Prefixed TCP Address Wrapper)
 // ---------------------------------------------------------------------------
 
-/// A scheme-prefixed TCP address wrapper around [`std::net::SocketAddr`].
-/// Formats via `Display` as `tcp://<ip>:<port>`.
+/// A wrapper around [`std::net::SocketAddr`] used as a listener address.
+/// `Debug`-formats as `TcpAddress(<ip>:<port>)` for logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpAddress(pub std::net::SocketAddr);
 
 impl ListenerAddress for TcpAddress {
     fn network(&self) -> &str {
         "tcp"
-    }
-}
-
-impl fmt::Display for TcpAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tcp://{}", self.0)
     }
 }
 
@@ -87,12 +81,6 @@ impl ListenerAddress for UnixListenerAddress {
     }
 }
 
-impl fmt::Display for UnixListenerAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unix:{}", self.path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,10 +96,10 @@ mod tests {
     }
 
     #[test]
-    fn tcp_address_display() {
+    fn tcp_address_debug_contains_socket_addr() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let tcp = TcpAddress(addr);
-        assert_eq!(tcp.to_string(), "tcp://127.0.0.1:8080");
+        assert!(format!("{tcp:?}").contains("127.0.0.1:8080"));
     }
 
     #[test]
@@ -141,9 +129,9 @@ mod tests {
     }
 
     #[test]
-    fn unix_address_display() {
+    fn unix_address_debug_contains_path() {
         let addr = UnixListenerAddress::new("/var/run/server.sock".to_string());
-        assert_eq!(addr.to_string(), "unix:/var/run/server.sock");
+        assert!(format!("{addr:?}").contains("/var/run/server.sock"));
     }
 
     #[test]

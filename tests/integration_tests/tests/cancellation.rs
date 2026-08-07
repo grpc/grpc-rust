@@ -109,7 +109,7 @@ async fn client_cancellation_sends_rst_stream() {
     let stream = ReceiverStream::new(rx);
     let mut request = Request::new(stream);
 
-    let cancel_handle = CancellationHandle::new(request.extensions_mut());
+    let cancel_handle = request.cancellation_handle();
 
     // Start the call. This will resolve when server sends headers.
     let response = client.bidi_stream(request).await.unwrap();

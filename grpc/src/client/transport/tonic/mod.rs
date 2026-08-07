@@ -156,7 +156,7 @@ impl Invoke for TonicTransport {
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
 
-        let cancel_tx = CancellationHandle::new(request.extensions_mut());
+        let cancel_tx = request.cancellation_handle();
 
         let Ok(path) = PathAndQuery::from_maybe_shared(method) else {
             return err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));

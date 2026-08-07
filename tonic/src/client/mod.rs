@@ -40,11 +40,8 @@
 //! communication. For more details, see
 //! [transport::Channel](../transport/struct.Channel.html#multiplexing-requests).
 
-mod cancellation;
 mod grpc;
 mod service;
 
-pub use self::cancellation::CancellationHandle;
-pub(crate) use self::cancellation::CancellationListener;
 pub use self::grpc::Grpc;
 pub use self::service::GrpcService;

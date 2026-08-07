@@ -27,7 +27,7 @@ use super::compression::{
 };
 use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
 use crate::Status;
-use crate::client::CancellationListener;
+use crate::request::CancellationListener;
 use bytes::{BufMut, Bytes, BytesMut};
 #[cfg(feature = "h2")]
 use h2::{Error as H2Error, Reason as H2Reason};

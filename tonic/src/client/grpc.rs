@@ -22,10 +22,10 @@
  *
  */
 
-use crate::client::cancellation::CancellationListener;
 use crate::codec::EncodeBody;
 use crate::codec::{CompressionEncoding, EnabledCompressionEncodings};
 use crate::metadata::GRPC_CONTENT_TYPE;
+use crate::request::CancellationListener;
 use crate::{
     Code, Request, Response, Status,
     body::Body,

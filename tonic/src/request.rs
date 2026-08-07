@@ -30,9 +30,14 @@ use crate::transport::server::TlsConnectInfo;
 use http::Extensions;
 #[cfg(feature = "server")]
 use std::net::SocketAddr;
-#[cfg(all(feature = "server", feature = "_tls-any"))]
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::task::Waker;
 use std::time::Duration;
+
+use atomic_waker::AtomicWaker;
+use http::Extensions;
 #[cfg(all(feature = "server", feature = "_tls-any"))]
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_stream::Stream;
@@ -374,6 +379,22 @@ impl<T> Request<T> {
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.extensions
     }
+
+    /// Get a cancellation handle for this request.
+    ///
+    /// Cancellation is only supported on the client side. Calling `cancel` on
+    /// the handle will abort the request by sending an HTTP/2 RST_STREAM.
+    pub fn cancellation_handle(&mut self) -> CancellationHandle {
+        if let Some(state) = self.extensions.get::<Arc<CancellationState>>() {
+            CancellationHandle {
+                state: Arc::clone(state),
+            }
+        } else {
+            let state = Arc::new(CancellationState::default());
+            self.extensions.insert(Arc::clone(&state));
+            CancellationHandle { state }
+        }
+    }
 }
 
 impl<T> IntoRequest<T> for T {
@@ -459,6 +480,108 @@ pub(crate) enum SanitizeHeaders {
     No,
 }
 
+/// Shared state used to coordinate cancellation of an outbound request stream.
+///
+/// It uses `AtomicBool` for the cancellation flag and `AtomicWaker` to store
+/// the waker of the task polling the stream. This allows lock-free coordination
+/// between the canceller (holder of `CancellationHandle`) and the poller
+/// (holder of `CancellationListener`).
+///
+/// Supports only one waker at a time.
+#[derive(Default, Debug)]
+pub(crate) struct CancellationState {
+    cancellation_requested: AtomicBool,
+    poll_waker: AtomicWaker,
+}
+
+/// A handle that allows triggering the cancellation of an outbound request
+/// stream.
+///
+/// This handle can be stored by the user and invoked to abort the request.
+///
+/// Cancellation is only supported on the client side.
+#[derive(Debug, Clone)]
+pub struct CancellationHandle {
+    state: Arc<CancellationState>,
+}
+
+/// A listener that can check if cancellation has been requested and register
+/// a single waker to be notified when cancellation occurs.
+///
+/// This is used by the task responsible for sending the outbound request stream
+/// to react to cancellation requests.
+#[derive(Debug)]
+pub(crate) struct CancellationListener {
+    state: Arc<CancellationState>,
+}
+
+impl CancellationListener {
+    /// Attempts to create a new `CancellationListener` by extracting the shared
+    /// `CancellationState` from the provided `Extensions`.
+    ///
+    /// If the state is present, it is removed from `Extensions` to ensure that
+    /// only one listener can be created for a given cancellation state. This
+    /// enforces the single-waker constraint of `CancellationState`.
+    pub(crate) fn new(extensions: &mut Extensions) -> Option<CancellationListener> {
+        // We can't send a listener in extensions as it doesn't implement Clone
+        // (to ensure only one waker is registered).
+        // Since we want to propagate the cancellation capability, we use
+        // `Arc<CancellationState>` for propagation in extensions and remove it
+        // here to avoid further creation of listeners with the same state.
+        extensions
+            .remove::<Arc<CancellationState>>()
+            .map(|state| CancellationListener { state })
+    }
+
+    /// Registers a new waker to be notified when cancellation is requested,
+    /// and returns the current cancellation state.
+    ///
+    /// Returns `true` if cancellation has already been requested, `false`
+    /// otherwise.
+    ///
+    /// The registration and check are ordered to ensure that if a cancellation
+    /// happens concurrently, either the canceller sees the waker and wakes it,
+    /// or this method returns `true` (or both).
+    pub(crate) fn update_waker(&mut self, waker: &Waker) -> bool {
+        // Order of operations is important to ensure correct synchronization:
+        // 1. Register the waker.
+        self.state.poll_waker.register(waker);
+        // 2. Load the cancellation flag.
+        // If cancellation happened before register, we might see it here and
+        // return true.
+        // If cancellation happens after register, the canceller will see the
+        // registered waker and wake us.
+        self.state.cancellation_requested.load(Ordering::Acquire)
+    }
+}
+
+impl CancellationHandle {
+    /// Cancel the stream.
+    ///
+    /// This will result in the outbound stream getting cancelled with an
+    /// RST_STREAM frame, if it hasn't gracefully closed.
+    ///
+    /// Consumes `self` to ensure cancellation is only requested once.
+    pub fn cancel(self) {
+        // Order of operations is important to ensure correct synchronization:
+        // 1. Set the cancellation flag.
+        // 2. Wake the registered waker.
+        //
+        // If `update_waker` registered the waker before we set the flag, we will
+        // wake it here.
+        // If `update_waker` registers the waker after we set the flag, it will
+        // see the flag as `true` and return immediately.
+        if self
+            .state
+            .cancellation_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.state.poll_waker.wake();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +647,55 @@ mod tests {
         let one_hour = Duration::from_secs(60 * 60);
         let value = duration_to_grpc_timeout(one_hour);
         assert_eq!(value, format!("{}m", one_hour.as_millis()));
+    }
+
+    #[test]
+    fn test_cancellation() {
+        let mut req = Request::new(());
+        let handle = req.cancellation_handle();
+
+        let listener = CancellationListener::new(req.extensions_mut()).unwrap();
+
+        assert!(
+            !listener
+                .state
+                .cancellation_requested
+                .load(Ordering::Relaxed)
+        );
+
+        handle.cancel();
+
+        assert!(
+            listener
+                .state
+                .cancellation_requested
+                .load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn test_cancellation_clone() {
+        let mut req = Request::new(());
+        let handle1 = req.cancellation_handle();
+        let handle2 = req.cancellation_handle();
+
+        let listener = CancellationListener::new(req.extensions_mut()).unwrap();
+
+        assert!(
+            !listener
+                .state
+                .cancellation_requested
+                .load(Ordering::Relaxed)
+        );
+
+        handle1.cancel();
+
+        assert!(
+            listener
+                .state
+                .cancellation_requested
+                .load(Ordering::Relaxed)
+        );
+        assert!(handle2.state.cancellation_requested.load(Ordering::Relaxed));
     }
 }

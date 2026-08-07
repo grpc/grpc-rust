@@ -24,10 +24,13 @@
 
 use std::time::Duration;
 
+use h2::server;
 use h2::Reason;
+use http::StatusCode;
 use integration_tests::pb::cancellation_test_client::CancellationTestClient;
 use integration_tests::pb::Input;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
@@ -38,62 +41,30 @@ async fn client_cancellation_sends_rst_stream() {
 
     let server_handle = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let mut connection = server::handshake(socket).await.unwrap();
 
-        let (body_done_tx, mut body_done_rx) =
-            tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
 
-        if let Some(result) = connection.accept().await {
-            let (request, mut respond) = result.unwrap();
+        // Poll the H2 connection to drive progress.
+        tokio::spawn(async move { while connection.accept().await.is_some() {} });
 
-            // Send response headers to satisfy the client's await on the call
-            let response = http::Response::builder()
-                .status(http::StatusCode::OK)
-                .header("content-type", "application/grpc")
-                .body(())
-                .unwrap();
-            let _respond_tx = respond.send_response(response, false).unwrap();
+        // Send response headers to satisfy the client's await on the call
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let _respond_tx = respond.send_response(response, false).unwrap();
 
-            let mut body = request.into_body();
+        let mut body = request.into_body();
 
-            tokio::spawn(async move {
-                let res = match body.data().await {
-                    Some(Ok(_)) => Err("Expected error or EOF, got data".to_string()),
-                    Some(Err(err)) => {
-                        if let Some(reason) = err.reason() {
-                            if reason == Reason::CANCEL {
-                                Ok(())
-                            } else {
-                                Err(format!("Expected CANCEL reason, got {:?}", reason))
-                            }
-                        } else {
-                            Err(format!("Expected reset with reason, got: {:?}", err))
-                        }
-                    }
-                    None => Err("Expected RST_STREAM, got clean close (EOS)".to_string()),
-                };
-                let _ = body_done_tx.send(res);
-            });
-        }
-
-        // Drive the connection
-        let mut drive_conn = true;
-        let mut body_res = Err("Body task did not complete".to_string());
-        while drive_conn {
-            tokio::select! {
-                res = connection.accept() => {
-                    if res.is_none() {
-                        drive_conn = false;
-                    }
-                }
-                res = &mut body_done_rx => {
-                    body_res = res.unwrap_or_else(|_| Err("Body task panicked".to_string()));
-                    drive_conn = false;
-                }
+        match body.data().await {
+            Some(Ok(_)) => panic!("Expected error or EOF, got data"),
+            Some(Err(err)) => {
+                assert_eq!(err.reason(), Some(Reason::CANCEL));
             }
-        }
-
-        body_res.unwrap();
+            None => panic!("Expected RST_STREAM, got clean close (EOS)"),
+        };
     });
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
@@ -104,7 +75,7 @@ async fn client_cancellation_sends_rst_stream() {
 
     let mut client = CancellationTestClient::new(channel);
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Input>(1);
+    let (tx, rx) = mpsc::channel::<Input>(1);
     let stream = ReceiverStream::new(rx);
     let mut request = Request::new(stream);
 

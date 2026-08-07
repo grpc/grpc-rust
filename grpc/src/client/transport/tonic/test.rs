@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use bytes::Buf;
 use bytes::Bytes;
+use h2::Reason;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -1057,27 +1058,22 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
         let (socket, _) = listener.accept().await.unwrap();
         let mut connection = h2::server::handshake(socket).await.unwrap();
 
-        if let Some(result) = connection.accept().await {
-            let (request, _respond) = result.unwrap();
-            let mut body = request.into_body();
+        let result = connection.accept().await.unwrap();
+        let (request, _respond) = result.unwrap();
+        let mut body = request.into_body();
 
-            match body.data().await {
-                Some(Ok(_)) => {
-                    panic!("Expected error or EOF, got data");
-                }
-                Some(Err(err)) => {
-                    println!("Got expected error: {:?}", err);
-                    if let Some(reason) = err.reason() {
-                        assert_eq!(reason, h2::Reason::CANCEL, "Expected CANCEL reason");
-                        return;
-                    }
-                    panic!("Expected reset with reason, got: {:?}", err);
-                }
-                None => {
-                    panic!("Expected RST_STREAM, got clean close (EOS)");
-                }
-            };
-        }
+        match body.data().await {
+            Some(Ok(_)) => {
+                panic!("Expected error or EOF, got data");
+            }
+            Some(Err(err)) => {
+                println!("Got expected error: {:?}", err);
+                assert_eq!(err.reason(), Some(Reason::CANCEL));
+            }
+            None => {
+                panic!("Expected RST_STREAM, got clean close (EOS)");
+            }
+        };
     });
 
     let builder = GLOBAL_TRANSPORT_REGISTRY
@@ -1110,13 +1106,12 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     // Drop the receiver to trigger cancellation.
     drop(rx);
 
-    // Keep tx alive to prevent it from closing the stream from send side.
-    let _keep_tx = tx;
-
     // Wait for the server to verify the reset.
-    // We wrap it in a timeout to avoid hanging if the test fails.
     tokio::time::timeout(Duration::from_secs(5), server_handle)
         .await
         .expect("Test timed out waiting for server to verify reset")
         .unwrap();
+
+    // Keep tx alive to prevent it from closing the stream from send side.
+    let _keep_tx = tx;
 }

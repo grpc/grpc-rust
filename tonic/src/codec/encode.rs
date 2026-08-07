@@ -33,12 +33,12 @@ use h2::{Error as H2Error, Reason as H2Reason};
 use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use std::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
 use tokio_stream::{Stream, StreamExt, adapters::Fuse};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 /// Combinator for efficient encoding of messages into reasonably sized buffers.
 /// EncodedBytes encodes ready messages from its delegate stream into a BytesMut,
@@ -368,7 +368,10 @@ where
         if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
             && let Poll::Ready(()) = cancellation_fut.poll(cx)
         {
-            let mut status = Status::cancelled("client cancelled");
+            let status = Status::cancelled("client cancelled");
+
+            #[cfg(feature = "h2")]
+            let mut status = status;
             #[cfg(feature = "h2")]
             {
                 status.set_source(std::sync::Arc::new(H2Error::from(H2Reason::CANCEL)));

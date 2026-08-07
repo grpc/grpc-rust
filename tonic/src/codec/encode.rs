@@ -27,13 +27,13 @@ use super::compression::{
 };
 use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
 use crate::Status;
-use crate::request::CancellationListener;
 use bytes::{BufMut, Bytes, BytesMut};
 #[cfg(feature = "h2")]
 use h2::{Error as H2Error, Reason as H2Reason};
 use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use std::{
     pin::Pin,
     task::{Context, Poll, ready},
@@ -245,7 +245,8 @@ pub struct EncodeBody<T, U> {
     #[pin]
     inner: EncodedBytes<T, U>,
     state: EncodeState,
-    cancellation_listener: Option<CancellationListener>,
+    #[pin]
+    cancellation_fut: Option<WaitForCancellationFutureOwned>,
 }
 
 #[derive(Debug)]
@@ -278,8 +279,9 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         source: U,
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
-        cancellation_listener: Option<CancellationListener>,
+        cancellation_token: Option<CancellationToken>,
     ) -> Self {
+        let cancellation_fut = cancellation_token.map(|c| c.cancelled_owned());
         Self {
             inner: EncodedBytes::new(
                 encoder,
@@ -293,7 +295,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 role: Role::Client,
                 is_end_stream: false,
             },
-            cancellation_listener,
+            cancellation_fut,
         }
     }
 
@@ -319,7 +321,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 role: Role::Server,
                 is_end_stream: false,
             },
-            cancellation_listener: None,
+            cancellation_fut: None,
         }
     }
 }
@@ -361,10 +363,10 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let mut self_proj = self.project();
+        let self_proj = self.project();
 
-        if let Some(cancellation_listener) = &mut self_proj.cancellation_listener
-            && cancellation_listener.update_waker(cx.waker())
+        if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
+            && let Poll::Ready(()) = cancellation_fut.poll(cx)
         {
             let mut status = Status::cancelled("client cancelled");
             #[cfg(feature = "h2")]

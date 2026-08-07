@@ -25,7 +25,6 @@
 use crate::codec::EncodeBody;
 use crate::codec::{CompressionEncoding, EnabledCompressionEncodings};
 use crate::metadata::GRPC_CONTENT_TYPE;
-use crate::request::CancellationListener;
 use crate::{
     Code, Request, Response, Status,
     body::Body,
@@ -319,7 +318,7 @@ impl<T> Grpc<T> {
         M1: Send + Sync + 'static,
         M2: Send + Sync + 'static,
     {
-        let cancellation_listener = CancellationListener::new(request.extensions_mut());
+        let cancellation_token = request.remove_cancellation_handle().map(|c| c.into_token());
 
         let request = request
             .map(|s| {
@@ -328,7 +327,7 @@ impl<T> Grpc<T> {
                     s.map(Ok),
                     self.config.send_compression_encodings,
                     self.config.max_encoding_message_size,
-                    cancellation_listener,
+                    cancellation_token,
                 )
             })
             .map(Body::new);

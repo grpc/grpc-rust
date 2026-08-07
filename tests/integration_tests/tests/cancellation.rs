@@ -29,7 +29,6 @@ use integration_tests::pb::cancellation_test_client::CancellationTestClient;
 use integration_tests::pb::Input;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::client::CancellationHandle;
 use tonic::Request;
 
 #[tokio::test]

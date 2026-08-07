@@ -163,6 +163,16 @@ bench!(message_count_1, 500, 505, 1);
 bench!(message_count_10, 500, 505, 10);
 bench!(message_count_20, 500, 505, 20);
 
+// representative unary and streaming workloads
+bench!(unary_1k_single_chunk, 1_000, 1_005, 1);
+bench!(unary_10k_single_chunk, 10_000, 10_005, 1);
+bench!(unary_64k_16k_chunks, 64 * 1024, 16 * 1024, 1);
+bench!(unary_1m_16k_chunks, 1024 * 1024, 16 * 1024, 1);
+bench!(streaming_1k_16k_chunks, 1_000, 16 * 1024, 100);
+bench!(streaming_1k_100b_chunks, 1_000, 100, 100);
+bench!(streaming_64k_16k_chunks, 64 * 1024, 16 * 1024, 20);
+bench!(unary_1m_single_chunk, 1024 * 1024, 1024 * 1024 + 5, 1);
+
 benchmark_group!(chunk_size, chunk_size_100, chunk_size_500, chunk_size_1005);
 
 benchmark_group!(
@@ -179,4 +189,16 @@ benchmark_group!(
     message_count_20
 );
 
-benchmark_main!(chunk_size, message_size, message_count);
+benchmark_group!(
+    representative,
+    unary_1k_single_chunk,
+    unary_10k_single_chunk,
+    unary_64k_16k_chunks,
+    unary_1m_16k_chunks,
+    streaming_1k_16k_chunks,
+    streaming_1k_100b_chunks,
+    streaming_64k_16k_chunks,
+    unary_1m_single_chunk
+);
+
+benchmark_main!(chunk_size, message_size, message_count, representative);

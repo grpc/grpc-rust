@@ -220,7 +220,9 @@ impl StreamingInner {
                 )));
             }
 
-            self.buf.reserve(len);
+            if self.buf.capacity() < len {
+                self.buf.reserve(len);
+            }
 
             self.state = State::ReadBody {
                 compression: compression_encoding,
@@ -453,3 +455,82 @@ impl<T> fmt::Debug for Streaming<T> {
 
 #[cfg(test)]
 static_assertions::assert_impl_all!(Streaming<()>: Send, Sync);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    #[derive(Debug)]
+    struct BytesDecoder {
+        buffer_settings: BufferSettings,
+    }
+
+    impl Decoder for BytesDecoder {
+        type Item = Bytes;
+        type Error = Status;
+
+        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+            Ok(Some(src.copy_to_bytes(src.remaining())))
+        }
+
+        fn buffer_settings(&self) -> BufferSettings {
+            self.buffer_settings
+        }
+    }
+
+    fn encode_messages(messages: &[Bytes]) -> Bytes {
+        let mut payload = BytesMut::new();
+
+        for message in messages {
+            payload.put_u8(0);
+            payload.put_u32(message.len() as u32);
+            payload.put_slice(message);
+        }
+
+        payload.freeze()
+    }
+
+    async fn decode_messages(
+        messages: &[Bytes],
+        chunk_size: usize,
+        buffer_size: usize,
+    ) -> Vec<Bytes> {
+        let payload = encode_messages(messages);
+        let frames = payload
+            .chunks(chunk_size)
+            .map(|chunk| Ok::<_, Status>(Frame::data(Bytes::copy_from_slice(chunk))))
+            .collect::<Vec<_>>();
+        let body = StreamBody::new(tokio_stream::iter(frames));
+        let decoder = BytesDecoder {
+            buffer_settings: BufferSettings::new(buffer_size, 32 * 1024),
+        };
+        let mut stream = Streaming::new_request(decoder, body, None, None);
+        let mut decoded = Vec::new();
+
+        while let Some(message) = stream.message().await.unwrap() {
+            decoded.push(message);
+        }
+
+        decoded
+    }
+
+    #[tokio::test]
+    async fn decodes_messages_with_varied_chunk_and_buffer_sizes() {
+        let messages = vec![
+            Bytes::from_static(b"first"),
+            Bytes::from(vec![b'a'; 64]),
+            Bytes::from_static(b"last"),
+        ];
+        let payload_len = encode_messages(&messages).len();
+
+        for (chunk_size, buffer_size) in [(1, 1), (7, 4), (16, 8), (payload_len, 2)] {
+            assert_eq!(
+                decode_messages(&messages, chunk_size, buffer_size).await,
+                messages
+            );
+        }
+    }
+}

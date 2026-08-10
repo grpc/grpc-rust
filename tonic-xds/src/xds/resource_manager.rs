@@ -384,21 +384,21 @@ mod tests {
     fn ok_event<T>(resource: Arc<T>) -> ResourceEvent<T> {
         ResourceEvent::ResourceChanged {
             result: Ok(resource),
-            done: ProcessingDone::noop(),
+            done: ProcessingDone::detached(),
         }
     }
 
     fn err_event<T>() -> ResourceEvent<T> {
         ResourceEvent::ResourceChanged {
             result: Err(xds_client::Error::ResourceDoesNotExist),
-            done: ProcessingDone::noop(),
+            done: ProcessingDone::detached(),
         }
     }
 
     fn ambient_event<T>() -> ResourceEvent<T> {
         ResourceEvent::AmbientError {
             error: xds_client::Error::ResourceDoesNotExist,
-            done: ProcessingDone::noop(),
+            done: ProcessingDone::detached(),
         }
     }
 
@@ -616,5 +616,70 @@ mod tests {
         state.handle_lds(ambient_event(), &client, &cache).await;
         assert!(state.rds_watcher.is_some());
         assert_eq!(state.rds_name.as_deref(), Some("rc"));
+    }
+
+    /// End-to-end replica of the production Istio hang: an RDS update that
+    /// references far more clusters than the xds-client worker's command
+    /// channel buffers (64), reconciled through the real cascade path —
+    /// `handle_rds` holds the event's `ProcessingDone` token while
+    /// `reconcile_clusters` awaits one `watch()` per cluster.
+    ///
+    /// Before xds-client gained ADS flow control, the worker sat inside
+    /// `handle_response` awaiting that token and stopped draining commands;
+    /// once the command channel filled, `reconcile_clusters` blocked on the
+    /// 65th watch and the client deadlocked. This test times out under that
+    /// behavior and completes under the fixed worker.
+    #[tokio::test]
+    async fn rds_referencing_many_clusters_reconciles_without_deadlock() {
+        use std::time::Duration;
+        use xds_client::{
+            ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder,
+            XdsClient as RealXdsClient,
+        };
+        use xds_test_util::{XdsTestControlPlaneService, config};
+
+        // Well past the worker's 64-slot command channel.
+        const CLUSTER_COUNT: usize = 100;
+
+        let control_plane = XdsTestControlPlaneService::new()
+            .start()
+            .await
+            .expect("control plane failed to start");
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Rds,
+            HashMap::from([(
+                "rc-many".to_string(),
+                config::build_route_config_with_cluster_count("rc-many", CLUSTER_COUNT),
+            )]),
+        );
+
+        let client_config = ClientConfig::new(
+            Node::new("test", "0"),
+            format!("http://{}", control_plane.addr()),
+        );
+        let xds_client: RealXdsClient = RealXdsClient::builder(
+            client_config,
+            TonicTransportBuilder::new(),
+            ProstCodec,
+            TokioRuntime,
+        )
+        .build();
+
+        let mut watcher = xds_client.watch::<RouteConfigResource>("rc-many").await;
+        let event = tokio::time::timeout(Duration::from_secs(10), watcher.next())
+            .await
+            .expect("timed out waiting for the RDS update")
+            .expect("watcher closed");
+
+        let cache = test_cache();
+        let mut state = CascadeState::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            state.handle_rds(event, &xds_client, &cache),
+        )
+        .await
+        .expect("deadlock: reconcile_clusters blocked while the worker awaited ProcessingDone");
+
+        assert_eq!(state.cds_watchers.len(), CLUSTER_COUNT);
     }
 }

@@ -23,11 +23,11 @@
  */
 
 use crate::client::CallOptions;
-use crate::core::RequestHeaders;
-use crate::core::Trailers;
 use crate::server::Handle;
 use crate::server::RecvStream;
+use crate::server::RequestHeaders;
 use crate::server::SendStream;
+use crate::server::Trailers;
 
 /// A trait which allows intercepting an incoming RPC call to a [`Handle`] implementation.
 #[trait_variant::make(Send)]
@@ -98,7 +98,7 @@ mod test {
     use super::*;
     use crate::client::CallOptions;
     use crate::core::RecvMessage;
-    use crate::core::RequestHeaders;
+    use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
 

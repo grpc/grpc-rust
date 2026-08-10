@@ -22,37 +22,25 @@
  *
  */
 
-use std::error::Error;
-use std::task::Context;
-use std::task::Poll;
-use std::time::Duration;
-
 use bytes::Bytes;
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use integration_tests::mock::MockStream;
-use integration_tests::pb::test_client;
-use integration_tests::pb::test_server;
-use integration_tests::pb::test_stream_client;
-use integration_tests::pb::test_stream_server;
-use integration_tests::pb::Input;
-use integration_tests::pb::InputStream;
-use integration_tests::pb::Output;
-use integration_tests::pb::OutputStream;
+use integration_tests::pb::{
+    test_client, test_server, test_stream_client, test_stream_server, Input, InputStream, Output,
+    OutputStream,
+};
 use integration_tests::BoxFuture;
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use std::error::Error;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::{net::TcpListener, sync::oneshot};
 use tonic::body::Body;
-use tonic::metadata::MetadataMap;
-use tonic::metadata::MetadataValue;
-use tonic::transport::server::TcpIncoming;
-use tonic::transport::Endpoint;
-use tonic::transport::Server;
-use tonic::Code;
-use tonic::Request;
-use tonic::Response;
-use tonic::Status;
-use tonic::Streaming;
+use tonic::metadata::{MetadataMap, MetadataValue};
+use tonic::{
+    transport::{server::TcpIncoming, Endpoint, Server},
+    Code, Request, Response, Status,
+};
 
 #[tokio::test]
 async fn status_with_details() {
@@ -187,7 +175,6 @@ async fn status_from_server_stream() {
     #[tonic::async_trait]
     impl test_stream_server::TestStream for Svc {
         type StreamCallStream = Stream<OutputStream>;
-        type BidiCallStream = Stream<OutputStream>;
 
         async fn stream_call(
             &self,
@@ -198,13 +185,6 @@ async fn status_from_server_stream() {
                 Err::<OutputStream, _>(Status::unavailable("bar")),
             ]);
             Ok(Response::new(Box::pin(s) as Self::StreamCallStream))
-        }
-
-        async fn bidi_call(
-            &self,
-            _: Request<Streaming<InputStream>>,
-        ) -> Result<Response<Self::BidiCallStream>, Status> {
-            Err(Status::unimplemented("not implemented"))
         }
     }
 
@@ -265,7 +245,6 @@ async fn status_from_server_stream_with_inferred_status() {
     #[tonic::async_trait]
     impl test_stream_server::TestStream for Svc {
         type StreamCallStream = Stream<OutputStream>;
-        type BidiCallStream = Stream<OutputStream>;
 
         async fn stream_call(
             &self,
@@ -273,13 +252,6 @@ async fn status_from_server_stream_with_inferred_status() {
         ) -> Result<Response<Self::StreamCallStream>, Status> {
             let s = tokio_stream::once(Ok(OutputStream {}));
             Ok(Response::new(Box::pin(s) as Self::StreamCallStream))
-        }
-
-        async fn bidi_call(
-            &self,
-            _: Request<Streaming<InputStream>>,
-        ) -> Result<Response<Self::BidiCallStream>, Status> {
-            Err(Status::unimplemented("not implemented"))
         }
     }
 
@@ -360,7 +332,6 @@ async fn message_and_then_status_from_server_stream() {
     #[tonic::async_trait]
     impl test_stream_server::TestStream for Svc {
         type StreamCallStream = Stream<OutputStream>;
-        type BidiCallStream = Stream<OutputStream>;
 
         async fn stream_call(
             &self,
@@ -371,13 +342,6 @@ async fn message_and_then_status_from_server_stream() {
                 Err::<OutputStream, _>(Status::unavailable("foo")),
             ]);
             Ok(Response::new(Box::pin(s) as Self::StreamCallStream))
-        }
-
-        async fn bidi_call(
-            &self,
-            _: Request<Streaming<InputStream>>,
-        ) -> Result<Response<Self::BidiCallStream>, Status> {
-            Err(Status::unimplemented("not implemented"))
         }
     }
 

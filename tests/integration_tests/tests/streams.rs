@@ -37,7 +37,6 @@ async fn status_from_server_stream_with_source() {
     #[tonic::async_trait]
     impl test_stream_server::TestStream for Svc {
         type StreamCallStream = Stream<OutputStream>;
-        type BidiCallStream = Stream<OutputStream>;
 
         async fn stream_call(
             &self,
@@ -46,13 +45,6 @@ async fn status_from_server_stream_with_source() {
             let s = Unsync(std::ptr::null_mut::<()>());
 
             Ok(Response::new(Box::pin(s) as Self::StreamCallStream))
-        }
-
-        async fn bidi_call(
-            &self,
-            _: Request<tonic::Streaming<InputStream>>,
-        ) -> Result<Response<Self::BidiCallStream>, Status> {
-            Err(Status::unimplemented("not implemented"))
         }
     }
 

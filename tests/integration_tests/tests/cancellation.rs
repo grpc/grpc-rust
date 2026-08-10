@@ -27,7 +27,7 @@ use std::time::Duration;
 use h2::server;
 use h2::Reason;
 use http::StatusCode;
-use integration_tests::pb::test_stream_client::TestStreamClient;
+use integration_tests::pb::test_bidi_stream_client::TestBidiStreamClient;
 use integration_tests::pb::InputStream;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -73,7 +73,7 @@ async fn client_cancellation_sends_rst_stream() {
         .await
         .unwrap();
 
-    let mut client = TestStreamClient::new(channel);
+    let mut client = TestBidiStreamClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<InputStream>(1);
     let stream = ReceiverStream::new(rx);

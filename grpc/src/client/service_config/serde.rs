@@ -31,7 +31,12 @@ use super::duration::GrpcDuration;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
-    pub(crate) load_balancing_config: Option<Vec<LoadBalancingConfigSerde>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "load_balancing_config_serde"
+    )]
+    pub(crate) load_balancing_config: Option<LoadBalancingConfigSerde>,
     pub(crate) method_config: Option<Vec<MethodConfigSerde>>,
     pub(crate) retry_throttling: Option<RetryThrottlingPolicySerde>,
     pub(crate) health_check_config: Option<HealthCheckConfigSerde>,
@@ -107,14 +112,32 @@ pub(crate) struct LoadBalancingConfigSerde {
     pub(crate) config: serde_json::Value,
 }
 
-impl<'de> Deserialize<'de> for LoadBalancingConfigSerde {
+impl Serialize for LoadBalancingConfigSerde {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&self.name, &self.config)?;
+        map.end()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawLbConfig {
+    name: String,
+    config: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for RawLbConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = LoadBalancingConfigSerde;
+            type Value = RawLbConfig;
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
                     "a map with a single key-value pair representing a load balancing policy",
@@ -129,7 +152,7 @@ impl<'de> Deserialize<'de> for LoadBalancingConfigSerde {
                     if map.next_key::<String>()?.is_some() {
                         return Err(serde::de::Error::custom("map has more than one key"));
                     }
-                    Ok(LoadBalancingConfigSerde { name, config })
+                    Ok(RawLbConfig { name, config })
                 } else {
                     Err(serde::de::Error::custom("map is empty"))
                 }
@@ -139,15 +162,79 @@ impl<'de> Deserialize<'de> for LoadBalancingConfigSerde {
     }
 }
 
-impl Serialize for LoadBalancingConfigSerde {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) mod load_balancing_config_serde {
+    use super::LoadBalancingConfigSerde;
+    use super::RawLbConfig;
+    use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+
+    pub(crate) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<LoadBalancingConfigSerde>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Option<LoadBalancingConfigSerde>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a list of load balancing policy configurations")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: serde::de::SeqAccess<'de>,
+            {
+                let mut selected = None;
+                while let Some(candidate) = seq.next_element::<RawLbConfig>()? {
+                    if selected.is_none()
+                        && GLOBAL_LB_REGISTRY.get_policy(&candidate.name).is_some()
+                    {
+                        selected = Some(LoadBalancingConfigSerde {
+                            name: candidate.name,
+                            config: candidate.config,
+                        });
+                    }
+                }
+                Ok(selected)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+
+    #[allow(clippy::ref_option)]
+    pub(crate) fn serialize<S>(
+        value: &Option<LoadBalancingConfigSerde>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry(&self.name, &self.config)?;
-        map.end()
+        use serde::ser::SerializeSeq;
+        match value {
+            Some(lb) => {
+                let mut seq = serializer.serialize_seq(Some(1))?;
+                seq.serialize_element(lb)?;
+                seq.end()
+            }
+            None => serializer.serialize_none(),
+        }
     }
 }
 
@@ -483,5 +570,90 @@ mod test {
         assert!(validate_status_code("INVALID_CODE").is_err());
         assert!(validate_status_code("17").is_err());
         assert!(validate_status_code("-1").is_err());
+    }
+
+    #[test]
+    fn test_load_balancing_config_serde() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "camelCase")]
+        struct TestConfig {
+            #[serde(
+                default,
+                skip_serializing_if = "Option::is_none",
+                with = "load_balancing_config_serde"
+            )]
+            load_balancing_config: Option<LoadBalancingConfigSerde>,
+        }
+
+        // 1. Single supported policy
+        let val: TestConfig = serde_json::from_value(json!({
+            "loadBalancingConfig": [{ "round_robin": {} }]
+        }))
+        .unwrap();
+        assert_eq!(
+            val.load_balancing_config,
+            Some(LoadBalancingConfigSerde {
+                name: "round_robin".to_string(),
+                config: json!({}),
+            })
+        );
+
+        // 2. Multiple policies; picks first supported
+        let val: TestConfig = serde_json::from_value(json!({
+            "loadBalancingConfig": [
+                { "unsupported_lb_1": { "key": "val" } },
+                { "pick_first": { "shuffleAddressList": true } },
+                { "round_robin": {} }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            val.load_balancing_config,
+            Some(LoadBalancingConfigSerde {
+                name: "pick_first".to_string(),
+                config: json!({ "shuffleAddressList": true }),
+            })
+        );
+
+        // 3. No supported policies -> collapses to None
+        let val: TestConfig = serde_json::from_value(json!({
+            "loadBalancingConfig": [
+                { "unsupported_1": {} },
+                { "unsupported_2": {} }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(val.load_balancing_config, None);
+
+        // 4. Empty array -> collapses to None
+        let val: TestConfig = serde_json::from_value(json!({
+            "loadBalancingConfig": []
+        }))
+        .unwrap();
+        assert_eq!(val.load_balancing_config, None);
+
+        // 5. Null or absent -> None
+        let val: TestConfig = serde_json::from_value(json!({
+            "loadBalancingConfig": null
+        }))
+        .unwrap();
+        assert_eq!(val.load_balancing_config, None);
+
+        let val: TestConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(val.load_balancing_config, None);
+
+        // 6. Invalid entry with multiple keys in single object -> Error
+        let res: Result<TestConfig, _> = serde_json::from_value(json!({
+            "loadBalancingConfig": [
+                { "round_robin": {}, "pick_first": {} }
+            ]
+        }));
+        assert!(res.is_err());
+
+        // 7. Invalid entry with empty object -> Error
+        let res: Result<TestConfig, _> = serde_json::from_value(json!({
+            "loadBalancingConfig": [{}]
+        }));
+        assert!(res.is_err());
     }
 }

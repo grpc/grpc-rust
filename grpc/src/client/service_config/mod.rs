@@ -25,6 +25,7 @@
 pub(crate) mod duration;
 pub(crate) mod serde;
 
+use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 
 pub type ParseResult = Result<ServiceConfig, String>;
@@ -55,29 +56,18 @@ impl ServiceConfig {
     ///
     /// Evaluates `load_balancing_config` first, falling back to legacy
     /// `load_balancing_policy`.
-    // TODO: Move LB policy lookup, validation, and resolution into service
-    // config parsing (this function) so that candidate configs collapse to a single
-    // selected policy and its parsed config, sharing this logic with child LB
-    // policies. graceful_switch should handle it in the same pathway when this
-    // work is done.
     pub(crate) fn lb_config(&self) -> Option<ParsedJsonLbConfig> {
-        if let Some(ref configs) = self.inner.load_balancing_config
-            && !configs.is_empty()
-        {
-            let vec: Vec<serde_json::Value> = configs
-                .iter()
-                .map(|c| {
-                    let mut map = serde_json::Map::new();
-                    map.insert(c.name.clone(), c.config.clone());
-                    serde_json::Value::Object(map)
-                })
-                .collect();
+        if let Some(ref config) = self.inner.load_balancing_config {
+            let mut map = serde_json::Map::new();
+            map.insert(config.name.clone(), config.config.clone());
             return Some(ParsedJsonLbConfig::from_value(serde_json::Value::Array(
-                vec,
+                vec![serde_json::Value::Object(map)],
             )));
         }
 
-        if let Some(ref policy) = self.inner.load_balancing_policy {
+        if let Some(ref policy) = self.inner.load_balancing_policy
+            && GLOBAL_LB_REGISTRY.get_policy(policy).is_some()
+        {
             let mut map = serde_json::Map::new();
             map.insert(
                 policy.clone(),
@@ -156,12 +146,9 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
 
         // Verify Load Balancing Config.
-        let lb_configs = sc.inner.load_balancing_config.unwrap();
-        assert_eq!(lb_configs.len(), 2);
-        assert_eq!(lb_configs[0].name, "pick_first");
-        assert_eq!(lb_configs[0].config, json!({ "shuffleAddressList": true }));
-        assert_eq!(lb_configs[1].name, "round_robin");
-        assert_eq!(lb_configs[1].config, json!({}));
+        let lb_config = sc.inner.load_balancing_config.unwrap();
+        assert_eq!(lb_config.name, "pick_first");
+        assert_eq!(lb_config.config, json!({ "shuffleAddressList": true }));
 
         // Verify Method Config.
         let method_configs = sc.inner.method_config.unwrap();
@@ -410,16 +397,17 @@ mod test {
         assert!(sc.inner.retry_throttling.is_none());
         assert!(sc.inner.health_check_config.is_none());
         assert!(sc.inner.connection_scaling.is_none());
-        let lb_configs = sc.inner.load_balancing_config.unwrap();
-        assert_eq!(lb_configs.len(), 1);
-        assert_eq!(lb_configs[0].name, "round_robin");
+        let lb_config = sc.inner.load_balancing_config.unwrap();
+        assert_eq!(lb_config.name, "round_robin");
+        assert_eq!(lb_config.config, json!({}));
     }
 
     #[test]
     fn test_lb_config_resolution() {
-        // 1. Explicit loadBalancingConfig
+        // 1. Explicit loadBalancingConfig selects first supported candidate
         let json_data = json!({
             "loadBalancingConfig": [
+                { "unsupported_lb_policy": { "foo": "bar" } },
                 { "round_robin": {} },
                 { "pick_first": { "shuffleAddressList": true } }
             ]
@@ -430,8 +418,7 @@ mod test {
         assert_eq!(
             val,
             json!([
-                { "round_robin": {} },
-                { "pick_first": { "shuffleAddressList": true } }
+                { "round_robin": {} }
             ])
         );
 
@@ -444,7 +431,16 @@ mod test {
         let val: serde_json::Value = lb_cfg.convert_to().unwrap();
         assert_eq!(val, json!([{ "round_robin": {} }]));
 
-        // 3. No LB config present
+        // 3. No supported LB config present
+        let json_data = json!({
+            "loadBalancingConfig": [
+                { "unsupported_lb_policy": { "foo": "bar" } }
+            ]
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        assert!(sc.lb_config().is_none());
+
+        // 4. No LB config present
         let json_data = json!({});
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         assert!(sc.lb_config().is_none());

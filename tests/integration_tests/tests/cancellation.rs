@@ -27,8 +27,8 @@ use std::time::Duration;
 use h2::server;
 use h2::Reason;
 use http::StatusCode;
-use integration_tests::pb::cancellation_test_client::CancellationTestClient;
-use integration_tests::pb::Input;
+use integration_tests::pb::test_stream_client::TestStreamClient;
+use integration_tests::pb::InputStream;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -73,26 +73,26 @@ async fn client_cancellation_sends_rst_stream() {
         .await
         .unwrap();
 
-    let mut client = CancellationTestClient::new(channel);
+    let mut client = TestStreamClient::new(channel);
 
-    let (tx, rx) = mpsc::channel::<Input>(1);
+    let (tx, rx) = mpsc::channel::<InputStream>(1);
     let stream = ReceiverStream::new(rx);
     let mut request = Request::new(stream);
 
     let cancel_handle = request.cancellation_handle();
 
     // Start the call. This will resolve when server sends headers.
-    let response = client.bidi_stream(request).await.unwrap();
+    let response = client.bidi_call(request).await.unwrap();
 
     // Trigger cancellation
     cancel_handle.cancel();
-
-    // Keep tx alive to prevent normal EOF
-    let _keep_tx = tx;
-    let _keep_rx = response;
 
     tokio::time::timeout(Duration::from_secs(5), server_handle)
         .await
         .expect("Test timed out waiting for server to verify reset")
         .unwrap();
+
+    // Keep tx alive to prevent normal EOF.
+    let _keep_tx = tx;
+    let _keep_rx = response;
 }

@@ -4,6 +4,8 @@ package stream;
 
 service TestStream {
   rpc StreamCall(InputStream) returns (stream OutputStream);
+
+  rpc BidiCall(stream InputStream) returns (stream OutputStream);
 }
 
 message InputStream {}

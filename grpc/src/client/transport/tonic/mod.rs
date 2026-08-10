@@ -457,7 +457,7 @@ impl Transport for TransportBuilder {
         let (service, worker) = Buffer::pair(service, DEFAULT_BUFFER_SIZE);
         runtime.spawn(Box::pin(worker));
         let authority = &security_info.authority.host_port_string();
-        let uri = Uri::from_maybe_shared(format!("http://{}", &authority))
+        let uri = Uri::from_maybe_shared(format!("http://{}", authority))
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
 

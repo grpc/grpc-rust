@@ -20,7 +20,6 @@ rust-version = {workspace = true}
 exclude = ["benches-disabled"]
 
 [features]
-h2 = ["dep:h2"]
 codegen = ["dep:async-trait"]
 gzip = ["dep:flate2"]
 deflate = ["dep:flate2"]
@@ -34,7 +33,6 @@ tls-webpki-roots = ["_tls-any","channel", "dep:webpki-roots"]
 tls-connect-info = ["dep:tokio-rustls"]
 router = ["dep:axum", "dep:tower", "tower?/util"]
 server = [
-  "h2",
   "dep:hyper", "hyper?/server",
   "dep:hyper-util", "hyper-util?/service", "hyper-util?/server-auto",
   "dep:socket2",
@@ -74,7 +72,7 @@ tokio-stream = {version = "0.1.16", default-features = false}
 async-trait = {version = "0.1.13", optional = true}
 
 # transport
-h2 = {version = "0.4", optional = true}
+h2 = {version = "0.4"}
 hyper = {version = "1", features = ["http1", "http2"], optional = true}
 hyper-util = { version = "0.1.11", features = ["tokio"], optional = true }
 socket2 = { version = "0.6", optional = true, features = ["all"] }

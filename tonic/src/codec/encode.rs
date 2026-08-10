@@ -28,11 +28,11 @@ use super::compression::{
 use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
 use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
-#[cfg(feature = "h2")]
 use h2::{Error as H2Error, Reason as H2Reason};
 use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
+use std::sync::Arc;
 use std::{
     pin::Pin,
     task::{Context, Poll, ready},
@@ -368,14 +368,10 @@ where
         if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
             && let Poll::Ready(()) = cancellation_fut.poll(cx)
         {
-            let status = Status::cancelled("client cancelled");
-
-            #[cfg(feature = "h2")]
-            let mut status = status;
-            #[cfg(feature = "h2")]
-            {
-                status.set_source(std::sync::Arc::new(H2Error::from(H2Reason::CANCEL)));
-            }
+            let mut status = Status::cancelled("client cancelled");
+            // h2 inspects the error's source chain to determine the RST code,
+            // so we set it here.
+            status.set_source(Arc::new(H2Error::from(H2Reason::CANCEL)));
             return Poll::Ready(Some(Err(status)));
         }
 

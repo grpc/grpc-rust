@@ -86,7 +86,6 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false }
 tokio-stream = { version = "0.1.17", default-features = false }
 tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = [
     "codegen",
-    "h2",
 ] }
 tower = { version = "0.5.2", features = [
     "limit",

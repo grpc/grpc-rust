@@ -27,7 +27,7 @@ use std::pin::Pin;
 
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
-use grpc::core::RequestHeaders;
+use grpc::client::RequestHeaders;
 use protobuf::ClearAndParse;
 use protobuf::Message;
 use protobuf::MessageMut;

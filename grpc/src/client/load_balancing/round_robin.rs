@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crate::client::ConnectivityState;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::FailingPicker;
@@ -47,7 +48,6 @@ use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::core::RequestHeaders;
 
 pub static POLICY_NAME: &str = "round_robin";
 static START: Once = Once::new();
@@ -260,6 +260,7 @@ mod test {
 
     use crate::StatusCodeError;
     use crate::client::ConnectivityState;
+    use crate::client::RequestHeaders;
     use crate::client::load_balancing::ChannelController;
     use crate::client::load_balancing::FailingPicker;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
@@ -284,7 +285,6 @@ mod test {
     use crate::client::name_resolution::Address;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
-    use crate::core::RequestHeaders;
     use crate::metadata::MetadataMap;
     use crate::rt::default_runtime;
 

@@ -22,7 +22,7 @@
  *
  */
 
-use grpc::core::Trailers;
+use grpc::client::Trailers;
 use protobuf::Parse;
 use protobuf::Serialize;
 use protobuf_well_known_types::Any;

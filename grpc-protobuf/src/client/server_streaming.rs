@@ -27,10 +27,10 @@ use std::pin::Pin;
 
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
+use grpc::client::RequestHeaders;
 use grpc::client::SendOptions;
 use grpc::client::SendStream as _;
 use grpc::client::stream_util::RecvStreamValidator;
-use grpc::core::RequestHeaders;
 use protobuf::AsView;
 use protobuf::ClearAndParse;
 use protobuf::Message;

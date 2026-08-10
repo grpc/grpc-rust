@@ -43,6 +43,7 @@ use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
@@ -76,7 +77,6 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
-use crate::core::RequestHeaders;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;

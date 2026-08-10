@@ -1095,7 +1095,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
         .await
         .unwrap();
 
-    let (tx, rx) = conn
+    let (mut tx, rx) = conn
         .dyn_invoke(
             RequestHeaders::new()
                 .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
@@ -1112,6 +1112,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
         .expect("Test timed out waiting for server to verify reset")
         .unwrap();
 
-    // Keep tx alive to prevent it from closing the stream from send side.
-    let _keep_tx = tx;
+    // Verify the send stream has ended.
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err())
 }

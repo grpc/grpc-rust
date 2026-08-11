@@ -1101,9 +1101,15 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,

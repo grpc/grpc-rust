@@ -22,6 +22,7 @@
  *
  */
 
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use tonic::async_trait;
@@ -29,7 +30,7 @@ use tonic::async_trait;
 use crate::attributes::Attributes;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
-use crate::credentials::SecurityLevel;
+use crate::credentials::SecurityInfo;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CompositeCallCredentials;
 use crate::credentials::common::Authority;
@@ -39,10 +40,11 @@ use crate::rt::GrpcRuntime;
 
 pub struct HandshakeOutput {
     pub endpoint: BoxEndpoint,
-    pub security: ChannelSecurityInfo,
+    pub security_info: SecurityInfo,
+    pub authority_validator: Box<dyn ValidateAuthority>,
 }
 
-pub trait ChannelSecurityContext: Send + Sync + 'static {
+pub trait ValidateAuthority: Debug + Send + Sync + 'static {
     /// Checks if the established connection is authorized to send requests to
     /// the given authority.
     ///
@@ -59,50 +61,9 @@ pub trait ChannelSecurityContext: Send + Sync + 'static {
     }
 }
 
-impl ChannelSecurityContext for Box<dyn ChannelSecurityContext> {
+impl ValidateAuthority for Box<dyn ValidateAuthority> {
     fn validate_authority(&self, authority: &Authority) -> bool {
         (**self).validate_authority(authority)
-    }
-}
-
-/// Represents the security state of an established client-side connection.
-pub struct ChannelSecurityInfo {
-    security_protocol: &'static str,
-    security_level: SecurityLevel,
-    security_context: Box<dyn ChannelSecurityContext>,
-    /// Stores extra data derived from the underlying protocol.
-    attributes: Attributes,
-}
-
-impl ChannelSecurityInfo {
-    pub fn new(
-        security_protocol: &'static str,
-        security_level: SecurityLevel,
-        security_context: Box<dyn ChannelSecurityContext>,
-        attributes: Attributes,
-    ) -> Self {
-        Self {
-            security_protocol,
-            security_level,
-            security_context,
-            attributes,
-        }
-    }
-
-    pub fn security_protocol(&self) -> &'static str {
-        self.security_protocol
-    }
-
-    pub fn security_level(&self) -> SecurityLevel {
-        self.security_level
-    }
-
-    pub fn security_context(&self) -> &dyn ChannelSecurityContext {
-        &self.security_context
-    }
-
-    pub fn attributes(&self) -> &Attributes {
-        &self.attributes
     }
 }
 
@@ -188,6 +149,7 @@ mod tests {
 
     use super::*;
     use crate::StatusError;
+    use crate::credentials::SecurityLevel;
     use crate::credentials::call::CallCredentials;
     use crate::credentials::call::CallDetails;
     use crate::credentials::call::ClientConnectionSecurityInfo;
@@ -290,7 +252,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(output.security.security_level(), SecurityLevel::NoSecurity);
-        assert_eq!(output.security.security_protocol(), "local");
+        assert_eq!(
+            output.security_info.security_level(),
+            SecurityLevel::NoSecurity
+        );
+        assert_eq!(output.security_info.security_protocol(), "local");
     }
 }

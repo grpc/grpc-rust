@@ -87,7 +87,7 @@ use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
 use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
-use crate::credentials::client::ChannelSecurityInfo;
+use crate::credentials::SecurityInfo;
 use crate::private;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
@@ -380,7 +380,7 @@ impl Transport for TransportBuilder {
     ) -> Result<
         (
             Self::Service,
-            ChannelSecurityInfo,
+            SecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -475,7 +475,7 @@ impl Transport for TransportBuilder {
             task_handle,
             runtime,
         };
-        Ok((service, handshake_ouput.security, rx))
+        Ok((service, handshake_ouput.security_info, rx))
     }
 }
 

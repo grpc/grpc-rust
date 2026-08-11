@@ -28,21 +28,19 @@ use std::sync::Arc;
 
 use tonic::async_trait;
 
-use crate::attributes::Attributes;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::ServerCredentials;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
+use crate::credentials::client::ValidateAuthority;
 use crate::credentials::common::Authority;
 use crate::credentials::server;
-use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
 use crate::rt::BoxEndpoint;
 use crate::rt::GrpcRuntime;
@@ -74,9 +72,9 @@ impl LocalChannelCredentials {
 /// An implementation of [`ClientConnectionSecurityContext`] for local
 /// connections.
 #[derive(Debug, Clone)]
-pub struct LocalConnectionSecurityContext;
+pub struct LocalConnectionAuthorityValidator;
 
-impl ChannelSecurityContext for LocalConnectionSecurityContext {
+impl ValidateAuthority for LocalConnectionAuthorityValidator {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -128,12 +126,8 @@ impl ChannelCredentials for LocalChannelCredentials {
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ChannelSecurityInfo::new(
-                PROTOCOL_NAME,
-                security_level,
-                Box::new(LocalConnectionSecurityContext),
-                Attributes::new(),
-            ),
+            security_info: SecurityInfo::new(PROTOCOL_NAME).with_security_level(security_level),
+            authority_validator: Box::new(LocalConnectionAuthorityValidator),
         })
     }
 
@@ -173,11 +167,7 @@ impl ServerCredentials for LocalServerCredentials {
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(server::HandshakeOutput {
             endpoint: source,
-            security: ServerConnectionSecurityInfo::new(
-                PROTOCOL_NAME,
-                security_level,
-                Attributes::new(),
-            ),
+            security: SecurityInfo::new(PROTOCOL_NAME).with_security_level(security_level),
         })
     }
 
@@ -263,7 +253,8 @@ mod test {
             .unwrap();
 
         let endpoint = output.endpoint;
-        let security_info = output.security;
+        let security_info = output.security_info;
+        let authority_validator = output.authority_validator;
 
         // Verify security info.
         assert_eq!(security_info.security_protocol(), "local");
@@ -286,11 +277,7 @@ mod test {
         assert_eq!(buf, test_data);
 
         // Validate arbitrary authority.
-        assert!(
-            security_info
-                .security_context()
-                .validate_authority(&authority)
-        );
+        assert!(authority_validator.validate_authority(&authority));
     }
 
     #[tokio::test]

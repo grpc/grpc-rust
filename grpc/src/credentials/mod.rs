@@ -49,6 +49,7 @@ pub use local::LocalChannelCredentials;
 pub use local::LocalServerCredentials;
 use tonic::async_trait;
 
+use crate::attributes::Attributes;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
@@ -133,6 +134,51 @@ pub enum SecurityLevel {
     ///
     /// This is the standard level for secure transports like TLS.
     PrivacyAndIntegrity,
+}
+
+/// Represents the security state of an established connection.
+pub struct SecurityInfo {
+    security_protocol: &'static str,
+    security_level: SecurityLevel,
+    /// Stores extra data derived from the underlying protocol.
+    attributes: Attributes,
+}
+
+impl SecurityInfo {
+    /// Creates a new SecurityInfo with ajdfskjklfdsjklsdfajklsfdajk
+    pub fn new(security_protocol: &'static str) -> Self {
+        Self {
+            security_protocol,
+            security_level: SecurityLevel::NoSecurity,
+            attributes: Attributes::new(),
+        }
+    }
+
+    /// Sets the security level of this `SecurityInfo`.
+    pub fn with_security_level(mut self, security_level: SecurityLevel) -> Self {
+        self.security_level = security_level;
+        self
+    }
+
+    /// Returns the security protocol of this `SecurityInfo`.
+    pub fn security_protocol(&self) -> &'static str {
+        self.security_protocol
+    }
+
+    /// Returns the security level of this `SecurityInfo`.
+    pub fn security_level(&self) -> SecurityLevel {
+        self.security_level
+    }
+
+    /// Returns the attributes of this `SecurityInfo`.
+    pub fn attributes(&self) -> &Attributes {
+        &self.attributes
+    }
+
+    /// Returns the mutable attributes of this `SecurityInfo`.
+    pub fn attributes_mut(&mut self) -> &mut Attributes {
+        &mut self.attributes
+    }
 }
 
 pub(crate) mod common {

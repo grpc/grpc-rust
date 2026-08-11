@@ -33,6 +33,7 @@ tls-webpki-roots = ["_tls-any","channel", "dep:webpki-roots"]
 tls-connect-info = ["dep:tokio-rustls"]
 router = ["dep:axum", "dep:tower", "tower?/util"]
 server = [
+  "h2",
   "dep:hyper", "hyper?/server",
   "dep:hyper-util", "hyper-util?/service", "hyper-util?/server-auto",
   "dep:socket2",
@@ -41,6 +42,7 @@ server = [
   "dep:tower", "tower?/util", "tower?/limit", "tower?/load-shed",
 ]
 channel = [
+  "h2",
   "dep:hyper", "hyper?/client",
   "dep:hyper-util", "hyper-util?/client-legacy",
   "dep:tower", "tower?/balance", "tower?/buffer", "tower?/discover", "tower?/limit", "tower?/load-shed", "tower?/util",
@@ -48,6 +50,7 @@ channel = [
   "dep:hyper-timeout",
 ]
 transport = ["server", "channel"]
+h2 = ["dep:h2"]
 
 # [[bench]]
 # name = "bench_main"
@@ -72,7 +75,7 @@ tokio-stream = {version = "0.1.16", default-features = false}
 async-trait = {version = "0.1.13", optional = true}
 
 # transport
-h2 = {version = "0.4"}
+h2 = {version = "0.4", optional = true}
 hyper = {version = "1", features = ["http1", "http2"], optional = true}
 hyper-util = { version = "0.1.11", features = ["tokio"], optional = true }
 socket2 = { version = "0.6", optional = true, features = ["all"] }

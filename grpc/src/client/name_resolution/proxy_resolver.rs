@@ -263,9 +263,9 @@ mod tests {
     use super::*;
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
+    use crate::core::Address;
     use crate::rt;
     use crate::rt::GrpcEndpoint;
     use crate::rt::GrpcRuntime;
@@ -324,6 +324,21 @@ mod tests {
             opts: TcpOptions,
         ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
             self.inner.tcp_stream(target, opts)
+        }
+
+        fn tcp_listener(
+            &self,
+            addr: std::net::SocketAddr,
+        ) -> rt::BoxFuture<Result<Box<dyn rt::EndpointListener>, String>> {
+            self.inner.tcp_listener(addr)
+        }
+
+        fn unix_listener(
+            &self,
+            path: std::path::PathBuf,
+            opts: rt::UnixSocketOptions,
+        ) -> rt::BoxFuture<Result<Box<dyn rt::EndpointListener>, String>> {
+            self.inner.unix_listener(path, opts)
         }
     }
 

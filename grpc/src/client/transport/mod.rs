@@ -29,7 +29,7 @@ use http::HeaderValue;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
-use crate::client::name_resolution::Address;
+use crate::core::Address;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
@@ -91,7 +91,7 @@ pub(crate) trait Transport: Sync {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
@@ -109,7 +109,7 @@ pub(crate) trait Transport: Sync {
 pub(crate) trait DynTransport: Send + Sync {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
@@ -127,7 +127,7 @@ pub(crate) trait DynTransport: Send + Sync {
 impl<T: Transport> DynTransport for T {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,

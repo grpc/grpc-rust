@@ -82,6 +82,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::credentials::client::ChannelSecurityInfo;
@@ -365,7 +366,7 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
@@ -405,7 +406,7 @@ impl Transport for TransportBuilder {
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
                 let addr: SocketAddr =
-                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(&address.address).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -414,9 +415,10 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => {
-                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
-            }
+            NetworkType::Unix => runtime.unix_stream(
+                PathBuf::from(&*address.address),
+                UnixSocketOptions::default(),
+            ),
         };
         let transport = transport_fut.await?;
         let credentials = &security_info.credentials;

@@ -45,41 +45,143 @@
 //! - **[`ResponseHeaders`] / [`Trailers`]:** Represent gRPC headers and
 //!   trailers sent to the client during the server's response.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
 use tonic::async_trait;
 
 use crate::client::CallOptions;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
+use crate::rt::GrpcRuntime;
 
 pub(crate) mod interceptor;
 
+/// A serving connection that supports graceful shutdown.
+///
+/// Implements `Future` to drive the connection, and exposes
+/// `graceful_shutdown()` to initiate a graceful drain.
+///
+/// # Contract
+/// Implementors MUST drive all of the connection's work within this future
+/// (or own the handles to any sub-tasks they spawn). Dropping the connection
+/// future MUST cancel all associated work and release the socket. Detaching
+/// work via a fire-and-forget spawn breaks force-shutdown and leaks tasks.
+///
+/// Furthermore, `graceful_shutdown()` MUST be idempotent: calling it multiple
+/// times on the same connection MUST be safe and act as a no-op after the
+/// initial shutdown signal is sent.
+#[doc(hidden)]
+pub trait GracefulConnection: Future<Output = ()> + Send + 'static {
+    /// Initiate graceful shutdown.
+    fn graceful_shutdown(self: Pin<&mut Self>, token: crate::private::Internal);
+}
+
 pub struct Server {
     handler: Option<Arc<dyn DynHandle>>,
+    runtime: GrpcRuntime,
 }
 
-pub struct Call<SS, RS> {
-    pub headers: RequestHeaders,
-    pub send: SS,
-    pub recv: RS,
-    pub trailers_tx: oneshot::Sender<Trailers>,
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::inmemory::InMemoryListener {}
 }
 
+/// A bound listening socket that yields incoming connections.
+///
+/// # Shutdown and drop semantics
+///
+/// When a `Listener` is dropped (for example, immediately when a shutdown signal
+/// fires or when the server stops accepting connections), dropping the listener
+/// closes the underlying socket/channel and rejects new incoming connections
+/// immediately, while existing accepted connections continue to run and drain
+/// independently.
+///
+/// **Sealed** — external crates cannot implement this trait.
 #[trait_variant::make(Send)]
-pub trait Listener {
-    type SendStream: SendStream + 'static;
-    type RecvStream: RecvStream + 'static;
-    async fn accept(&self) -> Option<Call<Self::SendStream, Self::RecvStream>>;
+pub trait Listener: sealed::Sealed {
+    /// The concrete transport type yielded by this listener.
+    type Transport: Transport + 'static;
+
+    /// Accepts the next incoming connection.
+    #[doc(hidden)]
+    async fn accept(&self, token: crate::private::Internal) -> Option<Self::Transport>;
+
+    /// Returns the address this listener is bound to.
+    fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress>;
+}
+
+/// A connection accepted by a [`Listener`] that can serve RPCs.
+#[doc(hidden)]
+pub trait Transport: Send + 'static {
+    /// The serving connection type.
+    type Connection: GracefulConnection;
+
+    /// Bind the handler and start serving.
+    /// Returns a [`GracefulConnection`] that drives the connection when polled.
+    fn serve(
+        self,
+        handler: Arc<dyn DynHandle>,
+        runtime: GrpcRuntime,
+        token: crate::private::Internal,
+    ) -> Self::Connection;
+}
+
+/// Coordinates graceful shutdown across all spawned connections.
+///
+/// Each connection is watched via `watch()`. When `shutdown()` is called,
+/// all watched connections receive a `graceful_shutdown()` signal.
+struct GracefulCoordinator {
+    tx: tokio::sync::watch::Sender<()>,
+}
+
+impl GracefulCoordinator {
+    fn new() -> Self {
+        let (tx, _) = tokio::sync::watch::channel(());
+        Self { tx }
+    }
+
+    fn watch<C: GracefulConnection>(&self, conn: C) -> impl Future<Output = ()> + Send + 'static {
+        let mut rx = self.tx.subscribe();
+        async move {
+            let mut conn = std::pin::pin!(conn);
+            loop {
+                tokio::select! {
+                    _ = &mut conn => { break; }
+                    res = rx.changed() => {
+                        match res {
+                            // Operator graceful signal: begin GOAWAY drain,
+                            // keep polling the connection to completion.
+                            Ok(()) => conn.as_mut().graceful_shutdown(crate::private::Internal),
+                            // Sender dropped == serve future dropped (force
+                            // shutdown): stop now. Dropping `conn` closes the
+                            // socket and cancels in-flight work.
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn shutdown(self) {
+        let _ = self.tx.send(());
+        self.tx.closed().await;
+    }
 }
 
 impl Server {
+    /// Creates a new server with no handler.
     pub fn new() -> Self {
-        Self { handler: None }
+        Self {
+            handler: None,
+            runtime: crate::rt::default_runtime(),
+        }
     }
 
+    /// Sets the RPC handler for this server.
     pub fn set_handler<H>(&mut self, h: H)
     where
         H: Handle + Send + Sync + 'static,
@@ -87,20 +189,68 @@ impl Server {
         self.handler = Some(Arc::new(h))
     }
 
-    pub async fn serve(&self, l: &impl Listener) {
-        while let Some(call) = l.accept().await {
-            let mut send: Box<dyn DynSendStream> = Box::new(call.send);
-            let recv = BoxedRecvStream(Box::new(call.recv));
-            let options = CallOptions::default();
-            let trailers_tx = call.trailers_tx;
-            let trailers = self
-                .handler
-                .as_ref()
-                .unwrap()
-                .dyn_handle(call.headers, options, &mut *send, recv)
-                .await;
-            let _ = trailers_tx.send(trailers);
+    /// Serves on the given listener until it stops producing connections.
+    ///
+    /// After the accept loop ends, the listener is dropped and the server waits
+    /// for all in-flight connections to drain before returning. Connections are
+    /// not notified to shut down gracefully; they run until completion or client
+    /// disconnect.
+    // TODO: Consider returning a `ServeOutcome` enum (e.g.
+    // ShutdownSignal / ListenerClosed) so callers can distinguish
+    // why the server stopped.
+    pub async fn serve(&self, listener: impl Listener) {
+        self.serve_with_shutdown(listener, std::future::pending())
+            .await;
+    }
+
+    /// Serves on the given listener until `signal` resolves, then drains
+    /// all in-flight connections before returning.
+    ///
+    /// When `signal` completes:
+    /// 1. The server stops accepting new connections and drops the listener,
+    ///    immediately closing the listening socket.
+    /// 2. All open HTTP/2 connections receive a GOAWAY frame.
+    /// 3. In-flight RPCs continue to completion.
+    /// 4. This method returns once all connections are closed.
+    // TODO(sauravz): The shutdown signal is currently per-listener like tonic
+    // Other implementations have signal on the server level.
+    // We need to evaluate what's the correct behavior here.
+    // Per Listener is more flexible and easy to implement, but
+    // doesn't allign with other implementations.
+    pub(crate) async fn serve_with_shutdown(
+        &self,
+        listener: impl Listener,
+        signal: impl Future<Output = ()>,
+    ) {
+        let graceful = GracefulCoordinator::new();
+
+        tokio::pin!(signal);
+
+        loop {
+            tokio::select! {
+                conn = listener.accept(crate::private::Internal) => {
+                    let Some(connection) = conn else { break };
+                    let handler = match self.handler.as_ref() {
+                        Some(h) => h.clone(),
+                        None => continue,
+                    };
+                    let serving = connection.serve(
+                        handler,
+                        self.runtime.clone(),
+                        crate::private::Internal,
+                    );
+                    let fut = graceful.watch(serving);
+                    self.runtime.spawn(Box::pin(fut));
+                }
+                _ = &mut signal => {
+                    break;
+                }
+            }
         }
+
+        drop(listener);
+
+        graceful.shutdown().await;
     }
 }
 
@@ -126,8 +276,9 @@ pub trait Handle: Send + Sync {
     ) -> Trailers;
 }
 
+#[doc(hidden)]
 #[async_trait]
-trait DynHandle: Send + Sync {
+pub trait DynHandle: Send + Sync {
     async fn dyn_handle(
         &self,
         headers: RequestHeaders,
@@ -161,7 +312,8 @@ impl<T: Handle> DynHandle for T {
 //     |
 //     = note: `Box<(dyn server::DynRecvStream + '0)>` must implement `server::RecvStream`, for any lifetime `'0`...
 //     = note: ...but `server::RecvStream` is actually implemented for the type `Box<(dyn server::DynRecvStream + 'static)>`
-struct BoxedRecvStream(Box<dyn DynRecvStream + 'static>);
+#[doc(hidden)]
+pub struct BoxedRecvStream(pub Box<dyn DynRecvStream + 'static>);
 
 // Implement RecvStream for the wrapper instead of the Box directly
 impl RecvStream for BoxedRecvStream {
@@ -181,6 +333,23 @@ pub enum ResponseStreamItem<'a> {
     Message(&'a dyn SendMessage),
 }
 
+/// Bridges [`DynHandle`] (object-safe) back to [`Handle`] (generic),
+/// enabling interceptor composition on top of a dynamic handler.
+pub(crate) struct DynHandleWrapper(pub Arc<dyn DynHandle>);
+
+impl Handle for DynHandleWrapper {
+    async fn handle(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        tx: &mut impl SendStream,
+        rx: impl RecvStream + 'static,
+    ) -> Trailers {
+        self.0
+            .dyn_handle(headers, options, tx, BoxedRecvStream(Box::new(rx)))
+            .await
+    }
+}
 /// Represents the sending side of a server stream.  See `ResponseStream`
 /// documentation for information about the different types of items and the
 /// order in which they must be sent.
@@ -202,8 +371,9 @@ pub trait SendStream {
     ) -> Result<(), ()>;
 }
 
+#[doc(hidden)]
 #[async_trait]
-trait DynSendStream: Send {
+pub trait DynSendStream: Send {
     async fn dyn_send<'a>(
         &mut self,
         item: ResponseStreamItem<'a>,
@@ -271,8 +441,9 @@ pub trait RecvStream {
     async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>>;
 }
 
+#[doc(hidden)]
 #[async_trait]
-trait DynRecvStream: Send {
+pub trait DynRecvStream: Send {
     async fn dyn_next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>>;
 }
 
@@ -422,5 +593,485 @@ impl Trailers {
 
     pub(crate) fn into_parts(self) -> (crate::Result<()>, MetadataMap) {
         (self.status, self.metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::sync::Notify;
+
+    /// A mock connection whose completion is controlled by a [`Notify`],
+    /// and which records whether [`graceful_shutdown`] was called.
+    struct MockConnection {
+        shutdown_called: Arc<AtomicBool>,
+        finish: Arc<Notify>,
+    }
+
+    impl MockConnection {
+        fn new() -> (Self, Arc<AtomicBool>, Arc<Notify>) {
+            let shutdown_called = Arc::new(AtomicBool::new(false));
+            let finish = Arc::new(Notify::new());
+            (
+                Self {
+                    shutdown_called: shutdown_called.clone(),
+                    finish: finish.clone(),
+                },
+                shutdown_called,
+                finish,
+            )
+        }
+    }
+
+    impl Future for MockConnection {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let notified = self.finish.notified();
+            tokio::pin!(notified);
+            notified.poll(cx)
+        }
+    }
+
+    impl GracefulConnection for MockConnection {
+        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            self.finish.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_watched_connection() {
+        let coordinator = GracefulCoordinator::new();
+        let (conn, shutdown_called, _finish) = MockConnection::new();
+
+        let watched = coordinator.watch(conn);
+        let handle = tokio::spawn(watched);
+
+        tokio::task::yield_now().await;
+
+        coordinator.shutdown().await;
+
+        handle.await.unwrap();
+        assert!(shutdown_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn connection_completes_before_shutdown() {
+        let coordinator = GracefulCoordinator::new();
+        let (conn, shutdown_called, finish) = MockConnection::new();
+
+        let watched = coordinator.watch(conn);
+        let handle = tokio::spawn(watched);
+
+        // Connection finishes on its own (e.g. client disconnected).
+        finish.notify_one();
+        handle.await.unwrap();
+
+        // graceful_shutdown was never called.
+        assert!(!shutdown_called.load(Ordering::SeqCst));
+
+        // Shutdown still returns promptly (no connections to drain).
+        coordinator.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn two_connections_both_drained() {
+        let coordinator = GracefulCoordinator::new();
+
+        let (conn_a, shutdown_a, _finish_a) = MockConnection::new();
+        let (conn_b, shutdown_b, _finish_b) = MockConnection::new();
+
+        let handle_a = tokio::spawn(coordinator.watch(conn_a));
+        let handle_b = tokio::spawn(coordinator.watch(conn_b));
+
+        tokio::task::yield_now().await;
+        coordinator.shutdown().await;
+
+        handle_a.await.unwrap();
+        handle_b.await.unwrap();
+        assert!(shutdown_a.load(Ordering::SeqCst));
+        assert!(shutdown_b.load(Ordering::SeqCst));
+    }
+
+    // -- Server + InMemoryListener integration tests --
+
+    #[tokio::test]
+    async fn server_stops_on_shutdown_signal() {
+        let listener = crate::inmemory::InMemoryListener::new();
+        let server = Server::new();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let listener_clone = listener.clone();
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(listener_clone, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        // Fire shutdown immediately.
+        let _ = shutdown_tx.send(());
+
+        // Server should exit promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+            .await
+            .expect("server did not shut down within 2s")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_stops_when_listener_closes() {
+        let listener = crate::inmemory::InMemoryListener::new();
+        let server = Server::new();
+
+        let listener_for_serve = listener.clone();
+        let server_handle = tokio::spawn(async move {
+            // serve() runs until the listener stops producing connections.
+            server.serve(listener_for_serve).await;
+        });
+
+        // Closing the listener makes accept() return None.
+        listener.close().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+            .await
+            .expect("server did not exit after listener close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_sender_breaks_watch_loop() {
+        let coordinator = GracefulCoordinator::new();
+        let (conn, shutdown_called, _finish) = MockConnection::new();
+
+        let watched = coordinator.watch(conn);
+        let handle = tokio::spawn(watched);
+
+        tokio::task::yield_now().await;
+
+        // Drop the coordinator/Sender explicitly (simulating serve future being dropped).
+        drop(coordinator);
+
+        // The watched task should exit promptly because `rx.changed()` returns `Err` -> `break`.
+        // If the old busy-loop bug existed, this `await` would time out / hang forever.
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("watched connection did not exit when coordinator was dropped")
+            .unwrap();
+
+        // `graceful_shutdown` should NOT have been called on the force-close path.
+        assert!(!shutdown_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_serve_future_force_closes_connection() {
+        let listener = crate::inmemory::InMemoryListener::new();
+        let server = Server::new();
+
+        // A never-resolving signal future (we won't signal gracefully, we will drop the serve future directly).
+        let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let listener_clone = listener.clone();
+        let (serve_started_tx, serve_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Run `serve_with_shutdown` inside a task we can abort/drop (or wrap with timeout).
+        let serve_handle = tokio::spawn(async move {
+            let serve_fut = server.serve_with_shutdown(listener_clone, async {
+                let _ = signal_rx.await;
+            });
+            let _ = serve_started_tx.send(());
+            // Wrap in a short timeout so the future drops mid-flight while connections are active.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), serve_fut).await;
+        });
+
+        serve_started_rx.await.unwrap();
+
+        // When the 50ms timeout in `serve_handle` elapses, `serve_fut` is dropped -> `coordinator.tx` dropped -> connection self-terminates.
+        serve_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn infinite_connection_graceful_shutdown_then_drop() {
+        let coordinator = GracefulCoordinator::new();
+        // MockConnection never notifies finish on its own or when graceful_shutdown is called.
+        let (conn, shutdown_called, _finish) = MockConnection::new();
+
+        let watched = coordinator.watch(conn);
+        let handle = tokio::spawn(watched);
+
+        tokio::task::yield_now().await;
+
+        // 1. Initiate graceful shutdown. `tx.send(())` wakes `rx.changed()`, triggering `graceful_shutdown()`.
+        // But because `conn` never completes (`_finish` never notified), `coordinator.shutdown()` would hang if awaited.
+        let _ = coordinator.tx.send(());
+        tokio::task::yield_now().await;
+        assert!(shutdown_called.load(Ordering::SeqCst));
+
+        // 2. Escalate to forceful shutdown by dropping the coordinator (simulating dropping the serve future).
+        drop(coordinator);
+
+        // The watched task MUST self-terminate (`rx.changed()` returns `Err` -> `break`) despite being mid-drain.
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("infinite watched connection did not exit when coordinator was dropped after graceful shutdown")
+            .unwrap();
+    }
+
+    #[derive(Debug)]
+    struct MockListenerAddress;
+
+    impl crate::rt::address::ListenerAddress for MockListenerAddress {
+        fn network(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// A mock listener that records when it is dropped via an atomic flag,
+    /// and yields [`MockTransport`]s from a channel.
+    struct MockListener {
+        dropped: Arc<AtomicBool>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<MockTransport>>,
+    }
+
+    impl MockListener {
+        fn new() -> (
+            Self,
+            Arc<AtomicBool>,
+            tokio::sync::mpsc::UnboundedSender<MockTransport>,
+        ) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Self {
+                    dropped: dropped.clone(),
+                    rx: tokio::sync::Mutex::new(rx),
+                },
+                dropped,
+                tx,
+            )
+        }
+    }
+
+    impl Drop for MockListener {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl super::sealed::Sealed for MockListener {}
+
+    impl Listener for MockListener {
+        type Transport = MockTransport;
+
+        async fn accept(&self, _token: crate::private::Internal) -> Option<Self::Transport> {
+            self.rx.lock().await.recv().await
+        }
+
+        fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress> {
+            Box::new(MockListenerAddress)
+        }
+    }
+
+    struct NopSendStream;
+
+    impl SendStream for NopSendStream {
+        async fn send<'a>(
+            &mut self,
+            _item: ResponseStreamItem<'a>,
+            _options: SendOptions,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct NopRecvStream;
+
+    impl RecvStream for NopRecvStream {
+        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+            None
+        }
+    }
+
+    struct MockServingConnection {
+        inner: Pin<Box<dyn Future<Output = ()> + Send>>,
+    }
+
+    impl Future for MockServingConnection {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.inner.as_mut().poll(cx)
+        }
+    }
+
+    impl GracefulConnection for MockServingConnection {
+        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+            // No-op for mock connection
+        }
+    }
+
+    struct MockTransport;
+
+    impl Transport for MockTransport {
+        type Connection = MockServingConnection;
+
+        fn serve(
+            self,
+            handler: Arc<dyn DynHandle>,
+            _runtime: GrpcRuntime,
+            _token: crate::private::Internal,
+        ) -> Self::Connection {
+            let inner = Box::pin(async move {
+                let mut tx = NopSendStream;
+                let rx = BoxedRecvStream(Box::new(NopRecvStream));
+                let _ = handler
+                    .dyn_handle(RequestHeaders::new(), CallOptions::new(), &mut tx, rx)
+                    .await;
+            });
+            MockServingConnection { inner }
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_dropped_when_shutdown_signal_fires() {
+        let (listener, dropped, _tx) = MockListener::new();
+        let server = Server::new();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        // Fire shutdown immediately.
+        let _ = shutdown_tx.send(());
+
+        // Server should exit promptly and drop the listener.
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+            .await
+            .expect("server did not shut down within 2s")
+            .unwrap();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "listener should be dropped after serve_with_shutdown completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_dropped_immediately_while_connections_drain() {
+        use crate::client::CallOptions;
+        use crate::server::{RecvStream, SendStream};
+        use crate::server::{RequestHeaders, Trailers};
+
+        let (listener, dropped, tx) = MockListener::new();
+
+        let mut server = Server::new();
+
+        let handler_started = Arc::new(AtomicBool::new(false));
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel::<()>();
+        let unblock_rx = Arc::new(tokio::sync::Mutex::new(Some(unblock_rx)));
+
+        struct DrainingHandler {
+            started: Arc<AtomicBool>,
+            unblock: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        }
+
+        impl Handle for DrainingHandler {
+            async fn handle(
+                &self,
+                _: RequestHeaders,
+                _: CallOptions,
+                _: &mut impl SendStream,
+                _: impl RecvStream + 'static,
+            ) -> Trailers {
+                self.started.store(true, Ordering::SeqCst);
+                if let Some(rx) = self.unblock.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Trailers::new(Ok(()))
+            }
+        }
+
+        server.set_handler(DrainingHandler {
+            started: handler_started.clone(),
+            unblock: unblock_rx,
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        // Send a MockTransport to the listener so the server accepts a connection.
+        tx.send(MockTransport)
+            .expect("should send mock transport to listener");
+
+        // Wait until handler has started running.
+        for _ in 0..50 {
+            if handler_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(handler_started.load(Ordering::SeqCst));
+
+        // Listener is still alive before shutdown signal.
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        // Fire shutdown signal.
+        let _ = shutdown_tx.send(());
+
+        // Wait brief moment for select! loop to break and drop(listener) to execute.
+        for _ in 0..50 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // 1. The listener must be dropped immediately, even though the RPC connection is still draining.
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "listener should be dropped immediately when shutdown signal fires"
+        );
+
+        // 2. New incoming connections should be rejected immediately.
+        assert!(
+            tx.send(MockTransport).is_err(),
+            "new connections must be rejected after listener is dropped"
+        );
+
+        // 3. The server future is still running because existing connection is draining (handler waiting on unblock_rx).
+        assert!(
+            !server_handle.is_finished(),
+            "server should wait for existing connections to drain"
+        );
+
+        // Unblock the handler so the RPC finishes and graceful shutdown completes.
+        let _ = unblock_tx.send(());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+            .await
+            .expect("server did not shut down after connection drained")
+            .unwrap();
     }
 }

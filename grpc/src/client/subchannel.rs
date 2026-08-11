@@ -50,13 +50,13 @@ use crate::client::channel::WorkQueueTx;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::private::Sealed;
-use crate::client::name_resolution::Address;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::transport::DynTransport;
 use crate::client::transport::ProxyOptions;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
+use crate::core::Address;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
 use crate::credentials::client::ChannelSecurityInfo;
@@ -245,7 +245,7 @@ pub(crate) struct InternalSubchannel {
 }
 
 struct InternalSubchannelData {
-    address: String,
+    address: Address,
     state: InternalSubchannelState,
     work_queue: WorkQueueTx,
     on_drop: Arc<Notify>,
@@ -312,7 +312,6 @@ impl InternalSubchannel {
         work_queue: WorkQueueTx,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
-        let address_string = address.address.to_string();
         if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {
             security_opts.credentials = Arc::new(HttpConnectHandshaker::new(
                 security_opts.credentials,
@@ -320,10 +319,10 @@ impl InternalSubchannel {
             ));
         }
         let this = Arc::new_cyclic(|weak_self| Self {
-            address,
+            address: address.clone(),
             on_drop: on_drop.clone(),
             data: Arc::new(Mutex::new(InternalSubchannelData {
-                address: address_string,
+                address,
                 transport_builder: transport,
                 backoff,
                 weak_self: weak_self.clone(),
@@ -375,7 +374,7 @@ fn begin_connecting_if_idle(data: Arc<Mutex<InternalSubchannelData>>) {
             }
             _ = on_drop.notified() => {
             }
-            result = transport_builder.dyn_connect(address, runtime, &security_opts, &transport_opts) => {
+            result = transport_builder.dyn_connect(&address, runtime, &security_opts, &transport_opts) => {
                     match result {
                         Ok((service, security_info, disconnection_listener)) => {
                             move_to_ready(data, Arc::new(ReadyState{

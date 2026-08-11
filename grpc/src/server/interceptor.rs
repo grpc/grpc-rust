@@ -89,6 +89,114 @@ pub trait HandleExt: Handle + Sized {
 
 impl<T: Handle + Sized> HandleExt for T {}
 
+/// A no-op interceptor that simply delegates to the next handler.
+///
+/// This is the default interceptor used by [`RouterBuilder`](crate::server::RouterBuilder)
+/// when no interceptor has been added.
+#[derive(Clone, Copy)]
+pub struct Identity;
+
+impl Intercept for Identity {
+    async fn intercept(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        tx: &mut impl SendStream,
+        rx: impl RecvStream + 'static,
+        next: &impl Handle,
+    ) -> Trailers {
+        next.handle(headers, options, tx, rx).await
+    }
+}
+
+/// Extension trait for chaining [`Intercept`] implementations.
+///
+/// Provides the [`chain`](InterceptExt::chain) method, which composes two
+/// interceptors into a single [`InterceptorChain`] that itself implements
+/// `Intercept`. Chains nest naturally via repeated calls:
+///
+/// ```ignore
+/// let pipeline = logging.chain(auth).chain(rate_limit);
+/// // execution order: logging → auth → rate_limit → handler
+/// ```
+pub trait InterceptExt: Intercept + Sized {
+    /// Chains `self` with `next`, returning an [`InterceptorChain`] where
+    /// `self` runs first and `next` runs second.
+    fn chain<I: Intercept>(self, next: I) -> InterceptorChain<Self, I> {
+        InterceptorChain {
+            first: self,
+            second: next,
+        }
+    }
+}
+
+impl<T: Intercept + Sized> InterceptExt for T {}
+
+/// Two interceptors chained together, where `first` runs before `second`.
+///
+/// Created via [`InterceptExt::chain`]. Itself implements [`Intercept`], so
+/// chains compose recursively:
+/// `InterceptorChain<A, InterceptorChain<B, C>>` runs A → B → C.
+///
+/// ```ignore
+/// let pipeline = logging.chain(auth);
+/// server.interceptor(pipeline);
+/// ```
+#[derive(Clone)]
+pub struct InterceptorChain<A, B> {
+    first: A,
+    second: B,
+}
+
+impl<A, B> Intercept for InterceptorChain<A, B>
+where
+    A: Intercept,
+    B: Intercept,
+{
+    async fn intercept(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        tx: &mut impl SendStream,
+        rx: impl RecvStream + 'static,
+        next: &impl Handle,
+    ) -> Trailers {
+        // Build a temporary Handle that runs `second` then delegates to `next`.
+        let inner = SecondThenNext {
+            second: &self.second,
+            next,
+        };
+        self.first.intercept(headers, options, tx, rx, &inner).await
+    }
+}
+
+/// A temporary Handle adapter used inside [`InterceptorChain`].
+///
+/// When called, it runs `second.intercept(...)` with `next` as the
+/// downstream handler, achieving the chained execution order.
+struct SecondThenNext<'a, B, N: ?Sized> {
+    second: &'a B,
+    next: &'a N,
+}
+
+impl<B, N> Handle for SecondThenNext<'_, B, N>
+where
+    B: Intercept,
+    N: Handle,
+{
+    async fn handle(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        tx: &mut impl SendStream,
+        rx: impl RecvStream + 'static,
+    ) -> Trailers {
+        self.second
+            .intercept(headers, options, tx, rx, self.next)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -101,6 +209,8 @@ mod test {
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
+    use crate::status::StatusCodeError;
+    use crate::status::StatusError;
 
     struct MockSendStream;
     impl SendStream for MockSendStream {
@@ -260,5 +370,190 @@ mod test {
 
         let final_order = order.lock().await;
         assert_eq!(*final_order, vec![1, 2, 0]);
+    }
+
+    // --- Chaining tests exercising `InterceptExt::chain` / `InterceptorChain` ---
+
+    /// Records its `id` when run, then delegates to `next`.
+    struct TrackingInterceptor {
+        id: usize,
+        order: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Intercept for TrackingInterceptor {
+        async fn intercept(
+            &self,
+            headers: RequestHeaders,
+            options: CallOptions,
+            tx: &mut impl SendStream,
+            rx: impl RecvStream + 'static,
+            next: &impl Handle,
+        ) -> Trailers {
+            self.order.lock().await.push(self.id);
+            next.handle(headers, options, tx, rx).await
+        }
+    }
+
+    /// Records `id` and returns without calling `next` (short-circuit).
+    struct ShortCircuitInterceptor {
+        id: usize,
+        order: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Intercept for ShortCircuitInterceptor {
+        async fn intercept(
+            &self,
+            _headers: RequestHeaders,
+            _options: CallOptions,
+            _tx: &mut impl SendStream,
+            _rx: impl RecvStream + 'static,
+            _next: &impl Handle,
+        ) -> Trailers {
+            self.order.lock().await.push(self.id);
+            Trailers::new(Ok(()))
+        }
+    }
+
+    /// Records `0` (handler marker) and returns the given trailers.
+    struct TrackingHandler {
+        order: Arc<Mutex<Vec<usize>>>,
+        trailers: Trailers,
+    }
+
+    impl Handle for TrackingHandler {
+        async fn handle(
+            &self,
+            _headers: RequestHeaders,
+            _options: CallOptions,
+            _tx: &mut impl SendStream,
+            _rx: impl RecvStream + 'static,
+        ) -> Trailers {
+            self.order.lock().await.push(0);
+            self.trailers.clone()
+        }
+    }
+
+    fn tracking_interceptor(id: usize, order: &Arc<Mutex<Vec<usize>>>) -> TrackingInterceptor {
+        TrackingInterceptor {
+            id,
+            order: order.clone(),
+        }
+    }
+
+    /// Invokes `chain.intercept(...)` against a `TrackingHandler` and returns the
+    /// resulting `Trailers`.
+    async fn run_chain(chain: &impl Intercept, handler: &impl Handle) -> Trailers {
+        let mut tx = MockSendStream;
+        let rx = MockRecvStream;
+        chain
+            .intercept(
+                RequestHeaders::default(),
+                CallOptions::default(),
+                &mut tx,
+                rx,
+                handler,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn chain_runs_first_then_second_then_handler() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let chain = tracking_interceptor(1, &order).chain(tracking_interceptor(2, &order));
+        let handler = TrackingHandler {
+            order: order.clone(),
+            trailers: Trailers::new(Ok(())),
+        };
+
+        run_chain(&chain, &handler).await;
+
+        assert_eq!(*order.lock().await, vec![1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn nested_chain_flattens_left_to_right() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let chain = tracking_interceptor(1, &order)
+            .chain(tracking_interceptor(2, &order))
+            .chain(tracking_interceptor(3, &order));
+        let handler = TrackingHandler {
+            order: order.clone(),
+            trailers: Trailers::new(Ok(())),
+        };
+
+        run_chain(&chain, &handler).await;
+
+        assert_eq!(*order.lock().await, vec![1, 2, 3, 0]);
+    }
+
+    #[tokio::test]
+    async fn chain_of_chains() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let left = tracking_interceptor(1, &order).chain(tracking_interceptor(2, &order));
+        let right = tracking_interceptor(3, &order).chain(tracking_interceptor(4, &order));
+        let chain = left.chain(right);
+        let handler = TrackingHandler {
+            order: order.clone(),
+            trailers: Trailers::new(Ok(())),
+        };
+
+        run_chain(&chain, &handler).await;
+
+        assert_eq!(*order.lock().await, vec![1, 2, 3, 4, 0]);
+    }
+
+    #[tokio::test]
+    async fn identity_is_transparent() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let chain = Identity.chain(tracking_interceptor(1, &order));
+        let handler = TrackingHandler {
+            order: order.clone(),
+            trailers: Trailers::new(Ok(())),
+        };
+
+        run_chain(&chain, &handler).await;
+
+        // Identity adds no entry; only interceptor 1 then the handler run.
+        assert_eq!(*order.lock().await, vec![1, 0]);
+    }
+
+    #[tokio::test]
+    async fn interceptor_can_short_circuit() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let chain = ShortCircuitInterceptor {
+            id: 1,
+            order: order.clone(),
+        }
+        .chain(tracking_interceptor(2, &order));
+        let handler = TrackingHandler {
+            order: order.clone(),
+            trailers: Trailers::new(Ok(())),
+        };
+
+        run_chain(&chain, &handler).await;
+
+        // The short-circuiting interceptor never calls `next`, so neither the
+        // downstream interceptor (2) nor the handler (0) run.
+        assert_eq!(*order.lock().await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn trailers_propagate_back_through_chain() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let chain = tracking_interceptor(1, &order).chain(tracking_interceptor(2, &order));
+        let distinctive = Trailers::new(Err(StatusError::new(
+            StatusCodeError::FailedPrecondition,
+            "from-handler",
+        )));
+        let handler = TrackingHandler {
+            order: order.clone(),
+            trailers: distinctive,
+        };
+
+        let result = run_chain(&chain, &handler).await;
+
+        let err = result.into_status().unwrap_err();
+        assert_eq!(err.code(), StatusCodeError::FailedPrecondition);
+        assert_eq!(err.message(), "from-handler");
     }
 }

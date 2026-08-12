@@ -145,7 +145,7 @@ pub struct SecurityInfo {
 }
 
 impl SecurityInfo {
-    /// Creates a new SecurityInfo with ajdfskjklfdsjklsdfajklsfdajk
+    /// Creates a new SecurityInfo for the security protocol given.
     pub fn new(security_protocol: &'static str) -> Self {
         Self {
             security_protocol,

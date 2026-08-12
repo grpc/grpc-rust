@@ -246,7 +246,7 @@ impl RustlsChannelCredentials {
     }
 }
 
-/// Security context for [`rustls`]-based gRPC [`ChannelCredentials`].
+/// Authority validator for [`rustls`]-based gRPC [`ChannelCredentials`].
 #[derive(Debug)]
 pub struct ClientTlsAuthorityValidator {
     verified_peer_cert: Option<CertificateDer<'static>>,

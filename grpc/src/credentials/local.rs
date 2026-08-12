@@ -69,8 +69,8 @@ impl LocalChannelCredentials {
     }
 }
 
-/// An implementation of [`ClientConnectionSecurityContext`] for local
-/// connections.
+/// An implementation of [`ValidateAuthority`] for local connections, allowing
+/// any authority to be used.
 #[derive(Debug, Clone)]
 pub struct LocalConnectionAuthorityValidator;
 

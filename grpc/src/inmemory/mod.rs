@@ -29,7 +29,8 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
+use std::task::Context;
+use std::task::Poll;
 
 use bytes::Buf;
 use tokio::sync::Mutex as TokioMutex;

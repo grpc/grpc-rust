@@ -853,7 +853,7 @@ impl ChannelCredentials for SlowChannelCredentials {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,
-            security_info: SecurityInfo::new("mock").with_security_level(SecurityLevel::NoSecurity),
+            security_info: SecurityInfo::new("mock"),
             authority_validator: Box::new(MockConnectionAuthorityValidator),
         })
     }

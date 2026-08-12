@@ -573,11 +573,14 @@ mod tests {
     #[tokio::test]
     async fn inmemory_handler_cancelled_on_connection_drop() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         use crate::client::CallOptions;
-        use crate::server::{RecvStream, SendStream};
-        use crate::server::{RequestHeaders, Trailers};
+        use crate::server::RecvStream;
+        use crate::server::RequestHeaders;
+        use crate::server::SendStream;
+        use crate::server::Trailers;
 
         let handler_started = Arc::new(AtomicBool::new(false));
         let handler_finished = Arc::new(AtomicBool::new(false));

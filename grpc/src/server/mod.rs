@@ -598,11 +598,15 @@ impl Trailers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+
     use tokio::sync::Notify;
+
+    use super::*;
 
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
@@ -974,8 +978,10 @@ mod tests {
     #[tokio::test]
     async fn listener_dropped_immediately_while_connections_drain() {
         use crate::client::CallOptions;
-        use crate::server::{RecvStream, SendStream};
-        use crate::server::{RequestHeaders, Trailers};
+        use crate::server::RecvStream;
+        use crate::server::RequestHeaders;
+        use crate::server::SendStream;
+        use crate::server::Trailers;
 
         let (listener, dropped, tx) = MockListener::new();
 

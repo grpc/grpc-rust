@@ -266,6 +266,9 @@ impl TonicRecvStream {
         status: crate::Result<()>,
         md: Option<&TonicMeta>,
     ) -> ResponseStreamItem {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            cancel_tx.cancel();
+        }
         let trailers = if let Some(md) = md {
             match md.try_into() {
                 Err(e) => Trailers::new(Err(StatusError::new(
@@ -324,18 +327,13 @@ impl RecvStream for TonicRecvStream {
                             let headers = ResponseHeaders::new(peer_info).with_metadata(md);
                             ResponseStreamItem::Headers(headers)
                         }
-                        Err(e) => {
-                            if let Some(cancel_tx) = self.cancel_tx.take() {
-                                cancel_tx.cancel();
-                            }
-                            self.trailers_from_grpc_result(
-                                Err(StatusError::new(
-                                    StatusCodeError::Internal,
-                                    format!("error decoding response: {e}"),
-                                )),
-                                None,
-                            )
-                        }
+                        Err(e) => self.trailers_from_grpc_result(
+                            Err(StatusError::new(
+                                StatusCodeError::Internal,
+                                format!("error decoding response: {e}"),
+                            )),
+                            None,
+                        ),
                     }
                 }
                 Err(_) => {
@@ -361,18 +359,13 @@ impl RecvStream for TonicRecvStream {
                         self.state = StreamState::Streaming(stream);
                         ResponseStreamItem::Message
                     }
-                    Err(e) => {
-                        if let Some(cancel_tx) = self.cancel_tx.take() {
-                            cancel_tx.cancel();
-                        }
-                        self.trailers_from_grpc_result(
-                            Err(StatusError::new(
-                                StatusCodeError::Internal,
-                                format!("error decoding response: {e}"),
-                            )),
-                            None,
-                        )
-                    }
+                    Err(e) => self.trailers_from_grpc_result(
+                        Err(StatusError::new(
+                            StatusCodeError::Internal,
+                            format!("error decoding response: {e}"),
+                        )),
+                        None,
+                    ),
                 },
                 Err(status) => {
                     // Stay closed after sending trailers (do not set self.state).

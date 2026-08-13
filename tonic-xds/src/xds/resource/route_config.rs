@@ -91,6 +91,26 @@ impl RouteConfigMetadata {
         self.filter_metadata.is_empty() && self.typed_filter_metadata.is_empty()
     }
 
+    /// Constructs a `RouteConfigMetadata` directly from pre-encoded bytes.
+    ///
+    /// Lets downstream crates build realistic metadata to unit-test a
+    /// [`PreRouteInterceptor`](crate::PreRouteInterceptor) without standing up
+    /// a control plane.
+    ///
+    /// Takes already-encoded `google.protobuf.Struct` bytes so that this does
+    /// not expose proto binding types to the public API surface.
+    #[cfg(any(test, feature = "testutil"))]
+    #[must_use]
+    pub fn from_encoded(
+        filter_metadata: HashMap<String, Bytes>,
+        typed_filter_metadata: HashMap<String, TypedMetadata>,
+    ) -> Self {
+        Self {
+            filter_metadata,
+            typed_filter_metadata,
+        }
+    }
+
     /// Builds the view from an xDS `Metadata`, pre-encoding each namespace's
     /// `Struct`/`Any` to bytes.
     pub(crate) fn from_proto(metadata: Metadata) -> Self {
@@ -120,7 +140,7 @@ impl RouteConfigMetadata {
 }
 
 /// Validated RouteConfiguration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RouteConfigResource {
     pub name: String,
     pub virtual_hosts: Vec<VirtualHostConfig>,

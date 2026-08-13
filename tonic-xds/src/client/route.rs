@@ -23,7 +23,7 @@
  */
 
 use crate::common::async_util::BoxFuture;
-use crate::xds::resource::route_config::RouteConfigMetadata;
+use crate::xds::resource::route_config::{RouteConfigMetadata, RouteConfigResource};
 use crate::xds::routing::RoutingError;
 use http::Request;
 use std::sync::Arc;
@@ -64,19 +64,44 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
+/// A route config obtained in one step, to serve a single request with.
+///
+/// Two cases so the common one -- a config is already in effect -- costs
+/// neither an allocation nor an await, while a request racing startup can still
+/// wait for the first config.
+pub(crate) enum AcquiredConfig {
+    /// A config is already in effect.
+    Ready(Arc<RouteConfigResource>),
+    /// None has arrived yet; await this for the first one, bounded by an
+    /// implementation-defined timeout.
+    Pending(BoxFuture<Result<Arc<RouteConfigResource>, RoutingError>>),
+}
+
+impl AcquiredConfig {
+    /// Resolves to the config, awaiting only when one is not already available.
+    pub(crate) async fn get(self) -> Result<Arc<RouteConfigResource>, RoutingError> {
+        match self {
+            Self::Ready(config) => Ok(config),
+            Self::Pending(wait) => wait.await,
+        }
+    }
+}
+
 /// Trait for routing requests to clusters.
 ///
 /// Implementations resolve a request's authority and headers into a target
 /// cluster name. The xDS-backed implementation is
 /// [`XdsRouter`](crate::xds::routing::XdsRouter).
 pub(crate) trait Router: Send + Sync + 'static {
-    fn route(&self, input: &RouteInput<'_>) -> BoxFuture<Result<RouteDecision, RoutingError>>;
+    /// Obtains the route config to serve one request with.
+    fn acquire(&self) -> AcquiredConfig;
 
-    /// Current route-config metadata, if available, used to feed a
-    /// [`PreRouteInterceptor`]. Defaults to `None` (e.g. for mock routers).
-    fn metadata(&self) -> Option<RouteConfigMetadata> {
-        None
-    }
+    /// Resolves `input` against `config`.
+    fn route(
+        &self,
+        input: &RouteInput<'_>,
+        config: &RouteConfigResource,
+    ) -> Result<RouteDecision, RoutingError>;
 }
 
 /// Tower service for routing requests to the appropriate cluster.
@@ -115,17 +140,19 @@ where
         let authority = self.authority.clone();
         let mut inner_service = self.inner.clone();
         Box::pin(async move {
-            if let Some(interceptor) = interceptor.as_ref()
-                && let Some(metadata) = router.metadata()
-            {
-                interceptor.on_request(request.headers_mut(), &metadata);
-            }
-            let headers = &request.headers();
-            let route_input = RouteInput {
-                authority: &authority,
-                headers,
+            // Scoped so the config `Arc` is dropped before the inner call:
+            // to avoid holding that config version for the life of a long-running stream.
+            let route_decision = {
+                let config = router.acquire().get().await?;
+                if let Some(interceptor) = interceptor.as_ref() {
+                    interceptor.on_request(request.headers_mut(), &config.metadata);
+                }
+                let route_input = RouteInput {
+                    authority: &authority,
+                    headers: request.headers(),
+                };
+                router.route(&route_input, &config)?
             };
-            let route_decision = router.route(&route_input).await?;
             request.extensions_mut().insert(route_decision);
             inner_service.call(request).await.map_err(Into::into)
         })
@@ -187,19 +214,165 @@ mod tests {
     }
 
     impl Router for CaptureAuthorityRouter {
-        fn route(&self, input: &RouteInput<'_>) -> BoxFuture<Result<RouteDecision, RoutingError>> {
+        fn acquire(&self) -> AcquiredConfig {
+            AcquiredConfig::Ready(Arc::new(RouteConfigResource::default()))
+        }
+
+        fn route(
+            &self,
+            input: &RouteInput<'_>,
+            _config: &RouteConfigResource,
+        ) -> Result<RouteDecision, RoutingError> {
             *self.captured.lock().unwrap() = Some(input.authority.to_string());
-            Box::pin(async move {
-                Ok(RouteDecision {
-                    cluster: "test-cluster".to_string(),
-                    request_hash: None,
-                })
+            Ok(RouteDecision {
+                cluster: "test-cluster".to_string(),
+                request_hash: None,
             })
         }
     }
 
-    /// Verifies the routing layer always sources `authority` from its layer
-    /// config, not from the request URI.
+    #[tokio::test]
+    async fn interceptor_runs_when_config_arrives_late() {
+        use crate::xds::cache::XdsCache;
+        use crate::xds::resource::route_config::{
+            PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch,
+            VirtualHostConfig,
+        };
+        use crate::xds::routing::XdsRouter;
+
+        struct MarkPartition;
+        impl PreRouteInterceptor for MarkPartition {
+            fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata) {
+                let partition = metadata
+                    .filter_metadata("partition")
+                    .expect("interceptor ran without config metadata");
+                headers.insert(
+                    "x-partition",
+                    http::HeaderValue::from_bytes(&partition).expect("valid header"),
+                );
+            }
+        }
+
+        // Start with no route config at all.
+        let cache = XdsCache::new();
+        let xds_router = XdsRouter::new(&cache);
+        assert!(
+            xds_router.snapshot().is_none(),
+            "precondition: no config yet"
+        );
+        let router: Arc<dyn Router> = Arc::new(xds_router);
+
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let inner = service_fn(move |req: Request<()>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(
+                    req.headers()
+                        .get("x-partition")
+                        .map(|v| v.to_str().expect("utf8").to_string()),
+                );
+                Ok::<_, BoxError>(http::Response::new(()))
+            }
+        });
+        let svc = XdsRoutingLayer::new(router, Some(Arc::new(MarkPartition)), Arc::from("svc"))
+            .layer(inner);
+
+        let call = tokio::spawn(svc.oneshot(Request::builder().uri("/pkg.S/M").body(()).unwrap()));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "request was served before any config existed",
+        );
+
+        let mut filter_metadata = std::collections::HashMap::new();
+        filter_metadata.insert("partition".to_string(), bytes::Bytes::from_static(b"7"));
+        cache.update_route_config(Arc::new(RouteConfigResource {
+            name: "rc".into(),
+            virtual_hosts: vec![VirtualHostConfig {
+                name: "vh".into(),
+                domains: vec!["svc".into()],
+                routes: vec![RouteConfig {
+                    match_criteria: RouteConfigMatch {
+                        path_specifier: PathSpecifierConfig::Prefix("/".into()),
+                        headers: vec![],
+                        case_sensitive: true,
+                        match_fraction: None,
+                    },
+                    action: RouteConfigAction::Cluster("c".into()),
+                }],
+            }],
+            metadata: RouteConfigMetadata::from_encoded(
+                filter_metadata,
+                std::collections::HashMap::new(),
+            ),
+        }));
+
+        call.await.expect("task").expect("request");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one request to be served");
+        assert_eq!(
+            seen[0].as_deref(),
+            Some("7"),
+            "interceptor did not run for a request that predated the first config",
+        );
+    }
+
+    #[tokio::test]
+    async fn releases_the_route_config_before_calling_the_inner_service() {
+        struct SharedConfigRouter {
+            config: Arc<RouteConfigResource>,
+        }
+
+        impl Router for SharedConfigRouter {
+            fn acquire(&self) -> AcquiredConfig {
+                AcquiredConfig::Ready(self.config.clone())
+            }
+
+            fn route(
+                &self,
+                _input: &RouteInput<'_>,
+                _config: &RouteConfigResource,
+            ) -> Result<RouteDecision, RoutingError> {
+                Ok(RouteDecision {
+                    cluster: "c".to_string(),
+                    request_hash: None,
+                })
+            }
+        }
+
+        let config = Arc::new(RouteConfigResource::default());
+        let router: Arc<dyn Router> = Arc::new(SharedConfigRouter {
+            config: config.clone(),
+        });
+
+        let baseline = Arc::strong_count(&config);
+
+        let observed = Arc::new(Mutex::new(None));
+        let sink = observed.clone();
+        let probe = Arc::downgrade(&config);
+        let inner = service_fn(move |_req: Request<()>| {
+            let sink = sink.clone();
+            let probe = probe.clone();
+            async move {
+                *sink.lock().unwrap() = Some(probe.strong_count());
+                Ok::<_, BoxError>(http::Response::new(()))
+            }
+        });
+        let svc = XdsRoutingLayer::new(router, None, Arc::from("svc")).layer(inner);
+
+        svc.oneshot(Request::builder().uri("/pkg.S/M").body(()).unwrap())
+            .await
+            .expect("request");
+
+        assert_eq!(
+            observed.lock().unwrap().expect("inner service ran"),
+            baseline,
+            "the routing layer still held the route config while the request ran",
+        );
+    }
+
     #[tokio::test]
     async fn uses_layer_authority_regardless_of_request_uri() {
         let captured = Arc::new(Mutex::new(None));

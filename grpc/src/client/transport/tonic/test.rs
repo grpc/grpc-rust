@@ -77,14 +77,14 @@ use crate::credentials::ChannelCredentials;
 use crate::credentials::CompositeChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
-use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
+use crate::credentials::client::ValidateAuthority;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
@@ -823,8 +823,8 @@ async fn tonic_transport_recv_drop_cancels_send() {
 }
 
 #[derive(Debug, Clone)]
-struct MockConnectionSecurityContext;
-impl ChannelSecurityContext for MockConnectionSecurityContext {
+struct MockConnectionAuthorityValidator;
+impl ValidateAuthority for MockConnectionAuthorityValidator {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -854,12 +854,8 @@ impl ChannelCredentials for SlowChannelCredentials {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ChannelSecurityInfo::new(
-                "mock",
-                SecurityLevel::NoSecurity,
-                Box::new(MockConnectionSecurityContext),
-                Attributes::new(),
-            ),
+            security_info: SecurityInfo::new("mock"),
+            authority_validator: Box::new(MockConnectionAuthorityValidator),
         })
     }
 

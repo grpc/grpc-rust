@@ -462,7 +462,6 @@ mod tests {
     use crate::client::route::RouteDecision;
     use crate::client::route::RouteInput;
     use crate::client::route::Router;
-    use crate::common::async_util::BoxFuture;
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
     use crate::testutil::grpc::TestServer;
@@ -516,15 +515,18 @@ mod tests {
     }
 
     impl Router for MockXdsManager {
+        fn acquire(&self) -> crate::client::route::AcquiredConfig {
+            crate::client::route::AcquiredConfig::Ready(Arc::new(Default::default()))
+        }
+
         fn route(
             &self,
             _input: &RouteInput<'_>,
-        ) -> BoxFuture<Result<RouteDecision, crate::xds::routing::RoutingError>> {
-            Box::pin(async move {
-                Ok(RouteDecision {
-                    cluster: "test-cluster".to_string(),
-                    request_hash: None,
-                })
+            _config: &crate::xds::resource::route_config::RouteConfigResource,
+        ) -> Result<RouteDecision, crate::xds::routing::RoutingError> {
+            Ok(RouteDecision {
+                cluster: "test-cluster".to_string(),
+                request_hash: None,
             })
         }
     }

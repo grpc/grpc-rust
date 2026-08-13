@@ -57,9 +57,9 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::Address;
+use crate::credentials::SecurityInfo;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::common::Authority;
 use crate::private;
 use crate::rt::GrpcRuntime;
@@ -86,7 +86,7 @@ impl Backoff for NopBackoff {
 
 struct ReadyState {
     service: Box<dyn DynInvoke>,
-    security_info: ChannelSecurityInfo,
+    security_info: SecurityInfo,
     authority: Authority,
 }
 

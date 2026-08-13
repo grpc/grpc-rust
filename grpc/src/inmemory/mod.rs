@@ -23,11 +23,14 @@
  */
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use bytes::Buf;
 use tokio::sync::Mutex as TokioMutex;
@@ -37,7 +40,6 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::DynRecvStream as ClientDynRecvStream;
 use crate::client::DynSendStream as ClientDynSendStream;
@@ -65,10 +67,8 @@ use crate::client::transport::TransportOptions;
 use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
-use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo;
-use crate::credentials::common::Authority;
 use crate::rt::GrpcRuntime;
 use crate::server::BoxedRecvStream;
 use crate::server::DynHandle;
@@ -82,9 +82,6 @@ use crate::server::SendOptions as ServerSendOptions;
 use crate::server::SendStream as ServerSendStream;
 use crate::server::Trailers as ServerTrailers;
 use crate::server::Transport as ServerTransport;
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 static LISTENERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<InMemoryServerCall>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -423,7 +420,7 @@ impl Transport for InMemoryTransport {
     ) -> Result<
         (
             Self::Service,
-            ChannelSecurityInfo,
+            SecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -439,24 +436,10 @@ impl Transport for InMemoryTransport {
             s: s.clone(),
             closed_tx: Some(closed_tx),
         };
-        let sec_info = ChannelSecurityInfo::new(
-            "inmemory",
-            SecurityLevel::PrivacyAndIntegrity,
-            Box::new(InMemoryChannelecurityContext {}),
-            Attributes::new(),
-        );
+        let sec_info =
+            SecurityInfo::new("inmemory").with_security_level(SecurityLevel::PrivacyAndIntegrity);
 
         Ok((conn, sec_info, closed_rx))
-    }
-}
-
-/// An implementation of [`ClientConnectionSecurityContext`] for in-memory connections.
-#[derive(Debug, Clone)]
-struct InMemoryChannelecurityContext;
-
-impl ChannelSecurityContext for InMemoryChannelecurityContext {
-    fn validate_authority(&self, _authority: &Authority) -> bool {
-        true
     }
 }
 
@@ -589,11 +572,15 @@ mod tests {
 
     #[tokio::test]
     async fn inmemory_handler_cancelled_on_connection_drop() {
-        use crate::client::CallOptions;
-        use crate::server::{RecvStream, SendStream};
-        use crate::server::{RequestHeaders, Trailers};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        use crate::client::CallOptions;
+        use crate::server::RecvStream;
+        use crate::server::RequestHeaders;
+        use crate::server::SendStream;
+        use crate::server::Trailers;
 
         let handler_started = Arc::new(AtomicBool::new(false));
         let handler_finished = Arc::new(AtomicBool::new(false));

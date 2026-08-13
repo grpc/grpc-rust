@@ -23,11 +23,10 @@
  */
 
 use serde::Deserialize;
-use serde::Serialize;
 
 use super::duration::GrpcDuration;
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
@@ -43,7 +42,7 @@ pub(crate) struct ServiceConfigSerde {
     pub(crate) connection_scaling: Option<ConnectionScalingSerde>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MethodConfigSerde {
     #[serde(default)]
@@ -56,7 +55,7 @@ pub(crate) struct MethodConfigSerde {
     pub(crate) max_response_message_bytes: Option<SerdeU32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct MethodNameSerde {
     #[serde(default)]
     pub(crate) service: String,
@@ -64,14 +63,14 @@ pub(crate) struct MethodNameSerde {
     pub(crate) method: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryThrottlingPolicySerde {
     pub(crate) max_tokens: SerdeU32,
     pub(crate) token_ratio: SerdeF32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryPolicySerde {
     pub(crate) max_attempts: SerdeU32,
@@ -81,7 +80,7 @@ pub(crate) struct RetryPolicySerde {
     pub(crate) retryable_status_codes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HedgingPolicySerde {
     pub(crate) max_attempts: SerdeU32,
@@ -89,13 +88,13 @@ pub(crate) struct HedgingPolicySerde {
     pub(crate) non_fatal_status_codes: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HealthCheckConfigSerde {
     pub(crate) service_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectionScalingSerde {
     #[serde(default = "default_max_connections_per_subchannel")]
@@ -112,60 +111,49 @@ pub(crate) struct LoadBalancingConfigSerde {
     pub(crate) config: serde_json::Value,
 }
 
-impl Serialize for LoadBalancingConfigSerde {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry(&self.name, &self.config)?;
-        map.end()
+pub(crate) mod load_balancing_config_serde {
+    use serde::Deserialize;
+
+    use super::LoadBalancingConfigSerde;
+    use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+
+    #[derive(Debug, Clone)]
+    struct RawLbConfig {
+        name: String,
+        config: serde_json::Value,
     }
-}
 
-#[derive(Debug, Clone)]
-struct RawLbConfig {
-    name: String,
-    config: serde_json::Value,
-}
-
-impl<'de> Deserialize<'de> for RawLbConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = RawLbConfig;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(
-                    "a map with a single key-value pair representing a load balancing policy",
-                )
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                if let Some(name) = map.next_key::<String>()? {
-                    let config = map.next_value::<serde_json::Value>()?;
-                    if map.next_key::<String>()?.is_some() {
-                        return Err(serde::de::Error::custom("map has more than one key"));
+    impl<'de> Deserialize<'de> for RawLbConfig {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = RawLbConfig;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str(
+                        "a map with a single key-value pair representing a load balancing policy",
+                    )
+                }
+                fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::MapAccess<'de>,
+                {
+                    if let Some(name) = map.next_key::<String>()? {
+                        let config = map.next_value::<serde_json::Value>()?;
+                        if map.next_key::<String>()?.is_some() {
+                            return Err(serde::de::Error::custom("map has more than one key"));
+                        }
+                        Ok(RawLbConfig { name, config })
+                    } else {
+                        Err(serde::de::Error::custom("map is empty"))
                     }
-                    Ok(RawLbConfig { name, config })
-                } else {
-                    Err(serde::de::Error::custom("map is empty"))
                 }
             }
+            deserializer.deserialize_map(Visitor)
         }
-        deserializer.deserialize_map(Visitor)
     }
-}
-
-pub(crate) mod load_balancing_config_serde {
-    use super::LoadBalancingConfigSerde;
-    use super::RawLbConfig;
-    use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 
     pub(crate) fn deserialize<'de, D>(
         deserializer: D,
@@ -216,25 +204,6 @@ pub(crate) mod load_balancing_config_serde {
         }
 
         deserializer.deserialize_any(Visitor)
-    }
-
-    #[allow(clippy::ref_option)]
-    pub(crate) fn serialize<S>(
-        value: &Option<LoadBalancingConfigSerde>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeSeq;
-        match value {
-            Some(lb) => {
-                let mut seq = serializer.serialize_seq(Some(1))?;
-                seq.serialize_element(lb)?;
-                seq.end()
-            }
-            None => serializer.serialize_none(),
-        }
     }
 }
 
@@ -400,7 +369,7 @@ impl ServiceConfigSerde {
 // Wraps a u32 to provide custom serialization and deserialization.
 // Specifically supports the deserialization of u32 values that may be
 // represented as strings in JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SerdeU32(pub(crate) u32);
 
 impl From<SerdeU32> for u32 {
@@ -443,7 +412,7 @@ impl<'de> Deserialize<'de> for SerdeU32 {
 // Wraps an f32 to provide custom serialization and deserialization.
 // Specifically supports the deserialization of f32 values that may be
 // represented as strings or numbers in JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SerdeF32(pub(crate) f32);
 
 impl From<SerdeF32> for f32 {

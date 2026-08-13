@@ -52,6 +52,7 @@ use std::sync::Arc;
 use tonic::async_trait;
 
 use crate::client::CallOptions;
+use crate::core::PeerInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -494,18 +495,24 @@ impl ResponseHeaders {
 }
 
 /// Contains all information transmitted in the request headers of an RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestHeaders {
     /// The full (e.g. "/Service/Method") method name specified for the call.
     method_name: String,
     /// The application-specified metadata for the call.
     metadata: MetadataMap,
+    /// Information about the client.
+    peer_info: PeerInfo,
 }
 
 impl RequestHeaders {
     /// Returns a default RequestHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(method_name: impl Into<String>, peer_info: PeerInfo) -> Self {
+        Self {
+            method_name: method_name.into(),
+            peer_info,
+            metadata: MetadataMap::default(),
+        }
     }
 
     /// Replaces the method name of self with `method_name`.
@@ -521,7 +528,7 @@ impl RequestHeaders {
     }
 
     /// Returns the full (e.g. "/Service/Method") method name for these headers.
-    pub fn method_name(&self) -> &str {
+    pub fn method_name(&self) -> &String {
         &self.method_name
     }
 
@@ -533,6 +540,17 @@ impl RequestHeaders {
     /// Returns a mutable reference to the metadata in these headers.
     pub fn metadata_mut(&mut self) -> &mut MetadataMap {
         &mut self.metadata
+    }
+
+    /// Replaces the peer_info of self with `peer_info`.
+    pub fn with_peer_info(mut self, peer_info: PeerInfo) -> Self {
+        self.peer_info = peer_info;
+        self
+    }
+
+    /// Replaces the peer_info of self with `peer_info`.
+    pub fn peer_info(&self) -> &PeerInfo {
+        &self.peer_info
     }
 
     /// Returns the owned fields in the RequestHeaders.
@@ -607,6 +625,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::core::test_peer_info;
 
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
@@ -935,7 +954,12 @@ mod tests {
                 let mut tx = NopSendStream;
                 let rx = BoxedRecvStream(Box::new(NopRecvStream));
                 let _ = handler
-                    .dyn_handle(RequestHeaders::new(), CallOptions::new(), &mut tx, rx)
+                    .dyn_handle(
+                        RequestHeaders::new("", test_peer_info()),
+                        CallOptions::new(),
+                        &mut tx,
+                        rx,
+                    )
                     .await;
             });
             MockServingConnection { inner }

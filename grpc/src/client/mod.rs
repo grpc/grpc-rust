@@ -53,6 +53,7 @@ use std::time::Instant;
 
 use tonic::async_trait;
 
+use crate::core::PeerInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -367,15 +368,19 @@ impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
 }
 
 /// Contains all information transmitted in the response headers of an RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ResponseHeaders {
     metadata: MetadataMap,
+    peer_info: PeerInfo,
 }
 
 impl ResponseHeaders {
     /// Returns a default ResponseHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(peer_info: PeerInfo) -> Self {
+        Self {
+            metadata: MetadataMap::default(),
+            peer_info,
+        }
     }
 
     /// Replaces the metadata of self with `metadata`.
@@ -396,6 +401,17 @@ impl ResponseHeaders {
 
     pub(crate) fn into_metadata(self) -> MetadataMap {
         self.metadata
+    }
+
+    /// Replaces the peer_info of self with `peer_info`.
+    pub fn with_peer_info(mut self, peer_info: PeerInfo) -> Self {
+        self.peer_info = peer_info;
+        self
+    }
+
+    /// Replaces the peer_info of self with `peer_info`.
+    pub fn peer_info(&self) -> &PeerInfo {
+        &self.peer_info
     }
 }
 
@@ -427,7 +443,7 @@ impl RequestHeaders {
     }
 
     /// Returns the full (e.g. "/Service/Method") method name for these headers.
-    pub fn method_name(&self) -> &str {
+    pub fn method_name(&self) -> &String {
         &self.method_name
     }
 
@@ -454,6 +470,7 @@ impl RequestHeaders {
 pub struct Trailers {
     status: crate::Result<()>,
     metadata: MetadataMap,
+    peer_info: Option<PeerInfo>,
 }
 
 impl Trailers {
@@ -462,6 +479,7 @@ impl Trailers {
         Self {
             status,
             metadata: MetadataMap::default(),
+            peer_info: None,
         }
     }
 
@@ -495,6 +513,23 @@ impl Trailers {
     /// Returns the status in the [`Trailers`], consuming the entire status.
     pub fn into_status(self) -> crate::Result<()> {
         self.status
+    }
+
+    /// Replaces the peer info in self with `peer_info`.
+    pub fn with_peer_info(mut self, peer_info: Option<PeerInfo>) -> Self {
+        self.peer_info = peer_info;
+        self
+    }
+
+    /// Returns the peer info in the trailers, if present.  Peer information
+    /// will not be available in trailers in any the following circumstances:
+    ///
+    /// 1. A ResponseHeaders was already present on the response stream.
+    ///
+    /// 2. The error was generated locally on the client before a connection was
+    ///    chosen for the RPC.
+    pub fn peer_info(&self) -> &Option<PeerInfo> {
+        &self.peer_info
     }
 
     pub(crate) fn into_parts(self) -> (crate::Result<()>, MetadataMap) {

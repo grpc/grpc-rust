@@ -98,6 +98,7 @@ mod test {
     use super::*;
     use crate::client::CallOptions;
     use crate::core::RecvMessage;
+    use crate::core::test_peer_info;
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
@@ -177,7 +178,7 @@ mod test {
 
         chain
             .handle(
-                RequestHeaders::default(),
+                RequestHeaders::new("", test_peer_info()),
                 CallOptions::default(),
                 &mut tx,
                 rx,
@@ -251,7 +252,7 @@ mod test {
 
         chain
             .handle(
-                RequestHeaders::default(),
+                RequestHeaders::new("", test_peer_info()),
                 CallOptions::default(),
                 &mut tx,
                 rx,

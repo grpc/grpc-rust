@@ -163,7 +163,11 @@ pub struct PeerInfo {
 
 impl PeerInfo {
     /// Constructs a new PeerInfo with the given fields.
-    pub fn new(local_address: Address, remote_address: Address, security_info: SecurityInfo) -> Self {
+    pub fn new(
+        local_address: Address,
+        remote_address: Address,
+        security_info: SecurityInfo,
+    ) -> Self {
         Self {
             local_address,
             remote_address,

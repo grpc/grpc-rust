@@ -368,16 +368,17 @@ where
         if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
             && let Poll::Ready(()) = cancellation_fut.poll(cx)
         {
-            let status = Status::cancelled("client cancelled");
-
             #[cfg(feature = "h2")]
-            let mut status = status;
-            #[cfg(feature = "h2")]
-            {
+            let status = {
+                let mut status = Status::cancelled("client cancelled");
                 // h2 inspects the error's source chain to determine the RST
                 // code, so we set it here.
                 status.set_source(std::sync::Arc::new(H2Error::from(H2Reason::CANCEL)));
-            }
+                status
+            };
+
+            #[cfg(not(feature = "h2"))]
+            let status = Status::cancelled("client cancelled");
             return Poll::Ready(Some(Err(status)));
         }
 

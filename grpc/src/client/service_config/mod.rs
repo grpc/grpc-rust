@@ -25,8 +25,13 @@
 pub(crate) mod duration;
 pub(crate) mod serde;
 
+use std::sync::Arc;
+
+use crate::client::load_balancing::DynLbConfig;
+use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::pick_first;
 
 pub type ParseResult = Result<ServiceConfig, String>;
 
@@ -52,33 +57,38 @@ impl ServiceConfig {
         })
     }
 
-    /// Extracts the load balancing configuration per gRPC specification rules.
-    ///
-    /// Evaluates `load_balancing_config` first, falling back to legacy
-    /// `load_balancing_policy`.
-    pub(crate) fn lb_config(&self) -> Option<ParsedJsonLbConfig> {
-        if let Some(config) = self.inner.load_balancing_config.as_ref() {
-            let mut map = serde_json::Map::new();
-            map.insert(config.name.clone(), config.config.clone());
-            return Some(ParsedJsonLbConfig::from_value(serde_json::Value::Array(
-                vec![serde_json::Value::Object(map)],
-            )));
+    /// Extracts the load balancing configuration per gRPC specification rules:
+    /// 1. First supported entry in `loadBalancingConfig`
+    /// 2. Supported policy in `loadBalancingPolicy`
+    /// 3. Default `pick_first` policy
+    pub(crate) fn lb_config(&self) -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
+        if let Some(config) = self.inner.load_balancing_config.as_ref()
+            && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&config.name)
+        {
+            return (builder, config.config.clone());
         }
 
         if let Some(ref policy) = self.inner.load_balancing_policy
-            && GLOBAL_LB_REGISTRY.get_policy(policy).is_some()
+            && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(policy)
         {
-            let mut map = serde_json::Map::new();
-            map.insert(
-                policy.clone(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-            return Some(ParsedJsonLbConfig::from_value(serde_json::Value::Array(
-                vec![serde_json::Value::Object(map)],
-            )));
+            let empty_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
+            let parsed_config = builder.parse_config(&empty_json).ok().flatten();
+            return (builder, parsed_config);
         }
 
-        None
+        Self::default_lb_policy()
+    }
+
+    /// Returns the default load balancing policy (`pick_first`).
+    pub(crate) fn default_lb_policy() -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
+        let builder = GLOBAL_LB_REGISTRY
+            .get_policy(pick_first::POLICY_NAME)
+            .expect("pick_first policy must be registered");
+        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({
+            "shuffleAddressList": true
+        }));
+        let parsed_config = builder.parse_config(&default_json).ok().flatten();
+        (builder, parsed_config)
     }
 }
 
@@ -146,9 +156,14 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
 
         // Verify Load Balancing Config.
-        let lb_config = sc.inner.load_balancing_config.clone().unwrap();
-        assert_eq!(lb_config.name, "pick_first");
-        assert_eq!(lb_config.config, json!({ "shuffleAddressList": true }));
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "pick_first");
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<crate::client::load_balancing::pick_first::PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(pf_config.shuffle_address_list);
 
         // Verify Method Config.
         let method_configs = sc.inner.method_config.unwrap();
@@ -397,52 +412,68 @@ mod test {
         assert!(sc.inner.retry_throttling.is_none());
         assert!(sc.inner.health_check_config.is_none());
         assert!(sc.inner.connection_scaling.is_none());
-        let lb_config = sc.inner.load_balancing_config.clone().unwrap();
-        assert_eq!(lb_config.name, "round_robin");
-        assert_eq!(lb_config.config, json!({}));
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "round_robin");
+        assert!(config.is_none());
     }
 
     #[test]
     fn test_lb_config_resolution() {
-        // 1. Explicit loadBalancingConfig selects first supported candidate
+        use crate::client::load_balancing::pick_first::PickFirstConfig;
+
+        // Explicit loadBalancingConfig selects first supported candidate
         let json_data = json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_policy": { "foo": "bar" } },
-                { "round_robin": {} },
-                { "pick_first": { "shuffleAddressList": true } }
+                { "pick_first": { "shuffleAddressList": true } },
+                { "round_robin": {} }
             ]
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        let lb_cfg = sc.lb_config().unwrap();
-        let val: serde_json::Value = lb_cfg.convert_to().unwrap();
-        assert_eq!(
-            val,
-            json!([
-                { "round_robin": {} }
-            ])
-        );
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "pick_first");
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(pf_config.shuffle_address_list);
 
-        // 2. Legacy loadBalancingPolicy fallback
+        // Legacy loadBalancingPolicy fallback
         let json_data = json!({
             "loadBalancingPolicy": "round_robin"
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        let lb_cfg = sc.lb_config().unwrap();
-        let val: serde_json::Value = lb_cfg.convert_to().unwrap();
-        assert_eq!(val, json!([{ "round_robin": {} }]));
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "round_robin");
+        assert!(config.is_none());
 
-        // 3. No supported LB config present
+        // No supported LB config present -> falls back to default pick_first
         let json_data = json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_policy": { "foo": "bar" } }
             ]
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        assert!(sc.lb_config().is_none());
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "pick_first");
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(pf_config.shuffle_address_list);
 
-        // 4. No LB config present
+        // No LB config present -> falls back to default pick_first
         let json_data = json!({});
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        assert!(sc.lb_config().is_none());
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "pick_first");
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(pf_config.shuffle_address_list);
     }
 }

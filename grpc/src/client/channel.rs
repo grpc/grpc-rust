@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -46,12 +45,12 @@ use crate::client::Invoke;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
+use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::pick_first;
 use crate::client::load_balancing::round_robin;
@@ -452,24 +451,15 @@ impl ResolverChannelController {
 
 impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
-        let lb_json_config = match update.service_config.as_ref() {
+        let (builder, config) = match update.service_config.as_ref() {
             Ok(Some(sc)) => sc.lb_config(),
-            _ => None,
-        }
-        .unwrap_or_else(|| {
-            ParsedJsonLbConfig::from_value(json!([{
-                pick_first::POLICY_NAME: {
-                    "shuffleAddressList": true,
-                    "unknown_field": false
-                }
-            }]))
-        });
+            _ => ServiceConfig::default_lb_policy(),
+        };
 
-        let config = GracefulSwitchPolicy::parse_config(&lb_json_config)?;
+        let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 
         self.lb_policy
-            .resolver_update(update, Some(&config), &mut self.lb_channel_controller)
-            .map_err(|err| err.to_string())
+            .resolver_update(update, Some(&gsb_config), &mut self.lb_channel_controller)
     }
 
     fn parse_service_config(&self, config: &str) -> ParseResult {

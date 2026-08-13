@@ -57,7 +57,7 @@ impl ServiceConfig {
     /// Evaluates `load_balancing_config` first, falling back to legacy
     /// `load_balancing_policy`.
     pub(crate) fn lb_config(&self) -> Option<ParsedJsonLbConfig> {
-        if let Some(ref config) = self.inner.load_balancing_config {
+        if let Some(config) = self.inner.load_balancing_config.as_ref() {
             let mut map = serde_json::Map::new();
             map.insert(config.name.clone(), config.config.clone());
             return Some(ParsedJsonLbConfig::from_value(serde_json::Value::Array(
@@ -146,7 +146,7 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
 
         // Verify Load Balancing Config.
-        let lb_config = sc.inner.load_balancing_config.unwrap();
+        let lb_config = sc.inner.load_balancing_config.clone().unwrap();
         assert_eq!(lb_config.name, "pick_first");
         assert_eq!(lb_config.config, json!({ "shuffleAddressList": true }));
 
@@ -397,7 +397,7 @@ mod test {
         assert!(sc.inner.retry_throttling.is_none());
         assert!(sc.inner.health_check_config.is_none());
         assert!(sc.inner.connection_scaling.is_none());
-        let lb_config = sc.inner.load_balancing_config.unwrap();
+        let lb_config = sc.inner.load_balancing_config.clone().unwrap();
         assert_eq!(lb_config.name, "round_robin");
         assert_eq!(lb_config.config, json!({}));
     }

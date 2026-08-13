@@ -30,12 +30,8 @@ use super::duration::GrpcDuration;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "load_balancing_config_serde"
-    )]
-    pub(crate) load_balancing_config: Option<LoadBalancingConfigSerde>,
+    #[serde(default)]
+    pub(crate) load_balancing_config: SelectedLbConfig,
     pub(crate) method_config: Option<Vec<MethodConfigSerde>>,
     pub(crate) retry_throttling: Option<RetryThrottlingPolicySerde>,
     pub(crate) health_check_config: Option<HealthCheckConfigSerde>,
@@ -111,10 +107,59 @@ pub(crate) struct LoadBalancingConfigSerde {
     pub(crate) config: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SelectedLbConfig(pub(crate) Option<LoadBalancingConfigSerde>);
+
+impl SelectedLbConfig {
+    pub(crate) fn as_ref(&self) -> Option<&LoadBalancingConfigSerde> {
+        self.0.as_ref()
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub(crate) fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn unwrap(self) -> LoadBalancingConfigSerde {
+        self.0.unwrap()
+    }
+}
+
+impl PartialEq<Option<LoadBalancingConfigSerde>> for SelectedLbConfig {
+    fn eq(&self, other: &Option<LoadBalancingConfigSerde>) -> bool {
+        &self.0 == other
+    }
+}
+
+impl From<Option<LoadBalancingConfigSerde>> for SelectedLbConfig {
+    fn from(opt: Option<LoadBalancingConfigSerde>) -> Self {
+        SelectedLbConfig(opt)
+    }
+}
+
+impl From<LoadBalancingConfigSerde> for SelectedLbConfig {
+    fn from(cfg: LoadBalancingConfigSerde) -> Self {
+        SelectedLbConfig(Some(cfg))
+    }
+}
+
+impl<'de> Deserialize<'de> for SelectedLbConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        load_balancing_config_serde::deserialize(deserializer)
+    }
+}
+
 pub(crate) mod load_balancing_config_serde {
     use serde::Deserialize;
 
     use super::LoadBalancingConfigSerde;
+    use super::SelectedLbConfig;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 
     #[derive(Debug, Clone)]
@@ -155,16 +200,14 @@ pub(crate) mod load_balancing_config_serde {
         }
     }
 
-    pub(crate) fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<LoadBalancingConfigSerde>, D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<SelectedLbConfig, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         struct Visitor;
 
         impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Option<LoadBalancingConfigSerde>;
+            type Value = SelectedLbConfig;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a list of load balancing policy configurations")
@@ -174,14 +217,14 @@ pub(crate) mod load_balancing_config_serde {
             where
                 E: serde::de::Error,
             {
-                Ok(None)
+                Ok(SelectedLbConfig(None))
             }
 
             fn visit_unit<E>(self) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                Ok(None)
+                Ok(SelectedLbConfig(None))
             }
 
             fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
@@ -199,7 +242,7 @@ pub(crate) mod load_balancing_config_serde {
                         });
                     }
                 }
-                Ok(selected)
+                Ok(SelectedLbConfig(selected))
             }
         }
 
@@ -546,12 +589,8 @@ mod test {
         #[derive(Deserialize, Debug, PartialEq)]
         #[serde(rename_all = "camelCase")]
         struct TestConfig {
-            #[serde(
-                default,
-                skip_serializing_if = "Option::is_none",
-                with = "load_balancing_config_serde"
-            )]
-            load_balancing_config: Option<LoadBalancingConfigSerde>,
+            #[serde(default)]
+            load_balancing_config: SelectedLbConfig,
         }
 
         // 1. Single supported policy
@@ -561,10 +600,10 @@ mod test {
         .unwrap();
         assert_eq!(
             val.load_balancing_config,
-            Some(LoadBalancingConfigSerde {
+            SelectedLbConfig(Some(LoadBalancingConfigSerde {
                 name: "round_robin".to_string(),
                 config: json!({}),
-            })
+            }))
         );
 
         // 2. Multiple policies; picks first supported
@@ -578,10 +617,10 @@ mod test {
         .unwrap();
         assert_eq!(
             val.load_balancing_config,
-            Some(LoadBalancingConfigSerde {
+            SelectedLbConfig(Some(LoadBalancingConfigSerde {
                 name: "pick_first".to_string(),
                 config: json!({ "shuffleAddressList": true }),
-            })
+            }))
         );
 
         // 3. No supported policies -> collapses to None
@@ -592,24 +631,24 @@ mod test {
             ]
         }))
         .unwrap();
-        assert_eq!(val.load_balancing_config, None);
+        assert_eq!(val.load_balancing_config, SelectedLbConfig(None));
 
         // 4. Empty array -> collapses to None
         let val: TestConfig = serde_json::from_value(json!({
             "loadBalancingConfig": []
         }))
         .unwrap();
-        assert_eq!(val.load_balancing_config, None);
+        assert_eq!(val.load_balancing_config, SelectedLbConfig(None));
 
         // 5. Null or absent -> None
         let val: TestConfig = serde_json::from_value(json!({
             "loadBalancingConfig": null
         }))
         .unwrap();
-        assert_eq!(val.load_balancing_config, None);
+        assert_eq!(val.load_balancing_config, SelectedLbConfig(None));
 
         let val: TestConfig = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(val.load_balancing_config, None);
+        assert_eq!(val.load_balancing_config, SelectedLbConfig(None));
 
         // 6. Invalid entry with multiple keys in single object -> Error
         let res: Result<TestConfig, _> = serde_json::from_value(json!({

@@ -276,8 +276,7 @@ health = ["dep:tonic-health"]
 grpc-web = ["dep:tonic-web", "dep:bytes", "dep:http", "dep:hyper", "dep:hyper-util", "dep:tracing-subscriber", "dep:tower", "dep:tower-http", "tower-http?/cors"]
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
 uds = ["dep:tokio-stream", "tokio-stream?/net", "dep:tower", "dep:hyper", "dep:hyper-util"]
-h2 = ["dep:h2"]
-streaming = ["dep:tokio-stream", "h2"]
+streaming = ["dep:tokio-stream", "dep:h2"]
 mock = ["dep:tokio-stream", "dep:tower", "dep:hyper-util"]
 json-codec = ["dep:serde", "dep:serde_json", "dep:bytes"]
 compression = ["tonic/gzip"]
@@ -297,6 +296,9 @@ full = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web",
 "tls-rustls", "tls-client-auth", "types", "cancellation", "h2c",
 "grpc-routeguide", "grpc-helloworld", "grpc-gcp"]
 default = ["full"]
+# Workaround for cargo-udeps bug.
+# TODO: Remove once the fix is released: https://github.com/est31/cargo-udeps/pull/338
+h2 = []
 
 [dependencies]
 # Common dependencies

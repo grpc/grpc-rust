@@ -29,9 +29,9 @@ use http::HeaderValue;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
-use crate::client::name_resolution::Address;
+use crate::core::Address;
 use crate::credentials::ChannelCredentials;
-use crate::credentials::client::ChannelSecurityInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt::GrpcRuntime;
@@ -91,14 +91,14 @@ pub(crate) trait Transport: Sync {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Self::Service,
-            ChannelSecurityInfo,
+            SecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -109,14 +109,14 @@ pub(crate) trait Transport: Sync {
 pub(crate) trait DynTransport: Send + Sync {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            ChannelSecurityInfo,
+            SecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -127,14 +127,14 @@ pub(crate) trait DynTransport: Send + Sync {
 impl<T: Transport> DynTransport for T {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            ChannelSecurityInfo,
+            SecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,

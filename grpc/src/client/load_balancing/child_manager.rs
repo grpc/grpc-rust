@@ -44,8 +44,8 @@ use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::WeakSubchannel;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::core::Address;
 use crate::rt::GrpcRuntime;
 
 // An LbPolicy implementation that manages multiple children.
@@ -513,9 +513,9 @@ mod test {
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::load_balancing::test_utils::{self};
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
+    use crate::core::Address;
     use crate::rt::default_runtime;
 
     // Sets up the test environment.

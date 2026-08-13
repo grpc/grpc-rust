@@ -36,7 +36,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use backoff::ExponentialBackoffBuilder;
 use backoff::backoff::Backoff;
 use http::{Request, Response};
@@ -47,6 +46,8 @@ use tower::retry::Retry;
 use tower::{Layer, Service};
 
 use crate::client::circuit_breaking::is_local_circuit_breaker_drop;
+use crate::client::route::RouteDecision;
+use crate::xds::resource::route_config::RouteRetryConfig;
 
 /// Check if an error's source chain contains a retryable connection-level error.
 ///
@@ -128,7 +129,9 @@ impl RetryBackoffConfig {
     pub(crate) fn new(base_interval: Duration) -> Self {
         let base_interval = base_interval.max(MIN_BACKOFF);
         Self {
-            max_interval: base_interval * 10,
+            // `checked_mul` guards the (already range-checked) `base_interval`
+            // against overflow; the fallback keeps `max_interval >= base`.
+            max_interval: base_interval.checked_mul(10).unwrap_or(base_interval),
             base_interval,
             backoff_multiplier: 2.0,
         }
@@ -205,10 +208,25 @@ impl Default for RetryConfig {
 /// Default gRPC [`RetryClassifier`]: retries on a retryable connection error or a
 /// retryable gRPC status code, and stamps the `grpc-previous-rpc-attempts` header
 /// on each retry per the gRPC spec.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct GrpcRetryClassifier {
     /// gRPC status codes that should be retried.
-    pub(crate) retry_on: Vec<tonic::Code>,
+    retry_on: Arc<[tonic::Code]>,
+}
+
+impl GrpcRetryClassifier {
+    /// Create a classifier that retries the given gRPC status codes.
+    pub(crate) fn new(retry_on: Vec<tonic::Code>) -> Self {
+        Self {
+            retry_on: retry_on.into(),
+        }
+    }
+}
+
+impl Default for GrpcRetryClassifier {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl RetryClassifier for GrpcRetryClassifier {
@@ -245,24 +263,44 @@ fn make_backoff(config: &RetryBackoffConfig) -> backoff::ExponentialBackoff {
         .build()
 }
 
-/// Retry *decision* state — attempt cap, backoff, and body cloning — shared
-/// across transports. Transport-specific decisions live in the classifier `C`
-/// (see [`RetryClassifier`]).
+/// Immutable, shared retry configuration: the transport-agnostic knobs (attempt
+/// cap, backoff) plus the transport-specific classifier `C`. Built once when a
+/// `RouteConfiguration` is validated (see
+/// [`GrpcRetrySharedConfig::from_route_retry`]) and shared across matching
+/// requests via an [`Arc`].
 ///
-/// Wraps a [`RetryConfig`] behind an [`ArcSwap`] so that configuration can be
-/// atomically updated (e.g. from xDS) without blocking in-flight requests.
-///
-/// Implements [`tower::retry::Policy`]. Tower's `Retry` service clones the policy
-/// for each request, so `backoff` and `attempts` track per-request retry state
-/// while the shared config is read from `ArcSwap` on each retry decision. The
-/// retry *state machine* stays entirely in tower's `Retry`/`ResponseFuture`;
-/// this type only implements the `Policy` trait, so no state machine is
-/// reimplemented here.
-#[derive(Clone, Debug)]
-pub(crate) struct RetryPolicy<C> {
-    config: Arc<ArcSwap<RetryConfig>>,
+/// Kept separate from the per-request retry state ([`RetryPolicy`]) so that
+/// instantiating a policy is an `Arc` clone plus a zero-field init.
+#[derive(Debug)]
+pub(crate) struct RetrySharedConfig<C> {
+    /// Attempt cap and backoff schedule.
+    config: RetryConfig,
     /// Decides retryability and per-retry request mutation for the transport.
     classifier: C,
+}
+
+impl<C> RetrySharedConfig<C> {
+    /// Create a shared retry config from a [`RetryConfig`] and a classifier.
+    pub(crate) fn new(config: RetryConfig, classifier: C) -> Self {
+        Self { config, classifier }
+    }
+}
+
+impl<C: Default> Default for RetrySharedConfig<C> {
+    fn default() -> Self {
+        Self::new(RetryConfig::default(), C::default())
+    }
+}
+
+/// Per-request retry *state*: a pointer to the shared, immutable
+/// [`RetrySharedConfig`] plus the mutable state for one request (backoff cursor
+/// and attempt counter). Implements [`tower::retry::Policy`]; tower's `Retry`
+/// clones it per request, so the state is per-request while the config stays
+/// shared behind the `Arc`.
+#[derive(Clone, Debug)]
+pub(crate) struct RetryPolicy<C> {
+    /// Immutable config shared across all requests on this route.
+    shared: Arc<RetrySharedConfig<C>>,
     /// Backoff state for the current request, created from config on first retry.
     backoff: Option<backoff::ExponentialBackoff>,
     /// Number of retry attempts made so far for the current request.
@@ -270,28 +308,31 @@ pub(crate) struct RetryPolicy<C> {
 }
 
 impl<C> RetryPolicy<C> {
-    /// Create a new retry policy with the given configuration and classifier.
+    /// Create a policy from a config and classifier, allocating the shared `Arc`.
+    /// Prefer [`from_shared`](Self::from_shared) on the hot path.
     pub(crate) fn new(config: RetryConfig, classifier: C) -> Self {
+        Self::from_shared(Arc::new(RetrySharedConfig::new(config, classifier)))
+    }
+
+    /// Instantiate per-request state from a shared config: a pointer clone plus
+    /// a zero-field init.
+    pub(crate) fn from_shared(shared: Arc<RetrySharedConfig<C>>) -> Self {
         Self {
-            config: Arc::new(ArcSwap::from(Arc::new(config))),
-            classifier,
+            shared,
             backoff: None,
             attempts: 0,
         }
     }
 
-    /// Atomically swap the configuration with a new one.
-    pub(crate) fn update_config(&self, config: RetryConfig) {
-        self.config.store(Arc::new(config));
+    /// Consume the policy and return its shared config.
+    pub(crate) fn into_shared(self) -> Arc<RetrySharedConfig<C>> {
+        self.shared
     }
 
-    /// Load the current configuration.
-    pub(crate) fn load_config(&self) -> Arc<RetryConfig> {
-        self.config.load_full()
-    }
-
-    /// Get or create the backoff, and advance it to the next delay.
-    fn backoff_next(&mut self, backoff_config: &RetryBackoffConfig) -> Duration {
+    /// Get or lazily create the backoff and advance it to the next delay. Only
+    /// reached when a request is actually being retried.
+    fn backoff_next(&mut self) -> Duration {
+        let backoff_config = &self.shared.config.retry_backoff;
         let backoff = self
             .backoff
             .get_or_insert_with(|| make_backoff(backoff_config));
@@ -303,8 +344,55 @@ impl<C> RetryPolicy<C> {
 
 impl<C: Default> Default for RetryPolicy<C> {
     fn default() -> Self {
-        Self::new(RetryConfig::default(), C::default())
+        Self::from_shared(Arc::new(RetrySharedConfig::default()))
     }
+}
+
+impl RetrySharedConfig<GrpcRetryClassifier> {
+    /// Build a shared gRPC config from a route's [`RouteRetryConfig`], mapping
+    /// `retry_on` to [`tonic::Code`]s; unset Envoy fields use [`RetryConfig`]
+    /// defaults. Returns `None` when no condition maps to a gRPC code, so the
+    /// route falls back to the layer default instead of masking connection
+    /// retries (gRFC A44).
+    pub(crate) fn from_route_retry(retry: &RouteRetryConfig) -> Option<Self> {
+        let retry_on = grpc_retry_on_codes(&retry.retry_on);
+        if retry_on.is_empty() {
+            return None;
+        }
+        let mut config = RetryConfig::new();
+        if let Some(num_retries) = retry.num_retries {
+            config = config.num_retries(num_retries);
+        }
+        if let Some(base_interval) = retry.base_interval {
+            let mut backoff = RetryBackoffConfig::new(base_interval);
+            if let Some(max_interval) = retry.max_interval {
+                backoff = backoff.max_interval(max_interval);
+            }
+            config = config.retry_backoff(backoff);
+        }
+        Some(Self::new(config, GrpcRetryClassifier::new(retry_on)))
+    }
+}
+
+/// Map Envoy `retry_on` conditions (comma-separated) to gRPC [`tonic::Code`]s.
+///
+/// Only the gRPC-status conditions from gRFC A44 are recognized; non-gRPC tokens
+/// (e.g. `5xx`, `gateway-error`, `reset`, `connect-failure`) are ignored because
+/// connection-level retries are handled separately by
+/// [`is_retryable_connection_error`].
+pub(crate) fn grpc_retry_on_codes(retry_on: &str) -> Vec<tonic::Code> {
+    use tonic::Code;
+    retry_on
+        .split(',')
+        .filter_map(|token| match token.trim() {
+            "cancelled" => Some(Code::Cancelled),
+            "deadline-exceeded" => Some(Code::DeadlineExceeded),
+            "internal" => Some(Code::Internal),
+            "resource-exhausted" => Some(Code::ResourceExhausted),
+            "unavailable" => Some(Code::Unavailable),
+            _ => None,
+        })
+        .collect()
 }
 
 impl<C, Req, Res> Policy<Request<Req>, Response<Res>, tower::BoxError> for RetryPolicy<C>
@@ -319,22 +407,20 @@ where
         req: &mut Request<Req>,
         result: &mut Result<Response<Res>, tower::BoxError>,
     ) -> Option<Self::Future> {
-        let config = self.load_config();
-
-        if self.attempts >= config.num_retries {
+        if self.attempts >= self.shared.config.num_retries {
             return None;
         }
 
-        if !self.classifier.is_retryable(result) {
+        if !self.shared.classifier.is_retryable(result) {
             return None;
         }
 
-        let delay = self.backoff_next(&config.retry_backoff);
+        let delay = self.backoff_next();
         self.attempts += 1;
 
         // Let the classifier stamp any per-retry request state (e.g. gRPC's
         // grpc-previous-rpc-attempts header).
-        self.classifier.prepare_retry(req, self.attempts);
+        self.shared.classifier.prepare_retry(req, self.attempts);
 
         Some(tokio::time::sleep(delay))
     }
@@ -347,50 +433,55 @@ where
 /// Non-breaking alias: existing gRPC callers keep the same name and behavior.
 pub(crate) type GrpcRetryPolicy = RetryPolicy<GrpcRetryClassifier>;
 
-/// Tower [`Layer`] that wraps a service with retry support.
+/// Shared, immutable gRPC retry config (attempt cap, backoff, retryable
+/// [`tonic::Code`] set); the [`GrpcRetryClassifier`] specialization of
+/// [`RetrySharedConfig`].
+pub(crate) type GrpcRetrySharedConfig = RetrySharedConfig<GrpcRetryClassifier>;
+
+/// Tower [`Layer`] that wraps a gRPC service with retry support.
 ///
-/// Converts the request body into a [`SharedBody`] (cloneable) and constructs
-/// a fresh [`tower::retry::Retry`] service per request so that each request
-/// gets its own retry state.
-///
-/// This layer is generic over the retry policy — it is not tied to gRPC.
-/// The gRPC-specific behavior lives in the [`Policy`] implementation
-/// (e.g. [`GrpcRetryPolicy`]).
+/// Builds a fresh [`tower::retry::Retry`] per request, selecting the config from
+/// the matched route's [`RouteDecision`] (stamped by the routing layer just
+/// outside). Requests with no [`RouteDecision`] (non-xDS callers) or whose route
+/// carries no retry policy use `fallback`.
 #[derive(Clone)]
-pub(crate) struct RetryLayer<P> {
-    policy: P,
+pub(crate) struct RetryLayer {
+    /// Config used when a request carries no per-route retry config.
+    fallback: Arc<GrpcRetrySharedConfig>,
 }
 
-impl<P> RetryLayer<P> {
-    /// Create a new retry layer with the given policy.
-    pub(crate) fn new(policy: P) -> Self {
-        Self { policy }
+impl RetryLayer {
+    /// Create a layer with the given `fallback` config.
+    pub(crate) fn new(fallback: Arc<GrpcRetrySharedConfig>) -> Self {
+        Self { fallback }
     }
 }
 
-impl<P: Clone, S> Layer<S> for RetryLayer<P> {
-    type Service = RetryService<P, S>;
+impl<S> Layer<S> for RetryLayer {
+    type Service = RetryService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
         RetryService {
             inner: service,
-            policy: self.policy.clone(),
+            fallback: Arc::clone(&self.fallback),
         }
     }
 }
 
 /// Service that converts request bodies to [`SharedBody`] and retries via
-/// [`tower::retry::Retry`] with the given policy.
+/// [`tower::retry::Retry`], selecting the per-request config from the matched
+/// route's [`RouteDecision`] (see [`RetryLayer`]).
 #[derive(Clone)]
-pub(crate) struct RetryService<P, S> {
+pub(crate) struct RetryService<S> {
     inner: S,
-    policy: P,
+    /// Config used when a request carries no per-route retry config.
+    fallback: Arc<GrpcRetrySharedConfig>,
 }
 
-impl<P, S, B, Res> Service<Request<B>> for RetryService<P, S>
+impl<S, B, Res> Service<Request<B>> for RetryService<S>
 where
-    P: Policy<Request<SharedBody<B>>, Response<Res>, S::Error> + Clone + Send + 'static,
-    P::Future: Send,
+    GrpcRetryPolicy: Policy<Request<SharedBody<B>>, Response<Res>, S::Error>,
+    <GrpcRetryPolicy as Policy<Request<SharedBody<B>>, Response<Res>, S::Error>>::Future: Send,
     S: Service<Request<SharedBody<B>>, Response = Response<Res>> + Clone + Send + 'static,
     S::Error: Debug + Send + 'static,
     S::Response: Send + 'static,
@@ -411,7 +502,14 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let mut retry_svc = Retry::new(self.policy.clone(), self.inner.clone());
+        // Config the routing layer stamped for this request's route, or the fallback.
+        let shared = request
+            .extensions()
+            .get::<RouteDecision>()
+            .and_then(|decision| decision.retry_config.clone())
+            .unwrap_or_else(|| Arc::clone(&self.fallback));
+        let policy = RetryPolicy::from_shared(shared);
+        let mut retry_svc = Retry::new(policy, self.inner.clone());
         let shared_request = request.map(|b| b.into_shared());
         Box::pin(retry_svc.call(shared_request))
     }
@@ -527,9 +625,7 @@ mod tests {
 
     #[test]
     fn test_is_retryable_grpc_status_via_result() {
-        let classifier = GrpcRetryClassifier {
-            retry_on: vec![tonic::Code::Unavailable],
-        };
+        let classifier = GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]);
         let response = http::Response::builder()
             .header("grpc-status", "14") // UNAVAILABLE
             .body(())
@@ -540,9 +636,7 @@ mod tests {
 
     #[test]
     fn test_is_not_retryable_ok_response() {
-        let classifier = GrpcRetryClassifier {
-            retry_on: vec![tonic::Code::Unavailable],
-        };
+        let classifier = GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]);
         let response = http::Response::builder()
             .header("grpc-status", "0") // OK
             .body(())
@@ -553,9 +647,7 @@ mod tests {
 
     #[test]
     fn test_is_not_retryable_no_grpc_status_header() {
-        let classifier = GrpcRetryClassifier {
-            retry_on: vec![tonic::Code::Unavailable],
-        };
+        let classifier = GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]);
         let response = http::Response::builder().body(()).unwrap();
         let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
         assert!(!classifier.is_retryable(&result));
@@ -635,12 +727,11 @@ mod tests {
 
     #[test]
     fn test_grpc_classifier_retry_on() {
-        let classifier = GrpcRetryClassifier {
-            retry_on: vec![tonic::Code::Unavailable, tonic::Code::Cancelled],
-        };
+        let classifier =
+            GrpcRetryClassifier::new(vec![tonic::Code::Unavailable, tonic::Code::Cancelled]);
         assert_eq!(
-            classifier.retry_on,
-            vec![tonic::Code::Unavailable, tonic::Code::Cancelled]
+            classifier.retry_on.as_ref(),
+            [tonic::Code::Unavailable, tonic::Code::Cancelled]
         );
     }
 
@@ -653,29 +744,84 @@ mod tests {
         assert_eq!(config.retry_backoff, backoff);
     }
 
-    // --- RetryPolicy (ArcSwap wrapper) tests ---
+    // --- from_route_retry tests ---
 
     #[test]
-    fn test_policy_load_config() {
-        let policy = GrpcRetryPolicy::new(
-            RetryConfig::new().num_retries(1),
-            GrpcRetryClassifier {
-                retry_on: vec![tonic::Code::Unavailable],
-            },
+    fn test_from_route_retry_maps_fields() {
+        let retry = RouteRetryConfig {
+            retry_on: "unavailable".into(),
+            num_retries: Some(3),
+            base_interval: Some(Duration::from_millis(100)),
+            max_interval: Some(Duration::from_millis(1000)),
+        };
+        let shared = GrpcRetrySharedConfig::from_route_retry(&retry).expect("codes present");
+        assert_eq!(shared.config.num_retries, 3);
+        assert_eq!(
+            shared.config.retry_backoff.base_interval,
+            Duration::from_millis(100)
         );
-        let loaded = policy.load_config();
-        assert_eq!(loaded.num_retries, 1);
+        assert_eq!(
+            shared.config.retry_backoff.max_interval,
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            shared.classifier.retry_on.as_ref(),
+            [tonic::Code::Unavailable]
+        );
     }
 
     #[test]
-    fn test_policy_update_config() {
-        let policy = GrpcRetryPolicy::default();
-        assert_eq!(policy.load_config().num_retries, 1);
+    fn test_from_route_retry_unset_fields_use_defaults() {
+        let retry = RouteRetryConfig {
+            retry_on: "cancelled".into(),
+            num_retries: None,
+            base_interval: None,
+            max_interval: None,
+        };
+        let shared = GrpcRetrySharedConfig::from_route_retry(&retry).expect("codes present");
+        assert_eq!(shared.config.num_retries, 1);
+        assert_eq!(shared.config.retry_backoff, RetryBackoffConfig::default());
+        assert_eq!(
+            shared.classifier.retry_on.as_ref(),
+            [tonic::Code::Cancelled]
+        );
+    }
 
-        policy.update_config(RetryConfig::new().num_retries(3));
+    #[test]
+    fn test_from_route_retry_empty_codes_yields_none() {
+        // `retry_on` with only non-gRPC tokens maps to no gRPC codes, so no
+        // policy is produced and connection retries are not masked (gRFC A44).
+        let retry = RouteRetryConfig {
+            retry_on: "5xx,reset".into(),
+            num_retries: Some(3),
+            base_interval: None,
+            max_interval: None,
+        };
+        assert!(GrpcRetrySharedConfig::from_route_retry(&retry).is_none());
+    }
 
-        let loaded = policy.load_config();
-        assert_eq!(loaded.num_retries, 3);
+    // --- from_shared tests ---
+
+    #[test]
+    fn from_shared_instantiates_zeroed_state_sharing_config() {
+        let shared = Arc::new(
+            GrpcRetrySharedConfig::from_route_retry(&RouteRetryConfig {
+                retry_on: "unavailable".into(),
+                num_retries: Some(2),
+                base_interval: None,
+                max_interval: None,
+            })
+            .expect("codes present"),
+        );
+        let policy = RetryPolicy::from_shared(Arc::clone(&shared));
+
+        assert_eq!(policy.attempts, 0);
+        assert!(policy.backoff.is_none());
+        assert!(Arc::ptr_eq(&policy.shared, &shared));
+        assert_eq!(policy.shared.config.num_retries, 2);
+
+        let policy2 = RetryPolicy::from_shared(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(&policy.shared, &policy2.shared));
     }
 
     /// Verify that two concurrent requests using the same policy get independent
@@ -685,9 +831,7 @@ mod tests {
     async fn test_retry_state_is_per_request() {
         let policy = GrpcRetryPolicy::new(
             RetryConfig::new().num_retries(2),
-            GrpcRetryClassifier {
-                retry_on: vec![tonic::Code::Unavailable],
-            },
+            GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]),
         );
 
         // Simulate two independent request sessions by cloning the policy

@@ -731,6 +731,7 @@ mod tests {
         request.extensions_mut().insert(RouteDecision {
             cluster: CLUSTER.to_string(),
             request_hash: None,
+            retry_config: None,
         });
         request
     }
@@ -984,9 +985,7 @@ mod tests {
                 RetryBackoffConfig::new(Duration::from_millis(1))
                     .max_interval(Duration::from_millis(1)),
             ),
-            GrpcRetryClassifier {
-                retry_on: vec![Code::Unavailable],
-            },
+            GrpcRetryClassifier::new(vec![Code::Unavailable]),
         );
         let calls = Arc::new(AtomicU32::new(0));
         let call_counter = calls.clone();
@@ -998,7 +997,7 @@ mod tests {
             },
         );
         let mut service = tower::ServiceBuilder::new()
-            .layer(RetryLayer::new(policy))
+            .layer(RetryLayer::new(policy.into_shared()))
             .layer(CircuitBreakingLayer::new(breakers.clone()))
             .service(service);
 

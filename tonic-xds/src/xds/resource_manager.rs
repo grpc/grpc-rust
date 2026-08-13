@@ -341,6 +341,7 @@ mod tests {
                             match_fraction: None,
                         },
                         action: RouteConfigAction::Cluster((*c).into()),
+                        retry_config: None,
                     })
                     .collect(),
             }],
@@ -366,6 +367,7 @@ mod tests {
                                 match_fraction: None,
                             },
                             action: RouteConfigAction::Cluster((*c).into()),
+                            retry_config: None,
                         })
                         .collect(),
                 }],

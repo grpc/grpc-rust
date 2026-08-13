@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use bytes::Buf;
 use bytes::Bytes;
+use h2::Reason;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -69,20 +70,21 @@ use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::CompositeChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
-use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
+use crate::credentials::client::ValidateAuthority;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
@@ -167,9 +169,14 @@ pub(crate) async fn tonic_transport_rpc() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, mut disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -694,9 +701,14 @@ async fn tonic_transport_invalid_base64_headers() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -770,9 +782,14 @@ async fn tonic_transport_recv_drop_cancels_send() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -806,8 +823,8 @@ async fn tonic_transport_recv_drop_cancels_send() {
 }
 
 #[derive(Debug, Clone)]
-struct MockConnectionSecurityContext;
-impl ChannelSecurityContext for MockConnectionSecurityContext {
+struct MockConnectionAuthorityValidator;
+impl ValidateAuthority for MockConnectionAuthorityValidator {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -837,12 +854,8 @@ impl ChannelCredentials for SlowChannelCredentials {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ChannelSecurityInfo::new(
-                "mock",
-                SecurityLevel::NoSecurity,
-                Box::new(MockConnectionSecurityContext),
-                Attributes::new(),
-            ),
+            security_info: SecurityInfo::new("mock"),
+            authority_validator: Box::new(MockConnectionAuthorityValidator),
         })
     }
 
@@ -1045,4 +1058,79 @@ impl Echo for EchoService {
         }
         Ok(response)
     }
+}
+
+#[tokio::test]
+async fn tonic_transport_recv_drop_sends_rst_stream() {
+    super::reg();
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+
+        let result = connection.accept().await.unwrap();
+        let (request, _respond) = result.unwrap();
+        let mut body = request.into_body();
+
+        match body.data().await {
+            Some(Ok(_)) => {
+                panic!("Expected error or EOF, got data");
+            }
+            Some(Err(err)) => {
+                println!("Got expected error: {:?}", err);
+                assert_eq!(err.reason(), Some(Reason::CANCEL));
+            }
+            None => {
+                panic!("Expected RST_STREAM, got clean close (EOS)");
+            }
+        };
+    });
+
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let config = Arc::new(TransportOptions::default());
+    let securty_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+
+    let (conn, _sec_info, _disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &securty_opts,
+            &config,
+        )
+        .await
+        .unwrap();
+
+    let (mut tx, rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new()
+                .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
+            CallOptions::default(),
+        )
+        .await;
+
+    // Drop the receiver to trigger cancellation.
+    drop(rx);
+
+    // Wait for the server to verify the reset.
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("Test timed out waiting for server to verify reset")
+        .unwrap();
+
+    // Verify the send stream has ended.
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err())
 }

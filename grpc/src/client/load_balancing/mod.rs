@@ -35,8 +35,8 @@ use crate::client::ConnectivityState;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 

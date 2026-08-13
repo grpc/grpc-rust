@@ -269,6 +269,21 @@ impl Runtime for FakeRuntime {
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
         self.inner.tcp_stream(target, opts)
     }
+
+    fn tcp_listener(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn rt::EndpointListener>, String>> + Send>> {
+        self.inner.tcp_listener(addr)
+    }
+
+    fn unix_listener(
+        &self,
+        path: std::path::PathBuf,
+        opts: rt::UnixSocketOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn rt::EndpointListener>, String>> + Send>> {
+        self.inner.unix_listener(path, opts)
+    }
 }
 
 #[tokio::test]

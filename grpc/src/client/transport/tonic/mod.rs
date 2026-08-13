@@ -28,25 +28,23 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
 use bytes::Buf;
 use bytes::BufMut as _;
 use bytes::Bytes;
-use futures::stream::StreamExt;
 use http::Request as HttpRequest;
 use http::Response as HttpResponse;
 use http::Uri;
 use http::uri::PathAndQuery;
 use hyper::client::conn::http2::Builder;
 use hyper::client::conn::http2::SendRequest;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::CancellationHandle;
 use tonic::Code;
 use tonic::Request as TonicRequest;
 use tonic::Status as TonicStatus;
@@ -84,9 +82,10 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
-use crate::credentials::client::ChannelSecurityInfo;
+use crate::credentials::SecurityInfo;
 use crate::private;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
@@ -100,10 +99,11 @@ use crate::rt::hyper_wrapper::HyperStream;
 mod test;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
-pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
 
+type BoxError = Box<dyn Error + Send + Sync>;
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, TonicStatus>> + Send>>;
+type BoxBuf = Box<dyn Buf + Send + Sync>;
 
 pub(crate) fn reg() {
     GLOBAL_TRANSPORT_REGISTRY.add_transport(
@@ -152,18 +152,12 @@ impl Invoke for TonicTransport {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::channel(1);
-        let stop_notify = Arc::new(Notify::new());
-
-        // Tonic runs the outbound request stream in a background task. It will
-        // NOT automatically stop sending if the inbound response stream is
-        // dropped. We use `take_until` with this Notify to explicitly force the
-        // stream to yield `None`, which tells Tonic to cancel the stream.
-        let stop_notify_clone = stop_notify.clone();
-        let request_stream =
-            ReceiverStream::new(req_rx).take_until(stop_notify_clone.notified_owned());
+        let request_stream = ReceiverStream::new(req_rx);
         let mut request = TonicRequest::new(Box::pin(request_stream));
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
+
+        let cancel_tx = request.cancellation_handle();
 
         let Ok(path) = PathAndQuery::from_maybe_shared(method) else {
             return err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));
@@ -193,7 +187,7 @@ impl Invoke for TonicTransport {
             TonicSendStream { sender: Ok(req_tx) },
             TonicRecvStream {
                 state: StreamState::AwaitingHeaders(resp_rx),
-                stop_notify: Some(stop_notify),
+                cancel_tx: Some(cancel_tx),
             },
         )
     }
@@ -230,7 +224,7 @@ fn trailers_from_status(status: crate::Result<()>, md: &TonicMeta) -> ResponseSt
 }
 
 struct TonicSendStream {
-    sender: Result<mpsc::Sender<Box<dyn Buf + Send + Sync>>, ()>,
+    sender: Result<mpsc::Sender<BoxBuf>, ()>,
 }
 
 impl SendStream for TonicSendStream {
@@ -250,7 +244,7 @@ impl SendStream for TonicSendStream {
 
 struct TonicRecvStream {
     state: StreamState,
-    stop_notify: Option<Arc<Notify>>,
+    cancel_tx: Option<CancellationHandle>,
 }
 
 enum StreamState {
@@ -287,8 +281,8 @@ impl RecvStream for TonicRecvStream {
                             ResponseStreamItem::Headers(ResponseHeaders::new().with_metadata(md))
                         }
                         Err(e) => {
-                            if let Some(notify) = self.stop_notify.take() {
-                                notify.notify_one();
+                            if let Some(cancel_tx) = self.cancel_tx.take() {
+                                cancel_tx.cancel();
                             }
                             trailers_from_status(
                                 Err(StatusError::new(
@@ -321,8 +315,8 @@ impl RecvStream for TonicRecvStream {
                         ResponseStreamItem::Message
                     }
                     Err(e) => {
-                        if let Some(notify) = self.stop_notify.take() {
-                            notify.notify_one();
+                        if let Some(cancel_tx) = self.cancel_tx.take() {
+                            cancel_tx.cancel();
                         }
                         trailers_from_status(
                             Err(StatusError::new(
@@ -351,8 +345,8 @@ impl RecvStream for TonicRecvStream {
 
 impl Drop for TonicRecvStream {
     fn drop(&mut self) {
-        if let Some(notify) = &self.stop_notify {
-            notify.notify_one();
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            cancel_tx.cancel();
         }
     }
 }
@@ -362,7 +356,7 @@ fn err_streams(status: StatusError) -> (TonicSendStream, TonicRecvStream) {
         TonicSendStream { sender: Err(()) },
         TonicRecvStream {
             state: StreamState::Error(status),
-            stop_notify: None,
+            cancel_tx: None,
         },
     )
 }
@@ -372,14 +366,14 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Self::Service,
-            ChannelSecurityInfo,
+            SecurityInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -412,7 +406,7 @@ impl Transport for TransportBuilder {
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
                 let addr: SocketAddr =
-                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(&address.address).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -421,9 +415,10 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => {
-                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
-            }
+            NetworkType::Unix => runtime.unix_stream(
+                PathBuf::from(&*address.address),
+                UnixSocketOptions::default(),
+            ),
         };
         let transport = transport_fut.await?;
         let credentials = &security_info.credentials;
@@ -464,7 +459,7 @@ impl Transport for TransportBuilder {
         let (service, worker) = Buffer::pair(service, DEFAULT_BUFFER_SIZE);
         runtime.spawn(Box::pin(worker));
         let authority = &security_info.authority.host_port_string();
-        let uri = Uri::from_maybe_shared(format!("http://{}", &authority))
+        let uri = Uri::from_maybe_shared(format!("http://{}", authority))
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
 
@@ -473,7 +468,7 @@ impl Transport for TransportBuilder {
             task_handle,
             runtime,
         };
-        Ok((service, handshake_ouput.security, rx))
+        Ok((service, handshake_ouput.security_info, rx))
     }
 }
 
@@ -541,7 +536,7 @@ impl Future for ResponseFuture {
 pub(crate) struct BufCodec {}
 
 impl Codec for BufCodec {
-    type Encode = Box<dyn Buf + Send + Sync>;
+    type Encode = BoxBuf;
     type Decode = Bytes;
     type Encoder = BufEncoder;
     type Decoder = BytesDecoder;
@@ -555,22 +550,10 @@ impl Codec for BufCodec {
     }
 }
 
-pub struct BytesEncoder {}
-
-impl Encoder for BytesEncoder {
-    type Item = Bytes;
-    type Error = TonicStatus;
-
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        dst.put_slice(&item);
-        Ok(())
-    }
-}
-
 pub struct BufEncoder {}
 
 impl Encoder for BufEncoder {
-    type Item = Box<dyn Buf + Send + Sync>;
+    type Item = BoxBuf;
     type Error = TonicStatus;
 
     fn encode(&mut self, mut item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {

@@ -208,6 +208,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("cluster-1".to_string()),
+                    retry_config: None,
                 }],
             }],
             metadata: Default::default(),

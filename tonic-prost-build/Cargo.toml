@@ -16,6 +16,7 @@ rust-version = { workspace = true }
 default = ["transport", "cleanup-markdown"]
 transport = ["tonic-build/transport"]
 cleanup-markdown = ["prost-build/cleanup-markdown"]
+local = ["tonic-build/local"]
 
 [dependencies]
 tonic-build = { version = "0.14.6", path = "../tonic-build", default-features = false }

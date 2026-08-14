@@ -31,6 +31,7 @@ use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
 use std::{
     fmt, future,
+    marker::PhantomData,
     pin::Pin,
     task::ready,
     task::{Context, Poll},
@@ -39,30 +40,32 @@ use sync_wrapper::SyncWrapper;
 use tokio_stream::Stream;
 use tracing::{debug, trace};
 
+// The `Send` decoder storage backing `Streaming<T>`'s `DecoderStore` impl.
+type SendDecoder<T> = SyncWrapper<Box<dyn Decoder<Item = T, Error = Status> + Send + 'static>>;
+
 /// Streaming requests and responses.
 ///
 /// This will wrap some inner [`Body`] and [`Decoder`] and provide an interface
 /// to fetch the message stream and trailing metadata
 pub struct Streaming<T> {
-    decoder: SyncWrapper<Box<dyn Decoder<Item = T, Error = Status> + Send + 'static>>,
-    inner: StreamingInner,
+    inner: StreamingImpl<T, SendDecoder<T>, Body>,
 }
 
-struct StreamingInner {
-    body: SyncWrapper<Body>,
-    state: State,
-    direction: Direction,
-    buf: BytesMut,
-    trailers: Option<HeaderMap>,
-    decompress_buf: BytesMut,
-    encoding: Option<CompressionEncoding>,
-    max_message_size: Option<usize>,
+pub(crate) struct StreamingInner<B> {
+    pub(crate) body: SyncWrapper<B>,
+    pub(crate) state: State,
+    pub(crate) direction: Direction,
+    pub(crate) buf: BytesMut,
+    pub(crate) trailers: Option<HeaderMap>,
+    pub(crate) decompress_buf: BytesMut,
+    pub(crate) encoding: Option<CompressionEncoding>,
+    pub(crate) max_message_size: Option<usize>,
 }
 
 impl<T> Unpin for Streaming<T> {}
 
 #[derive(Debug, Clone)]
-enum State {
+pub(crate) enum State {
     ReadHeader,
     ReadBody {
         compression: Option<CompressionEncoding>,
@@ -72,7 +75,7 @@ enum State {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Direction {
+pub(crate) enum Direction {
     Request,
     Response(StatusCode),
     EmptyResponse,
@@ -147,29 +150,29 @@ impl<T> Streaming<T> {
         D: Decoder<Item = T, Error = Status> + Send + 'static,
     {
         let buffer_size = decoder.buffer_settings().buffer_size;
+        let body = Body::new(
+            body.map_frame(|frame| frame.map_data(|mut buf| buf.copy_to_bytes(buf.remaining())))
+                .map_err(|err| Status::map_error(err.into())),
+        );
         Self {
-            decoder: SyncWrapper::new(Box::new(decoder)),
-            inner: StreamingInner {
-                body: SyncWrapper::new(Body::new(
-                    body.map_frame(|frame| {
-                        frame.map_data(|mut buf| buf.copy_to_bytes(buf.remaining()))
-                    })
-                    .map_err(|err| Status::map_error(err.into())),
-                )),
-                state: State::ReadHeader,
+            inner: StreamingImpl::new(
+                SyncWrapper::new(Box::new(decoder)),
+                body,
                 direction,
-                buf: BytesMut::with_capacity(buffer_size),
-                trailers: None,
-                decompress_buf: BytesMut::new(),
                 encoding,
                 max_message_size,
-            },
+                buffer_size,
+            ),
         }
     }
 }
 
-impl StreamingInner {
-    fn decode_chunk(
+impl<B> StreamingInner<B>
+where
+    B: HttpBody<Error = Status> + Unpin,
+    B::Data: Buf,
+{
+    pub(crate) fn decode_chunk(
         &mut self,
         buffer_settings: BufferSettings,
     ) -> Result<Option<DecodeBuf<'_>>, Status> {
@@ -278,7 +281,7 @@ impl StreamingInner {
     }
 
     // Returns Some(()) if data was found or None if the loop in `poll_next` should break
-    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<()>, Status>> {
+    pub(crate) fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<()>, Status>> {
         let frame = match ready!(Pin::new(self.body.get_mut()).poll_frame(cx)) {
             Some(Ok(frame)) => frame,
             Some(Err(status)) => {
@@ -301,23 +304,35 @@ impl StreamingInner {
             }
         };
 
+        // NB: avoid `Frame::into_data`/`into_trailers` `.unwrap()` and `{frame:?}` below —
+        // both require `Frame<B::Data>: Debug`, i.e. `B::Data: Debug`, which is not one of
+        // this impl's bounds.
         Poll::Ready(if frame.is_data() {
-            self.buf.put(frame.into_data().unwrap());
-            Ok(Some(()))
-        } else if frame.is_trailers() {
-            if let Some(trailers) = &mut self.trailers {
-                trailers.extend(frame.into_trailers().unwrap());
-            } else {
-                self.trailers = Some(frame.into_trailers().unwrap());
+            match frame.into_data() {
+                Ok(data) => {
+                    self.buf.put(data);
+                    Ok(Some(()))
+                }
+                Err(_) => unreachable!("frame checked is_data()"),
             }
-
-            Ok(None)
+        } else if frame.is_trailers() {
+            match frame.into_trailers() {
+                Ok(new_trailers) => {
+                    if let Some(trailers) = &mut self.trailers {
+                        trailers.extend(new_trailers);
+                    } else {
+                        self.trailers = Some(new_trailers);
+                    }
+                    Ok(None)
+                }
+                Err(_) => unreachable!("frame checked is_trailers()"),
+            }
         } else {
-            panic!("unexpected frame: {frame:?}");
+            panic!("unexpected frame: neither data nor trailers");
         })
     }
 
-    fn response(&mut self) -> Result<(), Status> {
+    pub(crate) fn response(&mut self) -> Result<(), Status> {
         if let Direction::Response(status) = self.direction {
             if let Err(Some(e)) = crate::status::infer_grpc_status(self.trailers.as_ref(), status) {
                 // If the trailers contain a grpc-status, then we should return that as the error
@@ -327,6 +342,142 @@ impl StreamingInner {
             }
         }
         Ok(())
+    }
+}
+
+/// Storage for a boxed [`Decoder`], abstracting over whether the box requires
+/// `Send` (core `Streaming`, stored behind a [`SyncWrapper`]) or not
+/// (`local::codec::Streaming`, stored directly).
+pub(crate) trait DecoderStore<T> {
+    fn buffer_settings(&mut self) -> BufferSettings;
+    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<T>, Status>;
+}
+
+impl<T> DecoderStore<T> for SendDecoder<T> {
+    fn buffer_settings(&mut self) -> BufferSettings {
+        self.get_mut().buffer_settings()
+    }
+
+    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<T>, Status> {
+        self.get_mut().decode(buf)
+    }
+}
+
+impl<T> DecoderStore<T> for Box<dyn Decoder<Item = T, Error = Status> + 'static> {
+    fn buffer_settings(&mut self) -> BufferSettings {
+        // Fully-qualified to reach the boxed `Decoder`'s method directly, rather than
+        // re-matching this very impl (same `Self` type) and recursing.
+        Decoder::buffer_settings(&**self)
+    }
+
+    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<T>, Status> {
+        Decoder::decode(&mut **self, buf)
+    }
+}
+
+/// Shared streaming shell behind [`Streaming`] and `local::codec::Streaming`: owns the
+/// decoder storage `DS` and the body/framing state (`StreamingInner<B>`), generic over
+/// how the decoder is boxed (`DS`) and how the body is boxed (`B`).
+pub(crate) struct StreamingImpl<T, DS, B> {
+    decoder: DS,
+    inner: StreamingInner<B>,
+    _decoded_item: PhantomData<T>,
+}
+
+impl<T, DS, B> StreamingImpl<T, DS, B>
+where
+    DS: DecoderStore<T>,
+    B: HttpBody<Error = Status> + Unpin,
+    B::Data: Buf,
+{
+    /// `body` arrives already wrapped in the caller's boxed body type; each public
+    /// constructor on `Streaming`/`local::codec::Streaming` does its own
+    /// `map_frame`/`map_err` + boxing before calling this.
+    pub(crate) fn new(
+        decoder: DS,
+        body: B,
+        direction: Direction,
+        encoding: Option<CompressionEncoding>,
+        max_message_size: Option<usize>,
+        buffer_size: usize,
+    ) -> Self {
+        Self {
+            decoder,
+            inner: StreamingInner {
+                body: SyncWrapper::new(body),
+                state: State::ReadHeader,
+                direction,
+                buf: BytesMut::with_capacity(buffer_size),
+                trailers: None,
+                decompress_buf: BytesMut::new(),
+                encoding,
+                max_message_size,
+            },
+            _decoded_item: PhantomData,
+        }
+    }
+
+    pub(crate) async fn message(&mut self) -> Result<Option<T>, Status> {
+        match future::poll_fn(|cx| self.poll_next(cx)).await {
+            Some(Ok(m)) => Ok(Some(m)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn trailers(&mut self) -> Result<Option<MetadataMap>, Status> {
+        // Shortcut to see if we already pulled the trailers in the stream step
+        // we need to do that so that the stream can error on trailing grpc-status
+        if let Some(trailers) = self.inner.trailers.take() {
+            return Ok(Some(MetadataMap::from_headers(trailers)));
+        }
+
+        // To fetch the trailers we must clear the body and drop it.
+        while self.message().await?.is_some() {}
+
+        // Since we call poll_trailers internally on poll_next we need to
+        // check if it got cached again.
+        if let Some(trailers) = self.inner.trailers.take() {
+            return Ok(Some(MetadataMap::from_headers(trailers)));
+        }
+
+        // We've polled through all the frames, and still no trailers, return None
+        Ok(None)
+    }
+
+    fn decode_chunk(&mut self) -> Result<Option<T>, Status> {
+        match self.inner.decode_chunk(self.decoder.buffer_settings())? {
+            Some(mut decode_buf) => match self.decoder.decode(&mut decode_buf)? {
+                Some(msg) => {
+                    self.inner.state = State::ReadHeader;
+                    Ok(Some(msg))
+                }
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Status>>> {
+        loop {
+            // When the stream encounters an error yield that error once and then on subsequent
+            // calls to poll_next return Poll::Ready(None) indicating that the stream has been
+            // fully exhausted.
+            if let State::Error(status) = &mut self.inner.state {
+                return Poll::Ready(status.take().map(Err));
+            }
+
+            if let Some(item) = self.decode_chunk()? {
+                return Poll::Ready(Some(Ok(item)));
+            }
+
+            if ready!(self.inner.poll_frame(cx))?.is_none() {
+                match self.inner.response() {
+                    Ok(()) => return Poll::Ready(None),
+                    Err(err) => self.inner.state = State::Error(Some(err)),
+                }
+            }
+        }
     }
 }
 
@@ -360,11 +511,7 @@ impl<T> Streaming<T> {
     /// # }
     /// ```
     pub async fn message(&mut self) -> Result<Option<T>, Status> {
-        match future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await {
-            Some(Ok(m)) => Ok(Some(m)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
-        }
+        self.inner.message().await
     }
 
     /// Fetch the trailing metadata.
@@ -383,39 +530,7 @@ impl<T> Streaming<T> {
     /// # }
     /// ```
     pub async fn trailers(&mut self) -> Result<Option<MetadataMap>, Status> {
-        // Shortcut to see if we already pulled the trailers in the stream step
-        // we need to do that so that the stream can error on trailing grpc-status
-        if let Some(trailers) = self.inner.trailers.take() {
-            return Ok(Some(MetadataMap::from_headers(trailers)));
-        }
-
-        // To fetch the trailers we must clear the body and drop it.
-        while self.message().await?.is_some() {}
-
-        // Since we call poll_trailers internally on poll_next we need to
-        // check if it got cached again.
-        if let Some(trailers) = self.inner.trailers.take() {
-            return Ok(Some(MetadataMap::from_headers(trailers)));
-        }
-
-        // We've polled through all the frames, and still no trailers, return None
-        Ok(None)
-    }
-
-    fn decode_chunk(&mut self) -> Result<Option<T>, Status> {
-        match self
-            .inner
-            .decode_chunk(self.decoder.get_mut().buffer_settings())?
-        {
-            Some(mut decode_buf) => match self.decoder.get_mut().decode(&mut decode_buf)? {
-                Some(msg) => {
-                    self.inner.state = State::ReadHeader;
-                    Ok(Some(msg))
-                }
-                None => Ok(None),
-            },
-            None => Ok(None),
-        }
+        self.inner.trailers().await
     }
 }
 
@@ -423,25 +538,7 @@ impl<T> Stream for Streaming<T> {
     type Item = Result<T, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            // When the stream encounters an error yield that error once and then on subsequent
-            // calls to poll_next return Poll::Ready(None) indicating that the stream has been
-            // fully exhausted.
-            if let State::Error(status) = &mut self.inner.state {
-                return Poll::Ready(status.take().map(Err));
-            }
-
-            if let Some(item) = self.decode_chunk()? {
-                return Poll::Ready(Some(Ok(item)));
-            }
-
-            if ready!(self.inner.poll_frame(cx))?.is_none() {
-                match self.inner.response() {
-                    Ok(()) => return Poll::Ready(None),
-                    Err(err) => self.inner.state = State::Error(Some(err)),
-                }
-            }
-        }
+        self.inner.poll_next(cx)
     }
 }
 
@@ -453,3 +550,58 @@ impl<T> fmt::Debug for Streaming<T> {
 
 #[cfg(test)]
 static_assertions::assert_impl_all!(Streaming<()>: Send, Sync);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body::Frame;
+    use std::collections::VecDeque;
+
+    struct FrameBody {
+        frames: VecDeque<bytes::Bytes>,
+    }
+
+    impl HttpBody for FrameBody {
+        type Data = bytes::Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.frames.pop_front().map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    struct VecDecoder;
+
+    impl Decoder for VecDecoder {
+        type Item = Vec<u8>;
+        type Error = Status;
+
+        fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+            let len = buf.remaining();
+            Ok(Some(buf.copy_to_bytes(len).to_vec()))
+        }
+    }
+
+    fn framed(payload: &[u8]) -> bytes::Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0);
+        buf.put_u32(payload.len() as u32);
+        buf.put_slice(payload);
+        buf.freeze()
+    }
+
+    #[tokio::test]
+    async fn decodes_crafted_frames() {
+        let body = FrameBody {
+            frames: VecDeque::from([framed(b"hello"), framed(b"world!")]),
+        };
+        let mut stream = Streaming::new_request(VecDecoder, body, None, None);
+
+        assert_eq!(stream.message().await.unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(stream.message().await.unwrap(), Some(b"world!".to_vec()));
+        assert_eq!(stream.message().await.unwrap(), None);
+    }
+}

@@ -36,6 +36,8 @@ use std::io;
 pub use self::buffer::{DecodeBuf, EncodeBuf};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
 pub use self::decode::Streaming;
+#[cfg(feature = "local")]
+pub(crate) use self::decode::{Direction, StreamingImpl};
 pub use self::encode::EncodeBody;
 
 // Doc hidden since this is used in a test in another crate, we can expose this publically later
@@ -89,7 +91,7 @@ const DEFAULT_YIELD_THRESHOLD: usize = 32 * 1024;
 /// Yield threshold defaults to 32 KiB.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferSettings {
-    buffer_size: usize,
+    pub(crate) buffer_size: usize,
     yield_threshold: usize,
 }
 

@@ -44,4 +44,8 @@ mod grpc;
 mod service;
 
 pub use self::grpc::Grpc;
+#[cfg(feature = "local")]
+pub(crate) use self::grpc::GrpcConfig;
+#[cfg(feature = "local")]
+pub(crate) use self::grpc::classify_response;
 pub use self::service::GrpcService;

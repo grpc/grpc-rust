@@ -133,6 +133,9 @@ pub mod service;
 #[cfg(any(feature = "server", feature = "channel"))]
 pub mod transport;
 
+#[cfg(feature = "local")]
+pub mod local;
+
 mod extensions;
 mod macros;
 mod request;

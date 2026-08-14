@@ -23,6 +23,11 @@ syn = "2.0"
 [features]
 default = ["transport"]
 transport = []
+local = []
+
+[[test]]
+name = "local_codegen"
+required-features = ["local"]
 
 [lints]
 workspace = true

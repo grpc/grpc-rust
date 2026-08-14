@@ -22,32 +22,29 @@
  *
  */
 
-//! Codegen exports used by `tonic-build`.
+//! Single-threaded transport: a hyper executor that spawns onto the current
+//! `tokio::task::LocalSet` (or `LocalRuntime`), plus the server and channel
+//! built on top of it.
+//!
+//! Calling into this module requires a tokio local context: a
+//! `tokio::task::LocalSet` (any tokio 1.x) or a `tokio::runtime::LocalRuntime`
+//! (tokio >= 1.51). `tokio::task::spawn_local` panics outside of one.
 
-pub use async_trait::async_trait;
-pub use tokio_stream;
+use std::future::Future;
 
-pub use std::future::Future;
-pub use std::pin::Pin;
-pub use std::sync::Arc;
-pub use std::task::{Context, Poll};
-pub use tower_service::Service;
-pub type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
-pub use crate::codec::{CompressionEncoding, EnabledCompressionEncodings};
-pub use crate::extensions::GrpcMethod;
-pub use crate::service::interceptor::InterceptedService;
-pub use bytes::Bytes;
-pub use http;
-pub use http_body::Body;
+pub mod channel;
+pub mod server;
 
-pub type BoxFuture<T, E> = self::Pin<Box<dyn self::Future<Output = Result<T, E>> + Send + 'static>>;
-pub type BoxStream<T> =
-    self::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, crate::Status>> + Send + 'static>>;
+/// A [`hyper::rt::Executor`] that spawns futures onto the current
+/// `tokio::task::LocalSet`/`LocalRuntime` via `tokio::task::spawn_local`.
+///
+/// Panics if used outside a tokio local context; not guarded, matches
+/// `spawn_local`'s own contract.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalExec;
 
-#[cfg(feature = "local")]
-pub type LocalBoxFuture<T, E> = self::Pin<Box<dyn self::Future<Output = Result<T, E>> + 'static>>;
-#[cfg(feature = "local")]
-pub type LocalBoxStream<T> =
-    self::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, crate::Status>> + 'static>>;
-#[cfg(feature = "local")]
-pub use std::rc::Rc;
+impl<F: Future + 'static> hyper::rt::Executor<F> for LocalExec {
+    fn execute(&self, fut: F) {
+        tokio::task::spawn_local(fut);
+    }
+}

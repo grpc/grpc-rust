@@ -60,6 +60,7 @@ pub struct Grpc<T> {
     config: GrpcConfig,
 }
 
+#[derive(Clone)]
 pub(crate) struct GrpcConfig {
     pub(crate) origin: Uri,
     /// Which compression encodings does the client accept?
@@ -85,13 +86,7 @@ impl<T> Grpc<T> {
     pub fn with_origin(inner: T, origin: Uri) -> Self {
         Self {
             inner,
-            config: GrpcConfig {
-                origin,
-                send_compression_encodings: None,
-                accept_compression_encodings: EnabledCompressionEncodings::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            },
+            config: GrpcConfig::new(origin),
         }
     }
 
@@ -411,6 +406,30 @@ pub(crate) fn classify_response(
 }
 
 impl GrpcConfig {
+    pub(crate) fn new(origin: Uri) -> Self {
+        Self {
+            origin,
+            send_compression_encodings: None,
+            accept_compression_encodings: EnabledCompressionEncodings::default(),
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
+        }
+    }
+
+    pub(crate) fn debug_fields<'a, 'b, 'c>(
+        &self,
+        d: &'c mut fmt::DebugStruct<'a, 'b>,
+    ) -> &'c mut fmt::DebugStruct<'a, 'b> {
+        d.field("origin", &self.origin)
+            .field("compression_encoding", &self.send_compression_encodings)
+            .field(
+                "accept_compression_encodings",
+                &self.accept_compression_encodings,
+            )
+            .field("max_decoding_message_size", &self.max_decoding_message_size)
+            .field("max_encoding_message_size", &self.max_encoding_message_size)
+    }
+
     pub(crate) fn prepare_request<B>(
         &self,
         request: Request<B>,
@@ -476,38 +495,15 @@ impl<T: Clone> Clone for Grpc<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            config: GrpcConfig {
-                origin: self.config.origin.clone(),
-                send_compression_encodings: self.config.send_compression_encodings,
-                accept_compression_encodings: self.config.accept_compression_encodings,
-                max_encoding_message_size: self.config.max_encoding_message_size,
-                max_decoding_message_size: self.config.max_decoding_message_size,
-            },
+            config: self.config.clone(),
         }
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Grpc")
-            .field("inner", &self.inner)
-            .field("origin", &self.config.origin)
-            .field(
-                "compression_encoding",
-                &self.config.send_compression_encodings,
-            )
-            .field(
-                "accept_compression_encodings",
-                &self.config.accept_compression_encodings,
-            )
-            .field(
-                "max_decoding_message_size",
-                &self.config.max_decoding_message_size,
-            )
-            .field(
-                "max_encoding_message_size",
-                &self.config.max_encoding_message_size,
-            )
-            .finish()
+        let mut d = f.debug_struct("Grpc");
+        d.field("inner", &self.inner);
+        self.config.debug_fields(&mut d).finish()
     }
 }

@@ -51,21 +51,21 @@ pub struct Streaming<T> {
     inner: StreamingImpl<T, SendDecoder<T>, Body>,
 }
 
-pub(crate) struct StreamingInner<B> {
-    pub(crate) body: SyncWrapper<B>,
-    pub(crate) state: State,
-    pub(crate) direction: Direction,
-    pub(crate) buf: BytesMut,
-    pub(crate) trailers: Option<HeaderMap>,
-    pub(crate) decompress_buf: BytesMut,
-    pub(crate) encoding: Option<CompressionEncoding>,
-    pub(crate) max_message_size: Option<usize>,
+struct StreamingInner<B> {
+    body: SyncWrapper<B>,
+    state: State,
+    direction: Direction,
+    buf: BytesMut,
+    trailers: Option<HeaderMap>,
+    decompress_buf: BytesMut,
+    encoding: Option<CompressionEncoding>,
+    max_message_size: Option<usize>,
 }
 
 impl<T> Unpin for Streaming<T> {}
 
 #[derive(Debug, Clone)]
-pub(crate) enum State {
+enum State {
     ReadHeader,
     ReadBody {
         compression: Option<CompressionEncoding>,

@@ -41,7 +41,7 @@ use http_body::Body as HttpBody;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::client::classify_response;
-use crate::codec::{Codec, CompressionEncoding, Decoder, EnabledCompressionEncodings, EncodeBody};
+use crate::codec::{Codec, CompressionEncoding, Decoder, EncodeBody};
 use crate::local::body::Body;
 use crate::local::codec::Streaming;
 use crate::{Request, Response, Status, client::GrpcService};
@@ -69,13 +69,7 @@ impl<T> Grpc<T> {
     pub fn with_origin(inner: T, origin: Uri) -> Self {
         Self {
             inner,
-            config: crate::client::GrpcConfig {
-                origin,
-                send_compression_encodings: None,
-                accept_compression_encodings: EnabledCompressionEncodings::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            },
+            config: crate::client::GrpcConfig::new(origin),
         }
     }
 
@@ -273,39 +267,16 @@ impl<T: Clone> Clone for Grpc<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            config: crate::client::GrpcConfig {
-                origin: self.config.origin.clone(),
-                send_compression_encodings: self.config.send_compression_encodings,
-                accept_compression_encodings: self.config.accept_compression_encodings,
-                max_encoding_message_size: self.config.max_encoding_message_size,
-                max_decoding_message_size: self.config.max_decoding_message_size,
-            },
+            config: self.config.clone(),
         }
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Grpc")
-            .field("inner", &self.inner)
-            .field("origin", &self.config.origin)
-            .field(
-                "compression_encoding",
-                &self.config.send_compression_encodings,
-            )
-            .field(
-                "accept_compression_encodings",
-                &self.config.accept_compression_encodings,
-            )
-            .field(
-                "max_decoding_message_size",
-                &self.config.max_decoding_message_size,
-            )
-            .field(
-                "max_encoding_message_size",
-                &self.config.max_encoding_message_size,
-            )
-            .finish()
+        let mut d = f.debug_struct("Grpc");
+        d.field("inner", &self.inner);
+        self.config.debug_fields(&mut d).finish()
     }
 }
 

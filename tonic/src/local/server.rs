@@ -345,7 +345,7 @@ where
         B: HttpBody + 'static,
         B::Error: Into<crate::BoxError>,
     {
-        let request_compression_encoding = self.request_encoding_if_supported(&request)?;
+        let request_compression_encoding = self.config.request_encoding_if_supported(&request)?;
 
         let (parts, body) = request.into_parts();
 
@@ -378,7 +378,7 @@ where
         B: HttpBody + 'static,
         B::Error: Into<crate::BoxError>,
     {
-        let encoding = self.request_encoding_if_supported(&request)?;
+        let encoding = self.config.request_encoding_if_supported(&request)?;
 
         let request = request.map(|body| {
             Streaming::new_request(
@@ -417,16 +417,6 @@ where
         );
 
         http::Response::from_parts(parts, Body::new(body))
-    }
-
-    fn request_encoding_if_supported<B>(
-        &self,
-        request: &http::Request<B>,
-    ) -> Result<Option<CompressionEncoding>, Status> {
-        CompressionEncoding::from_encoding_header(
-            request.headers(),
-            self.config.accept_compression_encodings,
-        )
     }
 }
 

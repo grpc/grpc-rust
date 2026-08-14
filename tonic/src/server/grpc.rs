@@ -96,6 +96,16 @@ impl ServerGrpcConfig {
             self.max_encoding_message_size = Some(limit);
         }
     }
+
+    pub(crate) fn request_encoding_if_supported<B>(
+        &self,
+        request: &http::Request<B>,
+    ) -> Result<Option<CompressionEncoding>, Status> {
+        CompressionEncoding::from_encoding_header(
+            request.headers(),
+            self.accept_compression_encodings,
+        )
+    }
 }
 
 /// A gRPC Server handler.
@@ -423,7 +433,7 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<crate::BoxError> + Send,
     {
-        let request_compression_encoding = self.request_encoding_if_supported(&request)?;
+        let request_compression_encoding = self.config.request_encoding_if_supported(&request)?;
 
         let (parts, body) = request.into_parts();
 
@@ -456,7 +466,7 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<crate::BoxError> + Send,
     {
-        let encoding = self.request_encoding_if_supported(&request)?;
+        let encoding = self.config.request_encoding_if_supported(&request)?;
 
         let request = request.map(|body| {
             Streaming::new_request(
@@ -495,16 +505,6 @@ where
         );
 
         http::Response::from_parts(parts, Body::new(body))
-    }
-
-    fn request_encoding_if_supported<B>(
-        &self,
-        request: &http::Request<B>,
-    ) -> Result<Option<CompressionEncoding>, Status> {
-        CompressionEncoding::from_encoding_header(
-            request.headers(),
-            self.config.accept_compression_encodings,
-        )
     }
 }
 

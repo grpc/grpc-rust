@@ -158,16 +158,23 @@ async fn connect(addr: SocketAddr) -> EchoClient<Channel> {
     EchoClient::new(channel)
 }
 
+/// Bootstrap an `EchoService` behind a freshly bound server and a connected
+/// client, returning the call counter alongside the client.
+async fn spawn_echo() -> (Rc<RefCell<u64>>, EchoClient<Channel>) {
+    let calls = Rc::new(RefCell::new(0u64));
+    let svc = EchoService {
+        calls: calls.clone(),
+    };
+    let addr = spawn_server(echo_server::EchoServer::new(svc)).await;
+    let client = connect(addr).await;
+    (calls, client)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn unary_echo_with_rc_state() {
     LocalSet::new()
         .run_until(async {
-            let calls = Rc::new(RefCell::new(0u64));
-            let svc = EchoService {
-                calls: calls.clone(),
-            };
-            let addr = spawn_server(echo_server::EchoServer::new(svc)).await;
-            let mut client = connect(addr).await;
+            let (calls, mut client) = spawn_echo().await;
 
             let response = client
                 .unary_echo(EchoRequest {
@@ -194,10 +201,7 @@ async fn unary_echo_with_rc_state() {
 async fn server_streaming_echo() {
     LocalSet::new()
         .run_until(async {
-            let calls = Rc::new(RefCell::new(0u64));
-            let svc = EchoService { calls };
-            let addr = spawn_server(echo_server::EchoServer::new(svc)).await;
-            let mut client = connect(addr).await;
+            let (_calls, mut client) = spawn_echo().await;
 
             let response = client
                 .server_streaming_echo(EchoRequest {
@@ -221,10 +225,7 @@ async fn server_streaming_echo() {
 async fn client_streaming_echo() {
     LocalSet::new()
         .run_until(async {
-            let calls = Rc::new(RefCell::new(0u64));
-            let svc = EchoService { calls };
-            let addr = spawn_server(echo_server::EchoServer::new(svc)).await;
-            let mut client = connect(addr).await;
+            let (_calls, mut client) = spawn_echo().await;
 
             // Non-`Send` request stream: the `map` closure captures an `Rc`.
             let tag = Rc::new(RefCell::new(0u32));
@@ -245,10 +246,7 @@ async fn client_streaming_echo() {
 async fn bidi_echo() {
     LocalSet::new()
         .run_until(async {
-            let calls = Rc::new(RefCell::new(0u64));
-            let svc = EchoService { calls };
-            let addr = spawn_server(echo_server::EchoServer::new(svc)).await;
-            let mut client = connect(addr).await;
+            let (_calls, mut client) = spawn_echo().await;
 
             let tag = Rc::new(RefCell::new(0u32));
             let messages = ["a".to_string(), "b".to_string(), "c".to_string()];
@@ -332,12 +330,7 @@ async fn interceptor_works() {
 fn works_on_local_runtime() {
     let rt = tokio::runtime::LocalRuntime::new().unwrap();
     rt.block_on(async {
-        let calls = Rc::new(RefCell::new(0u64));
-        let svc = EchoService {
-            calls: calls.clone(),
-        };
-        let addr = spawn_server(echo_server::EchoServer::new(svc)).await;
-        let mut client = connect(addr).await;
+        let (calls, mut client) = spawn_echo().await;
 
         let response = client
             .unary_echo(EchoRequest {

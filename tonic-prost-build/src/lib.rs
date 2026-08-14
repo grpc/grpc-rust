@@ -777,6 +777,30 @@ impl Builder {
         self
     }
 
+    /// Turn this `Builder`'s configuration into a `ServiceGenerator`.
+    fn into_service_generator(self) -> ServiceGenerator {
+        let service_generator = ServiceGenerator::new(
+            self.build_client,
+            self.build_server,
+            self.build_transport,
+            self.client_attributes,
+            self.server_attributes,
+            self.use_arc_self,
+            self.generate_default_stubs,
+            self.proto_path,
+            self.compile_well_known_types,
+            self.codec_path.clone(),
+            self.disable_comments,
+        );
+        #[cfg(feature = "local")]
+        let mut service_generator = service_generator;
+        #[cfg(feature = "local")]
+        {
+            service_generator.local = self.local;
+        }
+        service_generator
+    }
+
     /// Compile the .proto files and execute code generation.
     pub fn compile_protos<P>(self, protos: &[P], includes: &[P]) -> io::Result<()>
     where
@@ -882,27 +906,7 @@ impl Builder {
         }
 
         if self.build_client || self.build_server {
-            let service_generator = ServiceGenerator::new(
-                self.build_client,
-                self.build_server,
-                self.build_transport,
-                self.client_attributes,
-                self.server_attributes,
-                self.use_arc_self,
-                self.generate_default_stubs,
-                self.proto_path,
-                self.compile_well_known_types,
-                self.codec_path.clone(),
-                self.disable_comments,
-            );
-            #[cfg(feature = "local")]
-            let mut service_generator = service_generator;
-            #[cfg(feature = "local")]
-            {
-                service_generator.local = self.local;
-            }
-
-            config.service_generator(Box::new(service_generator));
+            config.service_generator(Box::new(self.into_service_generator()));
         };
 
         config.compile_protos(protos, includes)?;
@@ -990,27 +994,7 @@ impl Builder {
         }
 
         if self.build_client || self.build_server {
-            let service_generator = ServiceGenerator::new(
-                self.build_client,
-                self.build_server,
-                self.build_transport,
-                self.client_attributes,
-                self.server_attributes,
-                self.use_arc_self,
-                self.generate_default_stubs,
-                self.proto_path,
-                self.compile_well_known_types,
-                self.codec_path.clone(),
-                self.disable_comments,
-            );
-            #[cfg(feature = "local")]
-            let mut service_generator = service_generator;
-            #[cfg(feature = "local")]
-            {
-                service_generator.local = self.local;
-            }
-
-            config.service_generator(Box::new(service_generator));
+            config.service_generator(Box::new(self.into_service_generator()));
         };
 
         config.compile_fds(fds)?;
@@ -1021,25 +1005,6 @@ impl Builder {
     /// Turn the builder into a `ServiceGenerator` ready to be passed to `prost-build`s
     /// `Config::service_generator`.
     pub fn service_generator(self) -> Box<dyn prost_build::ServiceGenerator> {
-        let service_generator = ServiceGenerator::new(
-            self.build_client,
-            self.build_server,
-            self.build_transport,
-            self.client_attributes,
-            self.server_attributes,
-            self.use_arc_self,
-            self.generate_default_stubs,
-            self.proto_path,
-            self.compile_well_known_types,
-            self.codec_path.clone(),
-            self.disable_comments,
-        );
-        #[cfg(feature = "local")]
-        let mut service_generator = service_generator;
-        #[cfg(feature = "local")]
-        {
-            service_generator.local = self.local;
-        }
-        Box::new(service_generator)
+        Box::new(self.into_service_generator())
     }
 }

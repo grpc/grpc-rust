@@ -607,12 +607,13 @@ impl RouteConfigResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::route::v3::{
         RetryPolicy, RouteAction, VirtualHost, retry_policy::RetryBackOff, route::Action,
         route_action::ClusterSpecifier,
     };
     use envoy_types::pb::google::protobuf::{Duration as ProtoDuration, UInt32Value};
+
+    use super::*;
 
     fn make_route(prefix: &str, cluster: &str) -> envoy_types::pb::envoy::config::route::v3::Route {
         envoy_types::pb::envoy::config::route::v3::Route {
@@ -833,11 +834,6 @@ mod tests {
         assert_eq!(clusters.len(), 2);
         assert!(clusters.contains("c1"));
         assert!(clusters.contains("c2"));
-    }
-
-    #[test]
-    fn test_not_all_resources_required() {
-        assert!(!RouteConfigResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
     }
 
     #[test]

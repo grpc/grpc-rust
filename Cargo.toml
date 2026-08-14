@@ -34,6 +34,7 @@ members = [
   "tests/web",
   "tests/default_stubs",
   "tests/deprecated_methods",
+  "tests/local",
 ]
 resolver = "2"
 

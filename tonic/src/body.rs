@@ -24,33 +24,65 @@
 
 //! HTTP specific body utilities.
 
-use std::{pin::Pin, task::Poll};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use http_body_util::BodyExt as _;
 
 // A type erased HTTP body.
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, crate::Status>;
 
+/// Shared body plumbing behind `body::Body` and `local::body::Body`: either type is
+/// empty or wraps a (possibly `!Send`) boxed body `B`.
+#[derive(Debug)]
+pub(crate) enum BodyKind<B> {
+    Empty,
+    Wrap(B),
+}
+
+impl<B> BodyKind<B>
+where
+    B: http_body::Body<Data = bytes::Bytes, Error = crate::Status> + Unpin,
+{
+    pub(crate) fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<bytes::Bytes>, crate::Status>>> {
+        match self {
+            BodyKind::Empty => Poll::Ready(None),
+            BodyKind::Wrap(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    pub(crate) fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            BodyKind::Empty => http_body::SizeHint::with_exact(0),
+            BodyKind::Wrap(body) => body.size_hint(),
+        }
+    }
+
+    pub(crate) fn is_end_stream(&self) -> bool {
+        match self {
+            BodyKind::Empty => true,
+            BodyKind::Wrap(body) => body.is_end_stream(),
+        }
+    }
+}
+
 /// A body type used in `tonic`.
 #[derive(Debug)]
 pub struct Body {
-    kind: Kind,
-}
-
-#[derive(Debug)]
-enum Kind {
-    Empty,
-    Wrap(BoxBody),
+    kind: BodyKind<BoxBody>,
 }
 
 impl Body {
-    fn from_kind(kind: Kind) -> Self {
-        Self { kind }
-    }
-
     /// Create a new empty `Body`.
     pub const fn empty() -> Self {
-        Self { kind: Kind::Empty }
+        Self {
+            kind: BodyKind::Empty,
+        }
     }
 
     /// Create a new `Body` from an existing `Body`.
@@ -70,7 +102,9 @@ impl Body {
         }
 
         if let Some(body) = <dyn std::any::Any>::downcast_mut::<Option<BoxBody>>(&mut body) {
-            return Self::from_kind(Kind::Wrap(body.take().unwrap()));
+            return Self {
+                kind: BodyKind::Wrap(body.take().unwrap()),
+            };
         }
 
         let body = body
@@ -78,7 +112,9 @@ impl Body {
             .map_err(crate::Status::map_error)
             .boxed_unsync();
 
-        Self::from_kind(Kind::Wrap(body))
+        Self {
+            kind: BodyKind::Wrap(body),
+        }
     }
 }
 
@@ -96,23 +132,14 @@ impl http_body::Body for Body {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        match &mut self.kind {
-            Kind::Empty => Poll::Ready(None),
-            Kind::Wrap(body) => Pin::new(body).poll_frame(cx),
-        }
+        self.kind.poll_frame(cx)
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        match &self.kind {
-            Kind::Empty => http_body::SizeHint::with_exact(0),
-            Kind::Wrap(body) => body.size_hint(),
-        }
+        self.kind.size_hint()
     }
 
     fn is_end_stream(&self) -> bool {
-        match &self.kind {
-            Kind::Empty => true,
-            Kind::Wrap(body) => body.is_end_stream(),
-        }
+        self.kind.is_end_stream()
     }
 }

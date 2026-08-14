@@ -22,6 +22,8 @@
  *
  */
 
+// NB: keep in sync with src/local/router.rs
+
 use crate::{Status, body::Body, server::NamedService};
 use http::{Request, Response};
 use std::{

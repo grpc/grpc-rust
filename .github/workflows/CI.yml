@@ -239,7 +239,7 @@ jobs:
       with:
         # Windows is the long pole of a build. Caching it avoids adding ~4 minutes of build time
         cache-targets: ${{ matrix.os == 'windows-latest' }}
-    - run: cargo nextest run --workspace --all-features
+    - run: cargo hack nextest run --all-features --no-tests pass
       env:
         QUICKCHECK_TESTS: 1000  # run a lot of quickcheck iterations
 

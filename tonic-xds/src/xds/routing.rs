@@ -128,20 +128,17 @@ impl Router for XdsRouter {
         input: &RouteInput<'_>,
         config: &RoutingSnapshot,
     ) -> Result<RouteDecision, RoutingError> {
-        resolve_route(config, input.authority, input.headers)
+        resolve_route(config, input.authority, input.path, input.headers)
     }
 }
 
-/// Resolve a route decision from the given config, authority, and headers.
+/// Resolve a route decision from the given config, authority, path, and headers.
 fn resolve_route(
     rc: &RoutingSnapshot,
     authority: &str,
+    path: &str,
     headers: &http::HeaderMap,
 ) -> Result<RouteDecision, RoutingError> {
-    let path = headers
-        .get(":path")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
     let route = rc.matched_route(authority, path, headers)?;
     let cluster = match &route.action {
         RouteConfigAction::Cluster(name) => name.clone(),
@@ -403,6 +400,7 @@ mod tests {
     use crate::xds::resource::route_config::{
         RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
     };
+    use crate::xds::resource::safe_regex::SafeRegex;
     use crate::xds::resource::string_matcher::StringMatcher;
 
     fn simple_route(prefix: &str, cluster: &str) -> RouteConfig {
@@ -664,7 +662,7 @@ mod tests {
             routes: vec![RouteConfig {
                 match_criteria: RouteConfigMatch {
                     path_specifier: PathSpecifierConfig::SafeRegex(
-                        regex::Regex::new("^/svc/.*").unwrap(),
+                        SafeRegex::new("/svc/.*").unwrap(),
                     ),
                     headers: vec![],
                     case_sensitive: true,
@@ -1037,7 +1035,7 @@ mod tests {
                         headers: vec![HeaderMatcherConfig {
                             name: "x-tag".into(),
                             match_specifier: HeaderMatchSpecifierConfig::String(
-                                StringMatcher::SafeRegex(regex::Regex::new("^v[0-9]+$").unwrap()),
+                                StringMatcher::SafeRegex(SafeRegex::new("v[0-9]+").unwrap()),
                             ),
                             invert_match: false,
                         }],
@@ -1124,6 +1122,7 @@ mod tests {
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "my-service",
+            path: "/",
             headers: &headers,
         };
         let config = router.snapshot().expect("config");
@@ -1142,6 +1141,7 @@ mod tests {
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "svc",
+            path: "/",
             headers: &headers,
         };
 

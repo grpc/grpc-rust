@@ -41,6 +41,7 @@ pub(crate) mod hash_policy;
 pub(crate) mod listener;
 pub(crate) mod outlier_detection;
 pub(crate) mod route_config;
+pub(crate) mod safe_regex;
 pub(crate) mod san_matcher;
 pub(crate) mod security;
 pub(crate) mod string_matcher;

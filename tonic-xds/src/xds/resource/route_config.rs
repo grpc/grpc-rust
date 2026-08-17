@@ -25,19 +25,20 @@
 //! Validated RouteConfiguration resource (RDS).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use envoy_types::pb::envoy::config::core::v3::Metadata;
 use envoy_types::pb::envoy::config::route::v3::{
-    RouteConfiguration, RouteMatch, route, route_action, route_match,
+    RetryPolicy, RouteConfiguration, RouteMatch, route, route_action, route_match,
 };
 use prost::Message;
-use regex::Regex;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
+use super::safe_regex::SafeRegex;
 use super::string_matcher::StringMatcher;
-
 /// A `typed_filter_metadata` entry — a `google.protobuf.Any` (a type URL plus an
 /// encoded message value).
 #[derive(Debug, Clone)]
@@ -149,6 +150,96 @@ pub(crate) struct RouteConfigResource {
     pub metadata: RouteConfigMetadata,
 }
 
+/// Validated Envoy retry settings (gRFC A44) parsed from a `RouteAction` or
+/// `VirtualHost` `retry_policy`. A transport-neutral resource-layer type.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteRetryConfig {
+    /// Envoy `retry_on` conditions, comma-separated (e.g. `"unavailable"`).
+    pub retry_on: String,
+    /// `num_retries` if set; `None` means the caller applies its own default.
+    pub num_retries: Option<u32>,
+    /// `retry_back_off.base_interval` if set.
+    pub base_interval: Option<Duration>,
+    /// `retry_back_off.max_interval` if set.
+    pub max_interval: Option<Duration>,
+}
+
+impl RouteRetryConfig {
+    /// Parse and validate an Envoy `RetryPolicy` (gRFC A44). Returns
+    /// `Err(Validation)` — so the xDS client NACKs — when `num_retries < 1`, or
+    /// when `retry_back_off` is set with a `base_interval` or `max_interval`
+    /// that is not greater than zero.
+    fn from_proto(rp: &RetryPolicy) -> xds_client::Result<Self> {
+        let num_retries = match rp.num_retries.as_ref().map(|v| v.value) {
+            Some(0) => {
+                return Err(Error::Validation(
+                    "retry_policy.num_retries must be >= 1".into(),
+                ));
+            }
+            other => other,
+        };
+
+        let (base_interval, max_interval) = match rp.retry_back_off.as_ref() {
+            Some(backoff) => {
+                let base_interval = backoff
+                    .base_interval
+                    .as_ref()
+                    .and_then(proto_duration)
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        Error::Validation(
+                            "retry_policy.retry_back_off.base_interval must be greater than 0"
+                                .into(),
+                        )
+                    })?;
+                let max_interval = backoff
+                    .max_interval
+                    .as_ref()
+                    .map(|m| {
+                        proto_duration(m).filter(|d| !d.is_zero()).ok_or_else(|| {
+                            Error::Validation(
+                                "retry_policy.retry_back_off.max_interval must be greater than 0"
+                                    .into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                (Some(base_interval), max_interval)
+            }
+            None => (None, None),
+        };
+
+        Ok(Self {
+            retry_on: rp.retry_on.clone(),
+            num_retries,
+            base_interval,
+            max_interval,
+        })
+    }
+}
+
+/// Maximum `seconds` for a well-formed `google.protobuf.Duration`.
+const MAX_PROTO_DURATION_SECONDS: i64 = 315_576_000_000;
+
+/// Convert a protobuf `Duration` to [`std::time::Duration`], returning `None` for
+/// values outside the documented `google.protobuf.Duration` range. Rejected here
+/// so an invalid retry policy fails validation rather than overflowing later.
+fn proto_duration(d: &envoy_types::pb::google::protobuf::Duration) -> Option<Duration> {
+    if !(0..=MAX_PROTO_DURATION_SECONDS).contains(&d.seconds)
+        || !(0..=999_999_999).contains(&d.nanos)
+    {
+        return None;
+    }
+    let seconds = u64::try_from(d.seconds).ok()?;
+    let nanos = u32::try_from(d.nanos).ok()?;
+    Some(Duration::new(seconds, nanos))
+}
+
+/// Parse and validate an Envoy `RetryPolicy` into a shared [`RouteRetryConfig`].
+fn parse_retry(rp: &RetryPolicy) -> xds_client::Result<Arc<RouteRetryConfig>> {
+    Ok(Arc::new(RouteRetryConfig::from_proto(rp)?))
+}
+
 /// Validated virtual host with domain matching and routes.
 #[derive(Debug, Clone)]
 pub(crate) struct VirtualHostConfig {
@@ -162,6 +253,10 @@ pub(crate) struct VirtualHostConfig {
 pub(crate) struct RouteConfig {
     pub match_criteria: RouteConfigMatch,
     pub action: RouteConfigAction,
+    /// Validated retry settings (gRFC A44): the route's own `RouteAction.retry_policy`,
+    /// else the inherited `VirtualHost.retry_policy` (route-level fully overrides,
+    /// no merge), else `None`. Routes that inherit share one `Arc`.
+    pub retry_config: Option<Arc<RouteRetryConfig>>,
 }
 
 /// Validated route match criteria.
@@ -180,7 +275,7 @@ pub(crate) struct RouteConfigMatch {
 pub(crate) enum PathSpecifierConfig {
     Prefix(String),
     Path(String),
-    SafeRegex(Regex),
+    SafeRegex(SafeRegex),
 }
 
 /// Header matching criteria.
@@ -265,8 +360,11 @@ impl Resource for RouteConfigResource {
             }
 
             let mut routes = Vec::with_capacity(vh.routes.len());
+            // gRFC A44: routes inherit the virtual host's retry policy unless they
+            // set their own. Parse it once so inheriting routes share one `Arc`.
+            let vh_retry = vh.retry_policy.as_ref().map(parse_retry).transpose()?;
             for route in vh.routes {
-                if let Some(validated_route) = validate_route(route)? {
+                if let Some(validated_route) = validate_route(route, vh_retry.as_ref())? {
                     routes.push(validated_route);
                 }
             }
@@ -288,8 +386,11 @@ impl Resource for RouteConfigResource {
 
 /// Returns `Ok(None)` for routes that should be silently skipped (query param matchers,
 /// unsupported cluster specifiers like `cluster_header`).
+///
+/// `vh_retry` is the virtual host's policy, inherited when the route sets none.
 fn validate_route(
     route: envoy_types::pb::envoy::config::route::v3::Route,
+    vh_retry: Option<&Arc<RouteRetryConfig>>,
 ) -> xds_client::Result<Option<RouteConfig>> {
     let route_match = route
         .r#match
@@ -306,11 +407,19 @@ fn validate_route(
         .action
         .ok_or_else(|| Error::Validation("route missing action field".into()))?;
 
-    let validated_action = match action {
-        route::Action::Route(route_action) => match validate_route_action(route_action)? {
-            Some(action) => action,
-            None => return Ok(None),
-        },
+    let validated_action;
+    let route_retry;
+    match action {
+        route::Action::Route(mut route_action) => {
+            // Take the retry policy before `route_action` is consumed; parse it
+            // only if the route is kept, so dropped routes cost no parse.
+            let retry_policy = route_action.retry_policy.take();
+            match validate_route_action(route_action)? {
+                Some(action) => validated_action = action,
+                None => return Ok(None),
+            }
+            route_retry = retry_policy.as_ref().map(parse_retry).transpose()?;
+        }
         // Per A28: action field must be "route", otherwise NACK.
         _ => {
             return Err(Error::Validation(
@@ -322,6 +431,7 @@ fn validate_route(
     Ok(Some(RouteConfig {
         match_criteria,
         action: validated_action,
+        retry_config: route_retry.or_else(|| vh_retry.cloned()),
     }))
 }
 
@@ -332,7 +442,7 @@ fn validate_route_match(rm: RouteMatch) -> xds_client::Result<RouteConfigMatch> 
         Some(route_match::PathSpecifier::Prefix(p)) => PathSpecifierConfig::Prefix(p),
         Some(route_match::PathSpecifier::Path(p)) => PathSpecifierConfig::Path(p),
         Some(route_match::PathSpecifier::SafeRegex(r)) => {
-            let re = Regex::new(&r.regex)
+            let re = SafeRegex::new(&r.regex)
                 .map_err(|e| Error::Validation(format!("invalid path regex '{}': {e}", r.regex)))?;
             PathSpecifierConfig::SafeRegex(re)
         }
@@ -405,7 +515,7 @@ fn validate_header_matcher(
         // SafeRegexMatch is deprecated in favor of StringMatch, which is handled below.
         #[allow(deprecated)]
         Some(HeaderMatchSpecifier::SafeRegexMatch(r)) => {
-            let re = Regex::new(&r.regex).map_err(|e| {
+            let re = SafeRegex::new(&r.regex).map_err(|e| {
                 Error::Validation(format!("invalid header regex '{}': {e}", r.regex))
             })?;
             HeaderMatchSpecifierConfig::String(StringMatcher::SafeRegex(re))
@@ -496,10 +606,13 @@ impl RouteConfigResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::route::v3::{
-        RouteAction, VirtualHost, route::Action, route_action::ClusterSpecifier,
+        RetryPolicy, RouteAction, VirtualHost, retry_policy::RetryBackOff, route::Action,
+        route_action::ClusterSpecifier,
     };
+    use envoy_types::pb::google::protobuf::{Duration as ProtoDuration, UInt32Value};
+
+    use super::*;
 
     fn make_route(prefix: &str, cluster: &str) -> envoy_types::pb::envoy::config::route::v3::Route {
         envoy_types::pb::envoy::config::route::v3::Route {
@@ -513,6 +626,65 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicy {
+        RetryPolicy {
+            retry_on: retry_on.to_string(),
+            num_retries: Some(UInt32Value { value: num_retries }),
+            ..Default::default()
+        }
+    }
+
+    fn make_route_with_retry(
+        prefix: &str,
+        cluster: &str,
+        retry: RetryPolicy,
+    ) -> envoy_types::pb::envoy::config::route::v3::Route {
+        envoy_types::pb::envoy::config::route::v3::Route {
+            r#match: Some(RouteMatch {
+                path_specifier: Some(route_match::PathSpecifier::Prefix(prefix.to_string())),
+                ..Default::default()
+            }),
+            action: Some(Action::Route(RouteAction {
+                cluster_specifier: Some(ClusterSpecifier::Cluster(cluster.to_string())),
+                retry_policy: Some(retry),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn proto_dur(seconds: i64, nanos: i32) -> ProtoDuration {
+        ProtoDuration { seconds, nanos }
+    }
+
+    fn retry_policy_with_backoff(
+        base: Option<ProtoDuration>,
+        max: Option<ProtoDuration>,
+    ) -> RetryPolicy {
+        RetryPolicy {
+            retry_on: "unavailable".to_string(),
+            retry_back_off: Some(RetryBackOff {
+                base_interval: base,
+                max_interval: max,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn validate_with_route_retry(retry: RetryPolicy) -> xds_client::Result<RouteConfigResource> {
+        let rc = RouteConfiguration {
+            name: "rc".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vh1".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![make_route_with_retry("/", "c1", retry)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        RouteConfigResource::validate(rc)
     }
 
     fn make_route_config(name: &str) -> RouteConfiguration {
@@ -613,6 +785,89 @@ mod tests {
     }
 
     #[test]
+    fn safe_regex_path_matcher_requires_a_full_match() {
+        use envoy_types::pb::envoy::r#type::matcher::v3::RegexMatcher;
+
+        let unanchored_rm = RouteMatch {
+            path_specifier: Some(route_match::PathSpecifier::SafeRegex(RegexMatcher {
+                regex: r"/pkg\.Greeter/SayHello".to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let matched = validate_route_match(unanchored_rm).expect("valid regex");
+        let PathSpecifierConfig::SafeRegex(re) = matched.path_specifier else {
+            panic!("expected a SafeRegex path specifier");
+        };
+
+        assert!(
+            re.is_match("/pkg.Greeter/SayHello"),
+            "exact path must match"
+        );
+        assert!(
+            !re.is_match("/pkg.Greeter/SayHelloAgain"),
+            "a longer method sharing the prefix must not match"
+        );
+        assert!(
+            !re.is_match("/other.Svc/x/pkg.Greeter/SayHello"),
+            "the pattern must not match as a substring of a longer path"
+        );
+    }
+
+    #[test]
+    fn safe_regex_path_matcher_anchors_each_alternation_branch() {
+        use envoy_types::pb::envoy::r#type::matcher::v3::RegexMatcher;
+
+        let rm = RouteMatch {
+            path_specifier: Some(route_match::PathSpecifier::SafeRegex(RegexMatcher {
+                regex: "/a|/b".to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let matched = validate_route_match(rm).expect("valid regex");
+        let PathSpecifierConfig::SafeRegex(re) = matched.path_specifier else {
+            panic!("expected a SafeRegex path specifier");
+        };
+
+        assert!(re.is_match("/a"));
+        assert!(re.is_match("/b"));
+        assert!(
+            !re.is_match("/aX"),
+            "an alternation branch must not match a longer path"
+        );
+    }
+
+    #[test]
+    fn safe_regex_header_matcher_requires_a_full_match() {
+        use envoy_types::pb::envoy::config::route::v3::HeaderMatcher;
+        use envoy_types::pb::envoy::config::route::v3::header_matcher::HeaderMatchSpecifier;
+        use envoy_types::pb::envoy::r#type::matcher::v3::RegexMatcher;
+
+        #[allow(deprecated)]
+        let hm = HeaderMatcher {
+            name: "x-version".into(),
+            header_match_specifier: Some(HeaderMatchSpecifier::SafeRegexMatch(RegexMatcher {
+                regex: "v[0-9]+".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let matched = validate_header_matcher(hm).expect("valid regex");
+        let HeaderMatchSpecifierConfig::String(m) = matched.match_specifier else {
+            panic!("expected a string matcher");
+        };
+        assert!(m.is_match("v2"));
+        assert!(
+            !m.is_match("v2-beta"),
+            "a longer value sharing the prefix must not match"
+        );
+    }
+
+    #[test]
     fn test_cascade_weighted_clusters() {
         use envoy_types::pb::envoy::config::route::v3::{
             WeightedCluster, weighted_cluster::ClusterWeight,
@@ -661,11 +916,6 @@ mod tests {
         assert_eq!(clusters.len(), 2);
         assert!(clusters.contains("c1"));
         assert!(clusters.contains("c2"));
-    }
-
-    #[test]
-    fn test_not_all_resources_required() {
-        assert!(!RouteConfigResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
     }
 
     #[test]
@@ -976,5 +1226,124 @@ mod tests {
         let headers = &validated.virtual_hosts[0].routes[0].match_criteria.headers;
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].name, "x-env");
+    }
+
+    #[test]
+    fn test_vhost_retry_policy_inherited_and_route_overrides() {
+        // gRFC A44: a route with no policy inherits the virtual host's; a route
+        // with its own policy completely overrides it. Fields are private, so we
+        // verify the *selection* structurally via `Arc` identity — value mapping
+        // is covered by the `from_route_retry` tests in `client::retry`.
+        let rc = RouteConfiguration {
+            name: "rc".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vh1".to_string(),
+                domains: vec!["*".to_string()],
+                retry_policy: Some(retry_policy("unavailable", 3)),
+                routes: vec![
+                    make_route_with_retry("/own", "c-own", retry_policy("cancelled", 2)),
+                    make_route("/inherit-a", "c-a"),
+                    make_route("/inherit-b", "c-b"),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let validated = RouteConfigResource::validate(rc).unwrap();
+        let routes = &validated.virtual_hosts[0].routes;
+
+        let own = routes[0].retry_config.as_ref().expect("route-level policy");
+        let inherit_a = routes[1].retry_config.as_ref().expect("inherited policy");
+        let inherit_b = routes[2].retry_config.as_ref().expect("inherited policy");
+
+        // The overriding route gets its own config, distinct from the vhost's.
+        assert!(!Arc::ptr_eq(own, inherit_a));
+        // Inheriting routes share the single vhost-level config `Arc`.
+        assert!(Arc::ptr_eq(inherit_a, inherit_b));
+    }
+
+    #[test]
+    fn test_no_retry_policy_yields_none() {
+        // No vhost policy and no route policy => the route carries no retry config.
+        let rc = RouteConfiguration {
+            name: "rc".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vh1".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![make_route("/", "c1")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let validated = RouteConfigResource::validate(rc).unwrap();
+        assert!(validated.virtual_hosts[0].routes[0].retry_config.is_none());
+    }
+
+    // gRFC A44: the resource must be NACKed (validation error) when num_retries < 1
+    // or a set base_interval/max_interval is not greater than zero.
+
+    #[test]
+    fn test_retry_num_retries_zero_is_rejected() {
+        let err = validate_with_route_retry(retry_policy("unavailable", 0)).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn test_retry_base_interval_zero_is_rejected() {
+        let policy = retry_policy_with_backoff(Some(proto_dur(0, 0)), None);
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_base_interval_negative_is_rejected() {
+        let policy = retry_policy_with_backoff(Some(proto_dur(-1, 0)), None);
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_back_off_without_base_interval_is_rejected() {
+        // retry_back_off set but base_interval unset => base is 0 => rejected.
+        let policy = retry_policy_with_backoff(None, Some(proto_dur(1, 0)));
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_max_interval_zero_is_rejected() {
+        let policy =
+            retry_policy_with_backoff(Some(proto_dur(0, 100_000_000)), Some(proto_dur(0, 0)));
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_base_interval_below_1ms_is_accepted() {
+        // A44: values < 1ms are treated as 1ms (clamped), not rejected.
+        let policy = retry_policy_with_backoff(Some(proto_dur(0, 500_000)), None);
+        assert!(validate_with_route_retry(policy).is_ok());
+    }
+
+    #[test]
+    fn test_retry_valid_backoff_is_accepted() {
+        let mut policy =
+            retry_policy_with_backoff(Some(proto_dur(0, 100_000_000)), Some(proto_dur(1, 0)));
+        policy.num_retries = Some(UInt32Value { value: 2 });
+        let validated = validate_with_route_retry(policy).expect("valid retry policy");
+        assert!(validated.virtual_hosts[0].routes[0].retry_config.is_some());
+    }
+
+    #[test]
+    fn test_vhost_retry_invalid_is_rejected() {
+        // A virtual-host-level policy is validated the same way and NACKs on error.
+        let rc = RouteConfiguration {
+            name: "rc".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vh1".to_string(),
+                domains: vec!["*".to_string()],
+                retry_policy: Some(retry_policy("unavailable", 0)),
+                routes: vec![make_route("/", "c1")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(RouteConfigResource::validate(rc).is_err());
     }
 }

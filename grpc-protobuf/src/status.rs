@@ -176,7 +176,7 @@ impl StatusError {
     /// Create a new [`StatusError`] with the given code and message.
     pub fn new(code: StatusCodeError, message: impl Into<String>) -> Self {
         StatusError {
-            code: code,
+            code,
             message: message.into(),
             payloads: BTreeMap::new(),
         }

@@ -24,7 +24,7 @@
 
 use protobuf::proto;
 
-#[allow(unused)]
+#[allow(unused, clippy::all)]
 mod generated {
     pub mod routeguide {
         grpc::include_generated_proto!("generated/routeguide", "route_guide");

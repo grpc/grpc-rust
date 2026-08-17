@@ -22,10 +22,15 @@
  *
  */
 
+use crate::client::retry::GrpcRetrySharedConfig;
 use crate::common::async_util::BoxFuture;
-use crate::xds::resource::route_config::{RouteConfigMetadata, RouteConfigResource};
+use crate::xds::resource::route_config::{
+    RouteConfigMetadata, RouteConfigResource, RouteRetryConfig,
+};
 use crate::xds::routing::RoutingError;
 use http::Request;
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{BoxError, Layer, Service};
@@ -35,6 +40,8 @@ use tower::{BoxError, Layer, Service};
 pub(crate) struct RouteInput<'a> {
     /// The authority (host) of the request URI.
     pub authority: &'a str,
+    /// The request path (e.g. `/pkg.Service/Method`), used for path matching.
+    pub path: &'a str,
     /// The HTTP headers of the request. These can be used for header-based routing decisions.
     pub headers: &'a http::HeaderMap,
 }
@@ -50,6 +57,11 @@ pub(crate) struct RouteDecision {
     // Populated by the routing layer; consumed by the ring-hash picker (later PR).
     #[allow(dead_code)]
     pub request_hash: Option<u64>,
+    /// The matched route's compiled retry config (RDS `RouteAction.retry_policy`),
+    /// or `None` when the route sets no retry. Resolved from the [`RoutingSnapshot`]
+    /// this decision was made on, so the retry layer applies the config for exactly
+    /// the route the request took.
+    pub retry_config: Option<Arc<GrpcRetrySharedConfig>>,
 }
 
 /// A hook that runs before xDS route selection.
@@ -64,6 +76,57 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
+/// The validated [`RouteConfigResource`] bundled with the gRPC retry configs
+/// compiled from it, one per RDS update.
+///
+/// Bundling both behind one `Arc` lets routing resolve a route and its retry
+/// config from a single consistent RDS version, and keeps the request path to a
+/// map lookup plus a pointer clone. Compiling here, rather than in the xDS
+/// resource layer, keeps the resource types free of gRPC types.
+#[derive(Debug, Default)]
+pub(crate) struct RoutingSnapshot {
+    resource: Arc<RouteConfigResource>,
+    /// Compiled retry config, keyed by the identity (`Arc` address) of the
+    /// route's [`RouteRetryConfig`]. Routes that inherit a vhost policy share one
+    /// entry; a route whose `retry_on` maps to no gRPC code has none.
+    retry: HashMap<usize, Arc<GrpcRetrySharedConfig>>,
+}
+
+impl RoutingSnapshot {
+    /// Compiles each distinct route retry config once.
+    pub(crate) fn new(resource: Arc<RouteConfigResource>) -> Self {
+        let mut retry: HashMap<usize, Arc<GrpcRetrySharedConfig>> = HashMap::new();
+        for vhost in &resource.virtual_hosts {
+            for route in &vhost.routes {
+                if let Some(config) = &route.retry_config {
+                    let key = Arc::as_ptr(config) as usize;
+                    if let std::collections::hash_map::Entry::Vacant(entry) = retry.entry(key)
+                        && let Some(shared) = GrpcRetrySharedConfig::from_route_retry(config)
+                    {
+                        entry.insert(Arc::new(shared));
+                    }
+                }
+            }
+        }
+        Self { resource, retry }
+    }
+
+    /// The compiled gRPC retry config for a route's [`RouteRetryConfig`], if any.
+    pub(crate) fn retry_for(
+        &self,
+        config: Option<&Arc<RouteRetryConfig>>,
+    ) -> Option<Arc<GrpcRetrySharedConfig>> {
+        config.and_then(|config| self.retry.get(&(Arc::as_ptr(config) as usize)).cloned())
+    }
+}
+
+impl Deref for RoutingSnapshot {
+    type Target = RouteConfigResource;
+    fn deref(&self) -> &Self::Target {
+        &self.resource
+    }
+}
+
 /// A route config obtained in one step, to serve a single request with.
 ///
 /// Two cases so the common one -- a config is already in effect -- costs
@@ -71,15 +134,15 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
 /// wait for the first config.
 pub(crate) enum AcquiredConfig {
     /// A config is already in effect.
-    Ready(Arc<RouteConfigResource>),
+    Ready(Arc<RoutingSnapshot>),
     /// None has arrived yet; await this for the first one, bounded by an
     /// implementation-defined timeout.
-    Pending(BoxFuture<Result<Arc<RouteConfigResource>, RoutingError>>),
+    Pending(BoxFuture<Result<Arc<RoutingSnapshot>, RoutingError>>),
 }
 
 impl AcquiredConfig {
     /// Resolves to the config, awaiting only when one is not already available.
-    pub(crate) async fn get(self) -> Result<Arc<RouteConfigResource>, RoutingError> {
+    pub(crate) async fn get(self) -> Result<Arc<RoutingSnapshot>, RoutingError> {
         match self {
             Self::Ready(config) => Ok(config),
             Self::Pending(wait) => wait.await,
@@ -100,7 +163,7 @@ pub(crate) trait Router: Send + Sync + 'static {
     fn route(
         &self,
         input: &RouteInput<'_>,
-        config: &RouteConfigResource,
+        config: &RoutingSnapshot,
     ) -> Result<RouteDecision, RoutingError>;
 }
 
@@ -149,6 +212,7 @@ where
                 }
                 let route_input = RouteInput {
                     authority: &authority,
+                    path: request.uri().path(),
                     headers: request.headers(),
                 };
                 router.route(&route_input, &config)?
@@ -215,20 +279,92 @@ mod tests {
 
     impl Router for CaptureAuthorityRouter {
         fn acquire(&self) -> AcquiredConfig {
-            AcquiredConfig::Ready(Arc::new(RouteConfigResource::default()))
+            AcquiredConfig::Ready(Arc::new(RoutingSnapshot::default()))
         }
 
         fn route(
             &self,
             input: &RouteInput<'_>,
-            _config: &RouteConfigResource,
+            _config: &RoutingSnapshot,
         ) -> Result<RouteDecision, RoutingError> {
             *self.captured.lock().unwrap() = Some(input.authority.to_string());
             Ok(RouteDecision {
                 cluster: "test-cluster".to_string(),
                 request_hash: None,
+                retry_config: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn matches_routes_on_the_request_path() {
+        use crate::xds::cache::XdsCache;
+        use crate::xds::resource::route_config::{
+            PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch,
+            RouteConfigResource, VirtualHostConfig,
+        };
+        use crate::xds::routing::XdsRouter;
+
+        fn prefix_route(prefix: &str, cluster: &str) -> RouteConfig {
+            RouteConfig {
+                match_criteria: RouteConfigMatch {
+                    path_specifier: PathSpecifierConfig::Prefix(prefix.into()),
+                    headers: vec![],
+                    case_sensitive: true,
+                    match_fraction: None,
+                },
+                action: RouteConfigAction::Cluster(cluster.into()),
+                retry_config: None,
+            }
+        }
+
+        let cache = XdsCache::new();
+        cache.update_route_config(Arc::new(RouteConfigResource {
+            name: "rc".into(),
+            virtual_hosts: vec![VirtualHostConfig {
+                name: "vh".into(),
+                domains: vec!["greeter.svc:50051".into()],
+                // Most specific first; "/" matches anything, so picking it means
+                // the real path never reached matching.
+                routes: vec![
+                    prefix_route("/pkg.Greeter/", "greeter-cluster"),
+                    prefix_route("/", "fallback-cluster"),
+                ],
+            }],
+            metadata: Default::default(),
+        }));
+        let xds_router = XdsRouter::new(&cache);
+        while xds_router.snapshot().is_none() {
+            tokio::task::yield_now().await;
+        }
+        let router: Arc<dyn Router> = Arc::new(xds_router);
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        let inner = service_fn(move |req: Request<()>| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = req
+                    .extensions()
+                    .get::<RouteDecision>()
+                    .map(|d| d.cluster.clone());
+                Ok::<_, BoxError>(http::Response::new(()))
+            }
+        });
+        let svc = XdsRoutingLayer::new(router, None, Arc::from("greeter.svc:50051")).layer(inner);
+
+        // The URI a tonic-generated client produces.
+        let req = Request::builder()
+            .uri("/pkg.Greeter/SayHello")
+            .body(())
+            .unwrap();
+        svc.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("greeter-cluster"),
+            "route matching did not see the request path",
+        );
     }
 
     #[tokio::test]
@@ -301,6 +437,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("c".into()),
+                    retry_config: None,
                 }],
             }],
             metadata: RouteConfigMetadata::from_encoded(
@@ -322,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn releases_the_route_config_before_calling_the_inner_service() {
         struct SharedConfigRouter {
-            config: Arc<RouteConfigResource>,
+            config: Arc<RoutingSnapshot>,
         }
 
         impl Router for SharedConfigRouter {
@@ -333,16 +470,17 @@ mod tests {
             fn route(
                 &self,
                 _input: &RouteInput<'_>,
-                _config: &RouteConfigResource,
+                _config: &RoutingSnapshot,
             ) -> Result<RouteDecision, RoutingError> {
                 Ok(RouteDecision {
                     cluster: "c".to_string(),
                     request_hash: None,
+                    retry_config: None,
                 })
             }
         }
 
-        let config = Arc::new(RouteConfigResource::default());
+        let config = Arc::new(RoutingSnapshot::default());
         let router: Arc<dyn Router> = Arc::new(SharedConfigRouter {
             config: config.clone(),
         });
@@ -442,6 +580,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster(cluster.into()),
+                retry_config: None,
             }
         }
 

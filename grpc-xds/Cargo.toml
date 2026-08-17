@@ -20,6 +20,9 @@ allowed_external_types = []
 [dependencies]
 protobuf = "4.35.1-release"
 protobuf-well-known-types = "4.35.1-release"
+bytes = "1.11.0"
+xds-client = { version = "0.1.0-alpha.2", path = "../xds-client", default-features = false }
+regex = "1"
 
 [build-dependencies]
 protobuf-codegen = "4.35.1-release"

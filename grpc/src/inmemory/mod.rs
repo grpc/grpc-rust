@@ -379,10 +379,17 @@ pub struct InMemoryClientRecvStream {
 impl ClientRecvStream for InMemoryClientRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         match self.rx.recv().await {
-            Some(InMemoryResponseStreamItem::Headers(h)) => ResponseStreamItem::Headers(
-                ClientResponseHeaders::new(self.peer_info.take().unwrap())
+            Some(InMemoryResponseStreamItem::Headers(h)) => {
+                // Note: peer_info is always set when the stream is created, and
+                // the server should not send headers twice, so expect here
+                // should be safe.
+                ResponseStreamItem::Headers(
+                    ClientResponseHeaders::new(
+                        self.peer_info.take().expect("stream should have peer_info"),
+                    )
                     .with_metadata(h.into_metadata()),
-            ),
+                )
+            }
             Some(InMemoryResponseStreamItem::Message(mut buf)) => {
                 msg.decode(&mut buf).unwrap();
                 ResponseStreamItem::Message
@@ -392,9 +399,9 @@ impl ClientRecvStream for InMemoryClientRecvStream {
                     match trailer_rx.await {
                         Ok(trailers) => {
                             let (status, metadata) = trailers.into_parts();
-                            let mut client_trailers =
-                                ClientTrailers::new(status).with_metadata(metadata);
-                            client_trailers = client_trailers.with_peer_info(self.peer_info.take());
+                            let client_trailers = ClientTrailers::new(status)
+                                .with_metadata(metadata)
+                                .with_peer_info(self.peer_info.take());
                             return ResponseStreamItem::Trailers(client_trailers);
                         }
                         Err(_) => {

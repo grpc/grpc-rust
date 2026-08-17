@@ -528,7 +528,7 @@ impl RequestHeaders {
     }
 
     /// Returns the full (e.g. "/Service/Method") method name for these headers.
-    pub fn method_name(&self) -> &String {
+    pub fn method_name(&self) -> &str {
         &self.method_name
     }
 

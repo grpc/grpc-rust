@@ -343,10 +343,20 @@ impl XdsChannelBuilder {
         let xds_client = client_builder.build();
 
         let cache = Arc::new(XdsCache::new());
-        let resource_manager =
-            XdsResourceManager::new(xds_client.clone(), cache.clone(), listener_name);
+        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
+        let on_active_clusters: crate::xds::resource_manager::OnActiveClusters = {
+            let registry = cluster_registry.clone();
+            Arc::new(move |active| registry.retain_clusters(active))
+        };
+        let resource_manager = XdsResourceManager::new(
+            xds_client.clone(),
+            cache.clone(),
+            listener_name,
+            on_active_clusters,
+        );
 
         Ok(self.build_from_cache(
+            cluster_registry,
             cache,
             #[cfg(feature = "_tls-any")]
             cert_provider_registry,
@@ -361,6 +371,7 @@ impl XdsChannelBuilder {
     /// disconnected `XdsClient` and pre-populated cache.
     fn build_from_cache(
         &self,
+        cluster_registry: Arc<ClusterClientRegistryGrpc>,
         cache: Arc<XdsCache>,
         #[cfg(feature = "_tls-any")] cert_provider_registry: Arc<CertProviderRegistry>,
         xds_client: XdsClient,
@@ -391,7 +402,6 @@ impl XdsChannelBuilder {
         });
 
         let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
@@ -913,9 +923,14 @@ mod tests {
         use crate::xds::resource_manager::XdsResourceManager;
 
         let cache = Arc::new(XdsCache::new());
+        let cluster_registry = Arc::new(crate::client::cluster::ClusterClientRegistryGrpc::new());
         let xds_client = xds_client::XdsClient::disconnected();
-        let resource_manager =
-            XdsResourceManager::new(xds_client.clone(), cache.clone(), "test-listener".into());
+        let resource_manager = XdsResourceManager::new(
+            xds_client.clone(),
+            cache.clone(),
+            "test-listener".into(),
+            Arc::new(|_: &std::collections::HashSet<String>| {}),
+        );
 
         let builder = XdsChannelBuilder::new(test_config());
 
@@ -926,10 +941,17 @@ mod tests {
                 CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
                     .unwrap(),
             );
-            builder.build_from_cache(cache, registry, xds_client, resource_manager)
+            builder.build_from_cache(
+                cluster_registry,
+                cache,
+                registry,
+                xds_client,
+                resource_manager,
+            )
         };
         #[cfg(not(feature = "_tls-any"))]
-        let _channel = builder.build_from_cache(cache, xds_client, resource_manager);
+        let _channel =
+            builder.build_from_cache(cluster_registry, cache, xds_client, resource_manager);
         // Construction should succeed without panicking.
     }
 }

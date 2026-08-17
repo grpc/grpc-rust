@@ -25,6 +25,7 @@
 use crate::common::async_util::BoxFuture;
 use dashmap::DashMap;
 use http::{Request, Response};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
@@ -252,6 +253,19 @@ where
                 Arc::new(ClusterClient::new(name, discover))
             })
             .clone()
+    }
+
+    /// Drops every client whose cluster is not in `active`, the authoritative
+    /// cluster set from the current route configuration.
+    ///
+    /// In-flight requests keep their clones alive until they complete. This
+    /// takes the full set rather than the removed names because a request
+    /// racing an eviction (e.g. a retry carrying a stale route decision) can
+    /// re-insert a just-removed cluster through `get_cluster`; reconciling
+    /// against the authoritative set on every route update drops such
+    /// entries too, instead of leaking them for the channel's lifetime.
+    pub(crate) fn retain_clusters(&self, active: &HashSet<String>) {
+        self.registry.retain(|name, _| active.contains(name));
     }
 }
 

@@ -22,6 +22,8 @@
  *
  */
 
+// NB: keep in sync with src/local/server.rs
+
 use crate::codec::EncodeBody;
 use crate::codec::compression::{
     CompressionEncoding, EnabledCompressionEncodings, SingleMessageCompressionOverride,
@@ -37,6 +39,8 @@ use http_body::Body as HttpBody;
 use std::{fmt, pin::pin};
 use tokio_stream::{Stream, StreamExt};
 
+/// Unwraps a `Result`, or returns the `Err` status's `into_http()` response from the
+/// enclosing function.
 macro_rules! t {
     ($result:expr) => {
         match $result {
@@ -44,6 +48,64 @@ macro_rules! t {
             Err(status) => return status.into_http(),
         }
     };
+}
+// Only referenced (via `server/mod.rs`'s re-export) by `local::server`.
+#[cfg(feature = "local")]
+pub(crate) use t;
+
+/// Compression + message-size settings shared by [`Grpc`] and
+/// [`crate::local::server::Grpc`] (the `!Send` mirror), so the settings logic
+/// lives once for both.
+#[derive(Default)]
+pub(crate) struct ServerGrpcConfig {
+    /// Which compression encodings does the server accept for requests?
+    pub(crate) accept_compression_encodings: EnabledCompressionEncodings,
+    /// Which compression encodings might the server use for responses.
+    pub(crate) send_compression_encodings: EnabledCompressionEncodings,
+    /// Limits the maximum size of a decoded message.
+    pub(crate) max_decoding_message_size: Option<usize>,
+    /// Limits the maximum size of an encoded message.
+    pub(crate) max_encoding_message_size: Option<usize>,
+}
+
+impl ServerGrpcConfig {
+    pub(crate) fn apply_compression_config(
+        &mut self,
+        accept_encodings: EnabledCompressionEncodings,
+        send_encodings: EnabledCompressionEncodings,
+    ) {
+        for &encoding in CompressionEncoding::ENCODINGS {
+            if accept_encodings.is_enabled(encoding) {
+                self.accept_compression_encodings.enable(encoding);
+            }
+            if send_encodings.is_enabled(encoding) {
+                self.send_compression_encodings.enable(encoding);
+            }
+        }
+    }
+
+    pub(crate) fn apply_max_message_size_config(
+        &mut self,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    ) {
+        if let Some(limit) = max_decoding_message_size {
+            self.max_decoding_message_size = Some(limit);
+        }
+        if let Some(limit) = max_encoding_message_size {
+            self.max_encoding_message_size = Some(limit);
+        }
+    }
+
+    pub(crate) fn request_encoding_if_supported<B>(
+        &self,
+        request: &http::Request<B>,
+    ) -> Result<Option<CompressionEncoding>, Status> {
+        CompressionEncoding::from_encoding_header(
+            request.headers(),
+            self.accept_compression_encodings,
+        )
+    }
 }
 
 /// A gRPC Server handler.
@@ -57,14 +119,7 @@ macro_rules! t {
 /// implements some [`Body`].
 pub struct Grpc<T> {
     codec: T,
-    /// Which compression encodings does the server accept for requests?
-    accept_compression_encodings: EnabledCompressionEncodings,
-    /// Which compression encodings might the server use for responses.
-    send_compression_encodings: EnabledCompressionEncodings,
-    /// Limits the maximum size of a decoded message.
-    max_decoding_message_size: Option<usize>,
-    /// Limits the maximum size of an encoded message.
-    max_encoding_message_size: Option<usize>,
+    config: ServerGrpcConfig,
 }
 
 impl<T> Grpc<T>
@@ -75,10 +130,7 @@ where
     pub fn new(codec: T) -> Self {
         Self {
             codec,
-            accept_compression_encodings: EnabledCompressionEncodings::default(),
-            send_compression_encodings: EnabledCompressionEncodings::default(),
-            max_decoding_message_size: None,
-            max_encoding_message_size: None,
+            config: ServerGrpcConfig::default(),
         }
     }
 
@@ -110,7 +162,7 @@ where
     /// let service = ExampleServer::new(Svc).accept_compressed(CompressionEncoding::Gzip);
     /// ```
     pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-        self.accept_compression_encodings.enable(encoding);
+        self.config.accept_compression_encodings.enable(encoding);
         self
     }
 
@@ -141,7 +193,7 @@ where
     /// let service = ExampleServer::new(Svc).send_compressed(CompressionEncoding::Gzip);
     /// ```
     pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-        self.send_compression_encodings.enable(encoding);
+        self.config.send_compression_encodings.enable(encoding);
         self
     }
 
@@ -171,7 +223,7 @@ where
     /// let service = ExampleServer::new(Svc).max_decoding_message_size(limit);
     /// ```
     pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-        self.max_decoding_message_size = Some(limit);
+        self.config.max_decoding_message_size = Some(limit);
         self
     }
 
@@ -201,7 +253,7 @@ where
     /// let service = ExampleServer::new(Svc).max_encoding_message_size(limit);
     /// ```
     pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-        self.max_encoding_message_size = Some(limit);
+        self.config.max_encoding_message_size = Some(limit);
         self
     }
 
@@ -211,15 +263,8 @@ where
         accept_encodings: EnabledCompressionEncodings,
         send_encodings: EnabledCompressionEncodings,
     ) -> Self {
-        for &encoding in CompressionEncoding::ENCODINGS {
-            if accept_encodings.is_enabled(encoding) {
-                self = self.accept_compressed(encoding);
-            }
-            if send_encodings.is_enabled(encoding) {
-                self = self.send_compressed(encoding);
-            }
-        }
-
+        self.config
+            .apply_compression_config(accept_encodings, send_encodings);
         self
     }
 
@@ -229,13 +274,8 @@ where
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     ) -> Self {
-        if let Some(limit) = max_decoding_message_size {
-            self = self.max_decoding_message_size(limit);
-        }
-        if let Some(limit) = max_encoding_message_size {
-            self = self.max_encoding_message_size(limit);
-        }
-
+        self.config
+            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
         self
     }
 
@@ -252,7 +292,7 @@ where
     {
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
-            self.send_compression_encodings,
+            self.config.send_compression_encodings,
         );
 
         let request = match self.map_request_unary(req).await {
@@ -262,7 +302,7 @@ where
                     Err(status),
                     accept_encoding,
                     SingleMessageCompressionOverride::default(),
-                    self.max_encoding_message_size,
+                    self.config.max_encoding_message_size,
                 );
             }
         };
@@ -278,7 +318,7 @@ where
             response,
             accept_encoding,
             compression_override,
-            self.max_encoding_message_size,
+            self.config.max_encoding_message_size,
         )
     }
 
@@ -296,7 +336,7 @@ where
     {
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
-            self.send_compression_encodings,
+            self.config.send_compression_encodings,
         );
 
         let request = match self.map_request_unary(req).await {
@@ -306,7 +346,7 @@ where
                     Err(status),
                     accept_encoding,
                     SingleMessageCompressionOverride::default(),
-                    self.max_encoding_message_size,
+                    self.config.max_encoding_message_size,
                 );
             }
         };
@@ -319,7 +359,7 @@ where
             // disabling compression of individual stream items must be done on
             // the items themselves
             SingleMessageCompressionOverride::default(),
-            self.max_encoding_message_size,
+            self.config.max_encoding_message_size,
         )
     }
 
@@ -336,7 +376,7 @@ where
     {
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
-            self.send_compression_encodings,
+            self.config.send_compression_encodings,
         );
 
         let request = t!(self.map_request_streaming(req));
@@ -352,7 +392,7 @@ where
             response,
             accept_encoding,
             compression_override,
-            self.max_encoding_message_size,
+            self.config.max_encoding_message_size,
         )
     }
 
@@ -370,7 +410,7 @@ where
     {
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
-            self.send_compression_encodings,
+            self.config.send_compression_encodings,
         );
 
         let request = t!(self.map_request_streaming(req));
@@ -381,7 +421,7 @@ where
             response,
             accept_encoding,
             SingleMessageCompressionOverride::default(),
-            self.max_encoding_message_size,
+            self.config.max_encoding_message_size,
         )
     }
 
@@ -393,7 +433,7 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<crate::BoxError> + Send,
     {
-        let request_compression_encoding = self.request_encoding_if_supported(&request)?;
+        let request_compression_encoding = self.config.request_encoding_if_supported(&request)?;
 
         let (parts, body) = request.into_parts();
 
@@ -401,7 +441,7 @@ where
             self.codec.decoder(),
             body,
             request_compression_encoding,
-            self.max_decoding_message_size,
+            self.config.max_decoding_message_size,
         ));
 
         let message = stream
@@ -426,14 +466,14 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<crate::BoxError> + Send,
     {
-        let encoding = self.request_encoding_if_supported(&request)?;
+        let encoding = self.config.request_encoding_if_supported(&request)?;
 
         let request = request.map(|body| {
             Streaming::new_request(
                 self.codec.decoder(),
                 body,
                 encoding,
-                self.max_decoding_message_size,
+                self.config.max_decoding_message_size,
             )
         });
 
@@ -454,19 +494,7 @@ where
 
         let (mut parts, body) = response.into_http().into_parts();
 
-        // Set the content type
-        parts
-            .headers
-            .insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE);
-
-        #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
-        if let Some(encoding) = accept_encoding {
-            // Set the content encoding
-            parts.headers.insert(
-                crate::codec::compression::ENCODING_HEADER,
-                encoding.into_header_value(),
-            );
-        }
+        set_grpc_response_headers(&mut parts, accept_encoding);
 
         let body = EncodeBody::new_server(
             self.codec.encoder(),
@@ -478,16 +506,6 @@ where
 
         http::Response::from_parts(parts, Body::new(body))
     }
-
-    fn request_encoding_if_supported<B>(
-        &self,
-        request: &http::Request<B>,
-    ) -> Result<Option<CompressionEncoding>, Status> {
-        CompressionEncoding::from_encoding_header(
-            request.headers(),
-            self.accept_compression_encodings,
-        )
-    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
@@ -496,17 +514,43 @@ impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
             .field("codec", &self.codec)
             .field(
                 "accept_compression_encodings",
-                &self.accept_compression_encodings,
+                &self.config.accept_compression_encodings,
             )
             .field(
                 "send_compression_encodings",
-                &self.send_compression_encodings,
+                &self.config.send_compression_encodings,
             )
             .finish()
     }
 }
 
-fn compression_override_from_response<B, E>(
+/// Sets the gRPC response headers (content type, and, if compression features are
+/// enabled, the response's content encoding) on `parts`. Shared by both `map_response`
+/// variants (this one and `local::server::Grpc`'s).
+pub(crate) fn set_grpc_response_headers(
+    parts: &mut http::response::Parts,
+    accept_encoding: Option<CompressionEncoding>,
+) {
+    // Set the content type
+    parts
+        .headers
+        .insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE);
+
+    #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
+    if let Some(encoding) = accept_encoding {
+        // Set the content encoding
+        parts.headers.insert(
+            crate::codec::compression::ENCODING_HEADER,
+            encoding.into_header_value(),
+        );
+    }
+    // `accept_encoding` is otherwise unused without compression features; keep it a
+    // real use so the parameter never triggers `unused_variables` on that build.
+    #[cfg(not(any(feature = "gzip", feature = "deflate", feature = "zstd")))]
+    let _ = accept_encoding;
+}
+
+pub(crate) fn compression_override_from_response<B, E>(
     res: &Result<crate::Response<B>, E>,
 ) -> SingleMessageCompressionOverride {
     res.as_ref()

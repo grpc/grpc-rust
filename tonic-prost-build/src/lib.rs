@@ -108,6 +108,8 @@ pub fn configure() -> Builder {
         disable_comments: HashSet::default(),
         use_arc_self: false,
         generate_default_stubs: false,
+        #[cfg(feature = "local")]
+        local: false,
         codec_path: "tonic_prost::ProstCodec".to_string(),
         skip_debug: HashSet::default(),
     }
@@ -349,6 +351,8 @@ struct ServiceGenerator {
     server_attributes: Attributes,
     use_arc_self: bool,
     generate_default_stubs: bool,
+    #[cfg(feature = "local")]
+    local: bool,
     proto_path: String,
     compile_well_known_types: bool,
     codec_path: String,
@@ -379,6 +383,8 @@ impl ServiceGenerator {
             server_attributes,
             use_arc_self,
             generate_default_stubs,
+            #[cfg(feature = "local")]
+            local: false,
             proto_path,
             compile_well_known_types,
             codec_path,
@@ -399,6 +405,8 @@ impl prost_build::ServiceGenerator for ServiceGenerator {
             .disable_comments(self.disable_comments.clone())
             .use_arc_self(self.use_arc_self)
             .generate_default_stubs(self.generate_default_stubs);
+        #[cfg(feature = "local")]
+        builder.local(self.local);
 
         let mut tokens = TokenStream::new();
 
@@ -448,6 +456,8 @@ pub struct Builder {
     disable_comments: HashSet<String>,
     use_arc_self: bool,
     generate_default_stubs: bool,
+    #[cfg(feature = "local")]
+    local: bool,
     codec_path: String,
     skip_debug: HashSet<String>,
 }
@@ -706,8 +716,37 @@ impl Builder {
     }
 
     /// Use `Arc<Self>` on the Server trait.
+    ///
+    #[cfg_attr(
+        feature = "local",
+        doc = "Incompatible with [`local`](Self::local); enabling both panics at generation time."
+    )]
+    #[cfg_attr(
+        not(feature = "local"),
+        doc = "Incompatible with the `local` codegen mode (feature `local`); enabling both panics at generation time."
+    )]
     pub fn use_arc_self(mut self, enable: bool) -> Self {
         self.use_arc_self = enable;
+        self
+    }
+
+    /// Generate single-threaded (`!Send`) clients and servers targeting
+    /// `tonic::local` instead of the default `Send + Sync` API.
+    ///
+    /// Generated servers hold their handler in an `Rc` (no atomic
+    /// reference-counting), the service trait is `#[async_trait(?Send)]` with
+    /// no `Send + Sync` supertraits, and generated clients accept `!Send`
+    /// transports and request streams. Requires the `local` feature on the
+    /// `tonic` crate (plus `local-transport` for the provided server/channel).
+    ///
+    /// Incompatible with [`use_arc_self`](Self::use_arc_self): enabling both
+    /// panics at generation time, because `self: Arc<Self>` receivers cannot
+    /// be produced for `Rc`-held handlers.
+    ///
+    /// Available behind the `local` feature.
+    #[cfg(feature = "local")]
+    pub fn local(mut self, enable: bool) -> Self {
+        self.local = enable;
         self
     }
 
@@ -736,6 +775,30 @@ impl Builder {
         self.skip_debug
             .extend(paths.into_iter().map(|s| s.as_ref().to_string()));
         self
+    }
+
+    /// Turn this `Builder`'s configuration into a `ServiceGenerator`.
+    fn into_service_generator(self) -> ServiceGenerator {
+        let service_generator = ServiceGenerator::new(
+            self.build_client,
+            self.build_server,
+            self.build_transport,
+            self.client_attributes,
+            self.server_attributes,
+            self.use_arc_self,
+            self.generate_default_stubs,
+            self.proto_path,
+            self.compile_well_known_types,
+            self.codec_path.clone(),
+            self.disable_comments,
+        );
+        #[cfg(feature = "local")]
+        let mut service_generator = service_generator;
+        #[cfg(feature = "local")]
+        {
+            service_generator.local = self.local;
+        }
+        service_generator
     }
 
     /// Compile the .proto files and execute code generation.
@@ -843,21 +906,7 @@ impl Builder {
         }
 
         if self.build_client || self.build_server {
-            let service_generator = ServiceGenerator::new(
-                self.build_client,
-                self.build_server,
-                self.build_transport,
-                self.client_attributes,
-                self.server_attributes,
-                self.use_arc_self,
-                self.generate_default_stubs,
-                self.proto_path,
-                self.compile_well_known_types,
-                self.codec_path.clone(),
-                self.disable_comments,
-            );
-
-            config.service_generator(Box::new(service_generator));
+            config.service_generator(Box::new(self.into_service_generator()));
         };
 
         config.compile_protos(protos, includes)?;
@@ -945,21 +994,7 @@ impl Builder {
         }
 
         if self.build_client || self.build_server {
-            let service_generator = ServiceGenerator::new(
-                self.build_client,
-                self.build_server,
-                self.build_transport,
-                self.client_attributes,
-                self.server_attributes,
-                self.use_arc_self,
-                self.generate_default_stubs,
-                self.proto_path,
-                self.compile_well_known_types,
-                self.codec_path.clone(),
-                self.disable_comments,
-            );
-
-            config.service_generator(Box::new(service_generator));
+            config.service_generator(Box::new(self.into_service_generator()));
         };
 
         config.compile_fds(fds)?;
@@ -970,18 +1005,6 @@ impl Builder {
     /// Turn the builder into a `ServiceGenerator` ready to be passed to `prost-build`s
     /// `Config::service_generator`.
     pub fn service_generator(self) -> Box<dyn prost_build::ServiceGenerator> {
-        Box::new(ServiceGenerator::new(
-            self.build_client,
-            self.build_server,
-            self.build_transport,
-            self.client_attributes,
-            self.server_attributes,
-            self.use_arc_self,
-            self.generate_default_stubs,
-            self.proto_path,
-            self.compile_well_known_types,
-            self.codec_path.clone(),
-            self.disable_comments,
-        ))
+        Box::new(self.into_service_generator())
     }
 }

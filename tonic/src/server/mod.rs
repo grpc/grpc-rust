@@ -36,6 +36,17 @@ mod grpc;
 mod service;
 
 pub use self::grpc::Grpc;
+// `grpc` is a private module, so these `pub(crate)` items need a re-export to be
+// path-reachable from `local::server` (mirrors `client/mod.rs`'s `GrpcConfig` /
+// `classify_response` re-exports for the same reason).
+#[cfg(feature = "local")]
+pub(crate) use self::grpc::ServerGrpcConfig;
+#[cfg(feature = "local")]
+pub(crate) use self::grpc::compression_override_from_response;
+#[cfg(feature = "local")]
+pub(crate) use self::grpc::set_grpc_response_headers;
+#[cfg(feature = "local")]
+pub(crate) use self::grpc::t;
 pub use self::service::{
     ClientStreamingService, ServerStreamingService, StreamingService, UnaryService,
 };

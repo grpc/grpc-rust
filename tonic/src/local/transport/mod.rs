@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -22,30 +22,29 @@
  *
  */
 
-//! Generic client implementation.
+//! Single-threaded transport: a hyper executor that spawns onto the current
+//! `tokio::task::LocalSet` (or `LocalRuntime`), plus the server and channel
+//! built on top of it.
 //!
-//! This module contains the low level components to build a gRPC client. It
-//! provides a codec agnostic gRPC client dispatcher and a decorated tower
-//! service trait.
-//!
-//! This client is generally used by some code generation tool to provide stubs
-//! for the gRPC service. Thusly, they are a bit cumbersome to use by hand.
-//!
-//! ## Concurrent usage
-//!
-//! Upon using the your generated client, you will discover all the functions
-//! corresponding to your rpc methods take `&mut self`, making concurrent
-//! usage of the client difficult. The answer is simply to clone the client,
-//! which is cheap as all client instances will share the same channel for
-//! communication. For more details, see
-//! [transport::Channel](../transport/struct.Channel.html#multiplexing-requests).
+//! Calling into this module requires a tokio local context: a
+//! `tokio::task::LocalSet` (any tokio 1.x) or a `tokio::runtime::LocalRuntime`
+//! (tokio >= 1.51). `tokio::task::spawn_local` panics outside of one.
 
-mod grpc;
-mod service;
+use std::future::Future;
 
-pub use self::grpc::Grpc;
-#[cfg(feature = "local")]
-pub(crate) use self::grpc::GrpcConfig;
-#[cfg(feature = "local")]
-pub(crate) use self::grpc::classify_response;
-pub use self::service::GrpcService;
+pub mod channel;
+pub mod server;
+
+/// A [`hyper::rt::Executor`] that spawns futures onto the current
+/// `tokio::task::LocalSet`/`LocalRuntime` via `tokio::task::spawn_local`.
+///
+/// Panics if used outside a tokio local context; not guarded, matches
+/// `spawn_local`'s own contract.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalExec;
+
+impl<F: Future + 'static> hyper::rt::Executor<F> for LocalExec {
+    fn execute(&self, fut: F) {
+        tokio::task::spawn_local(fut);
+    }
+}

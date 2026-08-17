@@ -1,0 +1,19 @@
+[package]
+authors = ["gRPC authors"]
+edition = "2021"
+license = "MIT"
+name = "local-tests"
+publish = false
+
+[dependencies]
+prost = "0.14"
+tokio = {version = "1.51", features = ["rt", "macros"]}
+tokio-stream = "0.1"
+tonic = {path = "../../tonic", features = ["local", "local-transport"]}
+tonic-prost = {path = "../../tonic-prost"}
+
+[dev-dependencies]
+static_assertions = "1"
+
+[build-dependencies]
+tonic-prost-build = {path = "../../tonic-prost-build", features = ["local"]}

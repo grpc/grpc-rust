@@ -43,6 +43,7 @@ pub struct CodeGenBuilder {
     disable_comments: HashSet<String>,
     use_arc_self: bool,
     generate_default_stubs: bool,
+    local: bool,
 }
 
 impl CodeGenBuilder {
@@ -89,6 +90,15 @@ impl CodeGenBuilder {
     }
 
     /// Emit `Arc<Self>` instead of `&self` in service trait.
+    ///
+    #[cfg_attr(
+        feature = "local",
+        doc = "Incompatible with [`local`](Self::local); enabling both panics at generation time."
+    )]
+    #[cfg_attr(
+        not(feature = "local"),
+        doc = "Incompatible with the `local` codegen mode (feature `local`); enabling both panics at generation time."
+    )]
     pub fn use_arc_self(&mut self, enable: bool) -> &mut Self {
         self.use_arc_self = enable;
         self
@@ -97,6 +107,26 @@ impl CodeGenBuilder {
     /// Enable or disable returning automatic unimplemented gRPC error code for generated traits.
     pub fn generate_default_stubs(&mut self, generate_default_stubs: bool) -> &mut Self {
         self.generate_default_stubs = generate_default_stubs;
+        self
+    }
+
+    /// Generate single-threaded (`!Send`) clients and servers targeting
+    /// `tonic::local` instead of the default `Send + Sync` API.
+    ///
+    /// Generated servers hold their handler in an `Rc` (no atomic
+    /// reference-counting), the service trait is `#[async_trait(?Send)]` with
+    /// no `Send + Sync` supertraits, and generated clients accept `!Send`
+    /// transports and request streams. Requires the `local` feature on the
+    /// `tonic` crate (plus `local-transport` for the provided server/channel).
+    ///
+    /// Incompatible with [`use_arc_self`](Self::use_arc_self): enabling both
+    /// panics at generation time, because `self: Arc<Self>` receivers cannot
+    /// be produced for `Rc`-held handlers.
+    ///
+    /// Available behind the `local` feature.
+    #[cfg(feature = "local")]
+    pub fn local(&mut self, enable: bool) -> &mut Self {
+        self.local = enable;
         self
     }
 
@@ -113,6 +143,7 @@ impl CodeGenBuilder {
             self.build_transport,
             &self.attributes,
             &self.disable_comments,
+            self.local,
         )
     }
 
@@ -121,6 +152,9 @@ impl CodeGenBuilder {
     /// This takes some `Service` and will generate a `TokenStream` that contains
     /// a public module with the generated client.
     pub fn generate_server(&self, service: &impl Service, proto_path: &str) -> TokenStream {
+        if self.local && self.use_arc_self {
+            panic!("use_arc_self is not supported with local codegen");
+        }
         crate::server::generate_internal(
             service,
             self.emit_package,
@@ -130,6 +164,7 @@ impl CodeGenBuilder {
             &self.disable_comments,
             self.use_arc_self,
             self.generate_default_stubs,
+            self.local,
         )
     }
 }
@@ -144,6 +179,7 @@ impl Default for CodeGenBuilder {
             disable_comments: HashSet::default(),
             use_arc_self: false,
             generate_default_stubs: false,
+            local: false,
         }
     }
 }

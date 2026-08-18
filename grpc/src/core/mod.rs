@@ -155,13 +155,13 @@ impl Display for Address {
 /// Information about the connection to the RPC's peer (from the client/server
 /// pair).
 #[derive(Debug, Clone)]
-pub struct PeerInfo {
+pub struct ConnectionInfo {
     local_address: Address,
     remote_address: Address,
     security_info: SecurityInfo,
 }
 
-impl PeerInfo {
+impl ConnectionInfo {
     /// Constructs a new PeerInfo with the given fields.
     pub fn new(
         local_address: Address,
@@ -192,8 +192,8 @@ impl PeerInfo {
 }
 
 #[cfg(test)]
-pub(crate) fn test_peer_info() -> PeerInfo {
-    PeerInfo {
+pub(crate) fn test_peer_info() -> ConnectionInfo {
+    ConnectionInfo {
         local_address: Address {
             network_type: "",
             address: ByteStr::default(),

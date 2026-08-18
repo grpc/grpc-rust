@@ -57,7 +57,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::Address;
-use crate::core::PeerInfo;
+use crate::core::ConnectionInfo;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
@@ -86,7 +86,7 @@ impl Backoff for NopBackoff {
 
 struct ReadyState {
     service: Box<dyn DynInvoke>,
-    peer_info: PeerInfo,
+    peer_info: ConnectionInfo,
     authority: Authority,
 }
 

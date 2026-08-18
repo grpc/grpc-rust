@@ -37,7 +37,7 @@ use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::client::Trailers;
 use crate::client::interceptor::Intercept;
-use crate::core::PeerInfo;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 
@@ -182,7 +182,7 @@ impl SendStream for NopSendStream {
 
 pub(crate) struct FailingRecvStream {
     status: Option<StatusError>,
-    peer_info: Option<PeerInfo>,
+    peer_info: Option<ConnectionInfo>,
 }
 
 impl RecvStream for FailingRecvStream {
@@ -199,7 +199,7 @@ impl RecvStream for FailingRecvStream {
 impl FailingRecvStream {
     pub(crate) fn new_stream_pair(
         status: StatusError,
-        peer_info: Option<PeerInfo>,
+        peer_info: Option<ConnectionInfo>,
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
         (
             Box::new(NopSendStream),

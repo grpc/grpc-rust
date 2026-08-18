@@ -67,7 +67,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::core::Address;
-use crate::core::PeerInfo;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::credentials::SecurityInfo;
@@ -295,7 +295,7 @@ impl ServerRecvStream for InMemoryServerRecvStream {
 pub struct InMemoryConnection {
     s: mpsc::Sender<InMemoryServerCall>,
     closed_tx: Option<oneshot::Sender<Result<(), String>>>,
-    peer_info: PeerInfo,
+    peer_info: ConnectionInfo,
 }
 
 impl Invoke for InMemoryConnection {
@@ -373,7 +373,7 @@ impl Drop for InMemoryClientSendStream {
 pub struct InMemoryClientRecvStream {
     rx: mpsc::UnboundedReceiver<InMemoryResponseStreamItem>,
     trailer_rx: Option<oneshot::Receiver<ServerTrailers>>,
-    peer_info: Option<PeerInfo>,
+    peer_info: Option<ConnectionInfo>,
 }
 
 impl ClientRecvStream for InMemoryClientRecvStream {
@@ -434,7 +434,7 @@ impl Transport for InMemoryTransport {
     ) -> Result<
         (
             Self::Service,
-            PeerInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -454,7 +454,7 @@ impl Transport for InMemoryTransport {
             address: ByteStr::default(),
             attributes: Attributes::new(),
         };
-        let peer_info = PeerInfo::new(local_address, address.clone(), sec_info);
+        let peer_info = ConnectionInfo::new(local_address, address.clone(), sec_info);
         let conn = InMemoryConnection {
             s: s.clone(),
             closed_tx: Some(closed_tx),

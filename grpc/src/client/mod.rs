@@ -53,7 +53,7 @@ use std::time::Instant;
 
 use tonic::async_trait;
 
-use crate::core::PeerInfo;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -371,12 +371,12 @@ impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
 #[derive(Debug, Clone)]
 pub struct ResponseHeaders {
     metadata: MetadataMap,
-    peer_info: PeerInfo,
+    peer_info: ConnectionInfo,
 }
 
 impl ResponseHeaders {
     /// Returns a default ResponseHeaders instance.
-    pub fn new(peer_info: PeerInfo) -> Self {
+    pub fn new(peer_info: ConnectionInfo) -> Self {
         Self {
             metadata: MetadataMap::default(),
             peer_info,
@@ -404,13 +404,13 @@ impl ResponseHeaders {
     }
 
     /// Replaces the peer_info of self with `peer_info`.
-    pub fn with_peer_info(mut self, peer_info: PeerInfo) -> Self {
+    pub fn with_peer_info(mut self, peer_info: ConnectionInfo) -> Self {
         self.peer_info = peer_info;
         self
     }
 
     /// Replaces the peer_info of self with `peer_info`.
-    pub fn peer_info(&self) -> &PeerInfo {
+    pub fn peer_info(&self) -> &ConnectionInfo {
         &self.peer_info
     }
 }
@@ -470,7 +470,7 @@ impl RequestHeaders {
 pub struct Trailers {
     status: crate::Result<()>,
     metadata: MetadataMap,
-    peer_info: Option<PeerInfo>,
+    peer_info: Option<ConnectionInfo>,
 }
 
 impl Trailers {
@@ -516,7 +516,7 @@ impl Trailers {
     }
 
     /// Replaces the peer info in self with `peer_info`.
-    pub fn with_peer_info(mut self, peer_info: Option<PeerInfo>) -> Self {
+    pub fn with_peer_info(mut self, peer_info: Option<ConnectionInfo>) -> Self {
         self.peer_info = peer_info;
         self
     }
@@ -528,7 +528,7 @@ impl Trailers {
     ///
     /// 2. The error was generated locally on the client before a connection was
     ///    chosen for the RPC.
-    pub fn peer_info(&self) -> &Option<PeerInfo> {
+    pub fn peer_info(&self) -> &Option<ConnectionInfo> {
         &self.peer_info
     }
 

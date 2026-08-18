@@ -85,7 +85,7 @@ use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
 use crate::core::Address;
-use crate::core::PeerInfo;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::private;
@@ -136,7 +136,7 @@ struct TonicTransport {
     grpc: Grpc<TonicService>,
     task_handle: BoxedTaskHandle,
     runtime: GrpcRuntime,
-    peer_info: PeerInfo,
+    peer_info: ConnectionInfo,
 }
 
 impl Drop for TonicTransport {
@@ -234,7 +234,7 @@ impl SendStream for TonicSendStream {
 struct TonicRecvStream {
     state: StreamState,
     cancel_tx: Option<CancellationHandle>,
-    peer_info: Option<PeerInfo>,
+    peer_info: Option<ConnectionInfo>,
 }
 
 impl TonicRecvStream {
@@ -404,7 +404,7 @@ impl Transport for TransportBuilder {
     ) -> Result<
         (
             Self::Service,
-            PeerInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -505,7 +505,7 @@ impl Transport for TransportBuilder {
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
 
-        let peer_info = PeerInfo::new(
+        let peer_info = ConnectionInfo::new(
             local_address,
             remote_address,
             handshake_ouput.security_info.clone(),

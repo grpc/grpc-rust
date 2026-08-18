@@ -51,7 +51,7 @@ use std::sync::Arc;
 
 use tonic::async_trait;
 
-use crate::core::PeerInfo;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -516,12 +516,12 @@ pub struct RequestHeaders {
     /// The application-specified metadata for the call.
     metadata: MetadataMap,
     /// Information about the client.
-    peer_info: PeerInfo,
+    peer_info: ConnectionInfo,
 }
 
 impl RequestHeaders {
     /// Returns a default RequestHeaders instance.
-    pub fn new(method_name: impl Into<String>, peer_info: PeerInfo) -> Self {
+    pub fn new(method_name: impl Into<String>, peer_info: ConnectionInfo) -> Self {
         Self {
             method_name: method_name.into(),
             peer_info,
@@ -557,13 +557,13 @@ impl RequestHeaders {
     }
 
     /// Replaces the peer_info of self with `peer_info`.
-    pub fn with_peer_info(mut self, peer_info: PeerInfo) -> Self {
+    pub fn with_peer_info(mut self, peer_info: ConnectionInfo) -> Self {
         self.peer_info = peer_info;
         self
     }
 
     /// Replaces the peer_info of self with `peer_info`.
-    pub fn peer_info(&self) -> &PeerInfo {
+    pub fn peer_info(&self) -> &ConnectionInfo {
         &self.peer_info
     }
 

@@ -51,13 +51,27 @@ use std::sync::Arc;
 
 use tonic::async_trait;
 
-use crate::client::CallOptions;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
 pub(crate) mod interceptor;
+
+/// Settings to configure RPCs sent using the [`Handle`] trait.
+///
+/// Most applications will not need this type, and will set options via the
+/// generated (e.g. protobuf) APIs instead.
+#[derive(Default, Clone)]
+#[non_exhaustive]
+pub struct CallOptions {}
+
+impl CallOptions {
+    /// Constructs a new [`CallOptions`] with the default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// A serving connection that supports graceful shutdown.
 ///
@@ -977,7 +991,6 @@ mod tests {
 
     #[tokio::test]
     async fn listener_dropped_immediately_while_connections_drain() {
-        use crate::client::CallOptions;
         use crate::server::RecvStream;
         use crate::server::RequestHeaders;
         use crate::server::SendStream;

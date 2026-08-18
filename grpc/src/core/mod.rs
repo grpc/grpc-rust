@@ -122,7 +122,7 @@ impl dyn RecvMessage + '_ {
 
 /// An Address is an identifier that indicates how to connect to a server.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Address {
     /// The network type is used to identify what kind of transport to create
     /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.

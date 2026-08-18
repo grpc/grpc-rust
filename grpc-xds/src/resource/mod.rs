@@ -22,31 +22,27 @@
  *
  */
 
-// TODO: remove once A48 (least-request LB) and priority LB consume all fields.
-#![allow(dead_code)]
-//! xDS resource type implementations.
-//!
-//! Each module implements [`xds_client::Resource`] for one of the four resource types:
-//! - [`ListenerResource`] (LDS)
-//! - [`RouteConfigResource`] (RDS)
-//! - [`ClusterResource`] (CDS)
-//! - [`EndpointsResource`] (EDS)
-//!
-//! These are *validated* types containing only the fields relevant to gRPC
+//! The xDS data model layer: validated, owned representations of the raw
+//! discovery-protocol resources (LDS/RDS/CDS/EDS), each implementing
+//! [`xds_client::Resource`] so it can be deserialized, named, and validated
+//! (gRFC A27) independently of any live xDS traffic.
+//! The dependency manager assembles these into an [`crate::xds_config::XdsConfig`].
 
-pub(crate) mod circuit_breaking;
-pub(crate) mod cluster;
-pub(crate) mod endpoints;
-pub(crate) mod hash_policy;
-pub(crate) mod listener;
-pub(crate) mod outlier_detection;
-pub(crate) mod route_config;
-pub(crate) mod safe_regex;
-pub(crate) mod san_matcher;
-pub(crate) mod security;
-pub(crate) mod string_matcher;
+// TODO: remove once the xDS dependency manager subscribes to these resource
+// types and assembles them into an XdsConfig.
+#![allow(dead_code, unused_imports)]
 
-pub(crate) use cluster::ClusterResource;
-pub(crate) use endpoints::EndpointsResource;
-pub(crate) use listener::ListenerResource;
-pub(crate) use route_config::RouteConfigResource;
+mod cluster;
+mod endpoint;
+mod listener;
+mod route;
+
+pub(crate) use cluster::{ClusterDiscovery, ClusterResource};
+pub(crate) use endpoint::{
+    EndpointAddress, EndpointsResource, HealthStatus, LbEndpoint, Locality, LocalityLbEndpoints,
+};
+pub(crate) use listener::{ListenerResource, RouteSource};
+pub(crate) use route::{
+    HeaderMatchSpecifier, HeaderMatcher, PathSpecifier, Route, RouteAction, RouteConfigResource,
+    RouteMatch, StringMatcher, VirtualHost, WeightedCluster,
+};

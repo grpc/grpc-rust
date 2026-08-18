@@ -22,7 +22,7 @@
  *
  */
 
-#[allow(unused)]
+#[allow(unused, clippy::all)]
 mod generated {
     pub mod api {
         grpc::include_proto!("google/pubsub/v1", "pubsub");

@@ -22,7 +22,7 @@
  *
  */
 
-#[allow(unused)]
+#[allow(unused, clippy::all)]
 pub mod generated {
     pub mod grpc {
         pub mod testing {

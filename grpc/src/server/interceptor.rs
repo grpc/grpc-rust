@@ -22,7 +22,7 @@
  *
  */
 
-use crate::client::CallOptions;
+use crate::server::CallOptions;
 use crate::server::Handle;
 use crate::server::RecvStream;
 use crate::server::RequestHeaders;
@@ -96,7 +96,6 @@ mod test {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::client::CallOptions;
     use crate::core::RecvMessage;
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;

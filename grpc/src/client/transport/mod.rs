@@ -156,7 +156,7 @@ pub(crate) struct SecurityOpts {
 /// This may be added as an [`Address`] attribute by a
 /// [`crate::client::name_resolution::Resolver`]. If present, the subchannel
 /// will automatically handle the HTTP `CONNECT` handshake.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct ProxyOptions {
     proxy_authorization_header: Option<HeaderValue>,
     target_authority: String,

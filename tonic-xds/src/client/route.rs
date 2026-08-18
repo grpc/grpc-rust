@@ -40,6 +40,8 @@ use tower::{BoxError, Layer, Service};
 pub(crate) struct RouteInput<'a> {
     /// The authority (host) of the request URI.
     pub authority: &'a str,
+    /// The request path (e.g. `/pkg.Service/Method`), used for path matching.
+    pub path: &'a str,
     /// The HTTP headers of the request. These can be used for header-based routing decisions.
     pub headers: &'a http::HeaderMap,
 }
@@ -210,6 +212,7 @@ where
                 }
                 let route_input = RouteInput {
                     authority: &authority,
+                    path: request.uri().path(),
                     headers: request.headers(),
                 };
                 router.route(&route_input, &config)?
@@ -291,6 +294,77 @@ mod tests {
                 retry_config: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn matches_routes_on_the_request_path() {
+        use crate::xds::cache::XdsCache;
+        use crate::xds::resource::route_config::{
+            PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch,
+            RouteConfigResource, VirtualHostConfig,
+        };
+        use crate::xds::routing::XdsRouter;
+
+        fn prefix_route(prefix: &str, cluster: &str) -> RouteConfig {
+            RouteConfig {
+                match_criteria: RouteConfigMatch {
+                    path_specifier: PathSpecifierConfig::Prefix(prefix.into()),
+                    headers: vec![],
+                    case_sensitive: true,
+                    match_fraction: None,
+                },
+                action: RouteConfigAction::Cluster(cluster.into()),
+                retry_config: None,
+            }
+        }
+
+        let cache = XdsCache::new();
+        cache.update_route_config(Arc::new(RouteConfigResource {
+            name: "rc".into(),
+            virtual_hosts: vec![VirtualHostConfig {
+                name: "vh".into(),
+                domains: vec!["greeter.svc:50051".into()],
+                // Most specific first; "/" matches anything, so picking it means
+                // the real path never reached matching.
+                routes: vec![
+                    prefix_route("/pkg.Greeter/", "greeter-cluster"),
+                    prefix_route("/", "fallback-cluster"),
+                ],
+            }],
+            metadata: Default::default(),
+        }));
+        let xds_router = XdsRouter::new(&cache);
+        while xds_router.snapshot().is_none() {
+            tokio::task::yield_now().await;
+        }
+        let router: Arc<dyn Router> = Arc::new(xds_router);
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        let inner = service_fn(move |req: Request<()>| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = req
+                    .extensions()
+                    .get::<RouteDecision>()
+                    .map(|d| d.cluster.clone());
+                Ok::<_, BoxError>(http::Response::new(()))
+            }
+        });
+        let svc = XdsRoutingLayer::new(router, None, Arc::from("greeter.svc:50051")).layer(inner);
+
+        // The URI a tonic-generated client produces.
+        let req = Request::builder()
+            .uri("/pkg.Greeter/SayHello")
+            .body(())
+            .unwrap();
+        svc.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("greeter-cluster"),
+            "route matching did not see the request path",
+        );
     }
 
     #[tokio::test]

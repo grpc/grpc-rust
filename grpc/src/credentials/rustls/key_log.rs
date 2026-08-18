@@ -62,7 +62,7 @@ impl KeyLogFileInner {
             return Ok(());
         };
 
-        self.buf.truncate(0);
+        self.buf.clear();
         write!(self.buf, "{label} ")?;
         for b in client_random.iter() {
             write!(self.buf, "{b:02x}")?;

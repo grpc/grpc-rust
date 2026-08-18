@@ -234,7 +234,7 @@ impl ServerTransport for InMemoryServerCall {
     ) -> InMemoryServingConnection {
         let mut send = InMemoryServerSendStream { tx: self.resp_tx };
         let recv = BoxedRecvStream(Box::new(InMemoryServerRecvStream { rx: self.req_rx }));
-        let options = crate::client::CallOptions::default();
+        let options = crate::server::CallOptions::default();
         let trailers_tx = self.trailer_tx;
 
         let inner = Box::pin(async move {
@@ -575,7 +575,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
 
-        use crate::client::CallOptions;
+        use crate::server::CallOptions;
         use crate::server::RecvStream;
         use crate::server::RequestHeaders;
         use crate::server::SendStream;

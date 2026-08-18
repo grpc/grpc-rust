@@ -24,40 +24,16 @@
 
 use std::sync::Arc;
 
+use crate::server::DynHandle;
+use crate::server::DynHandleWrapper;
 use crate::server::descriptor::ServiceDescriptor;
-use crate::server::interceptor::{HandleExt, Intercept};
-use crate::server::{DynHandle, DynHandleWrapper};
+use crate::server::interceptor::HandleExt;
+use crate::server::interceptor::Intercept;
 
 /// A gRPC service that can register its methods with a server router.
 ///
 /// Implementations return their descriptor metadata via [`descriptor()`](Service::descriptor)
 /// and produce their method handlers via [`register_methods()`](Service::register_methods).
-///
-/// # Example
-///
-/// ```ignore
-/// use std::sync::Arc;
-/// use grpc::server::descriptor::*;
-/// use grpc::server::{DynHandle, Service};
-///
-/// struct EchoService { /* ... */ }
-///
-/// impl Service for EchoService {
-///     fn descriptor(&self) -> ServiceDescriptor {
-///         ServiceDescriptor::new(
-///             "mypackage.Echo",
-///             vec![MethodDescriptor::new("/mypackage.Echo/UnaryEcho", MethodType::Unary)],
-///         )
-///     }
-///
-///     fn register_methods(self) -> Vec<(String, Arc<dyn DynHandle>)> {
-///         vec![(
-///             "/mypackage.Echo/UnaryEcho".to_string(),
-///             Arc::new(self.unary_handler()),
-///         )]
-///     }
-/// }
-/// ```
 pub trait Service: Send + 'static {
     /// Returns the service descriptor (pure metadata).
     ///
@@ -109,12 +85,6 @@ pub trait ServiceExt: Service + Sized {
     /// when the service registers its methods, not at call time.
     ///
     /// Equivalent to Java's `ServerInterceptors.intercept(service, interceptor)`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let rate_limited_greeter = greeter_service.with_interceptor(rate_limiter);
-    /// ```
     fn with_interceptor<I: Intercept>(self, interceptor: I) -> InterceptedService<Self, I> {
         InterceptedService {
             service: self,
@@ -134,14 +104,18 @@ mod tests {
     use super::*;
     use crate::client::CallOptions;
     use crate::core::RecvMessage;
+    use crate::server::Handle;
+    use crate::server::RecvStream;
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
+    use crate::server::SendStream;
     use crate::server::Trailers;
-    use crate::server::descriptor::{MethodDescriptor, MethodType, ServiceDescriptor};
+    use crate::server::descriptor::MethodDescriptor;
+    use crate::server::descriptor::MethodType;
+    use crate::server::descriptor::ServiceDescriptor;
     use crate::server::interceptor::Intercept;
     use crate::server::router::RouterBuilder;
-    use crate::server::{Handle, RecvStream, SendStream};
 
     struct MockSendStream;
     impl SendStream for MockSendStream {

@@ -113,12 +113,7 @@ impl Intercept for Identity {
 ///
 /// Provides the [`chain`](InterceptExt::chain) method, which composes two
 /// interceptors into a single [`InterceptorChain`] that itself implements
-/// `Intercept`. Chains nest naturally via repeated calls:
-///
-/// ```ignore
-/// let pipeline = logging.chain(auth).chain(rate_limit);
-/// // execution order: logging → auth → rate_limit → handler
-/// ```
+/// `Intercept`. Chains nest naturally via repeated calls.
 pub trait InterceptExt: Intercept + Sized {
     /// Chains `self` with `next`, returning an [`InterceptorChain`] where
     /// `self` runs first and `next` runs second.
@@ -137,11 +132,6 @@ impl<T: Intercept + Sized> InterceptExt for T {}
 /// Created via [`InterceptExt::chain`]. Itself implements [`Intercept`], so
 /// chains compose recursively:
 /// `InterceptorChain<A, InterceptorChain<B, C>>` runs A → B → C.
-///
-/// ```ignore
-/// let pipeline = logging.chain(auth);
-/// server.interceptor(pipeline);
-/// ```
 #[derive(Clone)]
 pub struct InterceptorChain<A, B> {
     first: A,

@@ -24,7 +24,6 @@
 
 use crate::rt::GrpcRuntime;
 use crate::server::Server;
-use crate::server::ServerOptions;
 use crate::server::interceptor::Identity;
 use crate::server::interceptor::Intercept;
 use crate::server::interceptor::InterceptorChain;
@@ -36,18 +35,8 @@ use crate::server::service::Service;
 /// Register services with [`add_service()`](ServerBuilder::add_service) and add
 /// global interceptors with [`interceptor()`](ServerBuilder::interceptor), then
 /// finish with [`build()`](ServerBuilder::build).
-///
-/// # Examples
-///
-/// ```ignore
-/// let server = Server::builder()
-///     .interceptor(auth)
-///     .add_service(greeter_service)
-///     .build();
-/// ```
 pub struct ServerBuilder<I = Identity> {
     router: RouterBuilder<I>,
-    options: ServerOptions,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,17 +45,10 @@ pub struct ServerBuilder<I = Identity> {
 
 impl ServerBuilder<Identity> {
     /// Creates a new `ServerBuilder` with no interceptors.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ServerBuilder {
             router: RouterBuilder::new(),
-            options: ServerOptions::default(),
         }
-    }
-}
-
-impl Default for ServerBuilder<Identity> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -84,7 +66,6 @@ impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
     {
         ServerBuilder {
             router: self.router.chain_interceptor(next),
-            options: self.options,
         }
     }
 
@@ -100,7 +81,7 @@ impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
     /// [`build()`](ServerBuilder::build) can be used instead to use the default
     /// Tokio runtime.
     pub fn build_with_runtime(self, runtime: GrpcRuntime) -> Server {
-        Server::new(self.router.build(), runtime, self.options)
+        Server::new(self.router.build(), runtime)
     }
 }
 
@@ -115,11 +96,7 @@ impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
     /// Available only when the `_runtime-tokio` feature is enabled. Without it,
     /// use [`build_with_runtime()`](ServerBuilder::build_with_runtime).
     pub fn build(self) -> Server {
-        Server::new(
-            self.router.build(),
-            crate::rt::default_runtime(),
-            self.options,
-        )
+        Server::new(self.router.build(), crate::rt::default_runtime())
     }
 }
 
@@ -140,8 +117,11 @@ mod tests {
     use crate::server::SendStream;
     use crate::server::Server;
     use crate::server::Trailers;
-    use crate::server::descriptor::{MethodDescriptor, MethodType, ServiceDescriptor};
-    use crate::server::interceptor::{Intercept, InterceptExt};
+    use crate::server::descriptor::MethodDescriptor;
+    use crate::server::descriptor::MethodType;
+    use crate::server::descriptor::ServiceDescriptor;
+    use crate::server::interceptor::Intercept;
+    use crate::server::interceptor::InterceptExt;
     use crate::server::service::Service;
 
     struct MockSendStream;

@@ -37,7 +37,8 @@ use crate::server::RecvStream;
 use crate::server::RequestHeaders;
 use crate::server::SendStream;
 use crate::server::Trailers;
-use crate::server::descriptor::{MethodDescriptor, ServiceDescriptor};
+use crate::server::descriptor::MethodDescriptor;
+use crate::server::descriptor::ServiceDescriptor;
 use crate::server::interceptor::Identity;
 use crate::server::interceptor::Intercept;
 use crate::server::interceptor::InterceptExt;
@@ -45,13 +46,13 @@ use crate::server::interceptor::InterceptorChain;
 use crate::server::service::Service;
 
 /// A builder for constructing an immutable [`Router`].
-pub(crate) struct RouterBuilder<I = Identity> {
+pub(crate) struct RouterBuilder<I> {
     handlers: HashMap<String, Arc<dyn DynHandle>>,
     descriptors: Vec<ServiceDescriptor>,
     interceptor: I,
 }
 
-impl RouterBuilder {
+impl RouterBuilder<Identity> {
     /// Creates a new, empty `RouterBuilder` with no interceptors.
     pub(crate) fn new() -> RouterBuilder<Identity> {
         RouterBuilder {
@@ -121,15 +122,7 @@ impl Default for RouterBuilder<Identity> {
 /// both the router and server together.
 ///
 /// A `Router` is immutable once built; use [`RouterBuilder`] to construct one.
-///
-/// # Example
-///
-/// ```ignore
-/// let server = Server::builder()
-///     .add_service(my_service)
-///     .build();
-/// ```
-pub struct Router<I = Identity> {
+pub struct Router<I> {
     handlers: HashMap<String, Arc<dyn DynHandle>>,
     interceptor: I,
 }
@@ -200,7 +193,9 @@ mod test {
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
-    use crate::server::descriptor::{MethodDescriptor, MethodType, ServiceDescriptor};
+    use crate::server::descriptor::MethodDescriptor;
+    use crate::server::descriptor::MethodType;
+    use crate::server::descriptor::ServiceDescriptor;
 
     struct MockSendStream;
     impl SendStream for MockSendStream {

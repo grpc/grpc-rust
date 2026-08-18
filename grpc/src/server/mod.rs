@@ -60,11 +60,8 @@ use crate::rt::GrpcRuntime;
 pub mod builder;
 pub mod descriptor;
 pub(crate) mod interceptor;
-pub mod options;
 pub(crate) mod router;
 pub mod service;
-
-pub use options::ServerOptions;
 
 /// A serving connection that supports graceful shutdown.
 ///
@@ -89,7 +86,6 @@ pub trait GracefulConnection: Future<Output = ()> + Send + 'static {
 pub struct Server {
     handler: Option<Arc<dyn DynHandle>>,
     runtime: GrpcRuntime,
-    options: ServerOptions,
 }
 
 mod sealed {
@@ -182,39 +178,21 @@ impl GracefulCoordinator {
 
 impl Server {
     /// Creates a [`ServerBuilder`](builder::ServerBuilder) with no interceptors.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let server = Server::builder()
-    ///     .add_service(greeter_service)
-    ///     .build();
-    /// ```
     pub fn builder() -> builder::ServerBuilder<interceptor::Identity> {
         builder::ServerBuilder::new()
     }
 
-    /// Creates a new server with the given handler, runtime, and options.
-    pub(crate) fn new(
-        handler: impl Handle + 'static,
-        runtime: GrpcRuntime,
-        options: ServerOptions,
-    ) -> Self {
+    /// Creates a new server with the given handler and runtime.
+    pub(crate) fn new(handler: impl Handle + 'static, runtime: GrpcRuntime) -> Self {
         Self {
             handler: Some(Arc::new(handler)),
             runtime,
-            options,
         }
     }
 
     /// Returns the runtime used by this server.
     pub fn runtime(&self) -> &GrpcRuntime {
         &self.runtime
-    }
-
-    /// Returns the server options.
-    pub fn options(&self) -> &ServerOptions {
-        &self.options
     }
 
     /// Serves on the given listener until it stops producing connections.
@@ -287,7 +265,6 @@ impl Default for Server {
         Self {
             handler: None,
             runtime: crate::rt::default_runtime(),
-            options: ServerOptions::default(),
         }
     }
 }
@@ -630,11 +607,15 @@ impl Trailers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+
     use tokio::sync::Notify;
+
+    use super::*;
 
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
@@ -1011,10 +992,14 @@ mod tests {
     #[tokio::test]
     async fn listener_dropped_immediately_while_connections_drain() {
         use crate::client::CallOptions;
-        use crate::server::descriptor::{MethodDescriptor, MethodType, ServiceDescriptor};
+        use crate::server::RecvStream;
+        use crate::server::RequestHeaders;
+        use crate::server::SendStream;
+        use crate::server::Trailers;
+        use crate::server::descriptor::MethodDescriptor;
+        use crate::server::descriptor::MethodType;
+        use crate::server::descriptor::ServiceDescriptor;
         use crate::server::service::Service;
-        use crate::server::{RecvStream, SendStream};
-        use crate::server::{RequestHeaders, Trailers};
 
         let (listener, dropped, tx) = MockListener::new();
 

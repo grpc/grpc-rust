@@ -30,7 +30,6 @@ use grpc::client::InvokeOnce;
 use grpc::client::RequestHeaders;
 use grpc::client::SendOptions;
 use grpc::client::SendStream as _;
-use grpc::client::stream_util::RecvStreamValidator;
 use protobuf::AsView;
 use protobuf::ClearAndParse;
 use protobuf::Message;
@@ -81,14 +80,13 @@ where
     Res: Message + ClearAndParse,
     for<'b> Res::Mut<'b>: MessageMut<'b>,
 {
-    type Output = GrpcStreamingResponse<Res, RecvStreamValidator<C::RecvStream>>;
+    type Output = GrpcStreamingResponse<Res, C::RecvStream>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let headers = RequestHeaders::new().with_method_name(self.method);
             let (mut tx, rx) = self.channel.invoke_once(headers, self.args).await;
-            let rx = RecvStreamValidator::new(rx, false);
             let req = &ProtoSendMessage::from_view(&self.req);
             let _ = tx.send(req, SendOptions::new().with_final_msg(true)).await;
             GrpcStreamingResponse::new(rx)

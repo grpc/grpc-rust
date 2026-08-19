@@ -59,6 +59,7 @@ use protobuf::Proxied;
 use protobuf::Serialize;
 
 mod client;
+pub mod server;
 mod status;
 mod trailers_conv;
 pub use client::bidi::*;

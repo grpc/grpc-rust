@@ -38,10 +38,10 @@ use protobuf::MessageView;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
 
-pub(crate) mod bidi;
-pub(crate) mod client_streaming;
-pub(crate) mod server_streaming;
-pub(crate) mod unary;
+mod bidi;
+mod client_streaming;
+mod server_streaming;
+mod unary;
 
 pub use bidi::*;
 pub use client_streaming::*;

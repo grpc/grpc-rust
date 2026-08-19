@@ -75,10 +75,7 @@ where
     /// and returning the status of the call.
     pub async fn with_response_message(self, res: &mut impl AsMut<MutProxied = Res>) -> Status
     where
-        // ReqMsgView is a proto message view. (Ideally we could just require
-        // "AsView" and protobuf would automatically include the rest.)
-        ReqMsgView: AsView + Send + Sync + 'a,
-        <ReqMsgView as AsView>::Proxied: Message,
+        ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
         Res: Message,
     {
         let headers = RequestHeaders::new().with_method_name(self.method);
@@ -99,11 +96,7 @@ where
 impl<'a, C, ReqMsgView, Res> IntoFuture for UnaryCallBuilder<'a, C, ReqMsgView, Res>
 where
     C: InvokeOnce + 'a,
-    // ReqMsgView is a proto message view. (Ideally we could just require
-    // "AsView" and protobuf would automatically include the rest.  For now we
-    // need the HRTBs.)
-    ReqMsgView: AsView + Send + Sync + 'a,
-    <ReqMsgView as AsView>::Proxied: Message,
+    ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
     Res: Message,
 {
     type Output = Result<Res, StatusError>;

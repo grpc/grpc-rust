@@ -66,10 +66,7 @@ impl<'a, C, ReqMsgView, Res> ServerStreamingCallBuilder<'a, C, ReqMsgView, Res> 
 impl<'a, C, ReqMsgView, Res> IntoFuture for ServerStreamingCallBuilder<'a, C, ReqMsgView, Res>
 where
     C: InvokeOnce + 'a,
-    // ReqMsgView is a proto message view. (Ideally we could just require
-    // "AsView" and protobuf would automatically include the rest.)
-    ReqMsgView: AsView + Send + Sync + 'a,
-    <ReqMsgView as AsView>::Proxied: Message,
+    ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
     Res: Message,
 {
     type Output = GrpcStreamingResponse<Res, C::RecvStream>;

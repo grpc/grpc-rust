@@ -29,6 +29,7 @@ use serde::Deserialize;
 
 use super::duration::GrpcDuration;
 use crate::client::load_balancing::DynLbConfig;
+use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 
@@ -37,7 +38,7 @@ use crate::client::load_balancing::ParsedJsonLbConfig;
 pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
     #[serde(default)]
-    pub(crate) load_balancing_config: SelectedLbConfig,
+    pub(crate) load_balancing_config: LbConfigSerde,
     pub(crate) method_config: Option<Vec<MethodConfigSerde>>,
     pub(crate) retry_throttling: Option<RetryThrottlingPolicySerde>,
     pub(crate) health_check_config: Option<HealthCheckConfigSerde>,
@@ -88,27 +89,16 @@ fn default_max_connections_per_subchannel() -> SerdeU32 {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LoadBalancingConfigSerde {
-    pub(crate) name: String,
+pub(crate) struct LbInnerConfig {
+    pub(crate) builder: Arc<DynLbPolicyBuilder>,
     pub(crate) config: Option<DynLbConfig>,
 }
 
-impl PartialEq for LoadBalancingConfigSerde {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && match (&self.config, &other.config) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                (None, None) => true,
-                _ => false,
-            }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LbConfigSerde(Option<LbInnerConfig>);
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct SelectedLbConfig(pub(crate) Option<LoadBalancingConfigSerde>);
-
-impl SelectedLbConfig {
-    pub(crate) fn as_ref(&self) -> Option<&LoadBalancingConfigSerde> {
+impl LbConfigSerde {
+    pub(crate) fn as_ref(&self) -> Option<&LbInnerConfig> {
         self.0.as_ref()
     }
 
@@ -119,31 +109,26 @@ impl SelectedLbConfig {
     pub(crate) fn is_some(&self) -> bool {
         self.0.is_some()
     }
+}
 
-    pub(crate) fn unwrap(self) -> LoadBalancingConfigSerde {
-        self.0.unwrap()
+impl PartialEq for LbConfigSerde {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => {
+                a.builder.name() == b.builder.name()
+                    && match (&a.config, &b.config) {
+                        (Some(ca), Some(cb)) => Arc::ptr_eq(ca, cb),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (None, None) => true,
+            _ => false,
+        }
     }
 }
 
-impl PartialEq<Option<LoadBalancingConfigSerde>> for SelectedLbConfig {
-    fn eq(&self, other: &Option<LoadBalancingConfigSerde>) -> bool {
-        &self.0 == other
-    }
-}
-
-impl From<Option<LoadBalancingConfigSerde>> for SelectedLbConfig {
-    fn from(opt: Option<LoadBalancingConfigSerde>) -> Self {
-        SelectedLbConfig(opt)
-    }
-}
-
-impl From<LoadBalancingConfigSerde> for SelectedLbConfig {
-    fn from(cfg: LoadBalancingConfigSerde) -> Self {
-        SelectedLbConfig(Some(cfg))
-    }
-}
-
-impl<'de> Deserialize<'de> for SelectedLbConfig {
+impl<'de> Deserialize<'de> for LbConfigSerde {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -151,8 +136,6 @@ impl<'de> Deserialize<'de> for SelectedLbConfig {
         let raw_entries =
             Option::<Vec<HashMap<String, serde_json::Value>>>::deserialize(deserializer)?
                 .unwrap_or_default();
-
-        let mut selected = None;
 
         for map in raw_entries {
             let mut iter = map.into_iter();
@@ -167,15 +150,14 @@ impl<'de> Deserialize<'de> for SelectedLbConfig {
                 let parsed_config = builder
                     .parse_config(&parsed_json)
                     .map_err(serde::de::Error::custom)?;
-                selected = Some(LoadBalancingConfigSerde {
-                    name,
+                return Ok(LbConfigSerde(Some(LbInnerConfig {
+                    builder,
                     config: parsed_config,
-                });
-                break;
+                })));
             }
         }
 
-        Ok(SelectedLbConfig(selected))
+        Ok(LbConfigSerde(None))
     }
 }
 
@@ -414,7 +396,7 @@ mod test {
         #[serde(rename_all = "camelCase")]
         struct TestConfig {
             #[serde(default)]
-            load_balancing_config: SelectedLbConfig,
+            load_balancing_config: LbConfigSerde,
         }
 
         // Single supported policy without config (round_robin)
@@ -423,7 +405,7 @@ mod test {
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.name, "round_robin");
+        assert_eq!(selected.builder.name(), "round_robin");
         assert!(selected.config.is_none());
 
         // Multiple policies; picks first supported with parsed config (pick_first)
@@ -436,7 +418,7 @@ mod test {
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.name, "pick_first");
+        assert_eq!(selected.builder.name(), "pick_first");
         let pf_cfg = selected
             .config
             .as_ref()
@@ -488,7 +470,7 @@ mod test {
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.name, "pick_first");
+        assert_eq!(selected.builder.name(), "pick_first");
 
         // Invalid entry with multiple keys in single object -> Error
         let res: Result<TestConfig, _> = serde_json::from_value(json!({

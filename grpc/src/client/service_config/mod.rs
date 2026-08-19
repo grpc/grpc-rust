@@ -53,17 +53,14 @@ impl ServiceConfig {
         })
     }
 
-    /// Extracts the load balancing configuration per gRPC specification rules:
-    /// 1. First supported entry in `loadBalancingConfig`
-    /// 2. Supported policy in `loadBalancingPolicy`
-    /// 3. Default `pick_first` policy
+    // Chooses load balancing configuration per gRPC specification rules.
     pub(crate) fn lb_config(&self) -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
-        if let Some(config) = self.inner.load_balancing_config.as_ref()
-            && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&config.name)
-        {
-            return (builder, config.config.clone());
+        // Choose LbConfig if present.
+        if let Some(selected) = self.inner.load_balancing_config.as_ref() {
+            return (selected.builder.clone(), selected.config.clone());
         }
 
+        // Fall back to legacy `loadBalancingPolicy` if present.
         if let Some(ref policy) = self.inner.load_balancing_policy
             && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(policy)
         {
@@ -72,6 +69,7 @@ impl ServiceConfig {
             return (builder, parsed_config);
         }
 
+        // Fall back to default policy.
         Self::default_lb_policy()
     }
 
@@ -228,7 +226,7 @@ mod test {
             sc.inner.load_balancing_policy,
             Some("round_robin".to_string())
         );
-        assert_eq!(sc.inner.load_balancing_config, None);
+        assert!(sc.inner.load_balancing_config.is_none());
     }
 
     #[test]

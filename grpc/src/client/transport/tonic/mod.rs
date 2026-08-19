@@ -319,7 +319,7 @@ impl RecvStream for TonicRecvStream {
                                 return self.trailers_from_grpc_result(
                                     Err(StatusError::new(
                                         StatusCodeError::Internal,
-                                        "required peer info missing",
+                                        "required connection info missing",
                                     )),
                                     None,
                                 );

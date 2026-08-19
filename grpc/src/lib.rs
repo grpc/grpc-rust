@@ -55,13 +55,13 @@ pub(crate) mod codec;
 pub mod core;
 pub mod credentials;
 pub mod metadata;
+pub mod server;
 
 mod byte_str;
 mod inmemory;
 mod macros;
 mod rt;
 mod send_future;
-mod server;
 mod status;
 
 pub use status::Result;

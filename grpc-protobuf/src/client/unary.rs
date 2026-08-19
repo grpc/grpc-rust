@@ -35,10 +35,7 @@ use grpc::client::SendStream as _;
 use grpc::client::stream_util::RecvStreamValidator;
 use protobuf::AsMut;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageView;
-use protobuf::Proxied;
 
 use crate::CallBuilder;
 use crate::ProtoRecvMessage;
@@ -78,15 +75,8 @@ where
     /// and returning the status of the call.
     pub async fn with_response_message(self, res: &mut impl AsMut<MutProxied = Res>) -> Status
     where
-        // ReqMsgView is a proto message view. (Ideally we could just require
-        // "AsView" and protobuf would automatically include the rest.)
-        ReqMsgView: AsView + Send + Sync + 'a,
-        <ReqMsgView as AsView>::Proxied: Message,
-        for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-        // Res is a proto message. (Ideally we could just require "Message" and
-        // protobuf would automatically include the rest.)
+        ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
         Res: Message,
-        for<'b> Res::Mut<'b>: ClearAndParse + Send + Sync,
     {
         let headers = RequestHeaders::new().with_method_name(self.method);
         let (mut tx, rx) = self.channel.invoke_once(headers, self.args).await;
@@ -106,17 +96,8 @@ where
 impl<'a, C, ReqMsgView, Res> IntoFuture for UnaryCallBuilder<'a, C, ReqMsgView, Res>
 where
     C: InvokeOnce + 'a,
-    // ReqMsgView is a proto message view. (Ideally we could just require
-    // "AsView" and protobuf would automatically include the rest.  For now we
-    // need the HRTBs.)
-    ReqMsgView: AsView + Send + Sync + 'a,
-    <ReqMsgView as AsView>::Proxied: Message,
-    for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
+    ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
     Res: Message,
-    for<'b> Res::Mut<'b>: ClearAndParse + Send + Sync,
 {
     type Output = Result<Res, StatusError>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;

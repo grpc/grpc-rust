@@ -168,62 +168,34 @@ impl<'de> Deserialize<'de> for SelectedLbConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        struct Visitor;
+        let raw_entries =
+            Option::<Vec<HashMap<String, serde_json::Value>>>::deserialize(deserializer)?
+                .unwrap_or_default();
 
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = SelectedLbConfig;
+        let mut selected = None;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a list of load balancing policy configurations")
-            }
+        for map in raw_entries {
+            let mut iter = map.into_iter();
+            let (Some((name, raw_config)), None) = (iter.next(), iter.next()) else {
+                return Err(serde::de::Error::custom(
+                    "Each load balancing config entry must contain exactly one policy name.",
+                ));
+            };
 
-            fn visit_none<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(SelectedLbConfig(None))
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(SelectedLbConfig(None))
-            }
-
-            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-            where
-                S: serde::de::SeqAccess<'de>,
-            {
-                let mut selected = None;
-
-                while let Some(map) = seq.next_element::<HashMap<String, serde_json::Value>>()? {
-                    if selected.is_none() {
-                        let mut iter = map.into_iter();
-                        let (Some((name, raw_config)), None) = (iter.next(), iter.next()) else {
-                            return Err(serde::de::Error::custom(
-                                "Each load balancing config entry must contain exactly one policy name",
-                            ));
-                        };
-
-                        if let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&name) {
-                            let parsed_json = ParsedJsonLbConfig::from_value(raw_config);
-                            let parsed_config = builder
-                                .parse_config(&parsed_json)
-                                .map_err(serde::de::Error::custom)?;
-                            selected = Some(LoadBalancingConfigSerde {
-                                name,
-                                config: parsed_config,
-                            });
-                        }
-                    }
-                }
-
-                Ok(SelectedLbConfig(selected))
+            if let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&name) {
+                let parsed_json = ParsedJsonLbConfig::from_value(raw_config);
+                let parsed_config = builder
+                    .parse_config(&parsed_json)
+                    .map_err(serde::de::Error::custom)?;
+                selected = Some(LoadBalancingConfigSerde {
+                    name,
+                    config: parsed_config,
+                });
+                break;
             }
         }
 
-        deserializer.deserialize_any(Visitor)
+        Ok(SelectedLbConfig(selected))
     }
 }
 

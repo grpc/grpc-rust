@@ -451,23 +451,13 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
         assert_eq!(builder.name(), "pick_first");
-        let pf_config = config
-            .unwrap()
-            .downcast_ref::<PickFirstConfig>()
-            .unwrap()
-            .clone();
-        assert!(pf_config.shuffle_address_list);
+        assert!(config.is_none());
 
         // No LB config present -> falls back to default pick_first
         let json_data = json!({});
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
         assert_eq!(builder.name(), "pick_first");
-        let pf_config = config
-            .unwrap()
-            .downcast_ref::<PickFirstConfig>()
-            .unwrap()
-            .clone();
-        assert!(pf_config.shuffle_address_list);
+        assert!(config.is_none());
     }
 }

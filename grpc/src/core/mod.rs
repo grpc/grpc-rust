@@ -162,7 +162,7 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    /// Constructs a new PeerInfo with the given fields.
+    /// Constructs a new instance with the given fields.
     pub fn new(
         local_address: Address,
         remote_address: Address,
@@ -192,7 +192,7 @@ impl ConnectionInfo {
 }
 
 #[cfg(test)]
-pub(crate) fn test_peer_info() -> ConnectionInfo {
+pub(crate) fn test_connection_info() -> ConnectionInfo {
     ConnectionInfo {
         local_address: Address {
             network_type: "",

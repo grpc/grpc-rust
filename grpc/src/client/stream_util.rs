@@ -182,14 +182,14 @@ impl SendStream for NopSendStream {
 
 pub(crate) struct FailingRecvStream {
     status: Option<StatusError>,
-    peer_info: Option<ConnectionInfo>,
+    connection_info: Option<ConnectionInfo>,
 }
 
 impl RecvStream for FailingRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         match self.status.take() {
             Some(status) => ResponseStreamItem::Trailers(
-                Trailers::new(Err(status)).with_peer_info(self.peer_info.take()),
+                Trailers::new(Err(status)).with_connection_info(self.connection_info.take()),
             ),
             None => ResponseStreamItem::StreamClosed,
         }
@@ -199,13 +199,13 @@ impl RecvStream for FailingRecvStream {
 impl FailingRecvStream {
     pub(crate) fn new_stream_pair(
         status: StatusError,
-        peer_info: Option<ConnectionInfo>,
+        connection_info: Option<ConnectionInfo>,
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
         (
             Box::new(NopSendStream),
             Box::new(Self {
                 status: Some(status),
-                peer_info,
+                connection_info,
             }),
         )
     }
@@ -246,11 +246,15 @@ mod test {
         let scenarios = [
             vec![ResponseStreamItem::StreamClosed],
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
                 ResponseStreamItem::StreamClosed,
             ],
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
                 ResponseStreamItem::Message,
                 ResponseStreamItem::StreamClosed,
             ],
@@ -274,13 +278,21 @@ mod test {
     async fn test_validator_headers_repeated() {
         let scenarios = [
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
             ],
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
                 ResponseStreamItem::Message,
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
             ],
         ];
 
@@ -302,7 +314,9 @@ mod test {
         let scenarios = [
             vec![ResponseStreamItem::Trailers(Trailers::new(Ok(())))],
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
                 ResponseStreamItem::Trailers(Trailers::new(Ok(()))),
             ],
         ];
@@ -323,7 +337,7 @@ mod test {
     #[tokio::test]
     async fn test_validator_unary_multiple_messages() {
         let scenarios = [vec![
-            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_connection_info())),
             ResponseStreamItem::Message,
             ResponseStreamItem::Message,
         ]];
@@ -344,7 +358,7 @@ mod test {
     #[tokio::test]
     async fn test_validator_successful_stream() {
         let scenarios = [vec![
-            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_connection_info())),
             ResponseStreamItem::Message,
             ResponseStreamItem::Message,
             ResponseStreamItem::Message,
@@ -364,7 +378,7 @@ mod test {
     #[tokio::test]
     async fn test_validator_erroring_stream() {
         let scenarios = [vec![
-            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_connection_info())),
             ResponseStreamItem::Message,
             ResponseStreamItem::Message,
             ResponseStreamItem::Message,
@@ -390,7 +404,7 @@ mod test {
     #[tokio::test]
     async fn test_validator_successful_unary() {
         let scenarios = [vec![
-            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+            ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_connection_info())),
             ResponseStreamItem::Message,
             ResponseStreamItem::Trailers(Trailers::new(Ok(()))),
         ]];
@@ -412,14 +426,18 @@ mod test {
                 StatusError::new(StatusCodeError::Aborted, "some err"),
             )))],
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
                 ResponseStreamItem::Trailers(Trailers::new(Err(StatusError::new(
                     StatusCodeError::Aborted,
                     "some err",
                 )))),
             ],
             vec![
-                ResponseStreamItem::Headers(ResponseHeaders::new(crate::core::test_peer_info())),
+                ResponseStreamItem::Headers(ResponseHeaders::new(
+                    crate::core::test_connection_info(),
+                )),
                 ResponseStreamItem::Message,
                 ResponseStreamItem::Trailers(Trailers::new(Err(StatusError::new(
                     StatusCodeError::Aborted,

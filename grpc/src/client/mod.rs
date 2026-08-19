@@ -371,15 +371,15 @@ impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
 #[derive(Debug, Clone)]
 pub struct ResponseHeaders {
     metadata: MetadataMap,
-    peer_info: ConnectionInfo,
+    connection_info: ConnectionInfo,
 }
 
 impl ResponseHeaders {
     /// Returns a default ResponseHeaders instance.
-    pub fn new(peer_info: ConnectionInfo) -> Self {
+    pub fn new(connection_info: ConnectionInfo) -> Self {
         Self {
             metadata: MetadataMap::default(),
-            peer_info,
+            connection_info,
         }
     }
 
@@ -403,15 +403,15 @@ impl ResponseHeaders {
         self.metadata
     }
 
-    /// Replaces the peer_info of self with `peer_info`.
-    pub fn with_peer_info(mut self, peer_info: ConnectionInfo) -> Self {
-        self.peer_info = peer_info;
+    /// Replaces the connection of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
         self
     }
 
-    /// Replaces the peer_info of self with `peer_info`.
-    pub fn peer_info(&self) -> &ConnectionInfo {
-        &self.peer_info
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 }
 
@@ -470,7 +470,7 @@ impl RequestHeaders {
 pub struct Trailers {
     status: crate::Result<()>,
     metadata: MetadataMap,
-    peer_info: Option<ConnectionInfo>,
+    connection_info: Option<ConnectionInfo>,
 }
 
 impl Trailers {
@@ -479,7 +479,7 @@ impl Trailers {
         Self {
             status,
             metadata: MetadataMap::default(),
-            peer_info: None,
+            connection_info: None,
         }
     }
 
@@ -515,21 +515,22 @@ impl Trailers {
         self.status
     }
 
-    /// Replaces the peer info in self with `peer_info`.
-    pub fn with_peer_info(mut self, peer_info: Option<ConnectionInfo>) -> Self {
-        self.peer_info = peer_info;
+    /// Replaces the connection info in self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: Option<ConnectionInfo>) -> Self {
+        self.connection_info = connection_info;
         self
     }
 
-    /// Returns the peer info in the trailers, if present.  Peer information
-    /// will not be available in trailers in any the following circumstances:
+    /// Returns the connection info in the trailers, if present.  Connection
+    /// information will not be available in trailers in any the following
+    /// circumstances:
     ///
     /// 1. A ResponseHeaders was already present on the response stream.
     ///
     /// 2. The error was generated locally on the client before a connection was
     ///    chosen for the RPC.
-    pub fn peer_info(&self) -> &Option<ConnectionInfo> {
-        &self.peer_info
+    pub fn connection_info(&self) -> &Option<ConnectionInfo> {
+        &self.connection_info
     }
 
     pub(crate) fn into_parts(self) -> (crate::Result<()>, MetadataMap) {

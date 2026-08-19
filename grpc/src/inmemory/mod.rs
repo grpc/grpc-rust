@@ -295,7 +295,7 @@ impl ServerRecvStream for InMemoryServerRecvStream {
 pub struct InMemoryConnection {
     s: mpsc::Sender<InMemoryServerCall>,
     closed_tx: Option<oneshot::Sender<Result<(), String>>>,
-    peer_info: ConnectionInfo,
+    connection_info: ConnectionInfo,
 }
 
 impl Invoke for InMemoryConnection {
@@ -312,8 +312,8 @@ impl Invoke for InMemoryConnection {
         let (trailer_tx, trailer_rx) = oneshot::channel();
 
         let (method_name, metadata) = headers.into_parts();
-        let server_headers =
-            ServerRequestHeaders::new(method_name, self.peer_info.clone()).with_metadata(metadata);
+        let server_headers = ServerRequestHeaders::new(method_name, self.connection_info.clone())
+            .with_metadata(metadata);
 
         let call = InMemoryServerCall {
             headers: server_headers,
@@ -329,7 +329,7 @@ impl Invoke for InMemoryConnection {
             Box::new(InMemoryClientRecvStream {
                 rx: resp_rx,
                 trailer_rx: Some(trailer_rx),
-                peer_info: Some(self.peer_info.clone()),
+                connection_info: Some(self.connection_info.clone()),
             }),
         )
     }
@@ -373,19 +373,21 @@ impl Drop for InMemoryClientSendStream {
 pub struct InMemoryClientRecvStream {
     rx: mpsc::UnboundedReceiver<InMemoryResponseStreamItem>,
     trailer_rx: Option<oneshot::Receiver<ServerTrailers>>,
-    peer_info: Option<ConnectionInfo>,
+    connection_info: Option<ConnectionInfo>,
 }
 
 impl ClientRecvStream for InMemoryClientRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         match self.rx.recv().await {
             Some(InMemoryResponseStreamItem::Headers(h)) => {
-                // Note: peer_info is always set when the stream is created, and
+                // Note: connection_info is always set when the stream is created, and
                 // the server should not send headers twice, so expect here
                 // should be safe.
                 ResponseStreamItem::Headers(
                     ClientResponseHeaders::new(
-                        self.peer_info.take().expect("stream should have peer_info"),
+                        self.connection_info
+                            .take()
+                            .expect("stream should have connection_info"),
                     )
                     .with_metadata(h.into_metadata()),
                 )
@@ -401,7 +403,7 @@ impl ClientRecvStream for InMemoryClientRecvStream {
                             let (status, metadata) = trailers.into_parts();
                             let client_trailers = ClientTrailers::new(status)
                                 .with_metadata(metadata)
-                                .with_peer_info(self.peer_info.take());
+                                .with_connection_info(self.connection_info.take());
                             return ResponseStreamItem::Trailers(client_trailers);
                         }
                         Err(_) => {
@@ -454,14 +456,14 @@ impl Transport for InMemoryTransport {
             address: ByteStr::default(),
             attributes: Attributes::new(),
         };
-        let peer_info = ConnectionInfo::new(local_address, address.clone(), sec_info);
+        let connection_info = ConnectionInfo::new(local_address, address.clone(), sec_info);
         let conn = InMemoryConnection {
             s: s.clone(),
             closed_tx: Some(closed_tx),
-            peer_info: peer_info.clone(),
+            connection_info: connection_info.clone(),
         };
 
-        Ok((conn, peer_info, closed_rx))
+        Ok((conn, connection_info, closed_rx))
     }
 }
 
@@ -528,7 +530,7 @@ mod tests {
 
     use super::*;
     use crate::core::RecvMessage;
-    use crate::core::test_peer_info;
+    use crate::core::test_connection_info;
 
     struct NopRecvMessage;
     impl RecvMessage for NopRecvMessage {
@@ -550,7 +552,7 @@ mod tests {
         let mut stream = InMemoryClientRecvStream {
             rx,
             trailer_rx: Some(trailer_rx),
-            peer_info: Some(test_peer_info()),
+            connection_info: Some(test_connection_info()),
         };
 
         let mut msg = NopRecvMessage;
@@ -632,7 +634,7 @@ mod tests {
         let (trailer_tx, _trailer_rx) = oneshot::channel();
 
         let transport = InMemoryServerCall {
-            headers: RequestHeaders::new("", test_peer_info()),
+            headers: RequestHeaders::new("", test_connection_info()),
             req_rx,
             resp_tx,
             trailer_tx,

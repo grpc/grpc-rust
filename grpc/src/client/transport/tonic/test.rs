@@ -275,21 +275,27 @@ async fn grpc_invoke_tonic_unary() {
     let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
     assert_eq!(resp.message, "hello interop");
 
-    let peer_info = headers.peer_info();
-    assert_eq!(peer_info.local_address().network_type, TCP_IP_NETWORK_TYPE);
-    let local_addr: SocketAddr = peer_info.local_address().address.parse().unwrap();
-    assert_eq!(local_addr.ip(), addr.ip());
-    assert_eq!(peer_info.remote_address().network_type, TCP_IP_NETWORK_TYPE);
+    let connection_info = headers.connection_info();
     assert_eq!(
-        peer_info.remote_address().address.to_string(),
+        connection_info.local_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    let local_addr: SocketAddr = connection_info.local_address().address.parse().unwrap();
+    assert_eq!(local_addr.ip(), addr.ip());
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
         addr.to_string()
     );
-    assert_eq!(peer_info.security_info().security_protocol(), "local");
+    assert_eq!(connection_info.security_info().security_protocol(), "local");
 
     assert!(
-        trailers.peer_info().is_none(),
-        "trailers should not contain peer_info when headers were present; had {:?}",
-        trailers.peer_info().as_ref().unwrap()
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present; had {:?}",
+        trailers.connection_info().as_ref().unwrap()
     );
 
     assert!(
@@ -342,19 +348,25 @@ mod unix_tests {
         assert_eq!(resp.message, payload);
         assert!(trailers.status().is_ok());
 
-        let peer_info = headers.peer_info();
-        assert_eq!(peer_info.local_address().network_type, UNIX_NETWORK_TYPE);
-        assert!(!peer_info.local_address().address.is_empty());
-        assert_eq!(peer_info.remote_address().network_type, UNIX_NETWORK_TYPE);
+        let connection_info = headers.connection_info();
         assert_eq!(
-            peer_info.remote_address().address.to_string(),
+            connection_info.local_address().network_type,
+            UNIX_NETWORK_TYPE
+        );
+        assert!(!connection_info.local_address().address.is_empty());
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            UNIX_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
             expected_remote_addr
         );
-        assert_eq!(peer_info.security_info().security_protocol(), "local");
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
         assert!(
-            trailers.peer_info().is_none(),
-            "trailers should not contain peer_info when headers were present; had {:?}",
-            trailers.peer_info().as_ref().unwrap()
+            trailers.connection_info().is_none(),
+            "trailers should not contain connection_info when headers were present; had {:?}",
+            trailers.connection_info().as_ref().unwrap()
         );
 
         shutdown_notify.notify_one();
@@ -515,21 +527,27 @@ async fn grpc_invoke_tonic_unary_tls() {
     );
     assert_eq!(resp.message, "hello interop tls");
 
-    let peer_info = headers.peer_info();
-    assert_eq!(peer_info.local_address().network_type, TCP_IP_NETWORK_TYPE);
-    let local_addr: SocketAddr = peer_info.local_address().address.parse().unwrap();
-    assert_eq!(local_addr.ip(), addr.ip());
-    assert_eq!(peer_info.remote_address().network_type, TCP_IP_NETWORK_TYPE);
+    let connection_info = headers.connection_info();
     assert_eq!(
-        peer_info.remote_address().address.to_string(),
+        connection_info.local_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    let local_addr: SocketAddr = connection_info.local_address().address.parse().unwrap();
+    assert_eq!(local_addr.ip(), addr.ip());
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
         addr.to_string()
     );
-    assert_eq!(peer_info.security_info().security_protocol(), "tls");
+    assert_eq!(connection_info.security_info().security_protocol(), "tls");
 
     assert!(
-        trailers.peer_info().is_none(),
-        "trailers should not contain peer_info when headers were present; had {:?}",
-        trailers.peer_info().as_ref().unwrap()
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present; had {:?}",
+        trailers.connection_info().as_ref().unwrap()
     );
 
     assert!(
@@ -583,16 +601,19 @@ async fn grpc_invoke_failure_cases() {
             trailers.status().as_ref().unwrap_err().code(),
             StatusCodeError::Unauthenticated
         );
-        let peer_info = trailers
-            .peer_info()
+        let connection_info = trailers
+            .connection_info()
             .as_ref()
-            .expect("peer_info should be present in trailers");
-        assert_eq!(peer_info.remote_address().network_type, TCP_IP_NETWORK_TYPE);
+            .expect("connection_info should be present in trailers");
         assert_eq!(
-            peer_info.remote_address().address.to_string(),
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
             addr.to_string()
         );
-        assert_eq!(peer_info.security_info().security_protocol(), "local");
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     // Call credentials return error
@@ -622,16 +643,19 @@ async fn grpc_invoke_failure_cases() {
                 .message()
                 .contains("test message")
         );
-        let peer_info = trailers
-            .peer_info()
+        let connection_info = trailers
+            .connection_info()
             .as_ref()
-            .expect("peer_info should be present in trailers");
-        assert_eq!(peer_info.remote_address().network_type, TCP_IP_NETWORK_TYPE);
+            .expect("connection_info should be present in trailers");
         assert_eq!(
-            peer_info.remote_address().address.to_string(),
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
             addr.to_string()
         );
-        assert_eq!(peer_info.security_info().security_protocol(), "local");
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     // Call credentials return restricted control plane code (mapped to Internal)
@@ -661,16 +685,19 @@ async fn grpc_invoke_failure_cases() {
                 .message()
                 .contains("test message")
         );
-        let peer_info = trailers
-            .peer_info()
+        let connection_info = trailers
+            .connection_info()
             .as_ref()
-            .expect("peer_info should be present in trailers");
-        assert_eq!(peer_info.remote_address().network_type, TCP_IP_NETWORK_TYPE);
+            .expect("connection_info should be present in trailers");
         assert_eq!(
-            peer_info.remote_address().address.to_string(),
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
             addr.to_string()
         );
-        assert_eq!(peer_info.security_info().security_protocol(), "local");
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     shutdown_notify.notify_one();
@@ -1044,13 +1071,16 @@ async fn trailers_only_metadata() {
     let value = metadata_map.get("x-custom-trailer").unwrap();
     assert_eq!(value, "custom-value");
 
-    let peer_info = trailers
-        .peer_info()
+    let connection_info = trailers
+        .connection_info()
         .as_ref()
-        .expect("trailers should contain peer_info in trailers-only response");
-    assert_eq!(peer_info.remote_address().network_type, TCP_IP_NETWORK_TYPE);
+        .expect("trailers should contain connection_info in trailers-only response");
     assert_eq!(
-        peer_info.remote_address().address.to_string(),
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
         addr.to_string()
     );
 

@@ -564,7 +564,7 @@ mod test {
         assert_eq!(controller.recv_req().await.0, one);
         controller
             .send_resp(ResponseStreamItem::Headers(ResponseHeaders::new(
-                crate::core::test_peer_info(),
+                crate::core::test_connection_info(),
             )))
             .await;
 

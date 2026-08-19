@@ -516,15 +516,15 @@ pub struct RequestHeaders {
     /// The application-specified metadata for the call.
     metadata: MetadataMap,
     /// Information about the client.
-    peer_info: ConnectionInfo,
+    connection_info: ConnectionInfo,
 }
 
 impl RequestHeaders {
     /// Returns a default RequestHeaders instance.
-    pub fn new(method_name: impl Into<String>, peer_info: ConnectionInfo) -> Self {
+    pub fn new(method_name: impl Into<String>, connection_info: ConnectionInfo) -> Self {
         Self {
             method_name: method_name.into(),
-            peer_info,
+            connection_info,
             metadata: MetadataMap::default(),
         }
     }
@@ -556,15 +556,15 @@ impl RequestHeaders {
         &mut self.metadata
     }
 
-    /// Replaces the peer_info of self with `peer_info`.
-    pub fn with_peer_info(mut self, peer_info: ConnectionInfo) -> Self {
-        self.peer_info = peer_info;
+    /// Replaces the connection_info of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
         self
     }
 
-    /// Replaces the peer_info of self with `peer_info`.
-    pub fn peer_info(&self) -> &ConnectionInfo {
-        &self.peer_info
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 
     /// Returns the owned fields in the RequestHeaders.
@@ -639,7 +639,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::core::test_peer_info;
+    use crate::core::test_connection_info;
 
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
@@ -969,7 +969,7 @@ mod tests {
                 let rx = BoxedRecvStream(Box::new(NopRecvStream));
                 let _ = handler
                     .dyn_handle(
-                        RequestHeaders::new("", test_peer_info()),
+                        RequestHeaders::new("", test_connection_info()),
                         CallOptions::new(),
                         &mut tx,
                         rx,

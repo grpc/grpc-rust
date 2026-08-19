@@ -136,7 +136,7 @@ struct TonicTransport {
     grpc: Grpc<TonicService>,
     task_handle: BoxedTaskHandle,
     runtime: GrpcRuntime,
-    peer_info: ConnectionInfo,
+    connection_info: ConnectionInfo,
 }
 
 impl Drop for TonicTransport {
@@ -192,7 +192,7 @@ impl Invoke for TonicTransport {
             TonicRecvStream {
                 state: StreamState::AwaitingHeaders(resp_rx),
                 cancel_tx: Some(cancel_tx),
-                peer_info: Some(self.peer_info.clone()),
+                connection_info: Some(self.connection_info.clone()),
             },
         )
     }
@@ -206,7 +206,7 @@ impl TonicTransport {
             TonicRecvStream {
                 state: StreamState::LocalError(status),
                 cancel_tx: None,
-                peer_info: Some(self.peer_info.clone()),
+                connection_info: Some(self.connection_info.clone()),
             },
         )
     }
@@ -234,7 +234,7 @@ impl SendStream for TonicSendStream {
 struct TonicRecvStream {
     state: StreamState,
     cancel_tx: Option<CancellationHandle>,
-    peer_info: Option<ConnectionInfo>,
+    connection_info: Option<ConnectionInfo>,
 }
 
 impl TonicRecvStream {
@@ -280,7 +280,7 @@ impl TonicRecvStream {
         } else {
             Trailers::new(status)
         };
-        ResponseStreamItem::Trailers(trailers.with_peer_info(self.peer_info.take()))
+        ResponseStreamItem::Trailers(trailers.with_connection_info(self.connection_info.take()))
     }
 }
 
@@ -315,7 +315,7 @@ impl RecvStream for TonicRecvStream {
                         Ok(md) => {
                             // Start streaming and return the headers.
                             self.state = StreamState::Streaming(stream);
-                            let Some(peer_info) = self.peer_info.take() else {
+                            let Some(connection_info) = self.connection_info.take() else {
                                 return self.trailers_from_grpc_result(
                                     Err(StatusError::new(
                                         StatusCodeError::Internal,
@@ -324,7 +324,7 @@ impl RecvStream for TonicRecvStream {
                                     None,
                                 );
                             };
-                            let headers = ResponseHeaders::new(peer_info).with_metadata(md);
+                            let headers = ResponseHeaders::new(connection_info).with_metadata(md);
                             ResponseStreamItem::Headers(headers)
                         }
                         Err(e) => self.trailers_from_grpc_result(
@@ -505,7 +505,7 @@ impl Transport for TransportBuilder {
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
 
-        let peer_info = ConnectionInfo::new(
+        let connection_info = ConnectionInfo::new(
             local_address,
             remote_address,
             handshake_ouput.security_info.clone(),
@@ -515,9 +515,9 @@ impl Transport for TransportBuilder {
             grpc,
             task_handle,
             runtime,
-            peer_info: peer_info.clone(),
+            connection_info: connection_info.clone(),
         };
-        Ok((service, peer_info, rx))
+        Ok((service, connection_info, rx))
     }
 }
 

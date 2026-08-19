@@ -86,7 +86,7 @@ impl Backoff for NopBackoff {
 
 struct ReadyState {
     service: Box<dyn DynInvoke>,
-    peer_info: ConnectionInfo,
+    connection_info: ConnectionInfo,
     authority: Authority,
 }
 
@@ -195,12 +195,12 @@ impl DynInvoke for InternalSubchannel {
         };
 
         let fail_with = |status| -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-            FailingRecvStream::new_stream_pair(status, Some(state.peer_info.clone()))
+            FailingRecvStream::new_stream_pair(status, Some(state.connection_info.clone()))
         };
 
         if let Some(call_creds) = call_creds {
             if call_creds.minimum_channel_security_level()
-                > state.peer_info.security_info().security_level()
+                > state.connection_info.security_info().security_level()
             {
                 return fail_with(StatusError::new(
                     StatusCodeError::Unauthenticated,
@@ -211,9 +211,9 @@ impl DynInvoke for InternalSubchannel {
             let call_details = create_call_details(&state.authority, headers.method_name());
 
             let channel_sec_info = CallClientConnectionSecurityInfo::new(
-                state.peer_info.security_info().security_protocol(),
-                state.peer_info.security_info().security_level(),
-                state.peer_info.security_info().attributes().clone(),
+                state.connection_info.security_info().security_protocol(),
+                state.connection_info.security_info().security_level(),
+                state.connection_info.security_info().attributes().clone(),
             );
 
             if let Err(s) = call_creds
@@ -378,10 +378,10 @@ fn begin_connecting_if_idle(data: Arc<Mutex<InternalSubchannelData>>) {
             }
             result = transport_builder.dyn_connect(&address, runtime, &security_opts, &transport_opts) => {
                     match result {
-                        Ok((service, peer_info, disconnection_listener)) => {
+                        Ok((service, connection_info, disconnection_listener)) => {
                             move_to_ready(data, Arc::new(ReadyState{
                                 service,
-                                peer_info,
+                                connection_info,
                                 authority: security_opts.authority}), disconnection_listener).await;
                         }
                         Err(e) => {

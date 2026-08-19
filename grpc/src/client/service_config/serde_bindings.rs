@@ -137,6 +137,10 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
             Option::<Vec<HashMap<String, serde_json::Value>>>::deserialize(deserializer)?
                 .unwrap_or_default();
 
+        if raw_entries.is_empty() {
+            return Ok(LbConfigSerde(None));
+        }
+
         for map in raw_entries {
             let mut iter = map.into_iter();
             let (Some((name, raw_config)), None) = (iter.next(), iter.next()) else {
@@ -157,7 +161,9 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
             }
         }
 
-        Ok(LbConfigSerde(None))
+        Err(serde::de::Error::custom(
+            "No supported load balancing policy found in config.",
+        ))
     }
 }
 

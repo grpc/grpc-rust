@@ -93,7 +93,6 @@ mod test {
     use serde_json::json;
 
     use super::duration::GrpcDuration;
-    use super::serde::RetryOrHedgingPolicySerde;
     use super::serde::SerdeF32;
     use super::serde::SerdeU32;
     use super::*;
@@ -113,13 +112,6 @@ mod test {
                         { "service": "grpc.examples.echo.Echo2" }
                     ],
                     "timeout": "1.5s",
-                    "retryPolicy": {
-                        "maxAttempts": 3,
-                        "initialBackoff": "0.1s",
-                        "maxBackoff": "1s",
-                        "backoffMultiplier": 2.0,
-                        "retryableStatusCodes": ["UNAVAILABLE", "INTERNAL"]
-                    },
                     "maxRequestMessageBytes": 1024,
                     "maxResponseMessageBytes": "2048"
                 },
@@ -127,12 +119,7 @@ mod test {
                     "name": [
                         { "service": "grpc.examples.echo.EchoHedging" }
                     ],
-                    "waitForReady": true,
-                    "hedgingPolicy": {
-                        "maxAttempts": 3,
-                        "hedgingDelay": "0.5s",
-                        "nonFatalStatusCodes": ["UNAVAILABLE"]
-                    }
+                    "waitForReady": true
                 }
             ],
             "retryThrottling": {
@@ -176,31 +163,6 @@ mod test {
         assert_eq!(mc.max_request_message_bytes, Some(SerdeU32(1024)));
         assert_eq!(mc.max_response_message_bytes, Some(SerdeU32(2048)));
 
-        // Verify Retry Policy.
-        let rp = mc.retry_policy.as_ref().unwrap();
-        assert_eq!(rp.max_attempts, SerdeU32(3));
-        assert_eq!(
-            rp.initial_backoff,
-            GrpcDuration(Duration::new(0, 100_000_000))
-        );
-        assert_eq!(rp.max_backoff, GrpcDuration(Duration::from_secs(1)));
-        assert_eq!(rp.backoff_multiplier, SerdeF32(2.0));
-        assert_eq!(rp.retryable_status_codes, vec!["UNAVAILABLE", "INTERNAL"]);
-
-        let mc2 = &method_configs[1];
-        assert_eq!(mc2.wait_for_ready, Some(true));
-        let hp = mc2.hedging_policy.as_ref().unwrap();
-        assert_eq!(hp.max_attempts, SerdeU32(3));
-        assert_eq!(hp.hedging_delay, GrpcDuration(Duration::from_millis(500)));
-        assert_eq!(
-            hp.non_fatal_status_codes,
-            Some(vec!["UNAVAILABLE".to_string()])
-        );
-        assert_eq!(
-            mc2.retry_or_hedging_policy(),
-            Some(RetryOrHedgingPolicySerde::Hedging(hp.clone()))
-        );
-
         // Verify Retry Throttling.
         let rt = sc.inner.retry_throttling.unwrap();
         assert_eq!(rt.max_tokens, SerdeU32(100));
@@ -225,21 +187,6 @@ mod test {
         // Bad JSON formatting.
         assert!(ServiceConfig::parse("{").is_err());
 
-        // Invalid max attempts.
-        let json_data = json!({
-            "methodConfig": [{
-                "name": [{ "service": "foo" }],
-                "retryPolicy": {
-                    "maxAttempts": 1, // Invalid, must be > 1.
-                    "initialBackoff": "1s",
-                    "maxBackoff": "1s",
-                    "backoffMultiplier": 2.0,
-                    "retryableStatusCodes": []
-                }
-            }]
-        });
-        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
-
         // Invalid max tokens.
         let json_data = json!({
             "retryThrottling": {
@@ -253,36 +200,6 @@ mod test {
         let json_data = json!({
             "methodConfig": [{
                 "name": [{ "service": "", "method": "Echo" }]
-            }]
-        });
-        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
-
-        // Empty retryable status codes array.
-        let json_data = json!({
-            "methodConfig": [{
-                "name": [{ "service": "foo" }],
-                "retryPolicy": {
-                    "maxAttempts": 2,
-                    "initialBackoff": "1s",
-                    "maxBackoff": "1s",
-                    "backoffMultiplier": 2.0,
-                    "retryableStatusCodes": [] // Invalid, must be non-empty.
-                }
-            }]
-        });
-        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
-
-        // Invalid status code in retryableStatusCodes.
-        let json_data = json!({
-            "methodConfig": [{
-                "name": [{ "service": "foo" }],
-                "retryPolicy": {
-                    "maxAttempts": 2,
-                    "initialBackoff": "1s",
-                    "maxBackoff": "1s",
-                    "backoffMultiplier": 2.0,
-                    "retryableStatusCodes": ["INVALID_STATUS_CODE_NAME"]
-                }
             }]
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
@@ -312,27 +229,6 @@ mod test {
             Some("round_robin".to_string())
         );
         assert_eq!(sc.inner.load_balancing_config, None);
-    }
-
-    #[test]
-    fn test_retry_hedging_mutual_exclusivity() {
-        let json_data = json!({
-            "methodConfig": [{
-                "name": [{ "service": "foo" }],
-                "retryPolicy": {
-                    "maxAttempts": 2,
-                    "initialBackoff": "1s",
-                    "maxBackoff": "1s",
-                    "backoffMultiplier": 2.0,
-                    "retryableStatusCodes": []
-                },
-                "hedgingPolicy": {
-                    "maxAttempts": 2,
-                    "hedgingDelay": "1s"
-                }
-            }]
-        });
-        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
     }
 
     #[test]
@@ -369,13 +265,6 @@ mod test {
             "methodConfig": [
                 {
                     "name": [{ "service": "grpc.examples.echo.Echo" }],
-                    "retryPolicy": {
-                        "maxAttempts": 3,
-                        "initialBackoff": "0.1s",
-                        "maxBackoff": "1s",
-                        "backoffMultiplier": 2.0,
-                        "retryableStatusCodes": ["UNAVAILABLE"]
-                    }
                 },
                 {
                     "name": [{ "service": "grpc.examples.echo.Echo", "method": "SpecialCall" }],
@@ -386,7 +275,6 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let method_configs = sc.inner.method_config.unwrap();
         assert_eq!(method_configs[0].name[0].method, "");
-        assert!(method_configs[0].retry_policy.is_some());
         assert_eq!(method_configs[1].name[0].method, "SpecialCall");
         assert_eq!(
             method_configs[1].timeout,

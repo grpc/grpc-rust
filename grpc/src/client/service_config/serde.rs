@@ -51,8 +51,6 @@ pub(crate) struct MethodConfigSerde {
     pub(crate) name: Vec<MethodNameSerde>,
     pub(crate) wait_for_ready: Option<bool>,
     pub(crate) timeout: Option<GrpcDuration>,
-    pub(crate) retry_policy: Option<RetryPolicySerde>,
-    pub(crate) hedging_policy: Option<HedgingPolicySerde>,
     pub(crate) max_request_message_bytes: Option<SerdeU32>,
     pub(crate) max_response_message_bytes: Option<SerdeU32>,
 }
@@ -70,24 +68,6 @@ pub(crate) struct MethodNameSerde {
 pub(crate) struct RetryThrottlingPolicySerde {
     pub(crate) max_tokens: SerdeU32,
     pub(crate) token_ratio: SerdeF32,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RetryPolicySerde {
-    pub(crate) max_attempts: SerdeU32,
-    pub(crate) initial_backoff: GrpcDuration,
-    pub(crate) max_backoff: GrpcDuration,
-    pub(crate) backoff_multiplier: SerdeF32,
-    pub(crate) retryable_status_codes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct HedgingPolicySerde {
-    pub(crate) max_attempts: SerdeU32,
-    pub(crate) hedging_delay: GrpcDuration,
-    pub(crate) non_fatal_status_codes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -208,73 +188,6 @@ impl MethodNameSerde {
     }
 }
 
-#[rustfmt::skip]
-const VALID_STATUS_CODES: &[&str] = &[
-    "OK", "0",
-    "CANCELLED", "1",
-    "UNKNOWN", "2",
-    "INVALID_ARGUMENT", "3",
-    "DEADLINE_EXCEEDED", "4",
-    "NOT_FOUND", "5",
-    "ALREADY_EXISTS", "6",
-    "PERMISSION_DENIED", "7",
-    "RESOURCE_EXHAUSTED", "8",
-    "FAILED_PRECONDITION", "9",
-    "ABORTED", "10",
-    "OUT_OF_RANGE", "11",
-    "UNIMPLEMENTED", "12",
-    "INTERNAL", "13",
-    "UNAVAILABLE", "14",
-    "DATA_LOSS", "15",
-    "UNAUTHENTICATED", "16",
-];
-
-fn validate_status_code(code_str: &str) -> Result<(), String> {
-    if VALID_STATUS_CODES.contains(&code_str) {
-        Ok(())
-    } else {
-        Err(format!("invalid status code '{code_str}'"))
-    }
-}
-
-impl RetryPolicySerde {
-    fn validate(&self) -> Result<(), String> {
-        if self.max_attempts.0 <= 1 {
-            return Err("max_attempts must be > 1".to_string());
-        }
-        if self.initial_backoff.as_nanos() == 0 {
-            return Err("initial_backoff must be > 0".to_string());
-        }
-        if self.max_backoff.as_nanos() == 0 {
-            return Err("max_backoff must be > 0".to_string());
-        }
-        if self.backoff_multiplier.0 <= 0.0 {
-            return Err("backoff_multiplier must be > 0".to_string());
-        }
-        if self.retryable_status_codes.is_empty() {
-            return Err("retryable_status_codes must be non-empty".to_string());
-        }
-        for code in &self.retryable_status_codes {
-            validate_status_code(code)?;
-        }
-        Ok(())
-    }
-}
-
-impl HedgingPolicySerde {
-    fn validate(&self) -> Result<(), String> {
-        if self.max_attempts.0 <= 1 {
-            return Err("max_attempts must be > 1".to_string());
-        }
-        if let Some(ref codes) = self.non_fatal_status_codes {
-            for code in codes {
-                validate_status_code(code)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 impl RetryThrottlingPolicySerde {
     fn validate(&self) -> Result<(), String> {
         if self.max_tokens.0 == 0 || self.max_tokens.0 > 1000 {
@@ -287,42 +200,12 @@ impl RetryThrottlingPolicySerde {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RetryOrHedgingPolicySerde {
-    Retry(RetryPolicySerde),
-    Hedging(HedgingPolicySerde),
-}
-
 impl MethodConfigSerde {
-    pub(crate) fn retry_or_hedging_policy(&self) -> Option<RetryOrHedgingPolicySerde> {
-        self.retry_policy
-            .as_ref()
-            .map(|rp| RetryOrHedgingPolicySerde::Retry(rp.clone()))
-            .or_else(|| {
-                self.hedging_policy
-                    .as_ref()
-                    .map(|hp| RetryOrHedgingPolicySerde::Hedging(hp.clone()))
-            })
-    }
-
     fn validate(&self) -> Result<(), String> {
         for (j, name) in self.name.iter().enumerate() {
             if let Err(e) = name.validate() {
                 return Err(format!("name[{j}] {e}"));
             }
-        }
-        if self.retry_policy.is_some() && self.hedging_policy.is_some() {
-            return Err("cannot have both retryPolicy and hedgingPolicy defined".to_string());
-        }
-        if let Some(ref rp) = self.retry_policy
-            && let Err(e) = rp.validate()
-        {
-            return Err(format!("retry_policy.{e}"));
-        }
-        if let Some(ref hp) = self.hedging_policy
-            && let Err(e) = hp.validate()
-        {
-            return Err(format!("hedging_policy.{e}"));
         }
         Ok(())
     }
@@ -521,16 +404,6 @@ mod test {
 
         let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": "invalid" }));
         assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_validate_status_codes() {
-        for &code in VALID_STATUS_CODES {
-            assert!(validate_status_code(code).is_ok());
-        }
-        assert!(validate_status_code("INVALID_CODE").is_err());
-        assert!(validate_status_code("17").is_err());
-        assert!(validate_status_code("-1").is_err());
     }
 
     #[test]

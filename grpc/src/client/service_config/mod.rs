@@ -45,8 +45,9 @@ pub struct ServiceConfig {
 impl ServiceConfig {
     // Parses a service configuration from a JSON string.
     pub(crate) fn parse(config_json: &str) -> ParseResult {
-        let config_serde: serde::ServiceConfigSerde = serde_json::from_str(config_json)
-            .map_err(|e| format!("failed to deserialize service config JSON: {e}"))?;
+        let config_serde: crate::client::service_config::serde::ServiceConfigSerde =
+            serde_json::from_str(config_json)
+                .map_err(|e| format!("failed to deserialize service config JSON: {e}"))?;
         config_serde.validate()?;
         Ok(Self {
             inner: config_serde,

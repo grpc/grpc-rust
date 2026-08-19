@@ -22,6 +22,23 @@
  *
  */
 
+//! Types and call builders for client-side RPCs.
+//!
+//! # Basic usage
+//!
+//! There are four basic RPC (Remote Procedure Call) types and a corresponding
+//! call builder for each.
+//!
+//! * Unary: [`UnaryCallBuilder`]
+//! * Client Streaming: [`ClientStreamingCallBuilder`]
+//! * Server Streaming: [`ServerStreamingCallBuilder`]
+//! * Bidirectional Streaming: [`BidiCallBuilder`]
+//!
+//! Each call builder implements [`CallBuilder`] which can be used to configure
+//! the call.  Each one also provides an [`IntoFuture`] implementation to
+//! actually begin the call.  See the documentation for each type for additional
+//! usage information.
+
 use std::marker::PhantomData;
 use std::time::Duration;
 use std::time::Instant;

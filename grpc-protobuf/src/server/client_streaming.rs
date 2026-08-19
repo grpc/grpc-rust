@@ -23,9 +23,9 @@
  */
 
 use grpc::async_trait;
-use grpc::server::BoxedRecvStream;
 use grpc::server::CallOptions;
 use grpc::server::DynHandle;
+use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
 use grpc::server::RequestHeaders;
 use grpc::server::ResponseStreamItem;
@@ -39,6 +39,7 @@ use protobuf::Proxied;
 use protobuf::Serialize;
 
 use crate::ProtoSendMessage;
+use crate::SendFuture;
 use crate::ServerStatus;
 use crate::server::GrpcStreamingRequest;
 use crate::trailers_conv::trailers_from_status;
@@ -91,11 +92,11 @@ where
         _headers: RequestHeaders,
         _options: CallOptions,
         tx: &mut dyn DynSendStream,
-        rx: BoxedRecvStream,
+        rx: Box<dyn DynRecvStream>,
     ) -> Trailers {
         let requests = GrpcStreamingRequest::new(rx);
         let mut resp = <M::Response as Default>::default();
-        let status = self.method.call(requests, resp.as_mut()).await;
+        let status = self.method.call(requests, resp.as_mut()).make_send().await;
 
         if status.is_ok() {
             let send = ProtoSendMessage::from_view(&resp);

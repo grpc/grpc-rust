@@ -23,9 +23,9 @@
  */
 
 use grpc::async_trait;
-use grpc::server::BoxedRecvStream;
 use grpc::server::CallOptions;
 use grpc::server::DynHandle;
+use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
 use grpc::server::RequestHeaders;
 use grpc::server::Trailers;
@@ -88,7 +88,7 @@ where
         _headers: RequestHeaders,
         _options: CallOptions,
         tx: &mut dyn DynSendStream,
-        rx: BoxedRecvStream,
+        rx: Box<dyn DynRecvStream>,
     ) -> Trailers {
         // The request stream owns `rx`; the response sink borrows `tx`. They
         // are independent, so a handler can freely interleave receives and

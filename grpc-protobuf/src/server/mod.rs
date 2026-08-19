@@ -24,7 +24,6 @@
 
 use std::marker::PhantomData;
 
-use grpc::server::BoxedRecvStream;
 use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
 use grpc::server::ResponseStreamItem;
@@ -53,6 +52,8 @@ pub struct GrpcStreamingRequest<M> {
     rx: BoxedRecvStream,
     _phantom: PhantomData<M>,
 }
+
+type BoxedRecvStream = Box<dyn DynRecvStream>;
 
 impl<M> GrpcStreamingRequest<M>
 where

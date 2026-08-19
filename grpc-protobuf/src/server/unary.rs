@@ -23,7 +23,6 @@
  */
 
 use grpc::async_trait;
-use grpc::server::BoxedRecvStream;
 use grpc::server::CallOptions;
 use grpc::server::DynHandle;
 use grpc::server::DynRecvStream;
@@ -42,6 +41,7 @@ use protobuf::Serialize;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::SendFuture;
 use crate::ServerStatus;
 use crate::ServerStatusError;
 use crate::StatusCodeError;
@@ -94,7 +94,7 @@ where
         _headers: RequestHeaders,
         _options: CallOptions,
         tx: &mut dyn DynSendStream,
-        mut rx: BoxedRecvStream,
+        mut rx: Box<dyn DynRecvStream>,
     ) -> Trailers {
         let mut req = <M::Request as Default>::default();
 
@@ -110,7 +110,11 @@ where
         }
 
         let mut resp = <M::Response as Default>::default();
-        let status = self.method.call(req.as_view(), resp.as_mut()).await;
+        let status = self
+            .method
+            .call(req.as_view(), resp.as_mut())
+            .make_send()
+            .await;
 
         if status.is_ok() {
             let send = ProtoSendMessage::from_view(&resp);

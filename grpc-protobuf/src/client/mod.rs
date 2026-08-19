@@ -42,8 +42,6 @@ use grpc::client::stream_util::RecvStreamValidator;
 use grpc::core::RecvMessage;
 use protobuf::AsMut;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
@@ -70,7 +68,6 @@ impl<M, Tx> GrpcStreamingRequest<M, Tx>
 where
     Tx: SendStream,
     M: Message,
-    for<'b> M::View<'b>: MessageView<'b>,
 {
     fn new(tx: Tx) -> Self {
         Self {
@@ -117,7 +114,6 @@ impl<M, Rx> GrpcStreamingResponse<M, Rx>
 where
     Rx: ClientRecvStream,
     M: Message,
-    for<'b> M::Mut<'b>: MessageMut<'b>,
 {
     fn new(rx: Rx) -> Self {
         Self {

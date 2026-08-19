@@ -35,10 +35,7 @@ use grpc::client::SendStream;
 use grpc::client::stream_util::RecvStreamValidator;
 use protobuf::AsMut;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
 
 use crate::CallBuilder;
 use crate::ProtoRecvMessage;
@@ -77,16 +74,8 @@ where
 impl<'a, C, Req, Res> IntoFuture for ClientStreamingCallBuilder<'a, C, Req, Res>
 where
     C: InvokeOnce + 'a,
-    // Req is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Req: Message,
-    for<'b> Req::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
-    Res: Message + ClearAndParse,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
+    Res: Message,
 {
     type Output = ClientStreamingCall<'a, C, Req, Res>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
@@ -136,16 +125,8 @@ pub struct ClientStreamingCall<'a, C: InvokeOnce, Req, Res> {
 impl<'a, C, Req, Res> ClientStreamingCall<'a, C, Req, Res>
 where
     C: InvokeOnce + 'a,
-    // Req is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Req: Message,
-    for<'b> Req::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Res: Message,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
 {
     /// Sends `message` on the stream.  Will block if flow control does not
     /// allow for sending the request message.  Returns an error if the stream

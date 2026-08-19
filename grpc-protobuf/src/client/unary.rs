@@ -35,10 +35,7 @@ use grpc::client::SendStream as _;
 use grpc::client::stream_util::RecvStreamValidator;
 use protobuf::AsMut;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageView;
-use protobuf::Proxied;
 
 use crate::CallBuilder;
 use crate::ProtoRecvMessage;
@@ -82,11 +79,7 @@ where
         // "AsView" and protobuf would automatically include the rest.)
         ReqMsgView: AsView + Send + Sync + 'a,
         <ReqMsgView as AsView>::Proxied: Message,
-        for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-        // Res is a proto message. (Ideally we could just require "Message" and
-        // protobuf would automatically include the rest.)
         Res: Message,
-        for<'b> Res::Mut<'b>: ClearAndParse + Send + Sync,
     {
         let headers = RequestHeaders::new().with_method_name(self.method);
         let (mut tx, rx) = self.channel.invoke_once(headers, self.args).await;
@@ -111,12 +104,7 @@ where
     // need the HRTBs.)
     ReqMsgView: AsView + Send + Sync + 'a,
     <ReqMsgView as AsView>::Proxied: Message,
-    for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Res: Message,
-    for<'b> Res::Mut<'b>: ClearAndParse + Send + Sync,
 {
     type Output = Result<Res, StatusError>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;

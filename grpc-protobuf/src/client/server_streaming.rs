@@ -31,11 +31,7 @@ use grpc::client::RequestHeaders;
 use grpc::client::SendOptions;
 use grpc::client::SendStream as _;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
-use protobuf::Proxied;
 
 use crate::CallBuilder;
 use crate::GrpcStreamingResponse;
@@ -74,11 +70,7 @@ where
     // "AsView" and protobuf would automatically include the rest.)
     ReqMsgView: AsView + Send + Sync + 'a,
     <ReqMsgView as AsView>::Proxied: Message,
-    for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.)
-    Res: Message + ClearAndParse,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
+    Res: Message,
 {
     type Output = GrpcStreamingResponse<Res, C::RecvStream>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;

@@ -22,7 +22,7 @@
  *
  */
 
-use crate::client::retry::GrpcRetrySharedConfig;
+use crate::client::retry::{RetryClassifierFactory, RetrySharedConfig};
 use crate::common::async_util::BoxFuture;
 use crate::xds::resource::route_config::{
     RouteConfigMetadata, RouteConfigResource, RouteRetryConfig,
@@ -61,7 +61,7 @@ pub(crate) struct RouteDecision {
     /// or `None` when the route sets no retry. Resolved from the [`RoutingSnapshot`]
     /// this decision was made on, so the retry layer applies the config for exactly
     /// the route the request took.
-    pub retry_config: Option<Arc<GrpcRetrySharedConfig>>,
+    pub retry_config: Option<Arc<RetrySharedConfig>>,
 }
 
 /// A hook that runs before xDS route selection.
@@ -76,32 +76,36 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
-/// The validated [`RouteConfigResource`] bundled with the gRPC retry configs
+/// The validated [`RouteConfigResource`] bundled with the retry configs
 /// compiled from it, one per RDS update.
 ///
 /// Bundling both behind one `Arc` lets routing resolve a route and its retry
 /// config from a single consistent RDS version, and keeps the request path to a
 /// map lookup plus a pointer clone. Compiling here, rather than in the xDS
-/// resource layer, keeps the resource types free of gRPC types.
+/// resource layer, keeps the resource types free of client-side retry types.
 #[derive(Debug, Default)]
 pub(crate) struct RoutingSnapshot {
     resource: Arc<RouteConfigResource>,
     /// Compiled retry config, keyed by the identity (`Arc` address) of the
     /// route's [`RouteRetryConfig`]. Routes that inherit a vhost policy share one
-    /// entry; a route whose `retry_on` maps to no gRPC code has none.
-    retry: HashMap<usize, Arc<GrpcRetrySharedConfig>>,
+    /// entry; a route whose `retry_on` the factory maps to no classifier has none.
+    retry: HashMap<usize, Arc<RetrySharedConfig>>,
 }
 
 impl RoutingSnapshot {
-    /// Compiles each distinct route retry config once.
-    pub(crate) fn new(resource: Arc<RouteConfigResource>) -> Self {
-        let mut retry: HashMap<usize, Arc<GrpcRetrySharedConfig>> = HashMap::new();
+    /// Compiles each distinct route retry config once, using `factory` to build
+    /// the transport classifier for each route's `retry_on`.
+    pub(crate) fn new(
+        resource: Arc<RouteConfigResource>,
+        factory: &dyn RetryClassifierFactory,
+    ) -> Self {
+        let mut retry: HashMap<usize, Arc<RetrySharedConfig>> = HashMap::new();
         for vhost in &resource.virtual_hosts {
             for route in &vhost.routes {
                 if let Some(config) = &route.retry_config {
                     let key = Arc::as_ptr(config) as usize;
                     if let std::collections::hash_map::Entry::Vacant(entry) = retry.entry(key)
-                        && let Some(shared) = GrpcRetrySharedConfig::from_route_retry(config)
+                        && let Some(shared) = RetrySharedConfig::from_route_retry(config, factory)
                     {
                         entry.insert(Arc::new(shared));
                     }
@@ -111,11 +115,11 @@ impl RoutingSnapshot {
         Self { resource, retry }
     }
 
-    /// The compiled gRPC retry config for a route's [`RouteRetryConfig`], if any.
+    /// The compiled retry config for a route's [`RouteRetryConfig`], if any.
     pub(crate) fn retry_for(
         &self,
         config: Option<&Arc<RouteRetryConfig>>,
-    ) -> Option<Arc<GrpcRetrySharedConfig>> {
+    ) -> Option<Arc<RetrySharedConfig>> {
         config.and_then(|config| self.retry.get(&(Arc::as_ptr(config) as usize)).cloned())
     }
 }

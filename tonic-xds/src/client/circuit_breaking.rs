@@ -718,7 +718,7 @@ mod tests {
     use tower::service_fn;
 
     use crate::client::retry::{
-        GrpcRetryClassifier, GrpcRetryPolicy, RetryBackoffConfig, RetryConfig, RetryLayer,
+        GrpcRetryClassifier, RetryBackoffConfig, RetryConfig, RetryLayer, RetryPolicy,
     };
 
     use super::*;
@@ -980,12 +980,12 @@ mod tests {
     #[tokio::test]
     async fn limit_responses_do_not_enter_retry_policy() {
         let breakers = configured_breakers(0);
-        let policy = GrpcRetryPolicy::new(
+        let policy = RetryPolicy::new(
             RetryConfig::new().num_retries(4).retry_backoff(
                 RetryBackoffConfig::new(Duration::from_millis(1))
                     .max_interval(Duration::from_millis(1)),
             ),
-            GrpcRetryClassifier::new(vec![Code::Unavailable]),
+            Arc::new(GrpcRetryClassifier::new(vec![Code::Unavailable])),
         );
         let calls = Arc::new(AtomicU32::new(0));
         let call_counter = calls.clone();

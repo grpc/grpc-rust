@@ -43,6 +43,7 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use tokio::sync::watch;
 
+use crate::client::retry::{GrpcRetryClassifierFactory, RetryClassifierFactory};
 use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
 use crate::common::async_util::AbortOnDrop;
 use crate::xds::cache::XdsCache;
@@ -72,12 +73,24 @@ pub(crate) struct XdsRouter {
 }
 
 impl XdsRouter {
-    /// Creates a new `XdsRouter` that watches route config from the given cache.
+    /// Creates a new `XdsRouter` that watches route config from the given cache,
+    /// compiling per-route retry policies with the default
+    /// [`GrpcRetryClassifierFactory`].
     ///
     /// Spawns a background task that updates the local route config whenever
     /// the cache publishes a new one. The task is aborted when this router
     /// is dropped.
     pub(crate) fn new(cache: &XdsCache) -> Self {
+        Self::with_retry_factory(cache, Arc::new(GrpcRetryClassifierFactory))
+    }
+
+    /// Like [`new`](Self::new) but compiles per-route retry policies with a custom
+    /// [`RetryClassifierFactory`], letting a non-gRPC transport interpret
+    /// `retry_on` for that transport.
+    pub(crate) fn with_retry_factory(
+        cache: &XdsCache,
+        retry_factory: Arc<dyn RetryClassifierFactory>,
+    ) -> Self {
         let route_config = Arc::new(ArcSwapOption::empty());
         let (ready_tx, ready_rx) = watch::channel(false);
         let rc = route_config.clone();
@@ -85,7 +98,10 @@ impl XdsRouter {
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
-                rc.store(Some(Arc::new(RoutingSnapshot::new(config))));
+                rc.store(Some(Arc::new(RoutingSnapshot::new(
+                    config,
+                    retry_factory.as_ref(),
+                ))));
                 // Signal readiness on the first config, then drop the sender.
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(true);

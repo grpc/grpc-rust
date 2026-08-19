@@ -24,11 +24,17 @@
 
 //! Transport-agnostic retry utilities.
 //!
-//! The retry *decision* state (attempt cap, backoff, body cloning) lives in the
-//! generic [`RetryPolicy`], while transport-specific decisions (which responses
-//! are retryable, and any per-retry request mutation) live behind the
-//! [`RetryClassifier`] seam. [`GrpcRetryClassifier`] is the default gRPC
-//! implementation; [`GrpcRetryPolicy`] is the gRPC policy alias.
+//! The retry *decision* state (attempt cap, backoff, body cloning) lives in
+//! [`RetryPolicy`], while transport-specific decisions (which outcomes are
+//! retryable, and any per-retry request mutation) live behind the object-safe
+//! [`RetryClassifier`] seam, which inspects a [`RetryOutcome`]. The classifier is
+//! type-erased (`Arc<dyn RetryClassifier>`) so one engine serves any transport;
+//! [`GrpcRetryClassifier`] is the default gRPC implementation.
+//!
+//! RDS-driven per-route policies are compiled through the [`RetryClassifierFactory`]
+//! seam, which maps a route's Envoy `retry_on` conditions to a classifier;
+//! [`GrpcRetryClassifierFactory`] is the gRPC default, and a non-gRPC transport
+//! supplies its own to interpret `retry_on` for that transport.
 
 use std::fmt::Debug;
 use std::io;
@@ -53,7 +59,7 @@ use crate::xds::resource::route_config::RouteRetryConfig;
 ///
 /// These are errors where the request was definitely **not** sent, making it safe to retry.
 /// Walks the full error source chain via [`std::error::Error::source`].
-pub(crate) fn is_retryable_connection_error(err: &(dyn std::error::Error + 'static)) -> bool {
+pub fn is_retryable_connection_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
         if let Some(io_err) = e.downcast_ref::<io::Error>() {
@@ -78,27 +84,77 @@ pub(crate) fn is_retryable_grpc_status_code(
     code != tonic::Code::Ok && retryable_codes.contains(&code)
 }
 
-/// Transport-specific retry decisions. [`RetryPolicy`] owns everything else
-/// (attempt cap, backoff, body cloning), so a classifier only decides *whether*
-/// a response is retryable and optionally mutates the request before each retry.
-///
-/// This is the seam that lets non-gRPC transports (e.g. plain HTTP) reuse the
-/// shared retry engine by supplying their own retryable-status logic without
-/// duplicating any retry state machine.
-pub(crate) trait RetryClassifier: Clone {
-    /// Whether the request should be retried, given either the transport response
-    /// or a connection-level error. Implementations typically retry on a retryable
-    /// connection error (see [`is_retryable_connection_error`]) or a retryable
-    /// transport status.
-    fn is_retryable<Res>(&self, res: &Result<http::Response<Res>, tower::BoxError>) -> bool;
-
-    /// Optional per-retry request mutation (e.g. stamping a retry-attempt header),
-    /// called with the 1-based attempt number just before the retry is issued.
-    /// Default: no-op.
-    fn prepare_retry<Req>(&self, _req: &mut http::Request<Req>, _attempt: u32) {}
+/// The outcome of a single transport attempt, handed to
+/// [`RetryClassifier::is_retryable`]. Borrows from the response or error so the
+/// hot path builds it without cloning.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum RetryOutcome<'a> {
+    /// The transport produced a response; inspect `status`/`headers` to decide.
+    Response {
+        /// The response status.
+        status: http::StatusCode,
+        /// The response headers (e.g. gRPC's trailers-only `grpc-status`).
+        headers: &'a http::HeaderMap,
+    },
+    /// The transport failed before producing a usable response (e.g. a
+    /// connection-level error); see [`is_retryable_connection_error`].
+    Error(&'a tower::BoxError),
 }
 
-/// Maximum number of retry attempts allowed by the gRPC retry spec.
+impl<'a> RetryOutcome<'a> {
+    /// Borrow an outcome from a transport result without cloning.
+    pub(crate) fn from_result<B>(result: &'a Result<http::Response<B>, tower::BoxError>) -> Self {
+        match result {
+            Ok(response) => RetryOutcome::Response {
+                status: response.status(),
+                headers: response.headers(),
+            },
+            Err(err) => RetryOutcome::Error(err),
+        }
+    }
+}
+
+/// Transport-specific retry decisions. The retry engine (`RetryPolicy`) owns
+/// everything else (attempt cap, backoff, body cloning), so a classifier only
+/// decides *whether* an outcome is retryable and optionally mutates the request
+/// headers before each retry.
+///
+/// The seam is object-safe and type-erased (`Arc<dyn RetryClassifier>`) so a
+/// non-gRPC transport (e.g. plain HTTP) can plug its own retryable-outcome logic
+/// into the shared retry engine without duplicating any retry state machine.
+/// Local circuit-breaker drops are never retried by the engine, so classifiers
+/// need not handle them.
+pub trait RetryClassifier: Debug + Send + Sync + 'static {
+    /// Whether the request should be retried given the transport [`RetryOutcome`].
+    /// Implementations typically retry on a retryable connection error (see
+    /// [`is_retryable_connection_error`]) or a retryable transport status.
+    fn is_retryable(&self, outcome: RetryOutcome<'_>) -> bool;
+
+    /// Optional per-retry request-header mutation (e.g. stamping a retry-attempt
+    /// header), called with the 1-based attempt number just before the retry is
+    /// issued. Default: no-op.
+    fn prepare_retry(&self, _headers: &mut http::HeaderMap, _attempt: u32) {}
+}
+
+/// Compiles a route's Envoy `retry_on` conditions into a [`RetryClassifier`].
+///
+/// This is the transport seam for RDS-driven retry: the shared routing layer
+/// compiles each route's retry policy once by asking the factory for a
+/// classifier (the generic knobs — attempt cap and backoff — are handled by
+/// `RetrySharedConfig::from_route_retry`). gRPC uses
+/// [`GrpcRetryClassifierFactory`]; a non-gRPC transport (e.g. plain HTTP)
+/// supplies its own so it can interpret `retry_on` (e.g. `5xx`, `gateway-error`)
+/// and return an HTTP classifier without touching the retry engine.
+pub trait RetryClassifierFactory: Send + Sync + 'static {
+    /// Classifier for a route's comma-separated `retry_on` conditions, or `None`
+    /// when none apply to this transport so the route falls back to the layer
+    /// default (connection-error retries only; see
+    /// [`is_retryable_connection_error`]).
+    fn classifier_for(&self, retry_on: &str) -> Option<Arc<dyn RetryClassifier>>;
+}
+
+/// Maximum number of retry attempts, matching gRPC's retry design.
 /// Any `num_retries` value that would result in more than 5 total attempts
 /// is capped to `MAX_ATTEMPTS - 1 = 4`.
 const MAX_ATTEMPTS: u32 = 5;
@@ -230,22 +286,60 @@ impl Default for GrpcRetryClassifier {
 }
 
 impl RetryClassifier for GrpcRetryClassifier {
-    fn is_retryable<Res>(&self, res: &Result<http::Response<Res>, tower::BoxError>) -> bool {
-        match res {
-            Err(err) => is_retryable_connection_error(err.as_ref()),
-            Ok(response) if is_local_circuit_breaker_drop(response) => false,
-            Ok(response) => match tonic::Status::from_header_map(response.headers()) {
-                Some(status) => is_retryable_grpc_status_code(status.code(), &self.retry_on),
-                // No grpc-status header means success.
-                None => false,
-            },
+    fn is_retryable(&self, outcome: RetryOutcome<'_>) -> bool {
+        match outcome {
+            RetryOutcome::Error(err) => is_retryable_connection_error(err.as_ref()),
+            RetryOutcome::Response { headers, .. } => {
+                match tonic::Status::from_header_map(headers) {
+                    Some(status) => is_retryable_grpc_status_code(status.code(), &self.retry_on),
+                    // No grpc-status header means success.
+                    None => false,
+                }
+            }
         }
     }
 
-    fn prepare_retry<Req>(&self, req: &mut http::Request<Req>, attempt: u32) {
+    fn prepare_retry(&self, headers: &mut http::HeaderMap, attempt: u32) {
         // Per gRPC spec: advertise the number of previous attempts.
-        req.headers_mut()
-            .insert(GRPC_PREVIOUS_RPC_ATTEMPTS, http::HeaderValue::from(attempt));
+        headers.insert(GRPC_PREVIOUS_RPC_ATTEMPTS, http::HeaderValue::from(attempt));
+    }
+}
+
+/// Transport-agnostic default [`RetryClassifier`]: retries only on a retryable
+/// connection error and performs no per-retry header mutation. Used as the
+/// fallback for non-gRPC transports so connection-level retries don't stamp the
+/// gRPC-specific `grpc-previous-rpc-attempts` header (which would be confusing on
+/// e.g. plain HTTP traffic).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ConnectionErrorRetryClassifier;
+
+impl RetryClassifier for ConnectionErrorRetryClassifier {
+    fn is_retryable(&self, outcome: RetryOutcome<'_>) -> bool {
+        match outcome {
+            RetryOutcome::Error(err) => is_retryable_connection_error(err.as_ref()),
+            // No transport-specific status semantics: the default never retries a
+            // response. Per-route classifiers handle status-based retries.
+            RetryOutcome::Response { .. } => false,
+        }
+    }
+    // `prepare_retry` uses the trait default (no-op): the transport-agnostic
+    // fallback must not stamp any gRPC-specific retry header.
+}
+
+/// Default [`RetryClassifierFactory`] for gRPC: maps `retry_on` to retryable
+/// [`tonic::Code`]s and builds a `GrpcRetryClassifier`. Returns `None` when no
+/// condition maps to a gRPC code, so the route falls back to the layer default
+/// instead of masking connection retries (gRFC A44).
+#[derive(Debug, Default, Clone)]
+pub struct GrpcRetryClassifierFactory;
+
+impl RetryClassifierFactory for GrpcRetryClassifierFactory {
+    fn classifier_for(&self, retry_on: &str) -> Option<Arc<dyn RetryClassifier>> {
+        let codes = grpc_retry_on_codes(retry_on);
+        if codes.is_empty() {
+            return None;
+        }
+        Some(Arc::new(GrpcRetryClassifier::new(codes)))
     }
 }
 
@@ -264,31 +358,46 @@ fn make_backoff(config: &RetryBackoffConfig) -> backoff::ExponentialBackoff {
 }
 
 /// Immutable, shared retry configuration: the transport-agnostic knobs (attempt
-/// cap, backoff) plus the transport-specific classifier `C`. Built once when a
-/// `RouteConfiguration` is validated (see
-/// [`GrpcRetrySharedConfig::from_route_retry`]) and shared across matching
-/// requests via an [`Arc`].
+/// cap, backoff) plus the type-erased [`RetryClassifier`]. Built once when a
+/// `RouteConfiguration` is validated (see [`RetrySharedConfig::from_route_retry`])
+/// and shared across matching requests via an [`Arc`].
 ///
 /// Kept separate from the per-request retry state ([`RetryPolicy`]) so that
 /// instantiating a policy is an `Arc` clone plus a zero-field init.
 #[derive(Debug)]
-pub(crate) struct RetrySharedConfig<C> {
+pub(crate) struct RetrySharedConfig {
     /// Attempt cap and backoff schedule.
     config: RetryConfig,
     /// Decides retryability and per-retry request mutation for the transport.
-    classifier: C,
+    classifier: Arc<dyn RetryClassifier>,
 }
 
-impl<C> RetrySharedConfig<C> {
-    /// Create a shared retry config from a [`RetryConfig`] and a classifier.
-    pub(crate) fn new(config: RetryConfig, classifier: C) -> Self {
+impl RetrySharedConfig {
+    /// Create a shared retry config from a [`RetryConfig`] and a type-erased
+    /// [`RetryClassifier`].
+    pub(crate) fn new(config: RetryConfig, classifier: Arc<dyn RetryClassifier>) -> Self {
         Self { config, classifier }
     }
-}
 
-impl<C: Default> Default for RetrySharedConfig<C> {
-    fn default() -> Self {
-        Self::new(RetryConfig::default(), C::default())
+    /// Shared config with default knobs and a default [`GrpcRetryClassifier`]
+    /// (empty `retry_on`: status-code retries inactive, connection retries still
+    /// apply, stamping `grpc-previous-rpc-attempts` on each). Used as the gRPC
+    /// layer fallback.
+    pub(crate) fn grpc_default() -> Self {
+        Self::new(
+            RetryConfig::default(),
+            Arc::new(GrpcRetryClassifier::default()),
+        )
+    }
+
+    /// Shared config with default knobs and a transport-agnostic
+    /// [`ConnectionErrorRetryClassifier`] (connection-error retries only, no
+    /// per-retry header mutation). Used as the fallback for non-gRPC transports.
+    pub(crate) fn connection_default() -> Self {
+        Self::new(
+            RetryConfig::default(),
+            Arc::new(ConnectionErrorRetryClassifier),
+        )
     }
 }
 
@@ -298,25 +407,25 @@ impl<C: Default> Default for RetrySharedConfig<C> {
 /// clones it per request, so the state is per-request while the config stays
 /// shared behind the `Arc`.
 #[derive(Clone, Debug)]
-pub(crate) struct RetryPolicy<C> {
+pub(crate) struct RetryPolicy {
     /// Immutable config shared across all requests on this route.
-    shared: Arc<RetrySharedConfig<C>>,
+    shared: Arc<RetrySharedConfig>,
     /// Backoff state for the current request, created from config on first retry.
     backoff: Option<backoff::ExponentialBackoff>,
     /// Number of retry attempts made so far for the current request.
     attempts: u32,
 }
 
-impl<C> RetryPolicy<C> {
-    /// Create a policy from a config and classifier, allocating the shared `Arc`.
-    /// Prefer [`from_shared`](Self::from_shared) on the hot path.
-    pub(crate) fn new(config: RetryConfig, classifier: C) -> Self {
+impl RetryPolicy {
+    /// Create a policy from a config and a type-erased classifier, allocating the
+    /// shared `Arc`. Prefer [`from_shared`](Self::from_shared) on the hot path.
+    pub(crate) fn new(config: RetryConfig, classifier: Arc<dyn RetryClassifier>) -> Self {
         Self::from_shared(Arc::new(RetrySharedConfig::new(config, classifier)))
     }
 
     /// Instantiate per-request state from a shared config: a pointer clone plus
     /// a zero-field init.
-    pub(crate) fn from_shared(shared: Arc<RetrySharedConfig<C>>) -> Self {
+    pub(crate) fn from_shared(shared: Arc<RetrySharedConfig>) -> Self {
         Self {
             shared,
             backoff: None,
@@ -325,7 +434,7 @@ impl<C> RetryPolicy<C> {
     }
 
     /// Consume the policy and return its shared config.
-    pub(crate) fn into_shared(self) -> Arc<RetrySharedConfig<C>> {
+    pub(crate) fn into_shared(self) -> Arc<RetrySharedConfig> {
         self.shared
     }
 
@@ -342,23 +451,17 @@ impl<C> RetryPolicy<C> {
     }
 }
 
-impl<C: Default> Default for RetryPolicy<C> {
-    fn default() -> Self {
-        Self::from_shared(Arc::new(RetrySharedConfig::default()))
-    }
-}
-
-impl RetrySharedConfig<GrpcRetryClassifier> {
-    /// Build a shared gRPC config from a route's [`RouteRetryConfig`], mapping
-    /// `retry_on` to [`tonic::Code`]s; unset Envoy fields use [`RetryConfig`]
-    /// defaults. Returns `None` when no condition maps to a gRPC code, so the
-    /// route falls back to the layer default instead of masking connection
-    /// retries (gRFC A44).
-    pub(crate) fn from_route_retry(retry: &RouteRetryConfig) -> Option<Self> {
-        let retry_on = grpc_retry_on_codes(&retry.retry_on);
-        if retry_on.is_empty() {
-            return None;
-        }
+impl RetrySharedConfig {
+    /// Build a shared config from a route's [`RouteRetryConfig`]: the generic
+    /// knobs (`num_retries`, backoff) map to [`RetryConfig`], and `factory`
+    /// supplies the transport classifier from `retry_on`. Returns `None` when the
+    /// factory finds no applicable condition, so the route falls back to the
+    /// layer default instead of masking connection retries (gRFC A44).
+    pub(crate) fn from_route_retry(
+        retry: &RouteRetryConfig,
+        factory: &dyn RetryClassifierFactory,
+    ) -> Option<Self> {
+        let classifier = factory.classifier_for(&retry.retry_on)?;
         let mut config = RetryConfig::new();
         if let Some(num_retries) = retry.num_retries {
             config = config.num_retries(num_retries);
@@ -370,7 +473,7 @@ impl RetrySharedConfig<GrpcRetryClassifier> {
             }
             config = config.retry_backoff(backoff);
         }
-        Some(Self::new(config, GrpcRetryClassifier::new(retry_on)))
+        Some(Self::new(config, classifier))
     }
 }
 
@@ -395,9 +498,8 @@ pub(crate) fn grpc_retry_on_codes(retry_on: &str) -> Vec<tonic::Code> {
         .collect()
 }
 
-impl<C, Req, Res> Policy<Request<Req>, Response<Res>, tower::BoxError> for RetryPolicy<C>
+impl<Req, Res> Policy<Request<Req>, Response<Res>, tower::BoxError> for RetryPolicy
 where
-    C: RetryClassifier,
     Req: Clone,
 {
     type Future = tokio::time::Sleep;
@@ -411,16 +513,30 @@ where
             return None;
         }
 
-        if !self.shared.classifier.is_retryable(result) {
+        // A local circuit-breaker drop is a deliberate client-side drop and is
+        // never retried, regardless of the transport classifier.
+        if let Ok(response) = result.as_ref()
+            && is_local_circuit_breaker_drop(response)
+        {
+            return None;
+        }
+
+        if !self
+            .shared
+            .classifier
+            .is_retryable(RetryOutcome::from_result(result))
+        {
             return None;
         }
 
         let delay = self.backoff_next();
         self.attempts += 1;
 
-        // Let the classifier stamp any per-retry request state (e.g. gRPC's
-        // grpc-previous-rpc-attempts header).
-        self.shared.classifier.prepare_retry(req, self.attempts);
+        // Let the classifier stamp any per-retry request headers (e.g. gRPC's
+        // grpc-previous-rpc-attempts).
+        self.shared
+            .classifier
+            .prepare_retry(req.headers_mut(), self.attempts);
 
         Some(tokio::time::sleep(delay))
     }
@@ -430,15 +546,7 @@ where
     }
 }
 
-/// Non-breaking alias: existing gRPC callers keep the same name and behavior.
-pub(crate) type GrpcRetryPolicy = RetryPolicy<GrpcRetryClassifier>;
-
-/// Shared, immutable gRPC retry config (attempt cap, backoff, retryable
-/// [`tonic::Code`] set); the [`GrpcRetryClassifier`] specialization of
-/// [`RetrySharedConfig`].
-pub(crate) type GrpcRetrySharedConfig = RetrySharedConfig<GrpcRetryClassifier>;
-
-/// Tower [`Layer`] that wraps a gRPC service with retry support.
+/// Tower [`Layer`] that wraps a service with retry support.
 ///
 /// Builds a fresh [`tower::retry::Retry`] per request, selecting the config from
 /// the matched route's [`RouteDecision`] (stamped by the routing layer just
@@ -447,12 +555,12 @@ pub(crate) type GrpcRetrySharedConfig = RetrySharedConfig<GrpcRetryClassifier>;
 #[derive(Clone)]
 pub(crate) struct RetryLayer {
     /// Config used when a request carries no per-route retry config.
-    fallback: Arc<GrpcRetrySharedConfig>,
+    fallback: Arc<RetrySharedConfig>,
 }
 
 impl RetryLayer {
     /// Create a layer with the given `fallback` config.
-    pub(crate) fn new(fallback: Arc<GrpcRetrySharedConfig>) -> Self {
+    pub(crate) fn new(fallback: Arc<RetrySharedConfig>) -> Self {
         Self { fallback }
     }
 }
@@ -475,13 +583,13 @@ impl<S> Layer<S> for RetryLayer {
 pub(crate) struct RetryService<S> {
     inner: S,
     /// Config used when a request carries no per-route retry config.
-    fallback: Arc<GrpcRetrySharedConfig>,
+    fallback: Arc<RetrySharedConfig>,
 }
 
 impl<S, B, Res> Service<Request<B>> for RetryService<S>
 where
-    GrpcRetryPolicy: Policy<Request<SharedBody<B>>, Response<Res>, S::Error>,
-    <GrpcRetryPolicy as Policy<Request<SharedBody<B>>, Response<Res>, S::Error>>::Future: Send,
+    RetryPolicy: Policy<Request<SharedBody<B>>, Response<Res>, S::Error>,
+    <RetryPolicy as Policy<Request<SharedBody<B>>, Response<Res>, S::Error>>::Future: Send,
     S: Service<Request<SharedBody<B>>, Response = Response<Res>> + Clone + Send + 'static,
     S::Error: Debug + Send + 'static,
     S::Response: Send + 'static,
@@ -620,7 +728,7 @@ mod tests {
         let err: tower::BoxError =
             Box::new(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
         let result: Result<http::Response<()>, tower::BoxError> = Err(err);
-        assert!(classifier.is_retryable(&result));
+        assert!(classifier.is_retryable(RetryOutcome::from_result(&result)));
     }
 
     #[test]
@@ -631,7 +739,7 @@ mod tests {
             .body(())
             .unwrap();
         let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
-        assert!(classifier.is_retryable(&result));
+        assert!(classifier.is_retryable(RetryOutcome::from_result(&result)));
     }
 
     #[test]
@@ -642,7 +750,7 @@ mod tests {
             .body(())
             .unwrap();
         let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
-        assert!(!classifier.is_retryable(&result));
+        assert!(!classifier.is_retryable(RetryOutcome::from_result(&result)));
     }
 
     #[test]
@@ -650,7 +758,49 @@ mod tests {
         let classifier = GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]);
         let response = http::Response::builder().body(()).unwrap();
         let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
-        assert!(!classifier.is_retryable(&result));
+        assert!(!classifier.is_retryable(RetryOutcome::from_result(&result)));
+    }
+
+    // --- ConnectionErrorRetryClassifier tests ---
+
+    #[test]
+    fn test_connection_classifier_retries_connection_error() {
+        let classifier = ConnectionErrorRetryClassifier;
+        let err: tower::BoxError =
+            Box::new(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+        let result: Result<http::Response<()>, tower::BoxError> = Err(err);
+        assert!(classifier.is_retryable(RetryOutcome::from_result(&result)));
+    }
+
+    #[test]
+    fn test_connection_classifier_ignores_responses() {
+        // The transport-agnostic default never retries a response: even a gRPC
+        // UNAVAILABLE trailer is left to per-route (transport-specific) classifiers.
+        let classifier = ConnectionErrorRetryClassifier;
+        let response = http::Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header("grpc-status", "14")
+            .body(())
+            .unwrap();
+        let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
+        assert!(!classifier.is_retryable(RetryOutcome::from_result(&result)));
+    }
+
+    #[test]
+    fn test_connection_classifier_does_not_stamp_grpc_header() {
+        // The whole point of the generic default: connection retries must not add
+        // the gRPC-specific `grpc-previous-rpc-attempts` header.
+        let mut generic_headers = http::HeaderMap::new();
+        ConnectionErrorRetryClassifier.prepare_retry(&mut generic_headers, 1);
+        assert!(generic_headers.is_empty());
+
+        // Contrast: the gRPC default *does* stamp the header on the same retry.
+        let mut grpc_headers = http::HeaderMap::new();
+        GrpcRetryClassifier::default().prepare_retry(&mut grpc_headers, 1);
+        assert_eq!(
+            grpc_headers[GRPC_PREVIOUS_RPC_ATTEMPTS].to_str().unwrap(),
+            "1"
+        );
     }
 
     // --- RetryBackoffConfig tests ---
@@ -754,7 +904,8 @@ mod tests {
             base_interval: Some(Duration::from_millis(100)),
             max_interval: Some(Duration::from_millis(1000)),
         };
-        let shared = GrpcRetrySharedConfig::from_route_retry(&retry).expect("codes present");
+        let shared = RetrySharedConfig::from_route_retry(&retry, &GrpcRetryClassifierFactory)
+            .expect("codes present");
         assert_eq!(shared.config.num_retries, 3);
         assert_eq!(
             shared.config.retry_backoff.base_interval,
@@ -764,9 +915,16 @@ mod tests {
             shared.config.retry_backoff.max_interval,
             Duration::from_millis(1000)
         );
-        assert_eq!(
-            shared.classifier.retry_on.as_ref(),
-            [tonic::Code::Unavailable]
+        // The compiled classifier retries UNAVAILABLE (mapped from `retry_on`).
+        let unavailable: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder()
+                .header("grpc-status", "14")
+                .body(())
+                .unwrap());
+        assert!(
+            shared
+                .classifier
+                .is_retryable(RetryOutcome::from_result(&unavailable))
         );
     }
 
@@ -778,12 +936,19 @@ mod tests {
             base_interval: None,
             max_interval: None,
         };
-        let shared = GrpcRetrySharedConfig::from_route_retry(&retry).expect("codes present");
+        let shared = RetrySharedConfig::from_route_retry(&retry, &GrpcRetryClassifierFactory)
+            .expect("codes present");
         assert_eq!(shared.config.num_retries, 1);
         assert_eq!(shared.config.retry_backoff, RetryBackoffConfig::default());
-        assert_eq!(
-            shared.classifier.retry_on.as_ref(),
-            [tonic::Code::Cancelled]
+        // The compiled classifier retries CANCELLED (mapped from `retry_on`).
+        let cancelled: Result<http::Response<()>, tower::BoxError> = Ok(http::Response::builder()
+            .header("grpc-status", "1")
+            .body(())
+            .unwrap());
+        assert!(
+            shared
+                .classifier
+                .is_retryable(RetryOutcome::from_result(&cancelled))
         );
     }
 
@@ -797,7 +962,7 @@ mod tests {
             base_interval: None,
             max_interval: None,
         };
-        assert!(GrpcRetrySharedConfig::from_route_retry(&retry).is_none());
+        assert!(RetrySharedConfig::from_route_retry(&retry, &GrpcRetryClassifierFactory).is_none());
     }
 
     // --- from_shared tests ---
@@ -805,12 +970,15 @@ mod tests {
     #[test]
     fn from_shared_instantiates_zeroed_state_sharing_config() {
         let shared = Arc::new(
-            GrpcRetrySharedConfig::from_route_retry(&RouteRetryConfig {
-                retry_on: "unavailable".into(),
-                num_retries: Some(2),
-                base_interval: None,
-                max_interval: None,
-            })
+            RetrySharedConfig::from_route_retry(
+                &RouteRetryConfig {
+                    retry_on: "unavailable".into(),
+                    num_retries: Some(2),
+                    base_interval: None,
+                    max_interval: None,
+                },
+                &GrpcRetryClassifierFactory,
+            )
             .expect("codes present"),
         );
         let policy = RetryPolicy::from_shared(Arc::clone(&shared));
@@ -829,9 +997,9 @@ mod tests {
     /// the policy per request, so mutations from one request must not leak into another.
     #[tokio::test]
     async fn test_retry_state_is_per_request() {
-        let policy = GrpcRetryPolicy::new(
+        let policy = RetryPolicy::new(
             RetryConfig::new().num_retries(2),
-            GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]),
+            Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
         );
 
         // Simulate two independent request sessions by cloning the policy
@@ -897,5 +1065,136 @@ mod tests {
             .unwrap());
         let retry2b = policy_req2.retry(&mut req2, &mut result2b);
         assert!(retry2b.is_some(), "req2 should still have retries left");
+    }
+
+    // --- object-safe classifier seam (non-gRPC) ---
+
+    /// A minimal non-gRPC classifier: retries one fixed HTTP status (plus
+    /// connection errors) and stamps a custom retry-attempt header. Proves the
+    /// object-safe [`RetryClassifier`] seam serves a transport other than gRPC
+    /// without any HTTP-specific logic living in this crate.
+    #[derive(Debug)]
+    struct HttpStatusClassifier {
+        retry_status: http::StatusCode,
+    }
+
+    impl RetryClassifier for HttpStatusClassifier {
+        fn is_retryable(&self, outcome: RetryOutcome<'_>) -> bool {
+            match outcome {
+                RetryOutcome::Error(err) => is_retryable_connection_error(err.as_ref()),
+                RetryOutcome::Response { status, .. } => status == self.retry_status,
+            }
+        }
+
+        fn prepare_retry(&self, headers: &mut http::HeaderMap, attempt: u32) {
+            headers.insert("x-retry-attempt", http::HeaderValue::from(attempt));
+        }
+    }
+
+    #[test]
+    fn non_grpc_classifier_decides_by_http_status() {
+        let classifier = HttpStatusClassifier {
+            retry_status: http::StatusCode::SERVICE_UNAVAILABLE,
+        };
+        let retryable: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder().status(503).body(()).unwrap());
+        let not_retryable: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder().status(200).body(()).unwrap());
+        assert!(classifier.is_retryable(RetryOutcome::from_result(&retryable)));
+        assert!(!classifier.is_retryable(RetryOutcome::from_result(&not_retryable)));
+    }
+
+    #[tokio::test]
+    async fn engine_drives_non_grpc_classifier_and_prepares_headers() {
+        let mut policy = RetryPolicy::new(
+            RetryConfig::new().num_retries(1),
+            Arc::new(HttpStatusClassifier {
+                retry_status: http::StatusCode::SERVICE_UNAVAILABLE,
+            }),
+        );
+        let mut req = http::Request::builder().body(()).unwrap();
+        let mut result: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder().status(503).body(()).unwrap());
+
+        assert!(
+            policy.retry(&mut req, &mut result).is_some(),
+            "engine should retry a 503 for the HTTP classifier"
+        );
+        assert_eq!(
+            req.headers().get("x-retry-attempt").unwrap(),
+            "1",
+            "engine should let the classifier stamp per-retry headers"
+        );
+
+        // Exhausted after one retry (num_retries = 1).
+        let mut result2: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder().status(503).body(()).unwrap());
+        assert!(policy.retry(&mut req, &mut result2).is_none());
+    }
+
+    // --- classifier factory seam (RDS compilation) ---
+
+    /// A non-gRPC factory mapping any non-empty `retry_on` to an
+    /// [`HttpStatusClassifier`] (503) and `None` otherwise. Proves the
+    /// [`RetryClassifierFactory`] seam lets RDS compile a non-gRPC classifier
+    /// while the shared OSS code still applies the generic retry knobs.
+    #[derive(Debug)]
+    struct HttpRetryClassifierFactory;
+
+    impl RetryClassifierFactory for HttpRetryClassifierFactory {
+        fn classifier_for(&self, retry_on: &str) -> Option<Arc<dyn RetryClassifier>> {
+            if retry_on.is_empty() {
+                return None;
+            }
+            Some(Arc::new(HttpStatusClassifier {
+                retry_status: http::StatusCode::SERVICE_UNAVAILABLE,
+            }))
+        }
+    }
+
+    #[test]
+    fn factory_compiles_non_grpc_classifier_from_route_retry() {
+        let retry = RouteRetryConfig {
+            retry_on: "5xx".into(),
+            num_retries: Some(2),
+            base_interval: None,
+            max_interval: None,
+        };
+        let shared = RetrySharedConfig::from_route_retry(&retry, &HttpRetryClassifierFactory)
+            .expect("factory produced a classifier");
+        // Generic knobs are still applied by the shared compiler.
+        assert_eq!(shared.config.num_retries, 2);
+        // The compiled classifier is the factory's HTTP one: it retries a 503 and
+        // ignores a gRPC trailers-only status.
+        let http_503: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder().status(503).body(()).unwrap());
+        let grpc_unavailable: Result<http::Response<()>, tower::BoxError> =
+            Ok(http::Response::builder()
+                .header("grpc-status", "14")
+                .body(())
+                .unwrap());
+        assert!(
+            shared
+                .classifier
+                .is_retryable(RetryOutcome::from_result(&http_503))
+        );
+        assert!(
+            !shared
+                .classifier
+                .is_retryable(RetryOutcome::from_result(&grpc_unavailable))
+        );
+    }
+
+    #[test]
+    fn factory_returning_none_yields_no_route_policy() {
+        // Empty `retry_on` -> factory returns None -> the route falls back to the
+        // layer default instead of a route-specific policy.
+        let retry = RouteRetryConfig {
+            retry_on: String::new(),
+            num_retries: Some(3),
+            base_interval: None,
+            max_interval: None,
+        };
+        assert!(RetrySharedConfig::from_route_retry(&retry, &HttpRetryClassifierFactory).is_none());
     }
 }

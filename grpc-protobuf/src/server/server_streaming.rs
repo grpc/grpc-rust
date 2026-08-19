@@ -30,11 +30,8 @@ use grpc::server::DynSendStream;
 use grpc::server::RequestHeaders;
 use grpc::server::Trailers;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MutProxied;
 use protobuf::Proxied;
-use protobuf::Serialize;
 
 use crate::ProtoRecvMessage;
 use crate::SendFuture;
@@ -51,9 +48,9 @@ use crate::trailers_conv::trailers_from_status;
 #[trait_variant::make(Send)]
 pub trait ServerStreamingMethod: Sync + 'static {
     /// The protobuf request message type.
-    type Request: Message + Default;
+    type Request: Message;
     /// The protobuf response message type.
-    type Response: Message + Default;
+    type Response: Message;
 
     /// Handles a server-streaming RPC call.
     ///
@@ -84,8 +81,6 @@ impl<M: ServerStreamingMethod> ServerStreamingAdapter<M> {
 impl<M> DynHandle for ServerStreamingAdapter<M>
 where
     M: ServerStreamingMethod,
-    for<'a> <M::Request as MutProxied>::Mut<'a>: ClearAndParse + Send + Sync,
-    for<'a> <M::Response as Proxied>::View<'a>: Serialize + Send + Sync,
 {
     async fn dyn_handle(
         &self,

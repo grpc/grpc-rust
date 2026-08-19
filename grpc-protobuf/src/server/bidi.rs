@@ -29,11 +29,7 @@ use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
 use grpc::server::RequestHeaders;
 use grpc::server::Trailers;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MutProxied;
-use protobuf::Proxied;
-use protobuf::Serialize;
 
 use crate::ServerStatus;
 use crate::server::GrpcStreamingRequest;
@@ -47,9 +43,9 @@ use crate::trailers_conv::trailers_from_status;
 #[trait_variant::make(Send)]
 pub trait BidiStreamingMethod: Sync + 'static {
     /// The protobuf request message type.
-    type Request: Message + Default;
+    type Request: Message;
     /// The protobuf response message type.
-    type Response: Message + Default;
+    type Response: Message;
 
     /// Handles a bidirectional-streaming RPC call.
     ///
@@ -80,8 +76,6 @@ impl<M: BidiStreamingMethod> BidiStreamingAdapter<M> {
 impl<M> DynHandle for BidiStreamingAdapter<M>
 where
     M: BidiStreamingMethod,
-    for<'a> <M::Request as MutProxied>::Mut<'a>: ClearAndParse + Send + Sync,
-    for<'a> <M::Response as Proxied>::View<'a>: Serialize + Send + Sync,
 {
     async fn dyn_handle(
         &self,

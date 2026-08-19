@@ -33,11 +33,9 @@ use grpc::server::SendOptions;
 use grpc::server::Trailers;
 use protobuf::AsMut;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
 use protobuf::MutProxied;
 use protobuf::Proxied;
-use protobuf::Serialize;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
@@ -54,9 +52,9 @@ use crate::trailers_conv::trailers_from_status;
 #[trait_variant::make(Send)]
 pub trait UnaryMethod: Sync + 'static {
     /// The protobuf request message type.
-    type Request: Message + Default;
+    type Request: Message;
     /// The protobuf response message type.
-    type Response: Message + Default;
+    type Response: Message;
 
     /// Handles a unary RPC call.
     ///
@@ -86,8 +84,6 @@ impl<M: UnaryMethod> UnaryAdapter<M> {
 impl<M> DynHandle for UnaryAdapter<M>
 where
     M: UnaryMethod,
-    for<'a> <M::Request as MutProxied>::Mut<'a>: ClearAndParse + Send + Sync,
-    for<'a> <M::Response as Proxied>::View<'a>: Serialize + Send + Sync,
 {
     async fn dyn_handle(
         &self,

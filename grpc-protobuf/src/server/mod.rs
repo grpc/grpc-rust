@@ -31,8 +31,6 @@ use grpc::server::SendOptions;
 use protobuf::AsMut;
 use protobuf::AsView;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
@@ -58,7 +56,6 @@ type BoxedRecvStream = Box<dyn DynRecvStream>;
 impl<M> GrpcStreamingRequest<M>
 where
     M: Message,
-    for<'b> M::Mut<'b>: MessageMut<'b>,
 {
     /// Creates a new [`GrpcStreamingRequest`].
     pub(crate) fn new(rx: BoxedRecvStream) -> Self {
@@ -103,7 +100,6 @@ pub struct GrpcStreamingResponse<'a, M> {
 impl<'a, M> GrpcStreamingResponse<'a, M>
 where
     M: Message,
-    for<'b> M::View<'b>: MessageView<'b>,
 {
     pub(crate) fn new(tx: &'a mut dyn DynSendStream) -> Self {
         Self {

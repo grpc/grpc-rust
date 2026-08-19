@@ -33,7 +33,7 @@ use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
@@ -45,7 +45,7 @@ pub(crate) struct ServiceConfigSerde {
     pub(crate) connection_scaling: Option<ConnectionScalingSerde>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MethodConfigSerde {
     #[serde(default)]
@@ -64,20 +64,20 @@ pub(crate) struct MethodNameSerde {
     pub(crate) method: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetryThrottlingPolicySerde {
     pub(crate) max_tokens: SerdeU32,
     pub(crate) token_ratio: SerdeF32,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HealthCheckConfigSerde {
     pub(crate) service_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectionScalingSerde {
     #[serde(default = "default_max_connections_per_subchannel")]
@@ -108,23 +108,6 @@ impl LbConfigSerde {
 
     pub(crate) fn is_some(&self) -> bool {
         self.0.is_some()
-    }
-}
-
-impl PartialEq for LbConfigSerde {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (Some(a), Some(b)) => {
-                a.builder.name() == b.builder.name()
-                    && match (&a.config, &b.config) {
-                        (Some(ca), Some(cb)) => Arc::ptr_eq(ca, cb),
-                        (None, None) => true,
-                        _ => false,
-                    }
-            }
-            (None, None) => true,
-            _ => false,
-        }
     }
 }
 
@@ -398,7 +381,7 @@ mod test {
     fn test_load_balancing_config_serde() {
         use crate::client::load_balancing::pick_first::PickFirstConfig;
 
-        #[derive(Deserialize, Debug, PartialEq)]
+        #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
         struct TestConfig {
             #[serde(default)]

@@ -51,9 +51,9 @@ impl std::ops::Deref for GrpcDuration {
 }
 
 /// Service Config uses the [protobuf Duration format](https://protobuf.dev/reference/protobuf/google.protobuf/#duration)
-/// when parsing. The format is a string with a number followed
-/// by an optional fraction and the letter 's' for seconds. For example, "1s",
-/// "1.5s", "0.000000001s" are valid durations.
+/// when parsing. The format is a string with a number followed by an optional
+/// fraction and the letter 's' for seconds. For example, "1s", "1.5s",
+/// "0.000000001s" are valid durations.
 impl<'de> Deserialize<'de> for GrpcDuration {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -78,7 +78,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .ok_or_else(|| "empty duration string".to_string())?;
     let secs: u64 = secs_str
         .parse()
-        .map_err(|e| format!("failed to parse seconds: {}", e))?;
+        .map_err(|e| format!("failed to parse seconds: {e}"))?;
 
     let nanos = if let Some(fraction_str) = parts.next() {
         if fraction_str.is_empty() {
@@ -89,9 +89,10 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         }
         let fraction_val: u32 = fraction_str
             .parse()
-            .map_err(|e| format!("failed to parse fraction: {}", e))?;
-        let pad = 9 - fraction_str.len();
-        fraction_val * 10u32.pow(pad as u32)
+            .map_err(|e| format!("failed to parse fraction: {e}"))?;
+        let pad = u32::try_from(9 - fraction_str.len())
+            .map_err(|e| format!("invalid fraction length: {e}"))?;
+        fraction_val * 10u32.pow(pad)
     } else {
         0
     };

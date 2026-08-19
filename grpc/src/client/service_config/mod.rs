@@ -37,7 +37,7 @@ pub type ParseResult = Result<ServiceConfig, String>;
 
 /// An in-memory representation of a service config, provided to gRPC as a JSON
 /// object.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ServiceConfig {
     inner: serde_bindings::ServiceConfigSerde,
 }

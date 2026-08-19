@@ -23,7 +23,7 @@
  */
 
 pub(crate) mod duration;
-pub(crate) mod serde;
+pub(crate) mod serde_bindings;
 
 use std::sync::Arc;
 
@@ -39,13 +39,13 @@ pub type ParseResult = Result<ServiceConfig, String>;
 /// object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceConfig {
-    inner: serde::ServiceConfigSerde,
+    inner: serde_bindings::ServiceConfigSerde,
 }
 
 impl ServiceConfig {
     // Parses a service configuration from a JSON string.
     pub(crate) fn parse(config_json: &str) -> ParseResult {
-        let config_serde: crate::client::service_config::serde::ServiceConfigSerde =
+        let config_serde: crate::client::service_config::serde_bindings::ServiceConfigSerde =
             serde_json::from_str(config_json)
                 .map_err(|e| format!("failed to deserialize service config JSON: {e}"))?;
         config_serde.validate()?;
@@ -74,7 +74,7 @@ impl ServiceConfig {
         Self::default_lb_policy()
     }
 
-    /// Returns the default load balancing policy (`pick_first`).
+    // Returns the default load balancing policy (`pick_first`).
     pub(crate) fn default_lb_policy() -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
         let builder = GLOBAL_LB_REGISTRY
             .get_policy(pick_first::POLICY_NAME)
@@ -92,8 +92,8 @@ mod test {
     use serde_json::json;
 
     use super::duration::GrpcDuration;
-    use super::serde::SerdeF32;
-    use super::serde::SerdeU32;
+    use super::serde_bindings::SerdeF32;
+    use super::serde_bindings::SerdeU32;
     use super::*;
 
     #[test]

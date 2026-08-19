@@ -22,13 +22,9 @@
  *
  */
 
-// TODO(nathanielford) Move this to the internal crate once we have one.
-
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde::Serialize;
-use serde::Serializer;
 
 // Wraps std::time::Duration to provide custom serialization and deserialization
 // for gRPC service config, according to the protobuf Duration format.
@@ -69,15 +65,6 @@ impl<'de> Deserialize<'de> for GrpcDuration {
     }
 }
 
-impl Serialize for GrpcDuration {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format_duration(&self.0))
-    }
-}
-
 // Parsing logic, isolated for testing and to reduce serde monomorphization
 // footprint.
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -111,20 +98,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::new(secs, nanos))
 }
 
-// This is the inverse of parse_duration.
-fn format_duration(duration: &Duration) -> String {
-    let secs = duration.as_secs();
-    let nanos = duration.subsec_nanos();
-
-    if nanos == 0 {
-        format!("{}s", secs)
-    } else {
-        let frac = format!("{:09}", nanos);
-        let trimmed_frac = frac.trim_end_matches('0');
-        format!("{}.{}s", secs, trimmed_frac)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use serde_json::json;
@@ -155,59 +128,7 @@ mod test {
     }
 
     #[test]
-    fn test_serialize_duration() {
-        assert_eq!(
-            serde_json::to_value(GrpcDuration(Duration::from_secs(1))).unwrap(),
-            json!("1s")
-        );
-        assert_eq!(
-            serde_json::to_value(GrpcDuration(Duration::from_secs(0))).unwrap(),
-            json!("0s")
-        );
-        assert_eq!(
-            serde_json::to_value(GrpcDuration(Duration::new(1, 500_000_000))).unwrap(),
-            json!("1.5s")
-        );
-        assert_eq!(
-            serde_json::to_value(GrpcDuration(Duration::new(0, 1))).unwrap(),
-            json!("0.000000001s")
-        );
-        assert_eq!(
-            serde_json::to_value(GrpcDuration(Duration::new(1, 100))).unwrap(),
-            json!("1.0000001s")
-        );
-        assert_eq!(
-            serde_json::to_value(GrpcDuration(Duration::new(1, 100_000))).unwrap(),
-            json!("1.0001s")
-        );
-    }
-
-    #[test]
-    fn test_parse_format_inverse() {
-        let canonical_strings = ["1s", "0s", "1.5s", "0.000000001s", "1.0000001s", "1.0001s"];
-        for s in canonical_strings {
-            let parsed = parse_duration(s).unwrap();
-            let formatted = format_duration(&parsed);
-            assert_eq!(formatted, s);
-        }
-
-        let durations = [
-            Duration::from_secs(1),
-            Duration::from_secs(0),
-            Duration::new(1, 500_000_000),
-            Duration::new(0, 1),
-            Duration::new(1, 100),
-            Duration::new(1, 100_000),
-        ];
-        for d in durations {
-            let formatted = format_duration(&d);
-            let parsed = parse_duration(&formatted).unwrap();
-            assert_eq!(parsed, d);
-        }
-    }
-
-    #[test]
-    fn test_bijective_roundtrip() {
+    fn test_deserialize_duration() {
         let test_cases = [
             ("1s", GrpcDuration(Duration::from_secs(1))),
             ("0s", GrpcDuration(Duration::from_secs(0))),
@@ -219,8 +140,6 @@ mod test {
         for (s, expected) in test_cases {
             let val: GrpcDuration = serde_json::from_value(json!(s)).unwrap();
             assert_eq!(val, expected); // Deserialized value is correct.
-            let res = serde_json::to_value(&val).unwrap();
-            assert_eq!(res, json!(s)); // Re-serialized value is equivalent.
         }
     }
 }

@@ -41,8 +41,8 @@ use crate::rt::GrpcRuntime;
 
 #[derive(Debug, Clone)]
 pub struct GracefulSwitchLbConfig {
-    pub child_builder: Arc<DynLbPolicyBuilder>,
-    pub child_config: Option<DynLbConfig>,
+    child_builder: Arc<DynLbPolicyBuilder>,
+    child_config: Option<DynLbConfig>,
 }
 
 impl GracefulSwitchLbConfig {
@@ -64,10 +64,8 @@ impl GracefulSwitchLbConfig {
 /// to active and tear down the previously active policy.
 #[derive(Debug)]
 pub struct GracefulSwitchPolicy {
-    child_manager: ChildManager<()>, /* Child ID empty - only the name of the child LB policy
-                                      * matters. */
-    last_update: Option<LbState>, /* Saves the last output LbState to determine if an update is
-                                   * needed. */
+    child_manager: ChildManager<()>, // Child ID empty - only the name of the child LB policy matters.
+    last_update: Option<LbState>, // Saves the last output LbState to determine if an update is needed.
     active_child_builder: Option<Arc<DynLbPolicyBuilder>>,
 }
 
@@ -310,8 +308,8 @@ mod test {
         subchannel_list: TestSubchannelList,
     }
 
-    // Defines the functions resolver_update and subchannel_update to test graceful
-    // switch
+    // Defines the functions resolver_update and subchannel_update to test
+    //graceful switch.
     fn create_funcs_for_gracefulswitch_tests(name: &'static str) -> StubPolicyFuncs {
         StubPolicyFuncs {
             // Closure for resolver_update. It creates a subchannel for the

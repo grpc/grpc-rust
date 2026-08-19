@@ -309,7 +309,7 @@ mod test {
     }
 
     // Defines the functions resolver_update and subchannel_update to test
-    //graceful switch.
+    // graceful switch.
     fn create_funcs_for_gracefulswitch_tests(name: &'static str) -> StubPolicyFuncs {
         StubPolicyFuncs {
             // Closure for resolver_update. It creates a subchannel for the
@@ -364,7 +364,7 @@ mod test {
     // 1. Creates a work scheduler.
     // 2. Creates a fake channel that acts as a channel controller.
     // 3. Creates an StubPolicyBuilder with StubFuncs that each test will define and
-    //    name of the test.
+    //    name the test.
     // 5. Creates a GracefulSwitch.
     //
     // Returns the following:

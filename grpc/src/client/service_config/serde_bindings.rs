@@ -439,15 +439,14 @@ mod test {
         }));
         assert!(res.is_err());
 
-        // No supported policies -> collapses to None
-        let val: TestConfig = serde_json::from_value(json!({
+        // Non-empty array with no supported policies -> fails deserialization
+        let res: Result<TestConfig, _> = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "unsupported_1": {} },
                 { "unsupported_2": {} }
             ]
-        }))
-        .unwrap();
-        assert!(val.load_balancing_config.is_none());
+        }));
+        assert!(res.is_err());
 
         // Empty array -> collapses to None
         let val: TestConfig = serde_json::from_value(json!({

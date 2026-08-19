@@ -215,6 +215,14 @@ mod test {
             ]
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
+
+        // Non-empty loadBalancingConfig with no supported policy.
+        let json_data = json!({
+            "loadBalancingConfig": [
+                { "unsupported_lb_policy": { "foo": "bar" } }
+            ]
+        });
+        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
     }
 
     #[test]
@@ -320,7 +328,34 @@ mod test {
             .clone();
         assert!(pf_config.shuffle_address_list);
 
-        // Legacy loadBalancingPolicy fallback
+        // Non-empty loadBalancingConfig with no supported policy errors on parse
+        let json_data = json!({
+            "loadBalancingConfig": [
+                { "unsupported_lb_policy": { "foo": "bar" } }
+            ]
+        });
+        assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
+
+        // Empty loadBalancingConfig array falls back to loadBalancingPolicy if present
+        let json_data = json!({
+            "loadBalancingConfig": [],
+            "loadBalancingPolicy": "round_robin"
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "round_robin");
+        assert!(config.is_none());
+
+        // Empty loadBalancingConfig array with no loadBalancingPolicy falls back to default pick_first
+        let json_data = json!({
+            "loadBalancingConfig": []
+        });
+        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
+        let (builder, config) = sc.lb_config();
+        assert_eq!(builder.name(), "pick_first");
+        assert!(config.is_none());
+
+        // Legacy loadBalancingPolicy fallback when loadBalancingConfig is absent
         let json_data = json!({
             "loadBalancingPolicy": "round_robin"
         });
@@ -329,18 +364,7 @@ mod test {
         assert_eq!(builder.name(), "round_robin");
         assert!(config.is_none());
 
-        // No supported LB config present -> falls back to default pick_first
-        let json_data = json!({
-            "loadBalancingConfig": [
-                { "unsupported_lb_policy": { "foo": "bar" } }
-            ]
-        });
-        let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
-        let (builder, config) = sc.lb_config();
-        assert_eq!(builder.name(), "pick_first");
-        assert!(config.is_none());
-
-        // No LB config present -> falls back to default pick_first
+        // Neither loadBalancingConfig nor loadBalancingPolicy present -> default pick_first
         let json_data = json!({});
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();

@@ -40,11 +40,11 @@ use protobuf::Message;
 use protobuf::MessageView;
 use protobuf::Proxied;
 
-use crate::CallBuilder;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
 use crate::Status;
 use crate::StatusError;
+use crate::client::CallBuilder;
 use crate::client::Internal;
 use crate::trailers_conv::status_from_trailers;
 

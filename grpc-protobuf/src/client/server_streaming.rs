@@ -37,9 +37,9 @@ use protobuf::MessageMut;
 use protobuf::MessageView;
 use protobuf::Proxied;
 
-use crate::CallBuilder;
-use crate::GrpcStreamingResponse;
 use crate::ProtoSendMessage;
+use crate::client::CallBuilder;
+use crate::client::GrpcStreamingResponse;
 use crate::client::Internal;
 
 /// Configures a server-streaming call for gRPC Protobuf.  Implements

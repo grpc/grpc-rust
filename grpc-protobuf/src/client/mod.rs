@@ -51,10 +51,15 @@ use crate::Status;
 use crate::private::Internal;
 use crate::trailers_conv::status_from_trailers;
 
-pub(crate) mod bidi;
-pub(crate) mod client_streaming;
-pub(crate) mod server_streaming;
-pub(crate) mod unary;
+mod bidi;
+mod client_streaming;
+mod server_streaming;
+mod unary;
+
+pub use bidi::*;
+pub use client_streaming::*;
+pub use server_streaming::*;
+pub use unary::*;
 
 /// Allows sending streaming RPC protobuf request messages.
 ///

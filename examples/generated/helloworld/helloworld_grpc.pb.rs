@@ -2,6 +2,7 @@
 pub mod greeter_client {
     use grpc::client::*;
     use grpc_protobuf::*;
+    use grpc_protobuf::client::*;
     /// The greeting service definition.
     #[derive(Debug, Clone)]
     pub struct GreeterClient<T> {

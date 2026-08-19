@@ -28,10 +28,7 @@ use std::pin::Pin;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RequestHeaders;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
 
 use crate::CallBuilder;
 use crate::GrpcStreamingRequest;
@@ -64,16 +61,8 @@ impl<'a, C, Req, Res> BidiCallBuilder<'a, C, Req, Res> {
 impl<'a, C, Req, Res> IntoFuture for BidiCallBuilder<'a, C, Req, Res>
 where
     C: InvokeOnce + 'a,
-    // Req is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Req: Message,
-    for<'b> Req::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
-    Res: Message + ClearAndParse,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
+    Res: Message,
 {
     type Output = (
         GrpcStreamingRequest<Req, C::SendStream>,

@@ -37,7 +37,6 @@
 //!
 //! # Additional Types
 //!
-//! - **[`Call`]:** Represents an incoming RPC accepted by a [`Listener`].
 //! - **[`SendStream`] / [`RecvStream`]:** Represent the sending and receiving
 //!   sides of a server-side RPC.
 //! - **[`RequestHeaders`]:** Represents gRPC headers sent by the client to
@@ -49,8 +48,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tonic::async_trait;
-
+use crate::async_trait;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;

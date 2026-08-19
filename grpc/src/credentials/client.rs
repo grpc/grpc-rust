@@ -25,7 +25,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use tonic::async_trait;
+use crate::async_trait;
 
 use crate::attributes::Attributes;
 use crate::credentials::ChannelCredentials;
@@ -144,8 +144,8 @@ impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T
 
 #[cfg(test)]
 mod tests {
+    use crate::async_trait;
     use tokio::net::TcpListener;
-    use tonic::async_trait;
 
     use super::*;
     use crate::StatusError;

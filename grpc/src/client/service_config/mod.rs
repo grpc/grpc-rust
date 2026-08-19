@@ -39,18 +39,14 @@ pub type ParseResult = Result<ServiceConfig, String>;
 /// object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceConfig {
-    pub(crate) inner: serde::ServiceConfigSerde,
+    inner: serde::ServiceConfigSerde,
 }
 
 impl ServiceConfig {
-    /// Parses a service configuration from a JSON string.
-    pub fn parse(config_json: &str) -> ParseResult {
-        let config_serde: serde::ServiceConfigSerde = match serde_json::from_str(config_json) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!("failed to deserialize service config JSON: {e}"));
-            }
-        };
+    // Parses a service configuration from a JSON string.
+    pub(crate) fn parse(config_json: &str) -> ParseResult {
+        let config_serde: serde::ServiceConfigSerde = serde_json::from_str(config_json)
+            .map_err(|e| format!("failed to deserialize service config JSON: {e}"))?;
         config_serde.validate()?;
         Ok(Self {
             inner: config_serde,
@@ -84,9 +80,7 @@ impl ServiceConfig {
         let builder = GLOBAL_LB_REGISTRY
             .get_policy(pick_first::POLICY_NAME)
             .expect("pick_first policy must be registered");
-        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({
-            "shuffleAddressList": true
-        }));
+        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
         let parsed_config = builder.parse_config(&default_json).ok().flatten();
         (builder, parsed_config)
     }

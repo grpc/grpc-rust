@@ -119,6 +119,11 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Error = Status;
 
     fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        // prost::Message::encode only checks remaining_mut() and never
+        // reserves. BytesMut reports remaining_mut as essentially unbounded,
+        // and chunk_mut grows 64 bytes when full, so large messages would
+        // otherwise reallocate repeatedly while encoding.
+        buf.reserve(item.encoded_len());
         item.encode(buf)
             .expect("Message only errors if not enough space");
 
@@ -176,6 +181,7 @@ mod tests {
     use bytes::{Buf, BufMut, BytesMut};
     use http_body::Body;
     use http_body_util::BodyExt as _;
+    use prost::encoding::{DecodeContext, WireType};
     use std::pin::pin;
     use tonic::codec::SingleMessageCompressionOverride;
     use tonic::codec::{EncodeBody, HEADER_SIZE, Streaming};
@@ -328,6 +334,61 @@ mod tests {
             "8"
         );
         assert!(body.is_end_stream());
+    }
+
+    /// `prost::Message::encode` never calls `BufMut::reserve`; `BytesMut::chunk_mut`
+    /// grows 64 bytes at a time when full. `ProstEncoder` must pre-size from
+    /// `encoded_len()` so a large payload is not written into a near-empty buffer.
+    #[tokio::test]
+    async fn encode_presizes_buffer_from_encoded_len() {
+        const PAYLOAD: usize = 32 * 1024;
+        let encoder = ProstEncoder::<PresizeProbe>::new(BufferSettings::new(0, PAYLOAD * 2));
+        let source = tokio_stream::iter(std::iter::once(Ok::<_, Status>(PresizeProbe {
+            len: PAYLOAD,
+        })));
+        let mut body = pin!(EncodeBody::new_server(
+            encoder,
+            source,
+            None,
+            SingleMessageCompressionOverride::default(),
+            None,
+        ));
+
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+    }
+
+    struct PresizeProbe {
+        len: usize,
+    }
+
+    impl prost::Message for PresizeProbe {
+        fn encoded_len(&self) -> usize {
+            self.len
+        }
+
+        fn encode_raw(&self, buf: &mut impl BufMut) {
+            let spare = buf.chunk_mut().len();
+            assert!(
+                spare >= self.len,
+                "ProstEncoder should reserve encoded_len() before writing; spare={spare}, needed={}",
+                self.len
+            );
+            buf.put_bytes(0, self.len);
+        }
+
+        fn merge_field(
+            &mut self,
+            _tag: u32,
+            _wire_type: WireType,
+            _buf: &mut impl Buf,
+            _ctx: DecodeContext,
+        ) -> Result<(), prost::DecodeError> {
+            unimplemented!("decode is not exercised")
+        }
+
+        fn clear(&mut self) {}
     }
 
     #[derive(Debug, Clone, Default)]

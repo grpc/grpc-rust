@@ -23,9 +23,10 @@
  */
 
 use integration_tests::pb::{test_client::TestClient, test_server, Input, Output};
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{net::TcpListener, net::TcpStream, sync::oneshot};
 use tonic::{
     transport::{server::TcpIncoming, Endpoint, Server},
     Code, Request, Response, Status,
@@ -135,5 +136,81 @@ async fn connect_lazy_reconnects_after_first_failure() {
 
     assert_eq!(err.code(), Code::Unavailable);
 
+    jh.await.unwrap();
+}
+
+/// A unary call that does not return until `hold` is signaled.
+struct HoldSvc {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    hold: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[tonic::async_trait]
+impl test_server::Test for HoldSvc {
+    async fn unary_call(&self, _: Request<Input>) -> Result<Response<Output>, Status> {
+        let started = self.started.lock().unwrap().take();
+        if let Some(tx) = started {
+            let _ = tx.send(());
+        }
+        let hold = self.hold.lock().unwrap().take();
+        if let Some(rx) = hold {
+            let _ = rx.await;
+        }
+        Ok(Response::new(Output {}))
+    }
+}
+
+/// The listen socket must close when the shutdown signal fires, *before*
+/// in-flight RPCs finish. Otherwise new clients SYN-ACK into a dead backlog
+/// and hang until their own deadline.
+#[tokio::test]
+async fn shutdown_closes_listener_before_drain() {
+    let (started_tx, started_rx) = oneshot::channel();
+    let (hold_tx, hold_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let svc = test_server::TestServer::new(HoldSvc {
+        started: Mutex::new(Some(started_tx)),
+        hold: Mutex::new(Some(hold_rx)),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+
+    let jh = tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async { drop(shutdown_rx.await) })
+            .await
+            .unwrap();
+    });
+
+    let mut client = TestClient::connect(format!("http://{addr}")).await.unwrap();
+    let call = tokio::spawn(async move { client.unary_call(Request::new(Input {})).await });
+    started_rx.await.unwrap();
+
+    shutdown_tx.send(()).unwrap();
+
+    let kind = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(e) => return e.kind(),
+            }
+        }
+    })
+    .await
+    .expect("new connect must fail promptly after shutdown, while drain is still in progress");
+    assert!(
+        matches!(
+            kind,
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+        ),
+        "expected refused/reset after listen drop, got {kind:?}"
+    );
+
+    hold_tx.send(()).unwrap();
+    call.await.unwrap().unwrap();
     jh.await.unwrap();
 }

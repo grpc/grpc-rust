@@ -22,17 +22,14 @@
  *
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
-use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
@@ -42,10 +39,20 @@ use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::rt::GrpcRuntime;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GracefulSwitchLbConfig {
     child_builder: Arc<DynLbPolicyBuilder>,
     child_config: Option<DynLbConfig>,
+}
+
+impl GracefulSwitchLbConfig {
+    /// Creates a new [`GracefulSwitchLbConfig`].
+    pub fn new(child_builder: Arc<DynLbPolicyBuilder>, child_config: Option<DynLbConfig>) -> Self {
+        Self {
+            child_builder,
+            child_config,
+        }
+    }
 }
 
 /// A graceful switching load balancing policy.  In graceful switch, there is
@@ -142,42 +149,6 @@ impl GracefulSwitchPolicy {
         }
     }
 
-    /// Parses a child config list and returns a LB config for the
-    /// GracefulSwitchPolicy.  Config is expected to contain a JSON array of LB
-    /// policy names + configs matching the format of the "loadBalancingConfig"
-    /// field in the gRPC ServiceConfig. It returns a type that should be passed
-    /// to resolver_update in the LbConfig.config field.
-    pub fn parse_config(config: &ParsedJsonLbConfig) -> Result<GracefulSwitchLbConfig, String> {
-        let cfg: Vec<HashMap<String, serde_json::Value>> = match config.convert_to() {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!("failed to parse JSON config: {}", e));
-            }
-        };
-        for c in cfg {
-            if c.len() != 1 {
-                return Err(format!(
-                    "Each element in array must contain exactly one policy name/config; found {:?}",
-                    c.keys()
-                ));
-            }
-            let (policy_name, policy_config) = c.into_iter().next().unwrap();
-            let Some(child_builder) = GLOBAL_LB_REGISTRY.get_policy(policy_name.as_str()) else {
-                continue;
-            };
-            let parsed_config = ParsedJsonLbConfig {
-                value: policy_config,
-            };
-            let child_config = child_builder.parse_config(&parsed_config)?;
-            let gsb_config = GracefulSwitchLbConfig {
-                child_builder,
-                child_config,
-            };
-            return Ok(gsb_config);
-        }
-        Err("no supported policies found in config".into())
-    }
-
     fn update_picker(&mut self, channel_controller: &mut dyn ChannelController) {
         // If maybe_swap returns a None, then no update needs to happen.
         let Some(update) = self.maybe_swap(channel_controller) else {
@@ -255,14 +226,15 @@ mod test {
 
     use crate::client::RequestHeaders;
     use crate::client::load_balancing::ChannelController;
+    use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
     use crate::client::load_balancing::LbPolicy;
     use crate::client::load_balancing::LbState;
-    use crate::client::load_balancing::ParsedJsonLbConfig;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::PickResult;
     use crate::client::load_balancing::Picker;
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
+    use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
     use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
     use crate::client::load_balancing::test_utils::StubPolicyData;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
@@ -279,6 +251,11 @@ mod test {
     use crate::rt::default_runtime;
 
     const DEFAULT_TEST_SHORT_TIMEOUT: Duration = Duration::from_millis(10);
+
+    fn stub_lb_config(name: &str) -> GracefulSwitchLbConfig {
+        let builder = GLOBAL_LB_REGISTRY.get_policy(name).unwrap();
+        GracefulSwitchLbConfig::new(builder, None)
+    }
 
     struct TestSubchannelList {
         subchannels: Vec<Arc<dyn Subchannel>>,
@@ -331,7 +308,8 @@ mod test {
         subchannel_list: TestSubchannelList,
     }
 
-    // Defines the functions resolver_update and subchannel_update to test graceful switch
+    // Defines the functions resolver_update and subchannel_update to test
+    // graceful switch.
     fn create_funcs_for_gracefulswitch_tests(name: &'static str) -> StubPolicyFuncs {
         StubPolicyFuncs {
             // Closure for resolver_update. It creates a subchannel for the
@@ -385,15 +363,14 @@ mod test {
     // Performs the following:
     // 1. Creates a work scheduler.
     // 2. Creates a fake channel that acts as a channel controller.
-    // 3. Creates an StubPolicyBuilder with StubFuncs that each test will define
-    //    and name of the test.
+    // 3. Creates an StubPolicyBuilder with StubFuncs that each test will define and
+    //    name the test.
     // 5. Creates a GracefulSwitch.
     //
     // Returns the following:
     // 1. A receiver for events initiated by the LB policy (like creating a new
     //    subchannel, sending a new picker etc).
-    // 2. The GracefulSwitch to send resolver and subchannel updates from the
-    //    test.
+    // 2. The GracefulSwitch to send resolver and subchannel updates from the test.
     // 3. The controller to pass to the LB policy as part of the updates.
     fn setup() -> (
         mpsc::Receiver<TestEvent>,
@@ -487,16 +464,7 @@ mod test {
         );
 
         let (mut rx_events, mut graceful_switch, mut tcc) = setup();
-        let service_config = serde_json::json!([
-                { "stub-gracefulswitch_successful_first_update-one": serde_json::json!({}) },
-                { "stub-gracefulswitch_successful_first_update-two": serde_json::json!({}) }
-            ]
-        );
-
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
+        let parsed_config = stub_lb_config("stub-gracefulswitch_successful_first_update-one");
 
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let update = ResolverUpdate {
@@ -538,14 +506,7 @@ mod test {
             ),
         );
 
-        let service_config = serde_json::json!([
-                { "stub-gracefulswitch_switching_to_resolver_update-one": serde_json::json!({}) }
-            ]
-        );
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
+        let parsed_config = stub_lb_config("stub-gracefulswitch_switching_to_resolver_update-one");
 
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let update = ResolverUpdate {
@@ -573,14 +534,8 @@ mod test {
         );
 
         // 2. Switch to mock_policy_two as pending
-        let new_service_config = serde_json::json!([
-                { "stub-gracefulswitch_switching_to_resolver_update-two": serde_json::json!({}) }
-            ]
-        );
-        let new_parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: new_service_config,
-        })
-        .unwrap();
+        let new_parsed_config =
+            stub_lb_config("stub-gracefulswitch_switching_to_resolver_update-two");
         graceful_switch
             .resolver_update(update.clone(), Some(&new_parsed_config), &mut *tcc)
             .unwrap();
@@ -614,15 +569,7 @@ mod test {
             "stub-gracefulswitch_two_policies_same_type-one",
             create_funcs_for_gracefulswitch_tests("stub-gracefulswitch_two_policies_same_type-one"),
         );
-        let service_config = serde_json::json!(
-            [
-                { "stub-gracefulswitch_two_policies_same_type-one": serde_json::json!({}) }
-            ]
-        );
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
+        let parsed_config = stub_lb_config("stub-gracefulswitch_two_policies_same_type-one");
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let update = ResolverUpdate {
             endpoints: Ok(vec![endpoint.clone()]),
@@ -643,15 +590,7 @@ mod test {
             "stub-gracefulswitch_two_policies_same_type-one",
         );
 
-        let service_config2 = serde_json::json!(
-            [
-                { "stub-gracefulswitch_two_policies_same_type-one": serde_json::json!({}) }
-            ]
-        );
-        let parsed_config2 = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config2,
-        })
-        .unwrap();
+        let parsed_config2 = stub_lb_config("stub-gracefulswitch_two_policies_same_type-one");
         graceful_switch
             .resolver_update(update.clone(), Some(&parsed_config2), &mut *tcc)
             .unwrap();
@@ -678,15 +617,8 @@ mod test {
             ),
         );
 
-        let service_config = serde_json::json!([
-                { "stub-gracefulswitch_current_not_ready_pending_update-one": serde_json::json!({}) }
-            ]
-        );
-
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
+        let parsed_config =
+            stub_lb_config("stub-gracefulswitch_current_not_ready_pending_update-one");
 
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let second_endpoint = create_endpoint_with_one_address("0.0.0.0.0".to_string());
@@ -703,18 +635,12 @@ mod test {
         let current_subchannels = verify_subchannel_creation_from_policy(&mut rx_events);
         assert_channel_empty(&mut rx_events);
 
-        let new_service_config = serde_json::json!([
-                { "stub-gracefulswitch_current_not_ready_pending_update-two": serde_json::json!({ "shuffleAddressList": false }) },
-            ]
-        );
         let second_update = ResolverUpdate {
             endpoints: Ok(vec![second_endpoint.clone()]),
             ..Default::default()
         };
-        let new_parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: new_service_config,
-        })
-        .unwrap();
+        let new_parsed_config =
+            stub_lb_config("stub-gracefulswitch_current_not_ready_pending_update-two");
         graceful_switch
             .resolver_update(second_update.clone(), Some(&new_parsed_config), &mut *tcc)
             .unwrap();
@@ -748,14 +674,7 @@ mod test {
             "stub-gracefulswitch_current_leaving_ready-two",
             create_funcs_for_gracefulswitch_tests("stub-gracefulswitch_current_leaving_ready-two"),
         );
-        let service_config = serde_json::json!([
-                { "stub-gracefulswitch_current_leaving_ready-one": serde_json::json!({}) }
-            ]
-        );
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
+        let parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-one");
 
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let endpoint2 = create_endpoint_with_one_address("127.0.0.1:1235".to_string());
@@ -780,20 +699,11 @@ mod test {
             &mut rx_events,
             "stub-gracefulswitch_current_leaving_ready-one",
         );
-        let new_service_config = serde_json::json!(
-            [
-                { "stub-gracefulswitch_current_leaving_ready-two": serde_json::json!({}) },
-
-            ]
-        );
         let new_update = ResolverUpdate {
             endpoints: Ok(vec![endpoint2.clone()]),
             ..Default::default()
         };
-        let new_parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: new_service_config,
-        })
-        .unwrap();
+        let new_parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-two");
         graceful_switch
             .resolver_update(new_update.clone(), Some(&new_parsed_config), &mut *tcc)
             .unwrap();
@@ -833,15 +743,7 @@ mod test {
             "stub-gracefulswitch_current_leaving_ready-two",
             create_funcs_for_gracefulswitch_tests("stub-gracefulswitch_current_leaving_ready-two"),
         );
-        let service_config = serde_json::json!(
-            [
-                { "stub-gracefulswitch_current_leaving_ready-one": serde_json::json!({}) }
-            ]
-        );
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
+        let parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-one");
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let endpoint2 = create_endpoint_with_one_address("127.0.0.1:1235".to_string());
         let update = ResolverUpdate {
@@ -865,19 +767,11 @@ mod test {
             &mut rx_events,
             "stub-gracefulswitch_current_leaving_ready-one",
         );
-        let new_service_config = serde_json::json!(
-            [
-                { "stub-gracefulswitch_current_leaving_ready-two": serde_json::json!({}) },
-            ]
-        );
         let new_update = ResolverUpdate {
             endpoints: Ok(vec![endpoint2.clone()]),
             ..Default::default()
         };
-        let new_parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: new_service_config,
-        })
-        .unwrap();
+        let new_parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-two");
 
         graceful_switch
             .resolver_update(new_update.clone(), Some(&new_parsed_config), &mut *tcc)
@@ -924,15 +818,9 @@ mod test {
                 "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-two",
             ),
         );
-        let service_config = serde_json::json!(
-            [
-                { "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-one": serde_json::json!({}) }
-            ]
+        let parsed_config = stub_lb_config(
+            "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-one",
         );
-        let parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: service_config,
-        })
-        .unwrap();
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
         let update = ResolverUpdate {
             endpoints: Ok(vec![endpoint.clone()]),
@@ -953,20 +841,14 @@ mod test {
             &mut rx_events,
             "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-one",
         );
-        let new_service_config = serde_json::json!(
-            [
-                { "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-two": serde_json::json!({ "shuffleAddressList": false }) },
-            ]
-        );
         let second_endpoint = create_endpoint_with_one_address("127.0.0.1:1235".to_string());
         let second_update = ResolverUpdate {
             endpoints: Ok(vec![second_endpoint.clone()]),
             ..Default::default()
         };
-        let new_parsed_config = GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig {
-            value: new_service_config,
-        })
-        .unwrap();
+        let new_parsed_config = stub_lb_config(
+            "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-two",
+        );
         graceful_switch
             .resolver_update(second_update.clone(), Some(&new_parsed_config), &mut *tcc)
             .unwrap();

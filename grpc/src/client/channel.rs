@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -46,12 +45,12 @@ use crate::client::Invoke;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
+use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::pick_first;
 use crate::client::load_balancing::round_robin;
@@ -66,7 +65,7 @@ use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
-use crate::client::service_config::LbPolicyType;
+use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
@@ -252,8 +251,9 @@ struct PersistentChannel {
 }
 
 impl PersistentChannel {
-    /// Returns the current state of the channel. If there is no underlying active channel,
-    /// returns Idle. If `connect` is true, will create a new active channel iff none exists.
+    /// Returns the current state of the channel. If there is no underlying active
+    /// channel, returns Idle. If `connect` is true, will create a new active
+    /// channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
         // Done this away to avoid potentially locking twice.
         let active_channel = if connect {
@@ -270,8 +270,9 @@ impl PersistentChannel {
         active_channel.lb_watcher.cur().connectivity_state
     }
 
-    /// Gets the underlying active channel. If there is no current connection, it will create one.
-    /// This cannot fail and will always return a valid active channel.
+    /// Gets the underlying active channel. If there is no current connection,
+    /// it will create one. This cannot fail and will always return a valid
+    /// active channel.
     fn get_active_channel(&self) -> Arc<ActiveChannel> {
         let mut active_channel = self.active_channel.lock().unwrap();
 
@@ -285,8 +286,10 @@ impl PersistentChannel {
 
 // A channel that is not idle (connecting, ready, or erroring).
 struct ActiveChannel {
-    abort_handle: Box<dyn rt::TaskHandle>, // Work scheduler task killed when ActiveChannel is dropped.
-    lb_watcher: Arc<Watcher<LbState>>, // For getting the channel connectivity state and pickers for RPCs.
+    abort_handle: Box<dyn rt::TaskHandle>, /* Work scheduler task killed when ActiveChannel is
+                                            * dropped. */
+    lb_watcher: Arc<Watcher<LbState>>, /* For getting the channel connectivity state and pickers
+                                        * for RPCs. */
 }
 
 impl ActiveChannel {
@@ -448,28 +451,19 @@ impl ResolverChannelController {
 
 impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
-        let json_config = if let Ok(Some(service_config)) = update.service_config.as_ref()
-            && service_config
-                .load_balancing_policy
-                .as_ref()
-                .is_some_and(|p| *p == LbPolicyType::RoundRobin)
-        {
-            json!([{round_robin::POLICY_NAME: {}}])
-        } else {
-            json!([{pick_first::POLICY_NAME: {"shuffleAddressList": true, "unknown_field": false}}])
+        let (builder, config) = match update.service_config.as_ref() {
+            Ok(Some(sc)) => sc.lb_config(),
+            _ => ServiceConfig::default_lb_policy(),
         };
 
-        // TODO: config should come from ServiceConfig.
-        let config =
-            GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig::from_value(json_config))?;
+        let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 
         self.lb_policy
-            .resolver_update(update, Some(&config), &mut self.lb_channel_controller)
-            .map_err(|err| err.to_string())
+            .resolver_update(update, Some(&gsb_config), &mut self.lb_channel_controller)
     }
 
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
-        Err("service configs not supported".to_string())
+    fn parse_service_config(&self, config: &str) -> ParseResult {
+        ServiceConfig::parse(config)
     }
 }
 

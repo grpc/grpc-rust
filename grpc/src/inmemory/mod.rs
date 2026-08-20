@@ -59,7 +59,6 @@ use crate::client::name_resolution::ResolverOptions;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::global_registry as global_resolver_registry;
-use crate::client::service_config::ServiceConfig;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
@@ -483,13 +482,13 @@ impl Resolver for InMemoryResolver {
             })
             .collect();
 
+        let service_config = channel_controller
+            .parse_service_config(r#"{"loadBalancingConfig": [{"round_robin": {}}]}"#)
+            .map(Some);
+
         let _ = channel_controller.update(ResolverUpdate {
             endpoints: Ok(endpoints),
-            service_config: Ok(Some(ServiceConfig {
-                load_balancing_policy: Some(
-                    crate::client::service_config::LbPolicyType::RoundRobin,
-                ),
-            })),
+            service_config,
             ..Default::default()
         });
     }

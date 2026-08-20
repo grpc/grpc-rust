@@ -224,9 +224,12 @@ async fn shutdown_closes_listener_before_drain() {
     // Do not call connect in a loop before that.
     // A connect loop can make `incoming.next()` ready.
     // Then `select!` can accept the connection and ignore shutdown.
-    dropped_rx
+    // The timeout is only a hang guard. On an unfixed server, drop
+    // waits for drain, and drain waits for `hold`.
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
         .await
-        .expect("incoming was not dropped before drain");
+        .expect("incoming was not dropped before drain")
+        .unwrap();
 
     let err = TcpStream::connect(addr)
         .await

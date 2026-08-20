@@ -746,8 +746,9 @@ impl<L> Server<L> {
 
     /// Serve the service with the signal on the provided incoming stream.
     ///
-    /// When `signal` completes, `incoming` is dropped immediately (closing a
-    /// TCP listener) and already-accepted connections are then drained.
+    /// When `signal` completes, this function drops `incoming`.
+    /// If `incoming` is a [`TcpIncoming`], drop closes the listen socket.
+    /// The function then waits for accepted connections to close.
     pub async fn serve_with_incoming_shutdown<S, I, F, IO, IE, ResBody>(
         self,
         svc: S,
@@ -857,10 +858,10 @@ impl<L> Server<L> {
         let graceful = signal.is_some();
         let mut sig = pin!(Fuse { inner: signal });
 
-        // Scope the accept loop so `incoming` is dropped as soon as we stop
-        // accepting. For `TcpIncoming` that closes the listen socket immediately
-        // (kernel stops SYN-ACKing). Holding it until after drain leaves the
-        // port bound: new clients complete TCP, then hang until their deadline.
+        // This block ends the life of `incoming` when accept stops.
+        // Drop of a `TcpIncoming` closes the listen socket.
+        // If `incoming` lives until after drain, the listen socket stays open.
+        // New TCP connections can complete. The server does not read them.
         {
             let mut incoming = pin!(incoming);
 

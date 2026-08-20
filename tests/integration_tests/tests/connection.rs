@@ -142,7 +142,7 @@ async fn connect_lazy_reconnects_after_first_failure() {
     jh.await.unwrap();
 }
 
-/// A unary call that does not return until `hold` is signaled.
+/// A unary handler. The call waits until `hold` is received.
 struct HoldSvc {
     started: Mutex<Option<oneshot::Sender<()>>>,
     hold: Mutex<Option<oneshot::Receiver<()>>>,
@@ -163,7 +163,7 @@ impl test_server::Test for HoldSvc {
     }
 }
 
-/// Forwards `S` and sends on `on_drop` when the wrapper is dropped.
+/// Forwards polls to `inner`. Sends on `on_drop` when this value is dropped.
 struct NotifyOnDrop<S> {
     inner: S,
     on_drop: Option<oneshot::Sender<()>>,
@@ -185,9 +185,8 @@ impl<S: Stream + Unpin> Stream for NotifyOnDrop<S> {
     }
 }
 
-/// The incoming stream must be dropped when the shutdown signal fires,
-/// before in-flight RPCs finish. Otherwise a TCP listener stays bound
-/// and new clients SYN-ACK into a backlog that is never accepted.
+/// Shutdown must drop `incoming` before in-flight RPCs complete.
+/// If `incoming` is a `TcpIncoming`, drop closes the listen socket.
 #[tokio::test]
 async fn shutdown_closes_listener_before_drain() {
     let (started_tx, started_rx) = oneshot::channel();
@@ -221,22 +220,23 @@ async fn shutdown_closes_listener_before_drain() {
 
     shutdown_tx.send(()).unwrap();
 
-    // Wait for the accept stream to be dropped. Do not connect in a loop
-    // while waiting: that keeps accept ready and can starve the shutdown
-    // branch of `select!` (seen on Windows CI).
+    // Wait until `incoming` is dropped.
+    // Do not call connect in a loop before that.
+    // A connect loop can make `incoming.next()` ready.
+    // Then `select!` can accept the connection and ignore shutdown.
     dropped_rx
         .await
-        .expect("incoming must be dropped on shutdown, before drain finishes");
+        .expect("incoming was not dropped before drain");
 
     let err = TcpStream::connect(addr)
         .await
-        .expect_err("listen socket must be closed after incoming is dropped");
+        .expect_err("connect succeeded after incoming drop");
     assert!(
         matches!(
             err.kind(),
             io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
         ),
-        "expected refused/reset after listen drop, got {:?}",
+        "connect error was {:?}, not refused or reset",
         err.kind()
     );
 

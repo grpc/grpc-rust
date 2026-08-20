@@ -24,9 +24,12 @@
 
 use integration_tests::pb::{test_client::TestClient, test_server, Input, Output};
 use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::{net::TcpListener, net::TcpStream, sync::oneshot};
+use tokio_stream::Stream;
 use tonic::{
     transport::{server::TcpIncoming, Endpoint, Server},
     Code, Request, Response, Status,
@@ -160,14 +163,37 @@ impl test_server::Test for HoldSvc {
     }
 }
 
-/// The listen socket must close when the shutdown signal fires, *before*
-/// in-flight RPCs finish. Otherwise new clients SYN-ACK into a dead backlog
-/// and hang until their own deadline.
+/// Forwards `S` and sends on `on_drop` when the wrapper is dropped.
+struct NotifyOnDrop<S> {
+    inner: S,
+    on_drop: Option<oneshot::Sender<()>>,
+}
+
+impl<S> Drop for NotifyOnDrop<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.on_drop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl<S: Stream + Unpin> Stream for NotifyOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// The incoming stream must be dropped when the shutdown signal fires,
+/// before in-flight RPCs finish. Otherwise a TCP listener stays bound
+/// and new clients SYN-ACK into a backlog that is never accepted.
 #[tokio::test]
 async fn shutdown_closes_listener_before_drain() {
     let (started_tx, started_rx) = oneshot::channel();
     let (hold_tx, hold_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (dropped_tx, dropped_rx) = oneshot::channel();
 
     let svc = test_server::TestServer::new(HoldSvc {
         started: Mutex::new(Some(started_tx)),
@@ -176,7 +202,10 @@ async fn shutdown_closes_listener_before_drain() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+    let incoming = NotifyOnDrop {
+        inner: TcpIncoming::from(listener).with_nodelay(Some(true)),
+        on_drop: Some(dropped_tx),
+    };
 
     let jh = tokio::spawn(async move {
         Server::builder()
@@ -192,22 +221,23 @@ async fn shutdown_closes_listener_before_drain() {
 
     shutdown_tx.send(()).unwrap();
 
-    let kind = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match TcpStream::connect(addr).await {
-                Ok(_) => tokio::task::yield_now().await,
-                Err(e) => return e.kind(),
-            }
-        }
-    })
-    .await
-    .expect("new connect must fail promptly after shutdown, while drain is still in progress");
+    // Wait for the accept stream to be dropped. Do not connect in a loop
+    // while waiting: that keeps accept ready and can starve the shutdown
+    // branch of `select!` (seen on Windows CI).
+    dropped_rx
+        .await
+        .expect("incoming must be dropped on shutdown, before drain finishes");
+
+    let err = TcpStream::connect(addr)
+        .await
+        .expect_err("listen socket must be closed after incoming is dropped");
     assert!(
         matches!(
-            kind,
+            err.kind(),
             io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
         ),
-        "expected refused/reset after listen drop, got {kind:?}"
+        "expected refused/reset after listen drop, got {:?}",
+        err.kind()
     );
 
     hold_tx.send(()).unwrap();

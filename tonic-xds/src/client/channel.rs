@@ -459,6 +459,11 @@ impl XdsChannelBuilder {
         // configs come from RDS via the request's `RouteDecision`; see `RetryLayer`.
         let retry_layer = RetryLayer::new(fallback_retry);
 
+        #[cfg(feature = "_tls-any")]
+        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> = Arc::new(
+            XdsClusterDiscovery::new(parts.cache, make_connector, parts.cert_provider_registry),
+        );
+        #[cfg(not(feature = "_tls-any"))]
         let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> =
             Arc::new(XdsClusterDiscovery::new(parts.cache, make_connector));
 
@@ -483,13 +488,9 @@ impl XdsChannelBuilder {
     /// Separated so tests can inject a disconnected `XdsClient` and a
     /// pre-populated cache via [`XdsRuntimeParts`].
     fn build_grpc_channel_from_runtime(&self, parts: XdsRuntimeParts) -> XdsChannelGrpc {
-        #[cfg(feature = "_tls-any")]
-        let make_connector = GrpcMakeConnector::new(parts.cert_provider_registry.clone());
-        #[cfg(not(feature = "_tls-any"))]
-        let make_connector = GrpcMakeConnector::new();
         self.build_channel::<GrpcMakeConnector, TonicBody, TonicBody, TonicBody, _>(
             parts,
-            make_connector,
+            GrpcMakeConnector::new(),
             |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
             Arc::new(RetrySharedConfig::grpc_default()),
         )
@@ -565,6 +566,15 @@ impl XdsChannelBuilder {
     /// [`SharedBody<B>`] implements [`http_body::Body`], a hyper/HTTP-based
     /// endpoint can forward it directly.
     ///
+    /// # TLS
+    ///
+    /// The [`ClusterConfig`](crate::ClusterConfig) handed to the connector
+    /// exposes the cluster's parsed TLS settings via its `tls()` accessor
+    /// (under a TLS feature). A custom connector uses the returned
+    /// `ClusterTlsConfig` to build a gRFC-A29-conformant verifier and resolve
+    /// the optional mTLS identity — the same path the built-in gRPC connector
+    /// takes — without depending on crate-internal registry or matcher types.
+    ///
     /// # Retry semantics
     ///
     /// Per-route retry policies are compiled by the [`RetryClassifierFactory`]
@@ -574,9 +584,6 @@ impl XdsChannelBuilder {
     /// responses, so a non-gRPC transport supplies its own factory to interpret
     /// `retry_on` (e.g. `5xx`, `gateway-error`) for that transport. Without a
     /// custom factory only connection-error retries take effect.
-    ///
-    /// TODO: The cert-provider registry and the per-cluster TLS view
-    /// (`ClusterConfig::security`) are not yet exposed publicly, will address in following PR
     pub fn build_transport_channel<MC, B, ResBody>(
         &self,
         make_connector: MC,
@@ -975,7 +982,8 @@ mod tests {
             );
             Arc::new(XdsClusterDiscovery::new(
                 cache,
-                GrpcMakeConnector::new(registry),
+                GrpcMakeConnector::new(),
+                registry,
             ))
         };
         #[cfg(not(feature = "_tls-any"))]

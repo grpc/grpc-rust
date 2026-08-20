@@ -30,8 +30,8 @@ use http::HeaderValue;
 use crate::client::DynInvoke;
 use crate::client::Invoke;
 use crate::core::Address;
+use crate::core::ConnectionInfo;
 use crate::credentials::ChannelCredentials;
-use crate::credentials::SecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt::GrpcRuntime;
@@ -98,7 +98,7 @@ pub(crate) trait Transport: Sync {
     ) -> Result<
         (
             Self::Service,
-            SecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -116,7 +116,7 @@ pub(crate) trait DynTransport: Send + Sync {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            SecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -134,7 +134,7 @@ impl<T: Transport> DynTransport for T {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            SecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,

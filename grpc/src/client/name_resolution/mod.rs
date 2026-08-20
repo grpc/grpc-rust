@@ -40,6 +40,7 @@ use percent_encoding::utf8_percent_encode;
 use url::Url;
 
 use crate::attributes::Attributes;
+use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
 use crate::core::Address;
 use crate::rt::GrpcRuntime;
@@ -264,7 +265,7 @@ pub trait ChannelController: Send + Sync {
 
     /// Parses the provided JSON service config and returns an instance of a
     /// ParsedServiceConfig.
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String>;
+    fn parse_service_config(&self, config: &str) -> ParseResult;
 }
 
 #[derive(Clone, Debug)]

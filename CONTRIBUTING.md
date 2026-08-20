@@ -19,7 +19,7 @@ to complete this process.
 
 A great way to start is by searching through our open issues. [Unassigned issues
 labeled as "help
-wanted"](https://github.com/grpc/grpc-go/issues?q=sort%3Aupdated-desc%20is%3Aissue%20is%3Aopen%20label%3A%22Status%3A%20Help%20Wanted%22%20no%3Aassignee)
+wanted"](https://github.com/grpc/grpc-rust/issues?q=state%3Aopen%20label%3AE-help-wanted)
 are especially nice for first-time contributors, as they should be well-defined
 problems that already have agreed-upon solutions.
 

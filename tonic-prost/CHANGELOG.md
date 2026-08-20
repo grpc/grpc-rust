@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(codec)* pre-size the prost encode buffer from `encoded_len()` so large messages do not grow `BytesMut` 64 bytes at a time
+- *(codec)* pre-size the prost encode buffer from `encoded_len()` before `encode_raw`
 
 ## [0.14.6](https://github.com/hyperium/tonic/compare/tonic-prost-v0.14.5...tonic-prost-v0.14.6) - 2026-05-06
 

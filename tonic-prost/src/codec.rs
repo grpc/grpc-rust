@@ -119,14 +119,11 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Error = Status;
 
     fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        // prost::Message::encode only checks remaining_mut() and never
-        // reserves. BytesMut reports remaining_mut as essentially unbounded,
-        // and chunk_mut grows 64 bytes when full, so large messages would
-        // otherwise reallocate repeatedly while encoding.
+        // prost::Message::encode checks remaining_mut() (unbounded for
+        // BytesMut) and never reserves. Use encode_raw after one
+        // encoded_len() so we pre-size without walking the message twice.
         buf.reserve(item.encoded_len());
-        item.encode(buf)
-            .expect("Message only errors if not enough space");
-
+        item.encode_raw(buf);
         Ok(())
     }
 
@@ -356,6 +353,144 @@ mod tests {
 
         while let Some(frame) = body.frame().await {
             frame.unwrap();
+        }
+    }
+
+    #[test]
+    fn encode_raw_after_reserve_matches_encode() {
+        fn check(msg: impl Message) {
+            let mut expected = BytesMut::new();
+            msg.encode(&mut expected).unwrap();
+
+            let mut actual = BytesMut::new();
+            actual.reserve(msg.encoded_len());
+            msg.encode_raw(&mut actual);
+
+            assert_eq!(expected, actual);
+        }
+
+        check(BytesMsg {
+            data: vec![0xAB; 1024],
+        });
+        check(UnpackedVarints {
+            values: (0..256).collect(),
+        });
+    }
+
+    #[test]
+    fn reserve_does_not_increase_buffer_grows() {
+        let small = BytesMsg {
+            data: vec![0xAB; 64],
+        };
+        let large = BytesMsg {
+            data: vec![0xAB; 256 * 1024],
+        };
+        let varints = UnpackedVarints {
+            values: (0..16_384).collect(),
+        };
+
+        let small_reserved = grows(true, &small);
+        let small_unreserved = grows(false, &small);
+        let large_reserved = grows(true, &large);
+        let large_unreserved = grows(false, &large);
+        let varints_reserved = grows(true, &varints);
+        let varints_unreserved = grows(false, &varints);
+
+        assert!(
+            small_reserved <= small_unreserved,
+            "small reserved={small_reserved} unreserved={small_unreserved}"
+        );
+        assert!(
+            large_reserved <= large_unreserved,
+            "large reserved={large_reserved} unreserved={large_unreserved}"
+        );
+        assert!(
+            varints_reserved < varints_unreserved,
+            "varints reserved={varints_reserved} unreserved={varints_unreserved}"
+        );
+    }
+
+    fn grows(reserve: bool, msg: &impl Message) -> usize {
+        let mut buf = GrowCounter::new();
+        if reserve {
+            buf.reserve(msg.encoded_len());
+        }
+        msg.encode(&mut buf).unwrap();
+        buf.grows
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct BytesMsg {
+        #[prost(bytes = "vec", tag = "1")]
+        data: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct UnpackedVarints {
+        #[prost(int64, repeated, packed = "false", tag = "1")]
+        values: Vec<i64>,
+    }
+
+    struct GrowCounter {
+        inner: BytesMut,
+        grows: usize,
+    }
+
+    impl GrowCounter {
+        fn new() -> Self {
+            Self {
+                inner: BytesMut::new(),
+                grows: 0,
+            }
+        }
+
+        fn reserve(&mut self, additional: usize) {
+            let cap = self.inner.capacity();
+            self.inner.reserve(additional);
+            if self.inner.capacity() > cap {
+                self.grows += 1;
+            }
+        }
+    }
+
+    unsafe impl BufMut for GrowCounter {
+        fn remaining_mut(&self) -> usize {
+            self.inner.remaining_mut()
+        }
+
+        unsafe fn advance_mut(&mut self, cnt: usize) {
+            unsafe { self.inner.advance_mut(cnt) }
+        }
+
+        fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+            if self.inner.capacity() == self.inner.len() {
+                self.grows += 1;
+            }
+            self.inner.chunk_mut()
+        }
+
+        fn put_slice(&mut self, src: &[u8]) {
+            if self.inner.capacity() - self.inner.len() < src.len() {
+                self.grows += 1;
+            }
+            self.inner.put_slice(src);
+        }
+
+        fn put<T: Buf>(&mut self, src: T)
+        where
+            Self: Sized,
+        {
+            if self.inner.capacity() - self.inner.len() < src.remaining() {
+                self.grows += 1;
+            }
+            self.inner.put(src);
+        }
+
+        fn put_bytes(&mut self, val: u8, cnt: usize) {
+            if self.inner.capacity() - self.inner.len() < cnt {
+                self.grows += 1;
+            }
+            self.inner.put_bytes(val, cnt);
         }
     }
 

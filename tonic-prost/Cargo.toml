@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 http-body = "1"
 http-body-util = "0.1"
-bencher = "0.1.5"
+criterion = "0.8"
 
 [[bench]]
 name = "encode"

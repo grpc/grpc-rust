@@ -363,6 +363,31 @@ impl<T> Grpc<T> {
         )?;
 
         let status_code = response.status();
+
+        let is_valid_content_type = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .map(|val| val.as_bytes().starts_with(b"application/grpc"))
+            .unwrap_or(false);
+
+        if !is_valid_content_type {
+            let error_msg = format!(
+                "invalid content-type: {:?} (expected application/grpc)",
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .map(|v| v.to_str().unwrap_or("<invalid utf-8>"))
+                    .unwrap_or("<missing>")
+            );
+
+            if let Err(Some(status)) = crate::status::infer_grpc_status(None, status_code) {
+                // Return the mapped status code but with the custom error message.
+                return Err(Status::new(status.code(), error_msg));
+            } else {
+                return Err(Status::unknown(error_msg));
+            }
+        }
+
         let trailers_only_status = Status::from_header_map(response.headers());
 
         // We do not need to check for trailers if the `grpc-status` header is present

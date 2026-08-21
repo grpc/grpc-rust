@@ -309,18 +309,15 @@ async fn status_from_server_stream_with_inferred_status() {
         .await
         .unwrap();
 
-    let mut stream = client
+    let error = client
         .stream_call(InputStream {})
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap_err();
 
     assert_eq!(
-        stream.message().await.unwrap_err().code(),
+        error.code(),
         Code::Unavailable
     );
-
-    assert_eq!(stream.message().await.unwrap(), None);
 }
 
 #[tokio::test]

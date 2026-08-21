@@ -313,7 +313,14 @@ where
                     }
                     FindTrailers::IncompleteBuf => continue,
                     FindTrailers::Done(len) => Poll::Ready(match len {
-                        0 => None,
+                        // Emit trailers that were decoded alongside data on an
+                        // earlier poll before ending the stream
+                        0 => me
+                            .as_mut()
+                            .project()
+                            .trailers
+                            .take()
+                            .map(|trailers| Ok(Frame::trailers(trailers))),
                         _ => Some(Ok(Frame::data(buf.split_to(len).freeze()))),
                     }),
                 };
@@ -631,6 +638,60 @@ mod tests {
         let out = find_trailers(&buf[..]).unwrap_err();
 
         assert_eq!(out.code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn client_response_emits_trailers_buffered_behind_data() {
+        struct ChunkedBody(Vec<Bytes>);
+
+        impl Body for ChunkedBody {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                Poll::Ready(if self.0.is_empty() {
+                    None
+                } else {
+                    Some(Ok(Frame::data(self.0.remove(0))))
+                })
+            }
+        }
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert(Status::GRPC_STATUS, 0.into());
+
+        // A message frame and the trailers frame in a single chunk, as servers
+        // commonly flush a unary response
+        let message: &[u8] = b"\0\0\0\0\x05hello";
+        let mut chunk = BytesMut::from(message);
+        chunk.put(make_trailers_frame(trailers.clone()));
+
+        let mut call = GrpcWebCall::client_response(ChunkedBody(vec![chunk.freeze()]));
+
+        let data = std::future::poll_fn(|cx| Pin::new(&mut call).poll_frame(cx))
+            .await
+            .expect("missing data frame")
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(&data[..], message);
+
+        let got = std::future::poll_fn(|cx| Pin::new(&mut call).poll_frame(cx))
+            .await
+            .expect("trailers were dropped at end of stream")
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(got, trailers);
+
+        assert!(
+            std::future::poll_fn(|cx| Pin::new(&mut call).poll_frame(cx))
+                .await
+                .is_none()
+        );
     }
 
     #[test]

@@ -22,11 +22,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 http-body = "1"
 http-body-util = "0.1"
-criterion = "0.8"
-
-[[bench]]
-name = "encode"
-harness = false
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [

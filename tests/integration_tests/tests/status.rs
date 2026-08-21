@@ -309,15 +309,9 @@ async fn status_from_server_stream_with_inferred_status() {
         .await
         .unwrap();
 
-    let error = client
-        .stream_call(InputStream {})
-        .await
-        .unwrap_err();
+    let error = client.stream_call(InputStream {}).await.unwrap_err();
 
-    assert_eq!(
-        error.code(),
-        Code::Unavailable
-    );
+    assert_eq!(error.code(), Code::Unavailable);
 }
 
 #[tokio::test]

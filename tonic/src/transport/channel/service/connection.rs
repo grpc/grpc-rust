@@ -67,6 +67,10 @@ impl Connection {
             settings.max_frame_size(val);
         }
 
+        if let Some(val) = endpoint.data_frame_budget {
+            settings.data_frame_budget(val);
+        }
+
         if let Some(val) = endpoint.http2_keep_alive_timeout {
             settings.keep_alive_timeout(val);
         }

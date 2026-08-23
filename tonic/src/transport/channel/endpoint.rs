@@ -67,6 +67,7 @@ pub struct Endpoint {
     pub(crate) init_stream_window_size: Option<u32>,
     pub(crate) init_connection_window_size: Option<u32>,
     pub(crate) max_frame_size: Option<u32>,
+    pub(crate) data_frame_budget: Option<usize>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_keepalive_interval: Option<Duration>,
     pub(crate) tcp_keepalive_retries: Option<u32>,
@@ -117,6 +118,7 @@ impl Endpoint {
             init_stream_window_size: None,
             init_connection_window_size: None,
             max_frame_size: None,
+            data_frame_budget: None,
             tcp_keepalive: None,
             tcp_keepalive_interval: None,
             tcp_keepalive_retries: None,
@@ -148,6 +150,7 @@ impl Endpoint {
             init_stream_window_size: None,
             init_connection_window_size: None,
             max_frame_size: None,
+            data_frame_budget: None,
             tcp_keepalive: None,
             tcp_keepalive_interval: None,
             tcp_keepalive_retries: None,
@@ -529,6 +532,36 @@ impl Endpoint {
     pub fn max_frame_size(self, frame_size: impl Into<Option<u32>>) -> Self {
         Endpoint {
             max_frame_size: frame_size.into(),
+            ..self
+        }
+    }
+
+    /// Sets a connection-level budget for limiting memory overhead from
+    /// received small DATA frames.
+    ///
+    /// This guards against `GOAWAY(ENHANCE_YOUR_CALM)` disconnects on
+    /// streams that receive many small DATA frames back-to-back, such as a
+    /// server-streaming RPC that emits one small message per frame: HTTP/2
+    /// flow control accounts for DATA payload bytes but not the per-frame
+    /// buffering overhead, so an excessive number of small frames can
+    /// consume disproportionate memory relative to the bytes they carry.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, will default from underlying transport. As of `h2`
+    /// v0.4.18, that default is 25,600 bytes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tonic::transport::Endpoint;
+    /// # let builder = Endpoint::from_static("https://example.com");
+    /// let endpoint = builder.data_frame_budget(256_000usize);
+    /// ```
+    #[must_use]
+    pub fn data_frame_budget(self, budget: impl Into<Option<usize>>) -> Self {
+        Endpoint {
+            data_frame_budget: budget.into(),
             ..self
         }
     }

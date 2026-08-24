@@ -34,15 +34,23 @@ use std::task::{Context, Poll};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures_util::StreamExt as _;
 use http::{Request, Response};
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
+use tokio::sync::watch;
 use tonic::body::Body as TonicBody;
-use tower::{BoxError, Layer, Service};
+use tower::Layer;
+use tower::discover::Change;
+use tower::load::Load;
+use tower::{BoxError, Service};
 
+use crate::client::lb::{BoxDiscover, ClusterDiscovery};
 use crate::client::route::RouteDecision;
-use crate::common::async_util::BoxFuture;
-use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
+use crate::common::async_util::{AbortOnDrop, BoxFuture};
+use crate::xds::cache::{CacheEvent, XdsCache};
+use crate::xds::resource::ClusterResource;
+use crate::xds::resource::circuit_breaking::{CircuitBreakingConfig, DEFAULT_MAX_REQUESTS};
 
 static GLOBAL_COUNTERS: OnceLock<Arc<ClusterRequestCounterState>> = OnceLock::new();
 
@@ -85,6 +93,12 @@ impl ClusterCircuitBreakerRegistry {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn set_config(&self, cluster: impl Into<String>, config: CircuitBreakingConfig) {
+        let cluster = cluster.into();
+        self.set_cluster_config(cluster.clone(), cluster, config);
+    }
+
     pub(crate) fn set_cluster_config(
         &self,
         cluster: impl Into<String>,
@@ -103,7 +117,67 @@ impl ClusterCircuitBreakerRegistry {
                 counter_key,
                 counter,
             },
+            0,
         );
+    }
+
+    fn ensure_cluster_watch(
+        &self,
+        cache: &Arc<XdsCache>,
+        cluster: &str,
+        state: &Arc<ClusterCircuitBreakerState>,
+    ) -> u64 {
+        let mut lifecycle = state
+            .watch_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.running {
+            return lifecycle.generation;
+        }
+
+        let mut cluster_watch = cache.watch_cluster(cluster);
+        lifecycle.generation = lifecycle.generation.wrapping_add(1).max(1);
+        let generation = lifecycle.generation;
+        lifecycle.running = true;
+        state
+            .active_watch_generation
+            .store(generation, Ordering::Release);
+
+        let weak_registry = Arc::downgrade(&self.inner);
+        let weak_state = Arc::downgrade(state);
+        let task = tokio::spawn(async move {
+            while let Some(event) = cluster_watch.next_event().await {
+                let CacheEvent::Resource {
+                    resource: cluster_resource,
+                    ..
+                } = event
+                else {
+                    break;
+                };
+                let Some(inner) = weak_registry.upgrade() else {
+                    return;
+                };
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                let circuit_breakers = ClusterCircuitBreakerRegistry { inner };
+                let config = CircuitBreakerRuntimeConfig::from_cluster(
+                    &cluster_resource,
+                    &circuit_breakers.inner.counters,
+                );
+                circuit_breakers.update_state_config(&state, config, generation);
+            }
+
+            let Some(inner) = weak_registry.upgrade() else {
+                return;
+            };
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            ClusterCircuitBreakerRegistry { inner }.finish_cluster_watch(&state, generation);
+        });
+        lifecycle._task = Some(AbortOnDrop(task));
+        generation
     }
 
     fn ensure_state(&self, cluster: &str) -> Arc<ClusterCircuitBreakerState> {
@@ -119,25 +193,60 @@ impl ClusterCircuitBreakerRegistry {
     }
 
     fn cluster_breaker(&self, cluster: &str) -> Arc<ClusterCircuitBreaker> {
+        self.cluster_breaker_with_optional_cache(cluster, None)
+    }
+
+    fn cluster_breaker_with_cache(
+        &self,
+        cluster: &str,
+        cluster_cache: Arc<XdsCache>,
+    ) -> Arc<ClusterCircuitBreaker> {
+        self.cluster_breaker_with_optional_cache(cluster, Some(cluster_cache))
+    }
+
+    fn cluster_breaker_with_optional_cache(
+        &self,
+        cluster: &str,
+        cluster_cache: Option<Arc<XdsCache>>,
+    ) -> Arc<ClusterCircuitBreaker> {
         let state = self.ensure_state(cluster);
-        Arc::new(ClusterCircuitBreaker {
-            cluster: Arc::from(cluster),
+        let cluster: Arc<str> = Arc::from(cluster);
+        let default_counter_key = CounterKey::same_cluster(cluster.clone());
+        let breaker = Arc::new(ClusterCircuitBreaker {
+            cluster,
             state,
             counters: self.inner.counters.clone(),
-        })
+            default_counter_key,
+            registry: self.clone(),
+            cluster_cache,
+        });
+        if let Some(cache) = breaker.cluster_cache.as_ref() {
+            self.ensure_cluster_watch(cache, &breaker.cluster, &breaker.state);
+        }
+        breaker
     }
 
     fn update_state_config(
         &self,
         state: &ClusterCircuitBreakerState,
         config: CircuitBreakerRuntimeConfig,
+        watch_generation: u64,
     ) {
         let _update_guard = state
             .update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if watch_generation != 0
+            && state.active_watch_generation.load(Ordering::Acquire) != watch_generation
+        {
+            return;
+        }
         let previous = state.current_config();
         if previous.as_deref() == Some(&config) {
+            state
+                .config_watch_generation
+                .store(watch_generation, Ordering::Release);
+            state.notify_config_changed();
             return;
         }
 
@@ -153,6 +262,27 @@ impl ClusterCircuitBreakerRegistry {
         if counter_key_changed && let Some(previous) = previous {
             self.deactivate_config(previous);
         }
+        state
+            .config_watch_generation
+            .store(watch_generation, Ordering::Release);
+        state.notify_config_changed();
+    }
+
+    fn finish_cluster_watch(&self, state: &Arc<ClusterCircuitBreakerState>, generation: u64) {
+        let mut lifecycle = state
+            .watch_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.generation != generation {
+            return;
+        }
+
+        self.clear_state(state);
+        state
+            .finished_watch_generation
+            .store(generation, Ordering::Release);
+        lifecycle.running = false;
+        state.notify_config_changed();
     }
 
     fn clear_state(&self, state: &ClusterCircuitBreakerState) {
@@ -163,6 +293,7 @@ impl ClusterCircuitBreakerRegistry {
         if let Some(previous) = state.config.swap(None) {
             self.deactivate_config(previous);
         }
+        state.config_watch_generation.store(0, Ordering::Release);
     }
 
     fn deactivate_config(&self, config: Arc<CircuitBreakerRuntimeConfig>) {
@@ -172,18 +303,16 @@ impl ClusterCircuitBreakerRegistry {
         self.inner.counters.cleanup_if_unused(&counter_key);
     }
 
-    fn acquire(&self, cluster: &str) -> Result<Option<CircuitBreakerPermit>, CircuitBreakerLimit> {
+    fn acquire(&self, cluster: &str) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
         self.cluster_breaker(cluster).acquire()
     }
 
     #[cfg(test)]
     fn in_flight(&self, cluster: &str) -> u32 {
         let breaker = self.cluster_breaker(cluster);
-        breaker
-            .state
-            .current_config()
-            .map(|config| self.inner.counters.in_flight(&config.counter_key))
-            .unwrap_or(0)
+        self.inner
+            .counters
+            .in_flight(&breaker.current_counter_key())
     }
 
     #[cfg(test)]
@@ -236,6 +365,18 @@ impl PartialEq for CircuitBreakerRuntimeConfig {
 
 impl Eq for CircuitBreakerRuntimeConfig {}
 
+impl CircuitBreakerRuntimeConfig {
+    fn from_cluster(cluster: &ClusterResource, counters: &ClusterRequestCounters) -> Self {
+        let counter_key = CounterKey::new(cluster.name.as_str(), cluster.eds_service_name());
+        let counter = counters.counter(&counter_key);
+        Self {
+            max_requests: cluster.circuit_breaking.max_requests,
+            counter_key,
+            counter,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CounterKey {
     cluster: Arc<str>,
@@ -249,21 +390,58 @@ impl CounterKey {
             eds_service_name: eds_service_name.into(),
         }
     }
+
+    fn same_cluster(cluster: Arc<str>) -> Self {
+        Self {
+            cluster: cluster.clone(),
+            eds_service_name: cluster,
+        }
+    }
 }
 
 struct ClusterCircuitBreakerState {
     config: ArcSwapOption<CircuitBreakerRuntimeConfig>,
     update_lock: Mutex<()>,
     dropped_requests: AtomicU64,
+    watch_lifecycle: Mutex<ClusterWatchLifecycle>,
+    active_watch_generation: AtomicU64,
+    config_watch_generation: AtomicU64,
+    finished_watch_generation: AtomicU64,
+    config_version: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct ClusterWatchLifecycle {
+    generation: u64,
+    running: bool,
+    _task: Option<AbortOnDrop>,
 }
 
 impl fmt::Debug for ClusterCircuitBreakerState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let watch_running = self
+            .watch_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running;
         f.debug_struct("ClusterCircuitBreakerState")
             .field("current_config", &self.current_config())
             .field(
                 "dropped_requests",
                 &self.dropped_requests.load(Ordering::Acquire),
+            )
+            .field("watch_running", &watch_running)
+            .field(
+                "active_watch_generation",
+                &self.active_watch_generation.load(Ordering::Acquire),
+            )
+            .field(
+                "config_watch_generation",
+                &self.config_watch_generation.load(Ordering::Acquire),
+            )
+            .field(
+                "finished_watch_generation",
+                &self.finished_watch_generation.load(Ordering::Acquire),
             )
             .finish()
     }
@@ -271,10 +449,16 @@ impl fmt::Debug for ClusterCircuitBreakerState {
 
 impl ClusterCircuitBreakerState {
     fn new() -> Self {
+        let (config_version, _) = watch::channel(0);
         Self {
             config: ArcSwapOption::empty(),
             update_lock: Mutex::new(()),
             dropped_requests: AtomicU64::new(0),
+            watch_lifecycle: Mutex::new(ClusterWatchLifecycle::default()),
+            active_watch_generation: AtomicU64::new(0),
+            config_watch_generation: AtomicU64::new(0),
+            finished_watch_generation: AtomicU64::new(0),
+            config_version,
         }
     }
 
@@ -286,23 +470,76 @@ impl ClusterCircuitBreakerState {
         self.dropped_requests.fetch_add(1, Ordering::AcqRel);
     }
 
+    fn notify_config_changed(&self) {
+        self.config_version
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
     #[cfg(test)]
     fn dropped_requests(&self) -> u64 {
         self.dropped_requests.load(Ordering::Acquire)
     }
 }
 
-#[derive(Debug)]
 struct ClusterCircuitBreaker {
     cluster: Arc<str>,
     state: Arc<ClusterCircuitBreakerState>,
     counters: ClusterRequestCounters,
+    default_counter_key: CounterKey,
+    registry: ClusterCircuitBreakerRegistry,
+    cluster_cache: Option<Arc<XdsCache>>,
+}
+
+impl fmt::Debug for ClusterCircuitBreaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterCircuitBreaker")
+            .field("cluster", &self.cluster)
+            .field("state", &self.state)
+            .field("watching_cluster_cache", &self.cluster_cache.is_some())
+            .finish()
+    }
 }
 
 impl ClusterCircuitBreaker {
-    fn acquire(&self) -> Result<Option<CircuitBreakerPermit>, CircuitBreakerLimit> {
-        let Some(config) = self.state.current_config() else {
-            return Ok(None);
+    fn acquire(&self) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
+        if let Some(config) = self.state.current_config() {
+            return self.acquire_with_config(
+                config.counter_key.clone(),
+                config.counter.clone(),
+                config.max_requests,
+            );
+        }
+
+        let counter = self.counters.counter(&self.default_counter_key);
+        self.acquire_with_config(
+            self.default_counter_key.clone(),
+            counter,
+            DEFAULT_MAX_REQUESTS,
+        )
+    }
+
+    async fn acquire_when_ready(&self) -> Result<CircuitBreakerPermit, Response<TonicBody>> {
+        let Some(cache) = self.cluster_cache.as_ref() else {
+            return self
+                .acquire()
+                .map_err(|limit| limit_exceeded_response(&self.cluster, limit));
+        };
+
+        if let Some(config) = self.current_watched_config() {
+            return self
+                .acquire_with_config(
+                    config.counter_key.clone(),
+                    config.counter.clone(),
+                    config.max_requests,
+                )
+                .map_err(|limit| limit_exceeded_response(&self.cluster, limit));
+        }
+
+        let generation = self
+            .registry
+            .ensure_cluster_watch(cache, &self.cluster, &self.state);
+        let Some(config) = self.wait_for_config(generation).await else {
+            return Err(cluster_unavailable_response(&self.cluster));
         };
 
         self.acquire_with_config(
@@ -310,7 +547,49 @@ impl ClusterCircuitBreaker {
             config.counter.clone(),
             config.max_requests,
         )
-        .map(Some)
+        .map_err(|limit| limit_exceeded_response(&self.cluster, limit))
+    }
+
+    fn current_watched_config(&self) -> Option<Arc<CircuitBreakerRuntimeConfig>> {
+        let generation = self.state.active_watch_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return None;
+        }
+        self.watched_config_for_generation(generation)
+    }
+
+    fn watched_config_for_generation(
+        &self,
+        generation: u64,
+    ) -> Option<Arc<CircuitBreakerRuntimeConfig>> {
+        if self.state.config_watch_generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        let config = self.state.current_config();
+        if self.state.active_watch_generation.load(Ordering::Acquire) == generation
+            && self.state.config_watch_generation.load(Ordering::Acquire) == generation
+        {
+            config
+        } else {
+            None
+        }
+    }
+
+    async fn wait_for_config(&self, generation: u64) -> Option<Arc<CircuitBreakerRuntimeConfig>> {
+        let mut config_version = self.state.config_version.subscribe();
+        loop {
+            if let Some(config) = self.watched_config_for_generation(generation) {
+                return Some(config);
+            }
+            if self.state.finished_watch_generation.load(Ordering::Acquire) == generation
+                || self.state.active_watch_generation.load(Ordering::Acquire) != generation
+            {
+                return None;
+            }
+            if config_version.changed().await.is_err() {
+                return None;
+            }
+        }
     }
 
     fn acquire_with_config(
@@ -327,6 +606,13 @@ impl ClusterCircuitBreaker {
                 Err(limit)
             }
         }
+    }
+
+    fn current_counter_key(&self) -> CounterKey {
+        self.state
+            .current_config()
+            .map(|config| config.counter_key.clone())
+            .unwrap_or_else(|| self.default_counter_key.clone())
     }
 }
 
@@ -465,7 +751,7 @@ impl InFlightCounter {
 }
 
 #[derive(Debug)]
-struct CircuitBreakerPermit {
+pub(crate) struct CircuitBreakerPermit {
     counter: Option<Arc<InFlightCounter>>,
     counter_key: CounterKey,
     counters: ClusterRequestCounters,
@@ -482,6 +768,141 @@ impl Drop for CircuitBreakerPermit {
             }
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct CircuitBreakingClusterDiscovery<Endpoint, S> {
+    inner: Arc<dyn ClusterDiscovery<Endpoint, S>>,
+    circuit_breakers: ClusterCircuitBreakerRegistry,
+    cluster_cache: Option<Arc<XdsCache>>,
+}
+
+impl<Endpoint, S> CircuitBreakingClusterDiscovery<Endpoint, S> {
+    pub(crate) fn new(
+        inner: Arc<dyn ClusterDiscovery<Endpoint, S>>,
+        circuit_breakers: ClusterCircuitBreakerRegistry,
+    ) -> Self {
+        Self {
+            inner,
+            circuit_breakers,
+            cluster_cache: None,
+        }
+    }
+
+    pub(crate) fn with_cluster_cache(mut self, cache: Arc<XdsCache>) -> Self {
+        self.cluster_cache = Some(cache);
+        self
+    }
+}
+
+impl<Endpoint, S> fmt::Debug for CircuitBreakingClusterDiscovery<Endpoint, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CircuitBreakingClusterDiscovery")
+            .field("circuit_breakers", &self.circuit_breakers)
+            .field("watching_cluster_cache", &self.cluster_cache.is_some())
+            .finish()
+    }
+}
+
+impl<Endpoint, S> ClusterDiscovery<Endpoint, CircuitBreakingEndpointService<S>>
+    for CircuitBreakingClusterDiscovery<Endpoint, S>
+where
+    Endpoint: Send + 'static,
+    S: Send + 'static,
+{
+    fn discover_cluster(
+        &self,
+        cluster_name: &str,
+    ) -> BoxDiscover<Endpoint, CircuitBreakingEndpointService<S>> {
+        let breaker = match self.cluster_cache.clone() {
+            Some(cache) => self
+                .circuit_breakers
+                .cluster_breaker_with_cache(cluster_name, cache),
+            None => self.circuit_breakers.cluster_breaker(cluster_name),
+        };
+        Box::pin(
+            self.inner
+                .discover_cluster(cluster_name)
+                .map(move |change| {
+                    change.map(|change| match change {
+                        Change::Insert(endpoint, service) => Change::Insert(
+                            endpoint,
+                            CircuitBreakingEndpointService::new(service, breaker.clone()),
+                        ),
+                        Change::Remove(endpoint) => Change::Remove(endpoint),
+                    })
+                }),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CircuitBreakingEndpointService<S> {
+    inner: S,
+    breaker: Arc<ClusterCircuitBreaker>,
+}
+
+impl<S> CircuitBreakingEndpointService<S> {
+    fn new(inner: S, breaker: Arc<ClusterCircuitBreaker>) -> Self {
+        Self { inner, breaker }
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for CircuitBreakingEndpointService<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CircuitBreakingEndpointService")
+            .field("inner", &self.inner)
+            .field("breaker", &self.breaker)
+            .finish()
+    }
+}
+
+impl<S, B> Service<Request<B>> for CircuitBreakingEndpointService<S>
+where
+    S: Service<Request<B>, Response = Response<TonicBody>, Error: Into<BoxError>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = Response<TonicBody>;
+    type Error = BoxError;
+    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, request: Request<B>) -> Self::Future {
+        let breaker = self.breaker.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move {
+            let permit = match breaker.acquire_when_ready().await {
+                Ok(permit) => permit,
+                Err(response) => return Ok(response),
+            };
+
+            let response = inner.call(request).await.map_err(Into::into)?;
+            Ok(hold_permit(response, permit))
+        })
+    }
+}
+
+impl<S: Load> Load for CircuitBreakingEndpointService<S> {
+    type Metric = S::Metric;
+
+    fn load(&self) -> Self::Metric {
+        self.inner.load()
+    }
+}
+
+pub(crate) fn hold_permit(
+    response: Response<TonicBody>,
+    permit: CircuitBreakerPermit,
+) -> Response<TonicBody> {
+    response.map(|body| TonicBody::new(PermitBody::new(body, permit)))
 }
 
 /// Tower layer that enforces A32 max in-flight requests per xDS cluster.
@@ -598,12 +1019,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
             let response = inner.call(request).await.map_err(Into::into)?;
-            match permit {
-                Some(permit) => {
-                    Ok(response.map(|body| TonicBody::new(PermitBody::new(body, permit))))
-                }
-                None => Ok(response),
-            }
+            Ok(response.map(|body| TonicBody::new(PermitBody::new(body, permit))))
         })
     }
 }
@@ -619,12 +1035,22 @@ enum CircuitBreakingError {
 /// The retry layer uses this extension to distinguish local `UNAVAILABLE` drops
 /// from retryable responses returned by an upstream service.
 #[derive(Clone, Copy, Debug)]
-struct LocalCircuitBreakerDrop;
+pub(crate) struct LocalCircuitBreakerDrop;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalPreEndpointResponse;
 
 pub(crate) fn is_local_circuit_breaker_drop<B>(response: &Response<B>) -> bool {
     response
         .extensions()
         .get::<LocalCircuitBreakerDrop>()
+        .is_some()
+}
+
+pub(crate) fn is_local_pre_endpoint_response<B>(response: &Response<B>) -> bool {
+    response
+        .extensions()
+        .get::<LocalPreEndpointResponse>()
         .is_some()
 }
 
@@ -634,6 +1060,15 @@ fn limit_exceeded_response(cluster: &str, limit: CircuitBreakerLimit) -> Respons
         limit.max_requests,
     )));
     response.extensions_mut().insert(LocalCircuitBreakerDrop);
+    response.extensions_mut().insert(LocalPreEndpointResponse);
+    response
+}
+
+fn cluster_unavailable_response(cluster: &str) -> Response<TonicBody> {
+    let mut response = status_response(tonic::Status::unavailable(format!(
+        "cluster '{cluster}' is no longer available",
+    )));
+    response.extensions_mut().insert(LocalPreEndpointResponse);
     response
 }
 
@@ -724,7 +1159,6 @@ mod tests {
     use super::*;
 
     const CLUSTER: &str = "cluster-a";
-    const EDS_SERVICE_NAME: &str = "eds-service-a";
 
     fn request() -> Request<TonicBody> {
         let mut request = Request::new(TonicBody::empty());
@@ -738,12 +1172,18 @@ mod tests {
 
     fn configured_breakers(max_requests: u32) -> ClusterCircuitBreakerRegistry {
         let breakers = ClusterCircuitBreakerRegistry::new_for_test();
-        breakers.set_cluster_config(
-            CLUSTER,
-            EDS_SERVICE_NAME,
-            CircuitBreakingConfig { max_requests },
-        );
+        breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests });
         breakers
+    }
+
+    fn cluster_resource(max_requests: u32) -> Arc<ClusterResource> {
+        Arc::new(ClusterResource {
+            name: CLUSTER.to_string(),
+            eds_service_name: None,
+            lb_policy: crate::xds::resource::cluster::LbPolicy::RoundRobin,
+            security: None,
+            circuit_breaking: CircuitBreakingConfig { max_requests },
+        })
     }
 
     #[tokio::test]
@@ -819,11 +1259,7 @@ mod tests {
             .unwrap();
         assert_eq!(breakers.in_flight(CLUSTER), 2);
 
-        breakers.set_cluster_config(
-            CLUSTER,
-            EDS_SERVICE_NAME,
-            CircuitBreakingConfig { max_requests: 1 },
-        );
+        breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
 
         let third = service
             .ready()
@@ -1020,24 +1456,16 @@ mod tests {
         let counters = ClusterRequestCounters::isolated();
         let first_breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
         let second_breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
-        first_breakers.set_cluster_config(
-            CLUSTER,
-            EDS_SERVICE_NAME,
-            CircuitBreakingConfig { max_requests: 1 },
-        );
-        second_breakers.set_cluster_config(
-            CLUSTER,
-            EDS_SERVICE_NAME,
-            CircuitBreakingConfig { max_requests: 1 },
-        );
+        first_breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
+        second_breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
 
-        let first = first_breakers.acquire(CLUSTER).unwrap().unwrap();
+        let first = first_breakers.acquire(CLUSTER).unwrap();
         assert!(second_breakers.acquire(CLUSTER).is_err());
         assert_eq!(first_breakers.dropped_requests(CLUSTER), 0);
         assert_eq!(second_breakers.dropped_requests(CLUSTER), 1);
 
         drop(first);
-        let second = second_breakers.acquire(CLUSTER).unwrap().unwrap();
+        let second = second_breakers.acquire(CLUSTER).unwrap();
         drop(second);
         drop(first_breakers);
         drop(second_breakers);
@@ -1045,28 +1473,87 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_cluster_has_no_limit_or_counter() {
+    fn default_limit_rejects_the_1025th_request() {
         let breakers = ClusterCircuitBreakerRegistry::new_for_test();
         let breaker = breakers.cluster_breaker(CLUSTER);
+        let permits: Vec<_> = (0..DEFAULT_MAX_REQUESTS)
+            .map(|_| breaker.acquire().unwrap())
+            .collect();
 
-        for _ in 0..2048 {
-            assert!(breaker.acquire().unwrap().is_none());
-        }
+        assert!(breaker.acquire().is_err());
+        assert_eq!(breakers.dropped_requests(CLUSTER), 1);
 
-        assert_eq!(breakers.dropped_requests(CLUSTER), 0);
+        drop(permits);
         assert_eq!(breakers.counter_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_waiting_for_ready_does_not_hold_permit() {
+        let breakers = configured_breakers(1);
+        let service = BackpressuredService {
+            ready_budget: Arc::new(AtomicU32::new(0)),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let mut service =
+            CircuitBreakingEndpointService::new(service, breakers.cluster_breaker(CLUSTER));
+
+        let early =
+            tokio::time::timeout(tokio::time::Duration::from_millis(20), service.ready()).await;
+
+        assert!(
+            early.is_err(),
+            "endpoint wrapper should wait for inner endpoint readiness",
+        );
+        assert_eq!(breakers.in_flight(CLUSTER), 0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_limit_responses_are_not_retried() {
+        use crate::client::retry::{GrpcRetryClassifier, RetryConfig};
+
+        let breakers = configured_breakers(0);
+        let calls = Arc::new(AtomicU32::new(0));
+        let call_counter = calls.clone();
+        let service = service_fn(
+            move |_request: Request<shared_http_body::SharedBody<TonicBody>>| {
+                call_counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, BoxError>(Response::new(TonicBody::new(PendingBody))) }
+            },
+        );
+        let service =
+            CircuitBreakingEndpointService::new(service, breakers.cluster_breaker(CLUSTER));
+        let retry_policy = RetryPolicy::new(
+            RetryConfig::new().num_retries(1),
+            Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
+        );
+        let mut service = tower::ServiceBuilder::new()
+            .layer(RetryLayer::new(retry_policy.into_shared()))
+            .service(service);
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(TonicBody::empty()))
+            .await
+            .unwrap();
+        let status = tonic::Status::from_header_map(response.headers()).unwrap();
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(breakers.dropped_requests(CLUSTER), 1);
     }
 
     #[test]
     fn eds_service_name_change_uses_independent_counter() {
         let breakers = ClusterCircuitBreakerRegistry::new_for_test();
         breakers.set_cluster_config(CLUSTER, "eds-a", CircuitBreakingConfig { max_requests: 1 });
-        let first = breakers.acquire(CLUSTER).unwrap().unwrap();
+        let first = breakers.acquire(CLUSTER).unwrap();
         assert_eq!(breakers.in_flight(CLUSTER), 1);
 
         breakers.set_cluster_config(CLUSTER, "eds-b", CircuitBreakingConfig { max_requests: 1 });
         assert_eq!(breakers.in_flight(CLUSTER), 0);
-        let second = breakers.acquire(CLUSTER).unwrap().unwrap();
+        let second = breakers.acquire(CLUSTER).unwrap();
         assert_eq!(breakers.in_flight(CLUSTER), 1);
         assert!(breakers.acquire(CLUSTER).is_err());
 
@@ -1093,7 +1580,7 @@ mod tests {
     #[test]
     fn cluster_removal_cleans_up_counter_after_in_flight_requests_finish() {
         let breakers = configured_breakers(1);
-        let permit = breakers.acquire(CLUSTER).unwrap().unwrap();
+        let permit = breakers.acquire(CLUSTER).unwrap();
         assert_eq!(breakers.counter_count(), 1);
 
         breakers.clear_cluster_config(CLUSTER);
@@ -1105,14 +1592,134 @@ mod tests {
 
     #[tokio::test]
     async fn cached_breaker_observes_cluster_removal_and_recreation() {
+        let cache = Arc::new(XdsCache::new());
+        cache.update_cluster(CLUSTER, cluster_resource(1));
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
+        let breaker = breakers.cluster_breaker_with_cache(CLUSTER, cache.clone());
+
+        let first = breaker.acquire_when_ready().await.unwrap();
+        drop(first);
+
+        let generation = breaker
+            .state
+            .active_watch_generation
+            .load(Ordering::Acquire);
+        cache.remove_cluster(CLUSTER);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while breaker
+                .state
+                .finished_watch_generation
+                .load(Ordering::Acquire)
+                != generation
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        cache.update_cluster(CLUSTER, cluster_resource(1));
+        let second = tokio::time::timeout(Duration::from_secs(1), breaker.acquire_when_ready())
+            .await
+            .expect("re-added cluster should wake the cached breaker")
+            .expect("re-added cluster should be available");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn removal_before_watch_task_runs_wakes_waiting_request() {
+        let cache = Arc::new(XdsCache::new());
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
+        let breaker = breakers.cluster_breaker_with_cache(CLUSTER, cache.clone());
+
+        cache.remove_cluster(CLUSTER);
+        let response = tokio::time::timeout(Duration::from_secs(1), breaker.acquire_when_ready())
+            .await
+            .expect("cluster removal should wake the request")
+            .expect_err("removed cluster should be unavailable");
+        let status = tonic::Status::from_header_map(response.headers()).unwrap();
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(is_local_pre_endpoint_response(&response));
+        assert!(!is_local_circuit_breaker_drop(&response));
+    }
+
+    #[tokio::test]
+    async fn waiting_request_does_not_cross_watch_generations() {
+        let cache = Arc::new(XdsCache::new());
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
+        let breaker = breakers.cluster_breaker_with_cache(CLUSTER, cache.clone());
+        let old_generation = breaker
+            .state
+            .active_watch_generation
+            .load(Ordering::Acquire);
+        let mut old_request = Box::pin(breaker.acquire_when_ready());
+
+        std::future::poll_fn(|cx| {
+            assert!(matches!(old_request.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+
+        cache.remove_cluster(CLUSTER);
+        cache.update_cluster(CLUSTER, cluster_resource(1));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while breaker
+                .state
+                .finished_watch_generation
+                .load(Ordering::Acquire)
+                != old_generation
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let new_permit = breaker.acquire_when_ready().await.unwrap();
+        drop(new_permit);
+
+        let response = old_request
+            .await
+            .expect_err("old request must not consume the re-added cluster config");
+        assert_eq!(
+            tonic::Status::from_header_map(response.headers())
+                .unwrap()
+                .code(),
+            Code::Unavailable,
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_cache_backed_breaker_releases_watcher_owners() {
+        let cache = Arc::new(XdsCache::new());
+        cache.update_cluster(CLUSTER, cluster_resource(1));
+        let breakers = ClusterCircuitBreakerRegistry::new_for_test();
+        let breaker = breakers.cluster_breaker_with_cache(CLUSTER, cache.clone());
+        let permit = breaker.acquire_when_ready().await.unwrap();
+        drop(permit);
+
+        let weak_cache = Arc::downgrade(&cache);
+        let weak_registry = Arc::downgrade(&breakers.inner);
+        drop(breaker);
+        drop(breakers);
+        drop(cache);
+        tokio::task::yield_now().await;
+
+        assert!(weak_cache.upgrade().is_none());
+        assert!(weak_registry.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoint_holds_positive_limit_until_response_body_drops() {
         let breakers = configured_breakers(1);
         let calls = Arc::new(AtomicU32::new(0));
         let call_counter = calls.clone();
         let service = service_fn(move |_request: Request<TonicBody>| {
             call_counter.fetch_add(1, Ordering::SeqCst);
-            async { Ok::<_, BoxError>(Response::new(TonicBody::empty())) }
+            async { Ok::<_, BoxError>(Response::new(TonicBody::new(PendingBody))) }
         });
-        let mut service = CircuitBreakingLayer::new(breakers.clone()).layer(service);
+        let mut service =
+            CircuitBreakingEndpointService::new(service, breakers.cluster_breaker(CLUSTER));
 
         let first = service
             .ready()
@@ -1121,9 +1728,8 @@ mod tests {
             .call(request())
             .await
             .unwrap();
-        drop(first);
+        assert_eq!(breakers.in_flight(CLUSTER), 1);
 
-        breakers.clear_cluster_config(CLUSTER);
         let second = service
             .ready()
             .await
@@ -1131,14 +1737,13 @@ mod tests {
             .call(request())
             .await
             .unwrap();
-        assert!(tonic::Status::from_header_map(second.headers()).is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let status = tonic::Status::from_header_map(second.headers()).unwrap();
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        breakers.set_cluster_config(
-            CLUSTER,
-            EDS_SERVICE_NAME,
-            CircuitBreakingConfig { max_requests: 0 },
-        );
+        drop(first);
+        assert_eq!(breakers.in_flight(CLUSTER), 0);
+
         let third = service
             .ready()
             .await
@@ -1146,21 +1751,16 @@ mod tests {
             .call(request())
             .await
             .unwrap();
-        let status = tonic::Status::from_header_map(third.headers()).unwrap();
-        assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(third);
     }
 
     #[test]
     fn dropping_breakers_releases_config_counter_ref() {
         let counters = ClusterRequestCounters::isolated();
         let breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
-        breakers.set_cluster_config(
-            CLUSTER,
-            EDS_SERVICE_NAME,
-            CircuitBreakingConfig { max_requests: 1 },
-        );
-        let permit = breakers.acquire(CLUSTER).unwrap().unwrap();
+        breakers.set_config(CLUSTER, CircuitBreakingConfig { max_requests: 1 });
+        let permit = breakers.acquire(CLUSTER).unwrap();
         drop(permit);
         assert_eq!(counters.counter_count(), 1);
 
@@ -1172,7 +1772,7 @@ mod tests {
     #[test]
     fn cleanup_keeps_counter_with_outstanding_clone() {
         let counters = ClusterRequestCounters::isolated();
-        let counter_key = CounterKey::new(CLUSTER, EDS_SERVICE_NAME);
+        let counter_key = CounterKey::new(CLUSTER, CLUSTER);
         let counter = counters.counter(&counter_key);
 
         counters.cleanup_if_unused(&counter_key);
@@ -1194,6 +1794,19 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(counters.counter_count(), 2);
+    }
+
+    #[test]
+    fn cached_cluster_breaker_does_not_pin_default_counter() {
+        let counters = ClusterRequestCounters::isolated();
+        let breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone());
+        let breaker = breakers.cluster_breaker(CLUSTER);
+        let permit = breaker.acquire().unwrap();
+        assert_eq!(counters.counter_count(), 1);
+
+        drop(permit);
+        assert_eq!(counters.counter_count(), 0);
+        assert_eq!(breaker.cluster.as_ref(), CLUSTER);
     }
 
     #[tokio::test]

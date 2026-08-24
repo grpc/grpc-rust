@@ -29,8 +29,8 @@
 //!
 //! 1. The cluster resource watch — produces a fresh [`Connector`] on each
 //!    CDS update (e.g. when `transport_socket` changes). The connector is
-//!    held inside a [`ConnectorSwap`] so the diff loop reads the latest
-//!    snapshot per endpoint connection.
+//!    published with its cache generation so re-added endpoints cannot use
+//!    transport settings from the removed cluster generation.
 //! 2. The endpoint watch — produces `Change::Insert` / `Change::Remove`
 //!    events forwarded to the LB layer.
 //!
@@ -40,8 +40,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
@@ -54,10 +53,10 @@ use crate::client::endpoint::{
 use crate::client::endpoint::{ClusterTlsConfig, ClusterTlsError};
 use crate::client::lb::{BoxDiscover, ClusterDiscovery};
 use crate::common::async_util::BoxFuture;
-use crate::xds::cache::XdsCache;
+use crate::xds::cache::{CacheEvent, XdsCache};
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
-use crate::xds::endpoint_manager::{ConnectorSwap, EndpointManager};
+use crate::xds::endpoint_manager::{ConnectorState, EndpointManager};
 
 /// Buffer capacity for the discovery channel between the spawned task and
 /// Tower's LB layer.
@@ -141,9 +140,21 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
         tokio::spawn(async move {
             let mut cluster_watch = cache.watch_cluster(&cluster_name);
 
-            let connector_swap: ConnectorSwap<MC::Service> = loop {
-                let Some(cluster) = cluster_watch.next().await else {
+            let (generation, connector) = loop {
+                let event = tokio::select! {
+                    _ = tx.closed() => return,
+                    event = cluster_watch.next_event() => event,
+                };
+                let Some(event) = event else {
                     return;
+                };
+                let CacheEvent::Resource {
+                    generation,
+                    resource: cluster,
+                    ..
+                } = event
+                else {
+                    continue;
                 };
                 let cluster_config = ClusterConfig::from_resource(
                     &cluster,
@@ -151,7 +162,7 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                     &registry,
                 );
                 match make_connector.make_connector(cluster_config) {
-                    Ok(c) => break Arc::new(ArcSwap::from_pointee(c)),
+                    Ok(connector) => break (generation, connector),
                     Err(e) => tracing::warn!(
                         cluster = %cluster_name,
                         error = %e,
@@ -160,29 +171,57 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                 }
             };
 
-            let manager = EndpointManager::new(Arc::clone(&connector_swap));
+            let (connector_tx, connector_rx) =
+                watch::channel(Arc::new(ConnectorState::new(generation, connector)));
+            let manager = EndpointManager::new(connector_rx);
             let mut endpoints = manager.discover_endpoints(cache.watch_endpoints(&cluster_name));
 
             loop {
                 tokio::select! {
+                    _ = tx.closed() => return,
                     Some(change) = endpoints.next() => {
                         if tx.send(change).await.is_err() {
                             return;
                         }
                     }
-                    Some(cluster) = cluster_watch.next() => {
+                    event = cluster_watch.next_event() => {
+                        let Some(event) = event else {
+                            return;
+                        };
+                        let CacheEvent::Resource {
+                            generation,
+                            resource: cluster,
+                            ..
+                        } = event
+                        else {
+                            continue;
+                        };
                         let cluster_config = ClusterConfig::from_resource(
                             &cluster,
                             #[cfg(feature = "_tls-any")]
                             &registry,
                         );
                         match make_connector.make_connector(cluster_config) {
-                            Ok(new) => connector_swap.store(Arc::new(new)),
-                            Err(e) => tracing::warn!(
-                                cluster = %cluster_name,
-                                error = %e,
-                                "CDS update rejected; keeping previous connector",
-                            ),
+                            Ok(connector) => {
+                                connector_tx.send_replace(Arc::new(ConnectorState::new(
+                                    generation,
+                                    connector,
+                                )));
+                            }
+                            Err(e) if connector_tx.borrow().generation() == generation => {
+                                tracing::warn!(
+                                    cluster = %cluster_name,
+                                    error = %e,
+                                    "CDS update rejected; keeping previous connector",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    cluster = %cluster_name,
+                                    error = %e,
+                                    "re-added CDS update rejected; endpoints remain unavailable",
+                                );
+                            }
                         }
                     }
                     else => return,
@@ -363,6 +402,7 @@ impl Connector for TlsConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::cluster::{ClusterResource, LbPolicy};
 
     #[cfg(feature = "_tls-any")]
@@ -378,6 +418,7 @@ mod tests {
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: None,
+            circuit_breaking: CircuitBreakingConfig::default(),
         }
     }
 
@@ -388,6 +429,7 @@ mod tests {
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: Some(security),
+            circuit_breaking: CircuitBreakingConfig::default(),
         }
     }
 

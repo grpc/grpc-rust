@@ -291,11 +291,10 @@ grpc-gcp = [ "dep:protobuf", "dep:grpc-protobuf", "dep:grpc", "dep:grpc-google",
 "dep:rustls", "dep:protobuf-well-known-types" ]
 grpc-routeguide = ["dep:grpc", "dep:grpc-protobuf", "dep:protobuf", "dep:rand"]
 grpc-helloworld = ["dep:grpc", "dep:grpc-protobuf", "dep:protobuf"]
-full = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web",
+default = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web",
 "tracing", "uds", "streaming", "mock", "json-codec", "compression", "tls",
 "tls-rustls", "tls-client-auth", "types", "cancellation", "h2c",
 "grpc-routeguide", "grpc-helloworld"]
-default = ["full"]
 # Workaround for cargo-udeps bug.
 # TODO: Remove once the fix is released: https://github.com/est31/cargo-udeps/pull/338
 h2 = []

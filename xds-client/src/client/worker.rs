@@ -22,13 +22,11 @@
  *
  */
 
-//! ADS worker that manages the xDS stream.
+//! ADS resource actor and physical server task.
 //!
-//! The worker runs as a background task, managing:
-//! - The ADS stream lifecycle (connection, reconnection)
-//! - Resource subscriptions and version/nonce tracking
-//! - Dispatching resources to watchers
-//! - ACK/NACK protocol
+//! The worker coordinates resource subscriptions, cache state, watcher
+//! delivery, and ACK/NACK construction. A separate server task owns the ADS
+//! stream lifecycle, reconnect backoff, and wire I/O.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +49,10 @@ use crate::metrics::{self, KeyValue, MetricsRecorder};
 use crate::resource::{DecodedResource, DecoderFn};
 use crate::runtime::Runtime;
 use crate::transport::{Transport, TransportBuilder, TransportStream};
+
+const SERVER_EVENT_BUFFER_SIZE: usize = 64;
+const SERVER_COMMAND_BUFFER_SIZE: usize = 64;
+const DIRTY_RESEND_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
 ///
@@ -408,10 +410,6 @@ struct TypeState {
     type_url: Arc<str>,
     /// Decoder function for this resource type.
     decoder: DecoderFn,
-    /// Version from last successful response.
-    version_info: String,
-    /// Nonce from last response (for ACK/NACK).
-    nonce: String,
     /// Active watchers for this type.
     watchers: HashMap<WatcherId, WatcherEntry>,
     /// Current subscription mode (wildcard or named resources).
@@ -427,8 +425,6 @@ impl std::fmt::Debug for TypeState {
         f.debug_struct("TypeState")
             .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
-            .field("version_info", &self.version_info)
-            .field("nonce", &self.nonce)
             .field("watchers", &self.watchers)
             .field("subscription", &self.subscription)
             .field("cache", &format!("<{} entries>", self.cache.len()))
@@ -445,8 +441,6 @@ impl TypeState {
         Self {
             type_url,
             decoder,
-            version_info: String::new(),
-            nonce: String::new(),
             watchers: HashMap::new(),
             subscription: SubscriptionMode::Named(HashSet::new()),
             cache: HashMap::new(),
@@ -502,6 +496,15 @@ impl TypeState {
     }
 }
 
+/// Protocol state scoped to the active physical ADS stream and resource type.
+#[derive(Default)]
+struct StreamState {
+    /// Version from the last accepted response.
+    version_info: String,
+    /// Nonce from the last response on the current stream generation.
+    nonce: String,
+}
+
 /// Specifies which resources a watcher is interested in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WatcherSubscription {
@@ -548,15 +551,15 @@ struct WatcherEntry {
 /// The ADS worker manages the xDS stream and dispatches resources to watchers.
 pub(crate) struct AdsWorker<TB, C, R> {
     /// Transport builder for creating transports to xDS servers.
-    transport_builder: TB,
+    transport_builder: Option<TB>,
     /// Codec for encoding/decoding messages.
     codec: C,
     /// Runtime for spawning tasks and sleeping.
     runtime: R,
     /// Node identification.
     node: Node,
-    /// Backoff calculator for reconnection attempts.
-    backoff: Backoff,
+    /// Retry policy copied into the single physical server task.
+    retry_policy: crate::client::retry::RetryPolicy,
     /// Priority-ordered list of xDS servers.
     /// Index 0 has the highest priority.
     servers: Vec<Arc<ServerConfig>>,
@@ -568,12 +571,18 @@ pub(crate) struct AdsWorker<TB, C, R> {
     command_rx: mpsc::Receiver<WorkerCommand>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
+    /// Per-type protocol state for the single active physical ADS stream.
+    stream_state: HashMap<String, StreamState>,
     /// Cancellation handles for resource timers (gRFC A57).
     /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
     resource_timers: HashMap<(String, String), oneshot::Sender<()>>,
     /// Optional backend + per-client A78 metric attributes
     /// (`grpc.target` + `grpc.xds.server`).
     recorder: RecorderHandle,
+    /// Subscription types whose latest snapshot could not be queued.
+    dirty_types: HashSet<String>,
+    /// Removed subscription types whose snapshot deletion could not be queued.
+    removed_types: HashSet<String>,
 }
 
 /// A watcher notification staged during response handling: the channel to
@@ -588,18 +597,39 @@ type Delivery = (
 /// In-flight watcher deliveries for one response: sends every staged event
 /// (with backpressure) and resolves once all watchers signal `ProcessingDone`.
 /// While unresolved it gates reading the *next* response, but nothing else —
-/// see [`AdsWorker::run_connected`].
+/// the worker continues draining commands while it is pending.
 type PendingDispatch = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Outcome of a connected ADS session (see [`AdsWorker::run_connected`]).
-enum ConnectedOutcome {
-    /// All `XdsClient` handles were dropped; the worker should shut down.
-    Shutdown,
-    /// The ADS stream failed; the worker should reconnect. `saw_response`
-    /// indicates whether at least one response was received before the failure
-    /// — per gRFC A78, a stream that fails after a response is not counted as a
-    /// server failure.
-    Failed { saw_response: bool },
+enum ServerEvent {
+    Connected { generation: u64 },
+    Response { generation: u64, bytes: Bytes },
+    Closed { generation: u64, saw_response: bool },
+    Stopped,
+}
+
+enum ServerCommand {
+    Send {
+        type_url: String,
+        bytes: Bytes,
+    },
+    Remove {
+        type_url: String,
+    },
+    SendAck {
+        generation: u64,
+        bytes: Bytes,
+        reconnect_request: (String, Bytes),
+    },
+    Resume {
+        generation: u64,
+    },
+    Close {
+        generation: u64,
+    },
+}
+
+struct ServerHandle {
+    command_tx: mpsc::Sender<ServerCommand>,
 }
 
 impl<TB, C, R> AdsWorker<TB, C, R>
@@ -620,18 +650,21 @@ where
     ) -> Self {
         let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
         Self {
-            transport_builder,
+            transport_builder: Some(transport_builder),
             codec,
             runtime,
             node: config.node,
-            backoff: Backoff::new(config.retry_policy),
+            retry_policy: config.retry_policy,
             servers: config.servers.into_iter().map(Arc::new).collect(),
             resource_initial_timeout: config.resource_initial_timeout,
             command_tx,
             command_rx,
             type_states: HashMap::new(),
+            stream_state: HashMap::new(),
             resource_timers: HashMap::new(),
             recorder: RecorderHandle::new(recorder, target),
+            dirty_types: HashSet::new(),
+            removed_types: HashSet::new(),
         }
     }
 
@@ -644,83 +677,92 @@ where
         // servers *going from healthy to unhealthy*. `healthy` mirrors the
         // `connected` gauge so the counter (and gauge) are recorded only on that
         // transition.
+        while self.type_states.is_empty() {
+            match self.command_rx.recv().await {
+                Some(cmd) => {
+                    let _ = self.handle_command(None, cmd).await;
+                }
+                None => return,
+            }
+        }
+
+        let server = match self.servers.first() {
+            Some(server) => Arc::clone(server),
+            None => return,
+        };
+        self.recorder.set_server(Arc::from(server.uri()));
+        let (event_tx, mut event_rx) = mpsc::channel(SERVER_EVENT_BUFFER_SIZE);
+        let (command_tx, command_rx) = mpsc::channel(SERVER_COMMAND_BUFFER_SIZE);
+        let handle = ServerHandle { command_tx };
+        let request_snapshots = self.build_initial_requests().into_iter().collect();
+        let task = ServerTask {
+            transport_builder: self
+                .transport_builder
+                .take()
+                .expect("server task already started"),
+            runtime: self.runtime.clone(),
+            server,
+            command_rx,
+            event_tx,
+            backoff: Backoff::new(self.retry_policy.clone()),
+            request_snapshots,
+        };
+        self.runtime.spawn(task.run());
+
         let mut healthy = false;
+        let mut pending: Option<(u64, PendingDispatch)> = None;
         loop {
-            // Wait for at least one subscription before connecting.
-            // This prevents deadlock with servers that require a message before
-            // sending response headers - we need something to send.
-            while self.type_states.is_empty() {
-                match self.command_rx.recv().await {
-                    Some(cmd) => {
-                        let _ = self
-                            .handle_command::<<TB::Transport as Transport>::Stream>(None, cmd)
-                            .await;
+            self.flush_dirty(&handle);
+            tokio::select! {
+                event = event_rx.recv() => match event {
+                    Some(ServerEvent::Connected { generation }) => {
+                        if !healthy {
+                            self.recorder.record_connected(true);
+                            healthy = true;
+                        }
+                        // A reconnect supersedes any response completion from an
+                        // older stream generation.
+                        if pending.as_ref().is_some_and(|(g, _)| *g != generation) {
+                            pending = None;
+                        }
                     }
+                    Some(ServerEvent::Response { generation, bytes }) => {
+                        match self.handle_response(&handle, generation, bytes).await {
+                            Ok(dispatch) => {
+                                if let Some(dispatch) = dispatch {
+                                    pending = Some((generation, dispatch));
+                                } else {
+                                    let _ = handle.command_tx.send(ServerCommand::Resume { generation }).await;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = handle.command_tx.send(ServerCommand::Close { generation }).await;
+                            }
+                        }
+                    }
+                    Some(ServerEvent::Closed { generation, saw_response }) => {
+                        if pending.as_ref().is_some_and(|(g, _)| *g == generation) {
+                            pending = None;
+                        }
+                        for state in self.stream_state.values_mut() {
+                            state.nonce.clear();
+                        }
+                        if !saw_response {
+                            self.record_unhealthy(&mut healthy);
+                        }
+                    }
+                    Some(ServerEvent::Stopped) | None => return,
+                },
+                _ = async { pending.as_mut().unwrap().1.as_mut().await }, if pending.is_some() => {
+                    let (generation, _) = pending.take().expect("pending dispatch disappeared");
+                    let _ = handle.command_tx.send(ServerCommand::Resume { generation }).await;
+                }
+                cmd = self.command_rx.recv() => match cmd {
+                    Some(cmd) => { let _ = self.handle_command(Some(&handle), cmd).await; }
                     None => return,
-                }
-            }
-
-            // Nonces are tied to the stream
-            for type_state in self.type_states.values_mut() {
-                type_state.nonce.clear();
-            }
-
-            // Connect to server.
-            // Future extension (gRFC A71): Try servers in priority order with fallback.
-            let server = match self.servers.first() {
-                Some(s) => Arc::clone(s),
-                None => return, // No servers configured
-            };
-            self.recorder.set_server(Arc::from(server.uri()));
-
-            let transport = match self.transport_builder.build(&server).await {
-                Ok(t) => t,
-                Err(_) => {
-                    self.record_unhealthy(&mut healthy);
-                    match self.backoff.next_backoff() {
-                        Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => return, // Max attempts exceeded
-                    }
-                    continue;
-                }
-            };
-
-            let stream = match transport.new_stream(self.build_initial_requests()).await {
-                Ok(s) => {
-                    self.backoff.reset();
-                    s
-                }
-                Err(_) => {
-                    self.record_unhealthy(&mut healthy);
-                    match self.backoff.next_backoff() {
-                        Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => return, // Max attempts exceeded
-                    }
-                    continue;
-                }
-            };
-
-            if !healthy {
-                self.recorder.record_connected(true);
-                healthy = true;
-            }
-
-            match self.run_connected(stream).await {
-                ConnectedOutcome::Shutdown => return,
-                ConnectedOutcome::Failed { saw_response } => {
-                    // gRFC A78: a server goes unhealthy (one `server_failure`) on
-                    // a connectivity failure or when the ADS stream fails
-                    // *without* seeing a response message. A stream that failed
-                    // after receiving a response is not counted; just reconnect.
-                    if !saw_response {
-                        self.record_unhealthy(&mut healthy);
-                    }
-                    match self.backoff.next_backoff() {
-                        Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => return, // Max attempts exceeded
-                    }
-                    continue;
-                }
+                },
+                _ = self.runtime.sleep(DIRTY_RESEND_INTERVAL),
+                    if !self.dirty_types.is_empty() || !self.removed_types.is_empty() => {}
             }
         }
     }
@@ -742,7 +784,7 @@ where
     ///
     /// These are sent when establishing the stream to prevent deadlock with
     /// servers that don't send response headers until they receive a request.
-    fn build_initial_requests(&self) -> Vec<Bytes> {
+    fn build_initial_requests(&self) -> Vec<(String, Bytes)> {
         let mut requests = Vec::new();
 
         for (type_url, type_state) in &self.type_states {
@@ -751,76 +793,27 @@ where
             }
 
             let resource_names = type_state.resource_names_for_request();
+            let version_info = self
+                .stream_state
+                .get(type_url)
+                .map(|state| state.version_info.as_str())
+                .unwrap_or_default();
 
             let request = DiscoveryRequest {
                 node: &self.node,
                 type_url,
                 resource_names: &resource_names,
-                version_info: &type_state.version_info,
+                version_info,
                 response_nonce: "", // Initial request has empty nonce
                 error_detail: None,
             };
 
             if let Ok(bytes) = self.codec.encode_request(&request) {
-                requests.push(bytes);
+                requests.push((type_url.clone(), bytes));
             }
         }
 
         requests
-    }
-
-    /// Run the main event loop while connected.
-    ///
-    /// Returns [`ConnectedOutcome::Shutdown`] if the worker should shut down
-    /// (command channel closed), or [`ConnectedOutcome::Failed`] if the stream
-    /// failed and the worker should reconnect (carrying whether a response was
-    /// seen, per gRFC A78).
-    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> ConnectedOutcome {
-        // Whether at least one response was received on this stream. Per gRFC
-        // A78 a stream that fails *after* receiving a response is not counted as
-        // a server failure.
-        let mut saw_response = false;
-        // Watcher deliveries for the last response, still in flight (ADS flow
-        // control, per gRFC A88). While `Some`, the next response is not read
-        // — but commands keep draining below. Awaiting the deliveries inline
-        // in `handle_response` instead would freeze the whole loop: a watcher
-        // that issues commands (e.g. cascading watches) while holding its
-        // `ProcessingDone` token could fill the command channel and deadlock
-        // against a worker that only resumes once that token drops.
-        let mut pending: Option<PendingDispatch> = None;
-        loop {
-            tokio::select! {
-                result = stream.recv(), if pending.is_none() => {
-                    match result {
-                        Ok(Some(bytes)) => {
-                            saw_response = true;
-                            match self.handle_response(&mut stream, bytes).await {
-                                Ok(dispatch) => pending = dispatch,
-                                Err(_) => return ConnectedOutcome::Failed { saw_response },
-                            }
-                        }
-                        // Stream closed by server or errored; reconnect.
-                        Ok(None) | Err(_) => return ConnectedOutcome::Failed { saw_response },
-                    }
-                }
-
-                // `unwrap` is safe: the branch is disabled when `pending` is `None`.
-                _ = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
-                    pending = None;
-                }
-
-                cmd = self.command_rx.recv() => {
-                    match cmd {
-                        Some(cmd) => {
-                            if self.handle_command(Some(&mut stream), cmd).await.is_err() {
-                                return ConnectedOutcome::Failed { saw_response };
-                            }
-                        }
-                        None => return ConnectedOutcome::Shutdown,
-                    }
-                }
-            }
-        }
     }
 
     /// Build the in-flight delivery future for one response's staged watcher
@@ -846,11 +839,11 @@ where
 
     /// Handle a command, optionally sending network requests if connected.
     ///
-    /// When `stream` is `None`, only state updates are performed (disconnected mode).
-    /// When `stream` is `Some`, subscription changes trigger network requests.
-    async fn handle_command<S: TransportStream>(
+    /// Before the server task starts, only state updates are performed. Once a
+    /// handle is present, subscription changes queue the latest request.
+    async fn handle_command(
         &mut self,
-        stream: Option<&mut S>,
+        server: Option<&ServerHandle>,
         cmd: WorkerCommand,
     ) -> Result<()> {
         match cmd {
@@ -869,16 +862,20 @@ where
                     event_tx,
                     decoder,
                     all_resources_required_in_sotw,
-                ) && let Some(stream) = stream
+                ) && let Some(server) = server
                 {
-                    self.send_request(stream, type_url).await?;
+                    self.send_request(server, type_url)?;
                 }
             }
             WorkerCommand::Unwatch { watcher_id } => {
                 if let Some((type_url, true)) = self.remove_watcher(watcher_id)
-                    && let Some(stream) = stream
+                    && let Some(server) = server
                 {
-                    self.send_request(stream, &type_url).await?;
+                    if self.type_states.contains_key(&type_url) {
+                        self.send_request(server, &type_url)?;
+                    } else {
+                        self.queue_remove(server, type_url);
+                    }
                 }
             }
             WorkerCommand::ResourceTimerExpired { type_url, name } => {
@@ -988,6 +985,7 @@ where
         if type_state.watchers.is_empty() {
             let type_url_arc = Arc::clone(&type_state.type_url);
             self.type_states.remove(&type_url);
+            self.stream_state.remove(&type_url);
             // The type is gone — reset all of its resource buckets to zero.
             self.recorder
                 .sync_resource_counts(&type_url_arc, &HashMap::new());
@@ -998,25 +996,70 @@ where
         Some((type_url, subscriptions_changed))
     }
 
-    /// Send a DiscoveryRequest for a type.
-    async fn send_request<S: TransportStream>(&self, stream: &mut S, type_url: &str) -> Result<()> {
+    fn flush_dirty(&mut self, server: &ServerHandle) {
+        for type_url in self.removed_types.clone() {
+            self.queue_remove(server, type_url);
+        }
+        for type_url in self.dirty_types.clone() {
+            let _ = self.send_request(server, &type_url);
+        }
+    }
+
+    fn queue_remove(&mut self, server: &ServerHandle, type_url: String) {
+        self.dirty_types.remove(&type_url);
+        match server.command_tx.try_send(ServerCommand::Remove {
+            type_url: type_url.clone(),
+        }) {
+            Ok(()) => {
+                self.removed_types.remove(&type_url);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.removed_types.insert(type_url);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    /// Encode and queue the latest DiscoveryRequest snapshot for a type.
+    fn send_request(&mut self, server: &ServerHandle, type_url: &str) -> Result<()> {
+        self.removed_types.remove(type_url);
         let type_state = match self.type_states.get(type_url) {
             Some(s) => s,
-            None => return Ok(()),
+            None => {
+                self.dirty_types.remove(type_url);
+                return Ok(());
+            }
         };
 
         let resource_names = type_state.resource_names_for_request();
+        let (version_info, nonce) = self
+            .stream_state
+            .get(type_url)
+            .map(|state| (state.version_info.as_str(), state.nonce.as_str()))
+            .unwrap_or_default();
         let request = DiscoveryRequest {
             node: &self.node,
             type_url,
             resource_names: &resource_names,
-            version_info: &type_state.version_info,
-            response_nonce: &type_state.nonce,
+            version_info,
+            response_nonce: nonce,
             error_detail: None,
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        stream.send(bytes).await
+        match server.command_tx.try_send(ServerCommand::Send {
+            type_url: type_url.to_string(),
+            bytes,
+        }) {
+            Ok(()) => {
+                self.dirty_types.remove(type_url);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dirty_types.insert(type_url.to_string());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        Ok(())
     }
 
     /// Handle a response from the server.
@@ -1033,9 +1076,10 @@ where
     /// future (`None` when there is nothing to deliver) for `run_connected`
     /// to drive, so a slow (or stuck) watcher delays reading the next
     /// response — ADS flow control — without freezing command processing.
-    async fn handle_response<S: TransportStream>(
+    async fn handle_response(
         &mut self,
-        stream: &mut S,
+        server: &ServerHandle,
+        generation: u64,
         bytes: Bytes,
     ) -> Result<Option<PendingDispatch>> {
         let response = self.codec.decode_response(bytes)?;
@@ -1084,9 +1128,7 @@ where
         self.recorder
             .record_resource_updates(&type_url_arc, valid_count, invalid_count);
 
-        if let Some(type_state) = self.type_states.get_mut(&type_url) {
-            type_state.nonce = response.nonce.clone();
-        }
+        self.stream_state.entry(type_url.clone()).or_default().nonce = response.nonce.clone();
 
         let received_names: HashSet<String> = valid_resources
             .iter()
@@ -1117,10 +1159,11 @@ where
         if !has_errors {
             // Only update version on ACK; NACK must keep the old version so the
             // server knows which version the client is still running.
-            if let Some(ts) = self.type_states.get_mut(&type_url) {
-                ts.version_info = response.version_info.clone();
-            }
-            self.send_ack(stream, &response).await?;
+            self.stream_state
+                .entry(type_url.clone())
+                .or_default()
+                .version_info = response.version_info.clone();
+            self.send_ack(server, generation, &response).await?;
         } else {
             // Build NACK message combining both error categories
             let mut error_parts = Vec::new();
@@ -1138,7 +1181,7 @@ where
                 error_parts.push(per_resource_msg);
             }
 
-            self.send_nack(stream, &response, error_parts.join("; "))
+            self.send_nack(server, generation, &response, error_parts.join("; "))
                 .await?;
         }
 
@@ -1289,9 +1332,10 @@ where
     }
 
     /// Send an ACK for a response.
-    async fn send_ack<S: TransportStream>(
+    async fn send_ack(
         &self,
-        stream: &mut S,
+        server: &ServerHandle,
+        generation: u64,
         response: &DiscoveryResponse,
     ) -> Result<()> {
         let type_state = match self.type_states.get(&response.type_url) {
@@ -1310,13 +1354,31 @@ where
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        stream.send(bytes).await
+        let reconnect_request = DiscoveryRequest {
+            node: &self.node,
+            type_url: &response.type_url,
+            resource_names: &resource_names,
+            version_info: &response.version_info,
+            response_nonce: "",
+            error_detail: None,
+        };
+        let reconnect_bytes = self.codec.encode_request(&reconnect_request)?;
+        server
+            .command_tx
+            .send(ServerCommand::SendAck {
+                generation,
+                bytes,
+                reconnect_request: (response.type_url.clone(), reconnect_bytes),
+            })
+            .await
+            .map_err(|_| Error::Connection("server task closed".into()))
     }
 
     /// Send a NACK for a response.
-    async fn send_nack<S: TransportStream>(
+    async fn send_nack(
         &self,
-        stream: &mut S,
+        server: &ServerHandle,
+        generation: u64,
         response: &DiscoveryResponse,
         error_message: String,
     ) -> Result<()> {
@@ -1326,11 +1388,16 @@ where
         };
 
         let resource_names = type_state.resource_names_for_request();
+        let version_info = self
+            .stream_state
+            .get(&response.type_url)
+            .map(|state| state.version_info.as_str())
+            .unwrap_or_default();
         let request = DiscoveryRequest {
             node: &self.node,
             type_url: &response.type_url,
             resource_names: &resource_names,
-            version_info: &type_state.version_info, // Keep old version for NACK
+            version_info, // Keep old version for NACK
             response_nonce: &response.nonce,
             error_detail: Some(ErrorDetail {
                 code: 3, // INVALID_ARGUMENT
@@ -1339,7 +1406,24 @@ where
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        stream.send(bytes).await
+        let reconnect_request = DiscoveryRequest {
+            node: &self.node,
+            type_url: &response.type_url,
+            resource_names: &resource_names,
+            version_info,
+            response_nonce: "",
+            error_detail: None,
+        };
+        let reconnect_bytes = self.codec.encode_request(&reconnect_request)?;
+        server
+            .command_tx
+            .send(ServerCommand::SendAck {
+                generation,
+                bytes,
+                reconnect_request: (response.type_url.clone(), reconnect_bytes),
+            })
+            .await
+            .map_err(|_| Error::Connection("server task closed".into()))
     }
 
     /// Start a timer for a resource in Requested state (gRFC A57).
@@ -1413,6 +1497,190 @@ where
                 done: ProcessingDone::detached(),
             };
             let _ = event_tx.send(event).await;
+        }
+    }
+}
+
+/// Owns the lifecycle and wire I/O for the one active physical ADS server.
+///
+/// The resource actor above owns watches and cache transitions; this task owns
+/// transport construction, reconnect backoff, stream generations, and the
+/// current request snapshots needed to open a replacement stream.
+struct ServerTask<TB, R> {
+    transport_builder: TB,
+    runtime: R,
+    server: Arc<ServerConfig>,
+    command_rx: mpsc::Receiver<ServerCommand>,
+    event_tx: mpsc::Sender<ServerEvent>,
+    backoff: Backoff,
+    request_snapshots: HashMap<String, Bytes>,
+}
+
+enum BackoffOutcome {
+    Retry,
+    Exhausted,
+    Shutdown,
+}
+
+impl<TB, R> ServerTask<TB, R>
+where
+    TB: TransportBuilder,
+    R: Runtime,
+{
+    async fn run(mut self) {
+        let mut generation = 0_u64;
+        loop {
+            let transport = match self.transport_builder.build(&self.server).await {
+                Ok(transport) => transport,
+                Err(_) => {
+                    if !self.closed(generation, false).await {
+                        return;
+                    }
+                    match self.backoff().await {
+                        BackoffOutcome::Retry => continue,
+                        BackoffOutcome::Exhausted => {
+                            let _ = self.event_tx.send(ServerEvent::Stopped).await;
+                            return;
+                        }
+                        BackoffOutcome::Shutdown => return,
+                    }
+                }
+            };
+
+            let initial_requests = self.request_snapshots.values().cloned().collect();
+            let mut stream = match transport.new_stream(initial_requests).await {
+                Ok(stream) => stream,
+                Err(_) => {
+                    if !self.closed(generation, false).await {
+                        return;
+                    }
+                    match self.backoff().await {
+                        BackoffOutcome::Retry => continue,
+                        BackoffOutcome::Exhausted => {
+                            let _ = self.event_tx.send(ServerEvent::Stopped).await;
+                            return;
+                        }
+                        BackoffOutcome::Shutdown => return,
+                    }
+                }
+            };
+
+            generation = generation.wrapping_add(1);
+            self.backoff.reset();
+            if self
+                .event_tx
+                .send(ServerEvent::Connected { generation })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let mut saw_response = false;
+            let mut response_in_flight = false;
+            'connected: loop {
+                tokio::select! {
+                    command = self.command_rx.recv() => match command {
+                        Some(ServerCommand::Send { type_url, bytes }) => {
+                            self.request_snapshots.insert(type_url, bytes.clone());
+                            if stream.send(bytes).await.is_err() {
+                                break 'connected;
+                            }
+                        }
+                        Some(ServerCommand::Remove { type_url }) => {
+                            self.request_snapshots.remove(&type_url);
+                        }
+                        Some(ServerCommand::SendAck {
+                            generation: ack_generation,
+                            bytes,
+                            reconnect_request,
+                        }) => {
+                            if ack_generation == generation {
+                                self.request_snapshots.insert(
+                                    reconnect_request.0,
+                                    reconnect_request.1,
+                                );
+                                if stream.send(bytes).await.is_err() {
+                                    break 'connected;
+                                }
+                            }
+                        }
+                        Some(ServerCommand::Resume { generation: resume_generation }) => {
+                            if resume_generation == generation {
+                                response_in_flight = false;
+                            }
+                        }
+                        Some(ServerCommand::Close { generation: close_generation }) => {
+                            if close_generation == generation {
+                                break 'connected;
+                            }
+                        }
+                        None => return,
+                    },
+                    result = stream.recv(), if !response_in_flight => match result {
+                        Ok(Some(bytes)) => {
+                            saw_response = true;
+                            response_in_flight = true;
+                            if self.event_tx.send(ServerEvent::Response {
+                                generation,
+                                bytes,
+                            }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) | Err(_) => break 'connected,
+                    }
+                }
+            }
+
+            if !self.closed(generation, saw_response).await {
+                return;
+            }
+            match self.backoff().await {
+                BackoffOutcome::Retry => {}
+                BackoffOutcome::Exhausted => {
+                    let _ = self.event_tx.send(ServerEvent::Stopped).await;
+                    return;
+                }
+                BackoffOutcome::Shutdown => return,
+            }
+        }
+    }
+
+    async fn closed(&self, generation: u64, saw_response: bool) -> bool {
+        self.event_tx
+            .send(ServerEvent::Closed {
+                generation,
+                saw_response,
+            })
+            .await
+            .is_ok()
+    }
+
+    async fn backoff(&mut self) -> BackoffOutcome {
+        let Some(duration) = self.backoff.next_backoff() else {
+            return BackoffOutcome::Exhausted;
+        };
+        let sleep = self.runtime.sleep(duration);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return BackoffOutcome::Retry,
+                command = self.command_rx.recv() => match command {
+                    Some(ServerCommand::Send { type_url, bytes }) => {
+                        self.request_snapshots.insert(type_url, bytes);
+                    }
+                    Some(ServerCommand::Remove { type_url }) => {
+                        self.request_snapshots.remove(&type_url);
+                    }
+                    Some(ServerCommand::SendAck { reconnect_request, .. }) => {
+                        self.request_snapshots.insert(reconnect_request.0, reconnect_request.1);
+                    }
+                    Some(ServerCommand::Resume { .. })
+                    | Some(ServerCommand::Close { .. }) => {}
+                    None => return BackoffOutcome::Shutdown,
+                }
+            }
         }
     }
 }
@@ -1621,18 +1889,23 @@ mod tests {
 /// reading the next response.
 #[cfg(test)]
 mod flow_control_tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use bytes::Bytes;
+    use tokio::sync::mpsc;
 
-    use crate::client::config::ClientConfig;
+    use crate::client::config::{ClientConfig, ServerConfig};
+    use crate::client::retry::RetryPolicy;
     use crate::client::watch::{ResourceEvent, ResourceWatcher};
     use crate::codec::XdsCodec;
     use crate::error::Result;
     use crate::message::{DiscoveryRequest, DiscoveryResponse, Node, ResourceAny};
+    use crate::metrics::{self, KeyValue, MetricsRecorder};
     use crate::resource::{Resource, TypeUrl};
     use crate::runtime::tokio::TokioRuntime;
-    use crate::transport::mock::{MockServer, mock_transport};
+    use crate::transport::TransportBuilder;
+    use crate::transport::mock::{MockServer, MockTransport, MockTransportBuilder, mock_transport};
     use crate::{XdsClient, error::Error};
 
     const TEST_TYPE_URL: &str = "type.googleapis.com/test.Resource";
@@ -1750,6 +2023,78 @@ mod flow_control_tests {
         let version = lines.next().unwrap_or_default().to_string();
         let nonce = lines.next().unwrap_or_default().to_string();
         (version, nonce)
+    }
+
+    fn fast_retry_policy() -> RetryPolicy {
+        RetryPolicy::new(Duration::from_millis(1), Duration::from_millis(1), 1.0)
+            .unwrap()
+            .with_jitter(0.0)
+            .unwrap()
+    }
+
+    struct RecordingBuilder {
+        inner: MockTransportBuilder,
+        built_uris: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct ConnectionRecorder {
+        events: Mutex<Vec<(&'static str, i64)>>,
+    }
+
+    impl MetricsRecorder for ConnectionRecorder {
+        fn add_counter_u64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: u64,
+            _attrs: &[KeyValue],
+        ) {
+            if instrument.name == metrics::instruments::XDS_CLIENT_SERVER_FAILURE.name {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((instrument.name, value as i64));
+            }
+        }
+
+        fn add_up_down_counter_i64(
+            &self,
+            _instrument: &'static metrics::Instrument,
+            _value: i64,
+            _attrs: &[KeyValue],
+        ) {
+        }
+
+        fn record_histogram_f64(
+            &self,
+            _instrument: &'static metrics::Instrument,
+            _value: f64,
+            _attrs: &[KeyValue],
+        ) {
+        }
+
+        fn record_gauge_i64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: i64,
+            _attrs: &[KeyValue],
+        ) {
+            if instrument.name == metrics::instruments::XDS_CLIENT_CONNECTED.name {
+                self.events.lock().unwrap().push((instrument.name, value));
+            }
+        }
+    }
+
+    impl TransportBuilder for RecordingBuilder {
+        type Transport = MockTransport;
+
+        async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
+            self.built_uris
+                .lock()
+                .unwrap()
+                .push(server.uri().to_string());
+            self.inner.build(server).await
+        }
     }
 
     /// Client watching `res-0` (of resource type `T`) with an established
@@ -2044,5 +2389,190 @@ mod flow_control_tests {
             .send(Ok(Some(response("2", "n2", &["res-0", "res-1"]))))
             .unwrap();
         assert!(next_changed(&mut w1).await.0.is_ok());
+    }
+
+    /// Reconnect uses the last accepted version, clears the stream-scoped
+    /// nonce, and continues to deliver updates through the same watcher.
+    #[tokio::test]
+    async fn reconnect_preserves_request_and_watcher_behavior() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_retry_policy(fast_retry_policy());
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+
+        let mut first = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let initial = first.requests.recv().await.unwrap();
+        assert_eq!(parse_request(&initial), (String::new(), String::new()));
+
+        first
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (result, done) = next_changed(&mut watcher).await;
+        assert!(result.is_ok());
+        drop(done);
+        assert_eq!(
+            parse_request(&first.requests.recv().await.unwrap()),
+            ("1".to_string(), "n1".to_string())
+        );
+
+        first.responses.send(Ok(None)).unwrap();
+        let mut second = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("worker did not reconnect")
+            .expect("transport dropped");
+        assert_eq!(
+            parse_request(&second.requests.recv().await.unwrap()),
+            ("1".to_string(), String::new())
+        );
+
+        second
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+    }
+
+    /// Connected and server-failure metrics retain their pre-refactor edge
+    /// semantics across a failure before the first response and reconnect.
+    #[tokio::test]
+    async fn reconnect_preserves_connection_metric_transitions() {
+        let (builder, mut servers) = mock_transport();
+        let recorder = Arc::new(ConnectionRecorder::default());
+        let dyn_recorder: Arc<dyn MetricsRecorder> = recorder.clone();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_retry_policy(fast_retry_policy());
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
+            .with_metrics_recorder(dyn_recorder)
+            .build();
+        let _watcher = client.watch::<TestResource>("res-0").await;
+
+        let first = servers.recv().await.unwrap();
+        first.responses.send(Ok(None)).unwrap();
+        let _second = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("worker did not reconnect")
+            .expect("transport dropped");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if recorder.events.lock().unwrap().len() >= 4 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metric transitions were not recorded");
+        assert_eq!(
+            recorder.events.lock().unwrap().as_slice(),
+            [
+                (metrics::instruments::XDS_CLIENT_CONNECTED.name, 1),
+                (metrics::instruments::XDS_CLIENT_SERVER_FAILURE.name, 1),
+                (metrics::instruments::XDS_CLIENT_CONNECTED.name, 0),
+                (metrics::instruments::XDS_CLIENT_CONNECTED.name, 1),
+            ]
+        );
+    }
+
+    /// The compatibility refactor still selects only the first configured
+    /// server; ordered fallback belongs to the following PR.
+    #[tokio::test]
+    async fn only_the_first_configured_server_is_active() {
+        let (inner, mut servers) = mock_transport();
+        let built_uris = Arc::new(Mutex::new(Vec::new()));
+        let builder = RecordingBuilder {
+            inner,
+            built_uris: Arc::clone(&built_uris),
+        };
+        let config = ClientConfig::with_servers(
+            Node::new("test", "0"),
+            vec![
+                ServerConfig::new("mock:///primary"),
+                ServerConfig::new("mock:///backup"),
+            ],
+        );
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let _watcher = client.watch::<TestResource>("res-0").await;
+        let _server = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(built_uris.lock().unwrap().as_slice(), ["mock:///primary"]);
+    }
+
+    /// A coalesced subscription remains dirty until the bounded server-task
+    /// command channel actually has room for its latest snapshot.
+    #[tokio::test]
+    async fn dirty_subscription_survives_a_full_command_channel() {
+        let (builder, _servers) = mock_transport();
+        let (worker_command_tx, worker_command_rx) = mpsc::channel(1);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let mut worker = super::AdsWorker::new(
+            builder,
+            FakeCodec,
+            TokioRuntime,
+            config,
+            worker_command_tx,
+            worker_command_rx,
+            None,
+        );
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        assert!(worker.add_watcher(
+            TEST_TYPE_URL,
+            "res-0".to_string(),
+            super::WatcherId::new(),
+            event_tx,
+            Box::new(|_| unreachable!()),
+            false,
+        ));
+
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let server = super::ServerHandle { command_tx };
+        server
+            .command_tx
+            .try_send(super::ServerCommand::Resume { generation: 0 })
+            .unwrap();
+
+        worker.send_request(&server, TEST_TYPE_URL).unwrap();
+        assert!(worker.dirty_types.contains(TEST_TYPE_URL));
+        worker.flush_dirty(&server);
+        assert!(worker.dirty_types.contains(TEST_TYPE_URL));
+
+        let _ = command_rx.recv().await;
+        worker.flush_dirty(&server);
+        assert!(!worker.dirty_types.contains(TEST_TYPE_URL));
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(super::ServerCommand::Send { .. })
+        ));
+    }
+
+    /// A failed stream write is surfaced as stream closure and follows the
+    /// same reconnect path as a receive-side failure.
+    #[tokio::test]
+    async fn write_failure_reconnects_and_resubscribes() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_retry_policy(fast_retry_policy());
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let _first_watcher = client.watch::<TestResource>("res-0").await;
+        let mut first = servers.recv().await.unwrap();
+        let _ = first.requests.recv().await.unwrap();
+        drop(first.requests);
+
+        let _second_watcher = client.watch::<TestResource>("res-1").await;
+        let mut second = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("write failure did not trigger reconnect")
+            .expect("transport dropped");
+        let request = String::from_utf8(second.requests.recv().await.unwrap().to_vec()).unwrap();
+        assert!(request.ends_with("res-0,res-1") || request.ends_with("res-1,res-0"));
     }
 }

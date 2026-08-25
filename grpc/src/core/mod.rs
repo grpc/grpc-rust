@@ -46,6 +46,7 @@ use bytes::Buf;
 
 use crate::attributes::Attributes;
 use crate::byte_str::ByteStr;
+use crate::credentials::SecurityInfo;
 
 /// Represents a message sent by either a client or a server.
 #[allow(unused)]
@@ -148,5 +149,61 @@ impl Display for Address {
     #[allow(clippy::to_string_in_format_args)]
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}:{}", self.network_type, self.address.to_string())
+    }
+}
+
+/// Information about the connection to the RPC's peer (from the client/server
+/// pair).
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
+    local_address: Address,
+    remote_address: Address,
+    security_info: SecurityInfo,
+}
+
+impl ConnectionInfo {
+    /// Constructs a new instance with the given fields.
+    pub fn new(
+        local_address: Address,
+        remote_address: Address,
+        security_info: SecurityInfo,
+    ) -> Self {
+        Self {
+            local_address,
+            remote_address,
+            security_info,
+        }
+    }
+
+    /// Returns the connection's local address.
+    pub fn local_address(&self) -> &Address {
+        &self.local_address
+    }
+
+    /// Returns the peer's address.
+    pub fn remote_address(&self) -> &Address {
+        &self.remote_address
+    }
+
+    /// Returns the connection's security information (e.g. TLS parameters).
+    pub fn security_info(&self) -> &SecurityInfo {
+        &self.security_info
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_connection_info() -> ConnectionInfo {
+    ConnectionInfo {
+        local_address: Address {
+            network_type: "",
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        },
+        remote_address: Address {
+            network_type: "",
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        },
+        security_info: SecurityInfo::new(""),
     }
 }

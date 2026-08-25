@@ -40,6 +40,8 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::attributes::Attributes;
+use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::DynRecvStream as ClientDynRecvStream;
 use crate::client::DynSendStream as ClientDynSendStream;
@@ -64,6 +66,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::core::Address;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::credentials::SecurityInfo;
@@ -291,6 +294,7 @@ impl ServerRecvStream for InMemoryServerRecvStream {
 pub struct InMemoryConnection {
     s: mpsc::Sender<InMemoryServerCall>,
     closed_tx: Option<oneshot::Sender<Result<(), String>>>,
+    connection_info: ConnectionInfo,
 }
 
 impl Invoke for InMemoryConnection {
@@ -307,8 +311,7 @@ impl Invoke for InMemoryConnection {
         let (trailer_tx, trailer_rx) = oneshot::channel();
 
         let (method_name, metadata) = headers.into_parts();
-        let server_headers = ServerRequestHeaders::new()
-            .with_method_name(method_name)
+        let server_headers = ServerRequestHeaders::new(method_name, self.connection_info.clone())
             .with_metadata(metadata);
 
         let call = InMemoryServerCall {
@@ -325,6 +328,7 @@ impl Invoke for InMemoryConnection {
             Box::new(InMemoryClientRecvStream {
                 rx: resp_rx,
                 trailer_rx: Some(trailer_rx),
+                connection_info: Some(self.connection_info.clone()),
             }),
         )
     }
@@ -368,14 +372,25 @@ impl Drop for InMemoryClientSendStream {
 pub struct InMemoryClientRecvStream {
     rx: mpsc::UnboundedReceiver<InMemoryResponseStreamItem>,
     trailer_rx: Option<oneshot::Receiver<ServerTrailers>>,
+    connection_info: Option<ConnectionInfo>,
 }
 
 impl ClientRecvStream for InMemoryClientRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         match self.rx.recv().await {
-            Some(InMemoryResponseStreamItem::Headers(h)) => ResponseStreamItem::Headers(
-                ClientResponseHeaders::new().with_metadata(h.into_metadata()),
-            ),
+            Some(InMemoryResponseStreamItem::Headers(h)) => {
+                // Note: connection_info is always set when the stream is created, and
+                // the server should not send headers twice, so expect here
+                // should be safe.
+                ResponseStreamItem::Headers(
+                    ClientResponseHeaders::new(
+                        self.connection_info
+                            .take()
+                            .expect("stream should have connection_info"),
+                    )
+                    .with_metadata(h.into_metadata()),
+                )
+            }
             Some(InMemoryResponseStreamItem::Message(mut buf)) => {
                 msg.decode(&mut buf).unwrap();
                 ResponseStreamItem::Message
@@ -385,9 +400,10 @@ impl ClientRecvStream for InMemoryClientRecvStream {
                     match trailer_rx.await {
                         Ok(trailers) => {
                             let (status, metadata) = trailers.into_parts();
-                            return ResponseStreamItem::Trailers(
-                                ClientTrailers::new(status).with_metadata(metadata),
-                            );
+                            let client_trailers = ClientTrailers::new(status)
+                                .with_metadata(metadata)
+                                .with_connection_info(self.connection_info.take());
+                            return ResponseStreamItem::Trailers(client_trailers);
                         }
                         Err(_) => {
                             return ResponseStreamItem::Trailers(ClientTrailers::new(Err(
@@ -419,7 +435,7 @@ impl Transport for InMemoryTransport {
     ) -> Result<
         (
             Self::Service,
-            SecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -428,17 +444,25 @@ impl Transport for InMemoryTransport {
         let listeners = LISTENERS.lock().unwrap();
         let s = listeners
             .get(target)
-            .ok_or_else(|| format!("no listener for target: {}", target))?;
+            .ok_or_else(|| format!("no listener for target: {}", target))?
+            .clone();
 
         let (closed_tx, closed_rx) = oneshot::channel();
+        let sec_info =
+            SecurityInfo::new("inmemory").with_security_level(SecurityLevel::PrivacyAndIntegrity);
+        let local_address = Address {
+            network_type: address.network_type,
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        };
+        let connection_info = ConnectionInfo::new(local_address, address.clone(), sec_info);
         let conn = InMemoryConnection {
             s: s.clone(),
             closed_tx: Some(closed_tx),
+            connection_info: connection_info.clone(),
         };
-        let sec_info =
-            SecurityInfo::new("inmemory").with_security_level(SecurityLevel::PrivacyAndIntegrity);
 
-        Ok((conn, sec_info, closed_rx))
+        Ok((conn, connection_info, closed_rx))
     }
 }
 
@@ -505,6 +529,7 @@ mod tests {
 
     use super::*;
     use crate::core::RecvMessage;
+    use crate::core::test_connection_info;
 
     struct NopRecvMessage;
     impl RecvMessage for NopRecvMessage {
@@ -526,6 +551,7 @@ mod tests {
         let mut stream = InMemoryClientRecvStream {
             rx,
             trailer_rx: Some(trailer_rx),
+            connection_info: Some(test_connection_info()),
         };
 
         let mut msg = NopRecvMessage;
@@ -607,7 +633,7 @@ mod tests {
         let (trailer_tx, _trailer_rx) = oneshot::channel();
 
         let transport = InMemoryServerCall {
-            headers: RequestHeaders::new(),
+            headers: RequestHeaders::new("", test_connection_info()),
             req_rx,
             resp_tx,
             trailer_tx,

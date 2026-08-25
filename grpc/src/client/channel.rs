@@ -364,10 +364,10 @@ impl Invoke for Arc<ActiveChannel> {
         let mut i = self.lb_watcher.iter();
         loop {
             let Some(state) = i.next().await else {
-                return FailingRecvStream::new_stream_pair(StatusError::new(
-                    StatusCodeError::Internal,
-                    "channel has been closed",
-                ));
+                return FailingRecvStream::new_stream_pair(
+                    StatusError::new(StatusCodeError::Internal, "channel has been closed"),
+                    None,
+                );
             };
             let result = &state.picker.pick(&headers);
             match result {
@@ -384,7 +384,7 @@ impl Invoke for Arc<ActiveChannel> {
                     // Continue and retry the RPC with the next picker.
                 }
                 PickResult::Fail(status) => {
-                    return FailingRecvStream::new_stream_pair(status.clone());
+                    return FailingRecvStream::new_stream_pair(status.clone(), None);
                 }
                 PickResult::Drop(status) => {
                     todo!("dropped pick: {:?}", status);

@@ -114,6 +114,7 @@ allowed_external_types = [
     # not major released
     "prost::*",
     "opentelemetry::*",
+    "rustls::verify::ServerCertVerifier",
     "shared_http_body::shared_body::SharedBody",
 
     "tower_service::Service",

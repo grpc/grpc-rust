@@ -22,12 +22,11 @@
  *
  */
 
-//! Types and call builders for client-side RPCs.
+//! Client-side types and call builders for RPCs (Remote Procedure Calls).
 //!
 //! # Basic usage
 //!
-//! There are four basic RPC (Remote Procedure Call) types and a corresponding
-//! call builder for each.
+//! There are four basic RPCs types and a corresponding call builder for each.
 //!
 //! * Unary: [`UnaryCallBuilder`]
 //! * Client Streaming: [`ClientStreamingCallBuilder`]

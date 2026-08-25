@@ -30,7 +30,7 @@
 //!
 //! # Modules
 //!
-//! * [`client`] - Types and call builders for client-side RPCs
+//! * [`client`] - Client-side types and call builders for RPCs.
 
 use std::any::TypeId;
 

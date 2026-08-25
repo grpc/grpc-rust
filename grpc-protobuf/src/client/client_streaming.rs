@@ -37,11 +37,11 @@ use protobuf::AsMut;
 use protobuf::AsView;
 use protobuf::Message;
 
-use crate::CallBuilder;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
 use crate::Status;
 use crate::StatusOr;
+use crate::client::CallBuilder;
 use crate::client::Internal;
 use crate::trailers_conv::status_from_trailers;
 

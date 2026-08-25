@@ -49,6 +49,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::async_trait;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -486,18 +487,24 @@ impl ResponseHeaders {
 }
 
 /// Contains all information transmitted in the request headers of an RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestHeaders {
     /// The full (e.g. "/Service/Method") method name specified for the call.
     method_name: String,
     /// The application-specified metadata for the call.
     metadata: MetadataMap,
+    /// Information about the client.
+    connection_info: ConnectionInfo,
 }
 
 impl RequestHeaders {
     /// Returns a default RequestHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(method_name: impl Into<String>, connection_info: ConnectionInfo) -> Self {
+        Self {
+            method_name: method_name.into(),
+            connection_info,
+            metadata: MetadataMap::default(),
+        }
     }
 
     /// Replaces the method name of self with `method_name`.
@@ -525,6 +532,17 @@ impl RequestHeaders {
     /// Returns a mutable reference to the metadata in these headers.
     pub fn metadata_mut(&mut self) -> &mut MetadataMap {
         &mut self.metadata
+    }
+
+    /// Replaces the connection_info of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 
     /// Returns the owned fields in the RequestHeaders.
@@ -599,6 +617,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::core::test_connection_info;
 
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
@@ -927,7 +946,12 @@ mod tests {
                 let mut tx = NopSendStream;
                 let rx = Box::new(NopRecvStream);
                 let _ = handler
-                    .dyn_handle(RequestHeaders::new(), CallOptions::new(), &mut tx, rx)
+                    .dyn_handle(
+                        RequestHeaders::new("", test_connection_info()),
+                        CallOptions::new(),
+                        &mut tx,
+                        rx,
+                    )
                     .await;
             });
             MockServingConnection { inner }

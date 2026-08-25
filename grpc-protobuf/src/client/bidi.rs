@@ -30,9 +30,9 @@ use grpc::client::InvokeOnce;
 use grpc::client::RequestHeaders;
 use protobuf::Message;
 
-use crate::CallBuilder;
-use crate::GrpcStreamingRequest;
-use crate::GrpcStreamingResponse;
+use crate::client::CallBuilder;
+use crate::client::GrpcStreamingRequest;
+use crate::client::GrpcStreamingResponse;
 use crate::private::Internal;
 
 /// Configures a bidirectional call for gRPC Protobuf.  Implements

@@ -137,6 +137,7 @@ pub enum SecurityLevel {
 }
 
 /// Represents the security state of an established connection.
+#[derive(Debug, Clone)]
 pub struct SecurityInfo {
     security_protocol: &'static str,
     security_level: SecurityLevel,

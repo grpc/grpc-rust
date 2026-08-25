@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use crate::client::name_resolution::ChannelController;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::WorkScheduler;
+use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
 
 /// A work scheduler for testing.
@@ -80,7 +81,7 @@ impl ChannelController for TestChannelController {
         self.update_result.clone()
     }
 
-    fn parse_service_config(&self, _: &str) -> Result<ServiceConfig, String> {
-        Err("Unimplemented".to_string())
+    fn parse_service_config(&self, config: &str) -> ParseResult {
+        ServiceConfig::parse(config)
     }
 }

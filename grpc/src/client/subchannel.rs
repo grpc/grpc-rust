@@ -57,7 +57,7 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::Address;
-use crate::credentials::SecurityInfo;
+use crate::core::ConnectionInfo;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
@@ -86,7 +86,7 @@ impl Backoff for NopBackoff {
 
 struct ReadyState {
     service: Box<dyn DynInvoke>,
-    security_info: SecurityInfo,
+    connection_info: ConnectionInfo,
     authority: Authority,
 }
 
@@ -195,11 +195,13 @@ impl DynInvoke for InternalSubchannel {
         };
 
         let fail_with = |status| -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-            FailingRecvStream::new_stream_pair(status)
+            FailingRecvStream::new_stream_pair(status, Some(state.connection_info.clone()))
         };
 
         if let Some(call_creds) = call_creds {
-            if call_creds.minimum_channel_security_level() > state.security_info.security_level() {
+            if call_creds.minimum_channel_security_level()
+                > state.connection_info.security_info().security_level()
+            {
                 return fail_with(StatusError::new(
                     StatusCodeError::Unauthenticated,
                     "transport: cannot send secure credentials on an insecure connection",
@@ -209,9 +211,9 @@ impl DynInvoke for InternalSubchannel {
             let call_details = create_call_details(&state.authority, headers.method_name());
 
             let channel_sec_info = CallClientConnectionSecurityInfo::new(
-                state.security_info.security_protocol(),
-                state.security_info.security_level(),
-                state.security_info.attributes().clone(),
+                state.connection_info.security_info().security_protocol(),
+                state.connection_info.security_info().security_level(),
+                state.connection_info.security_info().attributes().clone(),
             );
 
             if let Err(s) = call_creds
@@ -376,10 +378,10 @@ fn begin_connecting_if_idle(data: Arc<Mutex<InternalSubchannelData>>) {
             }
             result = transport_builder.dyn_connect(&address, runtime, &security_opts, &transport_opts) => {
                     match result {
-                        Ok((service, security_info, disconnection_listener)) => {
+                        Ok((service, connection_info, disconnection_listener)) => {
                             move_to_ready(data, Arc::new(ReadyState{
                                 service,
-                                security_info,
+                                connection_info,
                                 authority: security_opts.authority}), disconnection_listener).await;
                         }
                         Err(e) => {

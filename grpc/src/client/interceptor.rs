@@ -563,7 +563,9 @@ mod test {
             .unwrap();
         assert_eq!(controller.recv_req().await.0, one);
         controller
-            .send_resp(ResponseStreamItem::Headers(ResponseHeaders::default()))
+            .send_resp(ResponseStreamItem::Headers(ResponseHeaders::new(
+                crate::core::test_connection_info(),
+            )))
             .await;
 
         let resp = rx.recv(&mut ByteRecvMsg::new()).await;

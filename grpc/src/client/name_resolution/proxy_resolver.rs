@@ -36,7 +36,7 @@ use crate::client::name_resolution::ResolverOptions;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
-use crate::client::service_config::ServiceConfig;
+use crate::client::service_config::ParseResult;
 use crate::client::transport::ProxyOptions;
 use crate::credentials::common::Authority;
 
@@ -228,7 +228,7 @@ impl<'a> ChannelController for InterceptingController<'a> {
         self.inner.update(update)
     }
 
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
+    fn parse_service_config(&self, config: &str) -> ParseResult {
         self.inner.parse_service_config(config)
     }
 }

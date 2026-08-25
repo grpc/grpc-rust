@@ -23,6 +23,7 @@
  */
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::result::Result;
@@ -271,8 +272,31 @@ async fn grpc_invoke_tonic_unary() {
     let target = format!("dns:///{}", addr);
     let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
 
-    let (_, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
+    let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
     assert_eq!(resp.message, "hello interop");
+
+    let connection_info = headers.connection_info();
+    assert_eq!(
+        connection_info.local_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    let local_addr: SocketAddr = connection_info.local_address().address.parse().unwrap();
+    assert_eq!(local_addr.ip(), addr.ip());
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
+        addr.to_string()
+    );
+    assert_eq!(connection_info.security_info().security_protocol(), "local");
+
+    assert!(
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present; had {:?}",
+        trailers.connection_info().as_ref().unwrap()
+    );
 
     assert!(
         trailers.status().is_ok(),
@@ -294,9 +318,11 @@ mod unix_tests {
     use tokio_stream::wrappers::UnixListenerStream;
 
     use super::*;
+    use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 
     async fn run_unix_test(bind_path: &PathBuf, target: &str) {
         let listener = UnixListener::bind(bind_path).unwrap();
+        let expected_remote_addr = format!("{:?}", listener.local_addr().unwrap());
         let channel = Channel::builder(target, LocalChannelCredentials::new_arc()).build();
 
         let shutdown_notify = Arc::new(Notify::new());
@@ -318,9 +344,30 @@ mod unix_tests {
         });
 
         let payload = "hello unix";
-        let (_, resp, trailers) = perform_unary_echo(&channel, payload).await;
+        let (headers, resp, trailers) = perform_unary_echo(&channel, payload).await;
         assert_eq!(resp.message, payload);
         assert!(trailers.status().is_ok());
+
+        let connection_info = headers.connection_info();
+        assert_eq!(
+            connection_info.local_address().network_type,
+            UNIX_NETWORK_TYPE
+        );
+        assert!(!connection_info.local_address().address.is_empty());
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            UNIX_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            expected_remote_addr
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
+        assert!(
+            trailers.connection_info().is_none(),
+            "trailers should not contain connection_info when headers were present; had {:?}",
+            trailers.connection_info().as_ref().unwrap()
+        );
 
         shutdown_notify.notify_one();
         server_handle.await.unwrap();
@@ -472,7 +519,7 @@ async fn grpc_invoke_tonic_unary_tls() {
     let target = format!("dns:///{}", addr);
     let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
 
-    let (headers, resp, trilers) = perform_unary_echo(&channel, "hello interop tls").await;
+    let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop tls").await;
 
     assert_eq!(
         headers.metadata().get("x-test-metadata-echo").unwrap(),
@@ -480,10 +527,33 @@ async fn grpc_invoke_tonic_unary_tls() {
     );
     assert_eq!(resp.message, "hello interop tls");
 
+    let connection_info = headers.connection_info();
+    assert_eq!(
+        connection_info.local_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    let local_addr: SocketAddr = connection_info.local_address().address.parse().unwrap();
+    assert_eq!(local_addr.ip(), addr.ip());
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
+        addr.to_string()
+    );
+    assert_eq!(connection_info.security_info().security_protocol(), "tls");
+
     assert!(
-        trilers.status().is_ok(),
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present; had {:?}",
+        trailers.connection_info().as_ref().unwrap()
+    );
+
+    assert!(
+        trailers.status().is_ok(),
         "RPC failed: {:?}",
-        trilers.status()
+        trailers.status()
     );
 
     shutdown_notify.notify_one();
@@ -531,6 +601,19 @@ async fn grpc_invoke_failure_cases() {
             trailers.status().as_ref().unwrap_err().code(),
             StatusCodeError::Unauthenticated
         );
+        let connection_info = trailers
+            .connection_info()
+            .as_ref()
+            .expect("connection_info should be present in trailers");
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            addr.to_string()
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     // Call credentials return error
@@ -560,6 +643,19 @@ async fn grpc_invoke_failure_cases() {
                 .message()
                 .contains("test message")
         );
+        let connection_info = trailers
+            .connection_info()
+            .as_ref()
+            .expect("connection_info should be present in trailers");
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            addr.to_string()
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     // Call credentials return restricted control plane code (mapped to Internal)
@@ -589,6 +685,19 @@ async fn grpc_invoke_failure_cases() {
                 .message()
                 .contains("test message")
         );
+        let connection_info = trailers
+            .connection_info()
+            .as_ref()
+            .expect("connection_info should be present in trailers");
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            addr.to_string()
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     shutdown_notify.notify_one();
@@ -961,6 +1070,19 @@ async fn trailers_only_metadata() {
     let metadata_map = trailers.metadata();
     let value = metadata_map.get("x-custom-trailer").unwrap();
     assert_eq!(value, "custom-value");
+
+    let connection_info = trailers
+        .connection_info()
+        .as_ref()
+        .expect("trailers should contain connection_info in trailers-only response");
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
+        addr.to_string()
+    );
 
     shutdown_notify.notify_one();
     server_handle.await.unwrap();

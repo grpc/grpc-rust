@@ -23,6 +23,10 @@
  */
 
 use crate::common::async_util::BoxFuture;
+#[cfg(feature = "_tls-any")]
+use crate::xds::cert_provider::verifier::XdsServerCertVerifier;
+#[cfg(feature = "_tls-any")]
+use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
 use crate::xds::resource::cluster::ClusterResource;
 use crate::xds::resource::security::ClusterSecurityConfig;
 use std::net::SocketAddr;
@@ -207,19 +211,37 @@ pub trait Connector {
 /// [`MakeConnector::make_connector`] so a factory can build a connector
 /// tailored to the cluster.
 ///
-/// The view is intentionally opaque: it currently exposes only the cluster
-/// name. Read access to the parsed TLS/security settings a custom connector
-/// needs for gRFC A29 parity is exposed separately (and is not required to
-/// build a plaintext connector).
+/// Besides the cluster name, the view exposes the cluster's parsed TLS
+/// settings via its `tls()` accessor (under a TLS feature). The view is
+/// otherwise opaque: internal matcher and registry types are never surfaced.
 pub struct ClusterConfig<'a> {
     name: &'a str,
-    /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal
-    /// for now; consumed by the built-in gRPC connector factory.
+    /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal;
+    /// read publicly through `ClusterConfig::tls`.
     pub(crate) security: Option<&'a ClusterSecurityConfig>,
+    /// Cert-provider registry. Ambient here so [`ClusterTlsConfig`] can resolve
+    /// provider instance names without the caller handling the registry.
+    #[cfg(feature = "_tls-any")]
+    registry: &'a CertProviderRegistry,
 }
 
 impl<'a> ClusterConfig<'a> {
-    /// Builds a view over a validated [`ClusterResource`].
+    /// Builds a view over a validated [`ClusterResource`], carrying the
+    /// cert-provider registry used to resolve the cluster's TLS providers.
+    #[cfg(feature = "_tls-any")]
+    pub(crate) fn from_resource(
+        cluster: &'a ClusterResource,
+        registry: &'a CertProviderRegistry,
+    ) -> Self {
+        Self {
+            name: &cluster.name,
+            security: cluster.security.as_ref(),
+            registry,
+        }
+    }
+
+    /// Builds a view over a validated [`ClusterResource`] (no TLS feature).
+    #[cfg(not(feature = "_tls-any"))]
     pub(crate) fn from_resource(cluster: &'a ClusterResource) -> Self {
         Self {
             name: &cluster.name,
@@ -231,13 +253,135 @@ impl<'a> ClusterConfig<'a> {
     pub fn name(&self) -> &str {
         self.name
     }
+
+    /// The cluster's parsed TLS/security configuration, or `None` when the
+    /// cluster uses plaintext.
+    ///
+    /// A custom [`MakeConnector`] uses the returned [`ClusterTlsConfig`] to
+    /// build a gRFC-A29-conformant TLS connector —
+    /// [`build_verifier`](ClusterTlsConfig::build_verifier) yields the server
+    /// certificate verifier and
+    /// [`identity_provider`](ClusterTlsConfig::identity_provider) the optional
+    /// mTLS identity source — without depending on the crate-internal
+    /// cert-provider registry or SAN-matcher types.
+    #[cfg(feature = "_tls-any")]
+    pub fn tls(&self) -> Option<ClusterTlsConfig<'a>> {
+        self.security.map(|security| ClusterTlsConfig {
+            security,
+            registry: self.registry,
+        })
+    }
+}
+
+/// A read-only view of a cluster's parsed TLS/security configuration.
+///
+/// Obtained from [`ClusterConfig::tls`]. Lets a custom [`MakeConnector`] build
+/// a gRFC-A29-conformant TLS connector without re-implementing SAN matching or
+/// certificate-chain validation, and without depending on the crate-internal
+/// cert-provider registry or matcher types. The cert-provider registry is
+/// resolved internally, so callers never handle it directly.
+#[cfg(feature = "_tls-any")]
+pub struct ClusterTlsConfig<'a> {
+    security: &'a ClusterSecurityConfig,
+    registry: &'a CertProviderRegistry,
+}
+
+#[cfg(feature = "_tls-any")]
+impl std::fmt::Debug for ClusterTlsConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterTlsConfig")
+            .field("ca_instance_name", &self.ca_instance_name())
+            .field("identity_instance_name", &self.identity_instance_name())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "_tls-any")]
+impl ClusterTlsConfig<'_> {
+    /// Bootstrap instance name of the CA trust bundle used to validate the
+    /// peer's certificate chain.
+    pub fn ca_instance_name(&self) -> &str {
+        &self.security.ca_instance_name
+    }
+
+    /// Bootstrap instance name of the local identity (client certificate).
+    /// `Some` implies mTLS is requested for this cluster.
+    pub fn identity_instance_name(&self) -> Option<&str> {
+        self.security.identity_instance_name.as_deref()
+    }
+
+    /// Build the gRFC-A29 server-certificate verifier for this cluster.
+    ///
+    /// Returns a rustls [`ServerCertVerifier`] that validates the peer chain
+    /// against the CA bundle — re-read from the provider each handshake, so CA
+    /// rotation is picked up — and enforces the cluster's SAN matchers.
+    ///
+    /// Build once per CDS update in [`MakeConnector::make_connector`] and clone
+    /// the returned `Arc` per connection; not for the per-request hot path.
+    ///
+    /// [`ServerCertVerifier`]: crate::ServerCertVerifier
+    pub fn build_verifier(
+        &self,
+    ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, ClusterTlsError> {
+        let ca_provider = self
+            .registry
+            .get(&self.security.ca_instance_name)
+            .ok_or_else(|| {
+                ClusterTlsError::UnknownCaInstance(self.security.ca_instance_name.clone())
+            })?
+            .clone();
+        Ok(Arc::new(XdsServerCertVerifier::new(
+            ca_provider,
+            self.security.san_matchers.clone(),
+        )))
+    }
+
+    /// Resolve the optional mTLS identity provider for this cluster.
+    ///
+    /// Returns `Ok(None)` when the cluster requests server authentication only
+    /// (no client certificate). When `Some`, fetch the identity per connection
+    /// (`provider.fetch()`) so identity rotation reaches each new connection.
+    pub fn identity_provider(
+        &self,
+    ) -> Result<Option<Arc<dyn CertificateProvider>>, ClusterTlsError> {
+        self.security
+            .identity_instance_name
+            .as_ref()
+            .map(|name| {
+                self.registry
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| ClusterTlsError::UnknownIdentityInstance(name.clone()))
+            })
+            .transpose()
+    }
+}
+
+/// Errors resolving a cluster's TLS configuration against the cert-provider
+/// registry (see [`ClusterTlsConfig`]).
+#[cfg(feature = "_tls-any")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClusterTlsError {
+    /// The cluster's CA provider instance is not configured in
+    /// `bootstrap.certificate_providers`.
+    #[error("CA provider instance '{0}' is not configured in bootstrap.certificate_providers")]
+    UnknownCaInstance(String),
+    /// The cluster's identity provider instance is not configured in
+    /// `bootstrap.certificate_providers`.
+    #[error(
+        "identity provider instance '{0}' is not configured in bootstrap.certificate_providers"
+    )]
+    UnknownIdentityInstance(String),
 }
 
 impl std::fmt::Debug for ClusterConfig<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClusterConfig")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
+        let mut dbg = f.debug_struct("ClusterConfig");
+        dbg.field("name", &self.name);
+        #[cfg(feature = "_tls-any")]
+        dbg.field("tls", &self.tls());
+        dbg.finish_non_exhaustive()
     }
 }
 

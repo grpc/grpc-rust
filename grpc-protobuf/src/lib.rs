@@ -31,6 +31,7 @@
 //! # Modules
 //!
 //! * [`client`] - Client-side types and call builders for RPCs.
+//! * [`server`] - Server-side types, handler traits, and adapters for RPCs.
 
 use std::any::TypeId;
 

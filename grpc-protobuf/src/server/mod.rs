@@ -22,6 +22,32 @@
  *
  */
 
+//! Server-side types, handler traits, and adapters for RPCs (Remote Procedure
+//! Calls).
+//!
+//! # Basic usage
+//!
+//! There are four basic RPC types, each with a corresponding method trait and
+//! server adapter:
+//!
+//! * Unary: [`UnaryMethod`] and [`UnaryAdapter`]
+//! * Client Streaming: [`ClientStreamingMethod`] and [`ClientStreamingAdapter`]
+//! * Server Streaming: [`ServerStreamingMethod`] and [`ServerStreamingAdapter`]
+//! * Bidirectional Streaming: [`BidiStreamingMethod`] and [`BidiStreamingAdapter`]
+//!
+//! The generated service code implements the appropriate method trait. The
+//! corresponding adapter wraps the method implementation and implements
+//! [`grpc::server::DynHandle`] to handle incoming RPC requests.
+//!
+//! # Streaming
+//!
+//! Streaming RPC handlers use the following types to exchange messages:
+//!
+//! * [`GrpcStreamingRequest`] - Allows receiving a stream of request messages
+//!   from the client.
+//! * [`GrpcStreamingResponse`] - Allows sending a stream of response messages
+//!   to the client.
+
 use std::marker::PhantomData;
 
 use grpc::server::DynRecvStream;

@@ -772,7 +772,7 @@ where
     async fn run_connected<S: TransportStream>(
         &mut self,
         mut stream: S,
-        &mut healthy: bool,
+        healthy: &mut bool,
     ) -> ConnectedOutcome {
         // Whether at least one response was received on this stream. Per gRFC
         // A78 a stream that fails *after* receiving a response is not counted as
@@ -792,9 +792,9 @@ where
                     match result {
                         Ok(Some(bytes)) => {
                             if !saw_response {
-                                if !healthy {
-                                    worker.recorder.record_connected(true);
-                                    healthy = true;
+                                if !*healthy {
+                                    self.recorder.record_connected(true);
+                                    *healthy = true;
                                 }
                                 saw_response = true;
                             }

@@ -111,8 +111,9 @@ impl ClusterResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::cluster::v3::cluster::EdsClusterConfig;
+
+    use super::*;
 
     fn make_cluster(name: &str) -> Cluster {
         Cluster {
@@ -184,11 +185,6 @@ mod tests {
         let cluster = make_cluster("");
         let err = ClusterResource::validate(cluster).unwrap_err();
         assert!(err.to_string().contains("cluster name is empty"));
-    }
-
-    #[test]
-    fn test_all_resources_required() {
-        assert!(ClusterResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
     }
 
     #[test]

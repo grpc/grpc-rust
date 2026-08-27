@@ -37,8 +37,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsStream as RustlsStream;
 use webpki::EndEntityCert;
 
-use crate::attributes::Attributes;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::ServerCredentials;
 use crate::credentials::rustls::ALPN_PROTO_STR_H2;
@@ -53,10 +53,9 @@ use crate::credentials::rustls::parse_key;
 use crate::credentials::rustls::sanitize_crypto_provider;
 use crate::credentials::rustls::tls_stream::TlsStream;
 use crate::credentials::server::HandshakeOutput;
-use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
+use crate::rt::BoxEndpoint;
 use crate::rt::EndpointIoStream;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
 #[cfg(test)]
@@ -341,15 +340,14 @@ impl ProducesTickets for NoTicketer {
     }
 }
 
+#[tonic::async_trait]
 impl ServerCredentials for RustlsServerCredentials {
-    type Output<Input> = TlsStream<Input>;
-
-    async fn accept<Input: GrpcEndpoint>(
+    async fn accept(
         &self,
-        source: Input,
+        source: BoxEndpoint,
         _runtime: GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
+    ) -> Result<HandshakeOutput, String> {
         let input_io = EndpointIoStream::new(source);
         let tls_stream = self
             .acceptor
@@ -362,14 +360,11 @@ impl ServerCredentials for RustlsServerCredentials {
             return Err("Client ignored ALPN requirements".into());
         }
 
-        let auth_info = ServerConnectionSecurityInfo::new(
-            "tls",
-            SecurityLevel::PrivacyAndIntegrity,
-            Attributes::new(),
-        );
+        let auth_info =
+            SecurityInfo::new("tls").with_security_level(SecurityLevel::PrivacyAndIntegrity);
         let endpoint = TlsStream::new(RustlsStream::Server(tls_stream));
         Ok(HandshakeOutput {
-            endpoint,
+            endpoint: Box::new(endpoint),
             security: auth_info,
         })
     }

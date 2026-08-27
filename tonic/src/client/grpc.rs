@@ -305,7 +305,7 @@ impl<T> Grpc<T> {
     /// Send a bi-directional streaming gRPC request.
     pub async fn streaming<S, M1, M2, C>(
         &mut self,
-        request: Request<S>,
+        mut request: Request<S>,
         path: PathAndQuery,
         mut codec: C,
     ) -> Result<Response<Streaming<M2>>, Status>
@@ -318,13 +318,16 @@ impl<T> Grpc<T> {
         M1: Send + Sync + 'static,
         M2: Send + Sync + 'static,
     {
+        let cancellation_token = request.remove_cancellation_handle().map(|c| c.into_token());
+
         let request = request
             .map(|s| {
-                EncodeBody::new_client(
+                EncodeBody::new_client_with_cancellation(
                     codec.encoder(),
                     s.map(Ok),
                     self.config.send_compression_encodings,
                     self.config.max_encoding_message_size,
+                    cancellation_token,
                 )
             })
             .map(Body::new);

@@ -32,6 +32,7 @@ use std::sync::atomic::Ordering;
 use rand::seq::SliceRandom;
 
 use crate::client::ConnectivityState;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::LbPolicy;
@@ -47,10 +48,9 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::core::RequestHeaders;
+use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
@@ -738,9 +738,9 @@ mod test {
     use std::time::Duration;
 
     use super::*;
-    use crate::client::load_balancing::test_utils::{
-        TestChannelController, TestEvent, TestWorkScheduler,
-    };
+    use crate::client::load_balancing::test_utils::TestChannelController;
+    use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestWorkScheduler;
 
     const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 

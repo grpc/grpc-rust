@@ -43,17 +43,20 @@
 //!   trait.
 //! - **[`SendStream`] / [`RecvStream`]:** Represent the sending and receiving
 //!   sides of an RPC call, returned by [`Invoke::invoke`].
+//! - **[`RequestHeaders`]:** Represents gRPC headers sent to the server to
+//!   initiate a request.
+//! - **[`ResponseHeaders`] / [`Trailers`]:** Represent gRPC headers and
+//!   trailers received from the server during its response.
 
 use std::fmt::Display;
 use std::time::Instant;
 
 use tonic::async_trait;
 
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
+use crate::metadata::MetadataMap;
 
 mod channel;
 pub use channel::Channel;
@@ -361,5 +364,176 @@ impl<T: RecvStream> DynRecvStream for T {
 impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         (**self).dyn_recv(msg).await
+    }
+}
+
+/// Contains all information transmitted in the response headers of an RPC.
+#[derive(Debug, Clone)]
+pub struct ResponseHeaders {
+    metadata: MetadataMap,
+    connection_info: ConnectionInfo,
+}
+
+impl ResponseHeaders {
+    /// Returns a default ResponseHeaders instance.
+    pub fn new(connection_info: ConnectionInfo) -> Self {
+        Self {
+            metadata: MetadataMap::default(),
+            connection_info,
+        }
+    }
+
+    /// Replaces the metadata of self with `metadata`.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Returns a reference to the metadata in these headers.
+    pub fn metadata(&self) -> &MetadataMap {
+        &self.metadata
+    }
+
+    /// Returns a mutable reference to the metadata in these headers.
+    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
+        &mut self.metadata
+    }
+
+    pub(crate) fn into_metadata(self) -> MetadataMap {
+        self.metadata
+    }
+
+    /// Replaces the connection of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
+    }
+}
+
+/// Contains all information transmitted in the request headers of an RPC.
+#[derive(Debug, Clone, Default)]
+pub struct RequestHeaders {
+    /// The full (e.g. "/Service/Method") method name specified for the call.
+    method_name: String,
+    /// The application-specified metadata for the call.
+    metadata: MetadataMap,
+}
+
+impl RequestHeaders {
+    /// Returns a default RequestHeaders instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the method name of self with `method_name`.
+    pub fn with_method_name(mut self, method_name: impl Into<String>) -> Self {
+        self.method_name = method_name.into();
+        self
+    }
+
+    /// Replaces the metadata of self with `metadata`.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Returns the full (e.g. "/Service/Method") method name for these headers.
+    pub fn method_name(&self) -> &str {
+        &self.method_name
+    }
+
+    /// Returns a reference to the metadata in these headers.
+    pub fn metadata(&self) -> &MetadataMap {
+        &self.metadata
+    }
+
+    /// Returns a mutable reference to the metadata in these headers.
+    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
+        &mut self.metadata
+    }
+
+    /// Returns the owned fields in the RequestHeaders.
+    // TODO: make public once fields are fixed.
+    pub(crate) fn into_parts(self) -> (String, MetadataMap) {
+        (self.method_name, self.metadata)
+    }
+}
+
+/// Contains all information transmitted in the response trailers of an RPC.
+/// gRPC does not support request trailers.
+#[derive(Debug, Clone)]
+pub struct Trailers {
+    status: crate::Result<()>,
+    metadata: MetadataMap,
+    connection_info: Option<ConnectionInfo>,
+}
+
+impl Trailers {
+    /// Returns a default [`Trailers`] instance.
+    pub fn new(status: crate::Result<()>) -> Self {
+        Self {
+            status,
+            metadata: MetadataMap::default(),
+            connection_info: None,
+        }
+    }
+
+    /// Replaces the status of self with `status`.
+    pub fn with_status(mut self, status: crate::Result<()>) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Returns a reference to the status contained in these trailers.
+    pub fn status(&self) -> &crate::Result<()> {
+        &self.status
+    }
+
+    /// Replaces the metadata of self with `metadata`.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Returns a mutable reference to the metadata in these trailers.
+    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
+        &mut self.metadata
+    }
+
+    /// Returns a reference to the metadata in these trailers.
+    pub fn metadata(&self) -> &MetadataMap {
+        &self.metadata
+    }
+
+    /// Returns the status in the [`Trailers`], consuming the entire status.
+    pub fn into_status(self) -> crate::Result<()> {
+        self.status
+    }
+
+    /// Replaces the connection info in self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: Option<ConnectionInfo>) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns the connection info in the trailers, if present.  Connection
+    /// information will not be available in trailers in any the following
+    /// circumstances:
+    ///
+    /// 1. A ResponseHeaders was already present on the response stream.
+    ///
+    /// 2. The error was generated locally on the client before a connection was
+    ///    chosen for the RPC.
+    pub fn connection_info(&self) -> &Option<ConnectionInfo> {
+        &self.connection_info
+    }
+
+    pub(crate) fn into_parts(self) -> (crate::Result<()>, MetadataMap) {
+        (self.status, self.metadata)
     }
 }

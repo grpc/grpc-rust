@@ -31,9 +31,9 @@
 //! Used wherever an xDS config carries a `StringMatcher` — HTTP header matching
 //! (gRFC A28) and SAN matching for server authorization (gRFC A29).
 
+use super::safe_regex::SafeRegex;
 use envoy_types::pb::envoy::r#type::matcher::v3::StringMatcher as StringMatcherProto;
 use envoy_types::pb::envoy::r#type::matcher::v3::string_matcher::MatchPattern;
-use regex::Regex;
 use xds_client::Error;
 
 /// Validated `envoy.type.matcher.v3.StringMatcher`.
@@ -43,7 +43,7 @@ pub(crate) enum StringMatcher {
     Prefix { value: String, ignore_case: bool },
     Suffix { value: String, ignore_case: bool },
     Contains { value: String, ignore_case: bool },
-    SafeRegex(Regex),
+    SafeRegex(SafeRegex),
 }
 
 impl StringMatcher {
@@ -59,7 +59,7 @@ impl StringMatcher {
             Some(MatchPattern::Suffix(value)) => Ok(Self::Suffix { value, ignore_case }),
             Some(MatchPattern::Contains(value)) => Ok(Self::Contains { value, ignore_case }),
             Some(MatchPattern::SafeRegex(r)) => {
-                let re = Regex::new(&r.regex)
+                let re = SafeRegex::new(&r.regex)
                     .map_err(|e| Error::Validation(format!("invalid regex '{}': {e}", r.regex)))?;
                 Ok(Self::SafeRegex(re))
             }
@@ -222,6 +222,27 @@ mod tests {
         assert!(m.is_match("foo123"));
         assert!(!m.is_match("foo"));
         assert!(!m.is_match("xfoo123"));
+    }
+
+    #[test]
+    fn safe_regex_requires_a_full_match() {
+        let m = StringMatcher::from_proto(proto(
+            MatchPattern::SafeRegex(RegexMatcher {
+                regex: "spiffe://td/ns/prod/sa/api".into(),
+                ..Default::default()
+            }),
+            false,
+        ))
+        .unwrap();
+        assert!(m.is_match("spiffe://td/ns/prod/sa/api"));
+        assert!(
+            !m.is_match("spiffe://td/ns/prod/sa/api-canary"),
+            "a longer SAN sharing the prefix must not match"
+        );
+        assert!(
+            !m.is_match("spiffe://evil/x?=spiffe://td/ns/prod/sa/api"),
+            "the pattern must not match as a substring of a longer SAN"
+        );
     }
 
     #[test]

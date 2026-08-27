@@ -23,6 +23,7 @@
  */
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::result::Result;
@@ -32,6 +33,7 @@ use std::time::Duration;
 
 use bytes::Buf;
 use bytes::Bytes;
+use h2::Reason;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -59,30 +61,31 @@ use crate::client::CallOptions;
 use crate::client::Channel;
 use crate::client::Invoke as _;
 use crate::client::RecvStream as _;
+use crate::client::RequestHeaders;
+use crate::client::ResponseHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream as _;
+use crate::client::Trailers;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::CompositeChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo;
-use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
+use crate::credentials::client::ValidateAuthority;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
@@ -167,9 +170,14 @@ pub(crate) async fn tonic_transport_rpc() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, mut disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -264,8 +272,31 @@ async fn grpc_invoke_tonic_unary() {
     let target = format!("dns:///{}", addr);
     let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
 
-    let (_, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
+    let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
     assert_eq!(resp.message, "hello interop");
+
+    let connection_info = headers.connection_info();
+    assert_eq!(
+        connection_info.local_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    let local_addr: SocketAddr = connection_info.local_address().address.parse().unwrap();
+    assert_eq!(local_addr.ip(), addr.ip());
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
+        addr.to_string()
+    );
+    assert_eq!(connection_info.security_info().security_protocol(), "local");
+
+    assert!(
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present; had {:?}",
+        trailers.connection_info().as_ref().unwrap()
+    );
 
     assert!(
         trailers.status().is_ok(),
@@ -287,9 +318,11 @@ mod unix_tests {
     use tokio_stream::wrappers::UnixListenerStream;
 
     use super::*;
+    use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 
     async fn run_unix_test(bind_path: &PathBuf, target: &str) {
         let listener = UnixListener::bind(bind_path).unwrap();
+        let expected_remote_addr = format!("{:?}", listener.local_addr().unwrap());
         let channel = Channel::builder(target, LocalChannelCredentials::new_arc()).build();
 
         let shutdown_notify = Arc::new(Notify::new());
@@ -311,9 +344,30 @@ mod unix_tests {
         });
 
         let payload = "hello unix";
-        let (_, resp, trailers) = perform_unary_echo(&channel, payload).await;
+        let (headers, resp, trailers) = perform_unary_echo(&channel, payload).await;
         assert_eq!(resp.message, payload);
         assert!(trailers.status().is_ok());
+
+        let connection_info = headers.connection_info();
+        assert_eq!(
+            connection_info.local_address().network_type,
+            UNIX_NETWORK_TYPE
+        );
+        assert!(!connection_info.local_address().address.is_empty());
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            UNIX_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            expected_remote_addr
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
+        assert!(
+            trailers.connection_info().is_none(),
+            "trailers should not contain connection_info when headers were present; had {:?}",
+            trailers.connection_info().as_ref().unwrap()
+        );
 
         shutdown_notify.notify_one();
         server_handle.await.unwrap();
@@ -465,7 +519,7 @@ async fn grpc_invoke_tonic_unary_tls() {
     let target = format!("dns:///{}", addr);
     let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
 
-    let (headers, resp, trilers) = perform_unary_echo(&channel, "hello interop tls").await;
+    let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop tls").await;
 
     assert_eq!(
         headers.metadata().get("x-test-metadata-echo").unwrap(),
@@ -473,10 +527,33 @@ async fn grpc_invoke_tonic_unary_tls() {
     );
     assert_eq!(resp.message, "hello interop tls");
 
+    let connection_info = headers.connection_info();
+    assert_eq!(
+        connection_info.local_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    let local_addr: SocketAddr = connection_info.local_address().address.parse().unwrap();
+    assert_eq!(local_addr.ip(), addr.ip());
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
+        addr.to_string()
+    );
+    assert_eq!(connection_info.security_info().security_protocol(), "tls");
+
     assert!(
-        trilers.status().is_ok(),
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present; had {:?}",
+        trailers.connection_info().as_ref().unwrap()
+    );
+
+    assert!(
+        trailers.status().is_ok(),
         "RPC failed: {:?}",
-        trilers.status()
+        trailers.status()
     );
 
     shutdown_notify.notify_one();
@@ -524,6 +601,19 @@ async fn grpc_invoke_failure_cases() {
             trailers.status().as_ref().unwrap_err().code(),
             StatusCodeError::Unauthenticated
         );
+        let connection_info = trailers
+            .connection_info()
+            .as_ref()
+            .expect("connection_info should be present in trailers");
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            addr.to_string()
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     // Call credentials return error
@@ -553,6 +643,19 @@ async fn grpc_invoke_failure_cases() {
                 .message()
                 .contains("test message")
         );
+        let connection_info = trailers
+            .connection_info()
+            .as_ref()
+            .expect("connection_info should be present in trailers");
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            addr.to_string()
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     // Call credentials return restricted control plane code (mapped to Internal)
@@ -582,6 +685,19 @@ async fn grpc_invoke_failure_cases() {
                 .message()
                 .contains("test message")
         );
+        let connection_info = trailers
+            .connection_info()
+            .as_ref()
+            .expect("connection_info should be present in trailers");
+        assert_eq!(
+            connection_info.remote_address().network_type,
+            TCP_IP_NETWORK_TYPE
+        );
+        assert_eq!(
+            connection_info.remote_address().address.to_string(),
+            addr.to_string()
+        );
+        assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
     shutdown_notify.notify_one();
@@ -694,9 +810,14 @@ async fn tonic_transport_invalid_base64_headers() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -770,9 +891,14 @@ async fn tonic_transport_recv_drop_cancels_send() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -806,8 +932,8 @@ async fn tonic_transport_recv_drop_cancels_send() {
 }
 
 #[derive(Debug, Clone)]
-struct MockConnectionSecurityContext;
-impl ChannelSecurityContext for MockConnectionSecurityContext {
+struct MockConnectionAuthorityValidator;
+impl ValidateAuthority for MockConnectionAuthorityValidator {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -837,12 +963,8 @@ impl ChannelCredentials for SlowChannelCredentials {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ChannelSecurityInfo::new(
-                "mock",
-                SecurityLevel::NoSecurity,
-                Box::new(MockConnectionSecurityContext),
-                Attributes::new(),
-            ),
+            security_info: SecurityInfo::new("mock"),
+            authority_validator: Box::new(MockConnectionAuthorityValidator),
         })
     }
 
@@ -949,6 +1071,19 @@ async fn trailers_only_metadata() {
     let value = metadata_map.get("x-custom-trailer").unwrap();
     assert_eq!(value, "custom-value");
 
+    let connection_info = trailers
+        .connection_info()
+        .as_ref()
+        .expect("trailers should contain connection_info in trailers-only response");
+    assert_eq!(
+        connection_info.remote_address().network_type,
+        TCP_IP_NETWORK_TYPE
+    );
+    assert_eq!(
+        connection_info.remote_address().address.to_string(),
+        addr.to_string()
+    );
+
     shutdown_notify.notify_one();
     server_handle.await.unwrap();
 }
@@ -1045,4 +1180,79 @@ impl Echo for EchoService {
         }
         Ok(response)
     }
+}
+
+#[tokio::test]
+async fn tonic_transport_recv_drop_sends_rst_stream() {
+    super::reg();
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+
+        let result = connection.accept().await.unwrap();
+        let (request, _respond) = result.unwrap();
+        let mut body = request.into_body();
+
+        match body.data().await {
+            Some(Ok(_)) => {
+                panic!("Expected error or EOF, got data");
+            }
+            Some(Err(err)) => {
+                println!("Got expected error: {:?}", err);
+                assert_eq!(err.reason(), Some(Reason::CANCEL));
+            }
+            None => {
+                panic!("Expected RST_STREAM, got clean close (EOS)");
+            }
+        };
+    });
+
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let config = Arc::new(TransportOptions::default());
+    let securty_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+
+    let (conn, _sec_info, _disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &securty_opts,
+            &config,
+        )
+        .await
+        .unwrap();
+
+    let (mut tx, rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new()
+                .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
+            CallOptions::default(),
+        )
+        .await;
+
+    // Drop the receiver to trigger cancellation.
+    drop(rx);
+
+    // Wait for the server to verify the reset.
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("Test timed out waiting for server to verify reset")
+        .unwrap();
+
+    // Verify the send stream has ended.
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err())
 }

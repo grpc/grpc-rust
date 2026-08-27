@@ -23,9 +23,13 @@
  */
 
 use integration_tests::pb::{test_client::TestClient, test_server, Input, Output};
+use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{net::TcpListener, net::TcpStream, sync::oneshot};
+use tokio_stream::Stream;
 use tonic::{
     transport::{server::TcpIncoming, Endpoint, Server},
     Code, Request, Response, Status,
@@ -135,5 +139,111 @@ async fn connect_lazy_reconnects_after_first_failure() {
 
     assert_eq!(err.code(), Code::Unavailable);
 
+    jh.await.unwrap();
+}
+
+/// A unary handler. The call waits until `hold` is received.
+struct HoldSvc {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    hold: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[tonic::async_trait]
+impl test_server::Test for HoldSvc {
+    async fn unary_call(&self, _: Request<Input>) -> Result<Response<Output>, Status> {
+        let started = self.started.lock().unwrap().take();
+        if let Some(tx) = started {
+            let _ = tx.send(());
+        }
+        let hold = self.hold.lock().unwrap().take();
+        if let Some(rx) = hold {
+            let _ = rx.await;
+        }
+        Ok(Response::new(Output {}))
+    }
+}
+
+/// Forwards polls to `inner`. Sends on `on_drop` when this value is dropped.
+struct NotifyOnDrop<S> {
+    inner: S,
+    on_drop: Option<oneshot::Sender<()>>,
+}
+
+impl<S> Drop for NotifyOnDrop<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.on_drop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl<S: Stream + Unpin> Stream for NotifyOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// Shutdown must drop `incoming` before in-flight RPCs complete.
+/// If `incoming` is a `TcpIncoming`, drop closes the listen socket.
+#[tokio::test]
+async fn shutdown_closes_listener_before_drain() {
+    let (started_tx, started_rx) = oneshot::channel();
+    let (hold_tx, hold_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+
+    let svc = test_server::TestServer::new(HoldSvc {
+        started: Mutex::new(Some(started_tx)),
+        hold: Mutex::new(Some(hold_rx)),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = NotifyOnDrop {
+        inner: TcpIncoming::from(listener).with_nodelay(Some(true)),
+        on_drop: Some(dropped_tx),
+    };
+
+    let jh = tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async { drop(shutdown_rx.await) })
+            .await
+            .unwrap();
+    });
+
+    let mut client = TestClient::connect(format!("http://{addr}")).await.unwrap();
+    let call = tokio::spawn(async move { client.unary_call(Request::new(Input {})).await });
+    started_rx.await.unwrap();
+
+    shutdown_tx.send(()).unwrap();
+
+    // Wait until `incoming` is dropped.
+    // Do not call connect in a loop before that.
+    // A connect loop can make `incoming.next()` ready.
+    // Then `select!` can accept the connection and ignore shutdown.
+    // The timeout is only a hang guard. On an unfixed server, drop
+    // waits for drain, and drain waits for `hold`.
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("incoming was not dropped before drain")
+        .unwrap();
+
+    let err = TcpStream::connect(addr)
+        .await
+        .expect_err("connect succeeded after incoming drop");
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+        ),
+        "connect error was {:?}, not refused or reset",
+        err.kind()
+    );
+
+    hold_tx.send(()).unwrap();
+    call.await.unwrap().unwrap();
     jh.await.unwrap();
 }

@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -22,17 +22,4 @@
  *
  */
 
-/// An in-memory representation of a service config, usually provided to gRPC as
-/// a JSON object.
-// TODO: complete this and ensure it meets all our requirements.
-#[derive(Debug, Default, Clone)]
-pub struct ServiceConfig {
-    pub(crate) load_balancing_policy: Option<LbPolicyType>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub enum LbPolicyType {
-    #[default]
-    PickFirst,
-    RoundRobin,
-}
+pub(crate) mod compression;

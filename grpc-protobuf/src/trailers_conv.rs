@@ -22,14 +22,14 @@
  *
  */
 
-use grpc::core::Trailers;
+use grpc::client::Trailers;
 use protobuf::Parse;
 use protobuf::Serialize;
 use protobuf_well_known_types::Any;
 
 use crate::status::*;
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 mod google_rpc {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

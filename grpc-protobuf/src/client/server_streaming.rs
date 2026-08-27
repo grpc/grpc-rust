@@ -27,20 +27,15 @@ use std::pin::Pin;
 
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
+use grpc::client::RequestHeaders;
 use grpc::client::SendOptions;
 use grpc::client::SendStream as _;
-use grpc::client::stream_util::RecvStreamValidator;
-use grpc::core::RequestHeaders;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
-use protobuf::Proxied;
 
-use crate::CallBuilder;
-use crate::GrpcStreamingResponse;
 use crate::ProtoSendMessage;
+use crate::client::CallBuilder;
+use crate::client::GrpcStreamingResponse;
 use crate::client::Internal;
 
 /// Configures a server-streaming call for gRPC Protobuf.  Implements
@@ -71,24 +66,16 @@ impl<'a, C, ReqMsgView, Res> ServerStreamingCallBuilder<'a, C, ReqMsgView, Res> 
 impl<'a, C, ReqMsgView, Res> IntoFuture for ServerStreamingCallBuilder<'a, C, ReqMsgView, Res>
 where
     C: InvokeOnce + 'a,
-    // ReqMsgView is a proto message view. (Ideally we could just require
-    // "AsView" and protobuf would automatically include the rest.)
-    ReqMsgView: AsView + Send + Sync + 'a,
-    <ReqMsgView as AsView>::Proxied: Message,
-    for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.)
-    Res: Message + ClearAndParse,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
+    ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
+    Res: Message,
 {
-    type Output = GrpcStreamingResponse<Res, RecvStreamValidator<C::RecvStream>>;
+    type Output = GrpcStreamingResponse<Res, C::RecvStream>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let headers = RequestHeaders::new().with_method_name(self.method);
             let (mut tx, rx) = self.channel.invoke_once(headers, self.args).await;
-            let rx = RecvStreamValidator::new(rx, false);
             let req = &ProtoSendMessage::from_view(&self.req);
             let _ = tx.send(req, SendOptions::new().with_final_msg(true)).await;
             GrpcStreamingResponse::new(rx)

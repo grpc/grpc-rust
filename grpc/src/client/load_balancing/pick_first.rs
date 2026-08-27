@@ -313,7 +313,7 @@ impl IdleState {
         ctx: &mut PickFirstContext<'_>,
         addresses: Vec<Address>,
     ) -> PickFirstState {
-        FirstPassState::fresh_enter(ctx, addresses)
+        Self::enter(ctx, addresses)
     }
 
     fn subchannel_update(
@@ -973,6 +973,11 @@ mod test {
             )
             .unwrap();
 
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+
+        policy.exit_idle(controller.as_mut());
+
         for _ in 0..addrs_len {
             expect_new_subchannel(&rx);
         }
@@ -1194,6 +1199,11 @@ mod test {
             )
             .unwrap();
 
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+
+        policy.exit_idle(controller.as_mut());
+
         let mut resulting_addrs = Vec::with_capacity(NUM_ADDRS);
         for _ in 0..NUM_ADDRS {
             let sc = expect_new_subchannel(&rx);
@@ -1263,6 +1273,11 @@ mod test {
                 controller.as_mut(),
             )
             .unwrap();
+
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+
+        policy.exit_idle(controller.as_mut());
 
         // Should only create subchannels for addr1 and addr2 (2 unique addrs).
         let sc1 = expect_new_subchannel(&rx);
@@ -1796,6 +1811,11 @@ mod test {
             )
             .unwrap();
 
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+
+        policy.exit_idle(controller.as_mut());
+
         let sc1 = expect_new_subchannel(&rx);
         let _sc2 = expect_new_subchannel(&rx);
         let addr = expect_connect(&rx);
@@ -1833,6 +1853,61 @@ mod test {
 
         // 5. Because addr1 is already in TransientFailure, the policy should skip addr1
         // and immediately connect addr3.
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr3");
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+    }
+
+    // Tests that when in IDLE, receiving resolver updates leaves the policy in IDLE
+    // without creating subchannels or connecting until exit_idle is called.
+    #[tokio::test]
+    async fn test_pick_first_idle_on_resolver_update_until_exit_idle() {
+        let (rx, mut policy, mut controller) = setup();
+
+        // 1. Send initial resolver update [addr1, addr2].
+        let endpoints = create_endpoints(vec!["addr1", "addr2"], None);
+        policy
+            .resolver_update(
+                ResolverUpdate {
+                    endpoints: Ok(endpoints),
+                    ..Default::default()
+                },
+                None,
+                controller.as_mut(),
+            )
+            .unwrap();
+
+        // 2. Expect IDLE picker update and NO subchannels or connect attempts.
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+        assert!(rx.try_recv().is_err(), "unexpected event in IDLE");
+
+        // 3. Send second resolver update [addr3, addr4] while still in IDLE.
+        let endpoints2 = create_endpoints(vec!["addr3", "addr4"], None);
+        policy
+            .resolver_update(
+                ResolverUpdate {
+                    endpoints: Ok(endpoints2),
+                    ..Default::default()
+                },
+                None,
+                controller.as_mut(),
+            )
+            .unwrap();
+
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Idle);
+        assert!(rx.try_recv().is_err(), "unexpected event in IDLE");
+
+        // 4. Explicitly exit idle.
+        policy.exit_idle(controller.as_mut());
+
+        // 5. Verify that subchannels are now created for the latest address list [addr3,
+        //    addr4]
+        // and connection begins.
+        expect_new_subchannel(&rx);
+        expect_new_subchannel(&rx);
         let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr3");
         let state = expect_picker_update(&rx);

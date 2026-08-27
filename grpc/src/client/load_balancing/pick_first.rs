@@ -316,7 +316,6 @@ impl IdleState {
         FirstPassState::fresh_enter(ctx, addresses)
     }
 
-    #[allow(clippy::unused_self)]
     fn subchannel_update(
         self,
         _ctx: &mut PickFirstContext<'_>,
@@ -723,54 +722,6 @@ impl Debug for PickFirstState {
     }
 }
 
-#[cfg(test)]
-impl PickFirstPolicy {
-    fn selected(&self) -> Option<&Arc<dyn Subchannel>> {
-        match &self.state {
-            PickFirstState::Ready(r) => Some(&r.selected),
-            _ => None,
-        }
-    }
-
-    fn timer(&self) -> Option<&Timer> {
-        match &self.state {
-            PickFirstState::FirstPass(fp) => Some(&fp.timer),
-            _ => None,
-        }
-    }
-
-    fn steady_state(&self) -> Option<&SteadyState> {
-        match &self.state {
-            PickFirstState::SteadyState(ss) => Some(ss),
-            _ => None,
-        }
-    }
-
-    fn subchannels(&self) -> Vec<Arc<dyn Subchannel>> {
-        match &self.state {
-            PickFirstState::FirstPass(fp) => fp
-                .subchannels
-                .iter()
-                .map(|e| e.subchannel.clone())
-                .collect(),
-            PickFirstState::SteadyState(ss) => ss
-                .subchannels
-                .iter()
-                .map(|e| e.subchannel.clone())
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn last_connection_error(&self) -> Option<&str> {
-        match &self.state {
-            PickFirstState::FirstPass(fp) => fp.last_connection_error.as_deref(),
-            PickFirstState::SteadyState(ss) => Some(&ss.last_connection_error),
-            _ => None,
-        }
-    }
-}
-
 // Implements the happy eyeballs timer task. `expired` becomes set when it
 // fires. When dropped, the timer is cancelled.
 struct Timer {
@@ -858,6 +809,53 @@ mod test {
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
+
+    impl PickFirstPolicy {
+        fn selected(&self) -> Option<&Arc<dyn Subchannel>> {
+            match &self.state {
+                PickFirstState::Ready(r) => Some(&r.selected),
+                _ => None,
+            }
+        }
+
+        fn timer(&self) -> Option<&Timer> {
+            match &self.state {
+                PickFirstState::FirstPass(fp) => Some(&fp.timer),
+                _ => None,
+            }
+        }
+
+        fn steady_state(&self) -> Option<&SteadyState> {
+            match &self.state {
+                PickFirstState::SteadyState(ss) => Some(ss),
+                _ => None,
+            }
+        }
+
+        fn subchannels(&self) -> Vec<Arc<dyn Subchannel>> {
+            match &self.state {
+                PickFirstState::FirstPass(fp) => fp
+                    .subchannels
+                    .iter()
+                    .map(|e| e.subchannel.clone())
+                    .collect(),
+                PickFirstState::SteadyState(ss) => ss
+                    .subchannels
+                    .iter()
+                    .map(|e| e.subchannel.clone())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        fn last_connection_error(&self) -> Option<&str> {
+            match &self.state {
+                PickFirstState::FirstPass(fp) => fp.last_connection_error.as_deref(),
+                PickFirstState::SteadyState(ss) => Some(&ss.last_connection_error),
+                _ => None,
+            }
+        }
+    }
 
     const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 

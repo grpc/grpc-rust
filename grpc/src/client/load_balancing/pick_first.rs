@@ -394,13 +394,16 @@ impl FirstPassState {
 
             PickFirstState::FirstPass(first_pass)
         } else {
-            let err = first_pass
-                .last_connection_error
-                .clone()
-                .unwrap_or_else(|| "all addresses in transient failure".to_string());
-
-            SteadyState::enter(ctx, first_pass.addresses, first_pass.subchannels, err)
+            first_pass.enter_steady_state(ctx)
         }
+    }
+
+    // Ensures error is carried into the steady state transition.
+    fn enter_steady_state(self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
+        let err = self
+            .last_connection_error
+            .unwrap_or_else(|| "all addresses in transient failure".to_string());
+        SteadyState::enter(ctx, self.addresses, self.subchannels, err)
     }
 
     fn trigger_connection(&mut self, ctx: &mut PickFirstContext<'_>, sc: &Arc<dyn Subchannel>) {
@@ -478,12 +481,7 @@ impl FirstPassState {
                 .any(|e| e.state.connectivity_state == ConnectivityState::Connecting);
 
             if !any_connecting {
-                let err = self
-                    .last_connection_error
-                    .clone()
-                    .unwrap_or_else(|| "all addresses in transient failure".to_string());
-
-                return SteadyState::enter(ctx, self.addresses, self.subchannels, err);
+                return self.enter_steady_state(ctx);
             }
         }
 

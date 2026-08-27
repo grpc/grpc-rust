@@ -1,10 +1,36 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use super::service::TlsConnector;
 use crate::transport::{
-    tls::{Certificate, Identity},
     Error,
+    tls::{Certificate, Identity},
 };
 use http::Uri;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use tokio_rustls::rustls::pki_types::TrustAnchor;
 
 /// Configures TLS settings for endpoints.
@@ -134,6 +160,22 @@ impl ClientTlsConfig {
     }
 
     pub(crate) fn into_tls_connector(self, uri: &Uri) -> Result<TlsConnector, crate::BoxError> {
+        self.build_tls_connector(uri, None)
+    }
+
+    pub(crate) fn into_tls_connector_with_verifier(
+        self,
+        uri: &Uri,
+        verifier: Arc<dyn ServerCertVerifier>,
+    ) -> Result<TlsConnector, crate::BoxError> {
+        self.build_tls_connector(uri, Some(verifier))
+    }
+
+    fn build_tls_connector(
+        self,
+        uri: &Uri,
+        server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    ) -> Result<TlsConnector, crate::BoxError> {
         let domain = match &self.domain {
             Some(domain) => domain,
             None => {
@@ -150,6 +192,7 @@ impl ClientTlsConfig {
             self.certs,
             self.trust_anchors,
             self.identity,
+            server_cert_verifier,
             domain,
             self.assume_http2,
             self.use_key_log,

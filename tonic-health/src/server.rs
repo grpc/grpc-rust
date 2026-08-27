@@ -1,14 +1,38 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Contains all healthcheck based server utilities.
 
+use crate::ServingStatus;
 use crate::pb::health_server::{Health, HealthServer};
 use crate::pb::{HealthCheckRequest, HealthCheckResponse};
-use crate::ServingStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 use tokio_stream::Stream;
-use tonic::{server::NamedService, Request, Response, Status};
+use tonic::{Request, Response, Status, server::NamedService};
 
 /// Creates a `HealthReporter` and a linked `HealthServer` pair. Together,
 /// these types can be used to serve the gRPC Health Checking service.
@@ -196,10 +220,10 @@ impl HealthCheckResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::pb::health_server::Health;
-    use crate::pb::HealthCheckRequest;
-    use crate::server::{HealthReporter, HealthService};
     use crate::ServingStatus;
+    use crate::pb::HealthCheckRequest;
+    use crate::pb::health_server::Health;
+    use crate::server::{HealthReporter, HealthService};
     use tokio::sync::watch;
     use tokio_stream::StreamExt;
     use tonic::{Code, Request, Status};

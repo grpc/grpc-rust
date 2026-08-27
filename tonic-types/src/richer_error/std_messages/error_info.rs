@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use std::collections::HashMap;
 
 use prost::{DecodeError, Message};
@@ -5,7 +29,7 @@ use prost_types::Any;
 
 use crate::richer_error::FromAnyRef;
 
-use super::super::{pb, FromAny, IntoAny};
+use super::super::{FromAny, IntoAny, pb};
 
 /// Used to encode/decode the `ErrorInfo` standard error message described in
 /// [error_details.proto]. Describes the cause of the error with structured
@@ -127,8 +151,7 @@ mod tests {
 
         let formatted = format!("{gen_any:?}");
 
-        let expected =
-            "Any { type_url: \"type.googleapis.com/google.rpc.ErrorInfo\", value: [10, 9, 83, 79, 77, 69, 95, 73, 78, 70, 79, 18, 12, 109, 121, 100, 111, 109, 97, 105, 110, 46, 99, 111, 109, 26, 30, 10, 23, 105, 110, 115, 116, 97, 110, 99, 101, 76, 105, 109, 105, 116, 80, 101, 114, 82, 101, 113, 117, 101, 115, 116, 18, 3, 49, 48, 48] }";
+        let expected = "Any { type_url: \"type.googleapis.com/google.rpc.ErrorInfo\", value: [10, 9, 83, 79, 77, 69, 95, 73, 78, 70, 79, 18, 12, 109, 121, 100, 111, 109, 97, 105, 110, 46, 99, 111, 109, 26, 30, 10, 23, 105, 110, 115, 116, 97, 110, 99, 101, 76, 105, 109, 105, 116, 80, 101, 114, 82, 101, 113, 117, 101, 115, 116, 18, 3, 49, 48, 48] }";
 
         assert!(
             formatted.eq(expected),

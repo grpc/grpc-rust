@@ -4,16 +4,25 @@ members = [
   "tonic-build",
   "tonic-health",
   "tonic-protobuf",
-  "tonic-protobuf-build",
   "tonic-types",
   "tonic-reflection",
   "tonic-prost",
   "tonic-prost-build",
-  "tonic-web", # Non-published crates
+  "tonic-web",
   "examples",
   "codegen",
   "grpc",
-  "interop", # Tests
+  "grpc-benchmark",
+  "grpc-google",
+  "grpc-protobuf",
+  "grpc-protobuf-build",
+  "grpc-xds",
+  "protoc-gen-rust-grpc",
+  "xds-client",
+  "xds-client-opentelemetry",
+  "tonic-xds",
+  "xds-test-util",
+  "interop",
   "tests/disable_comments",
   "tests/wellknown",
   "tests/wellknown-compiled",
@@ -29,7 +38,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.75"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

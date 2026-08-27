@@ -1,6 +1,30 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use std::{fmt, io::Cursor};
 
-use tokio_rustls::rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 
 use crate::transport::{Certificate, Identity};
 
@@ -16,6 +40,8 @@ pub(crate) enum TlsError {
     CertificateParseError,
     PrivateKeyParseError,
     HandshakeTimeout,
+    #[cfg(feature = "channel")]
+    VerifierConflict,
 }
 
 impl fmt::Display for TlsError {
@@ -31,6 +57,14 @@ impl fmt::Display for TlsError {
                 "Error parsing TLS private key - no RSA or PKCS8-encoded keys found."
             ),
             TlsError::HandshakeTimeout => write!(f, "TLS handshake timeout."),
+            #[cfg(feature = "channel")]
+            TlsError::VerifierConflict => write!(
+                f,
+                "Endpoint::tls_config_with_verifier cannot be combined with \
+                 ClientTlsConfig::ca_certificate(s), trust_anchor(s), or with_*_roots \
+                 methods — those configure the default verifier, which is replaced by \
+                 the custom one."
+            ),
         }
     }
 }

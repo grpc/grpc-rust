@@ -1,18 +1,46 @@
-#[cfg(feature = "_tls-any")]
-use super::service::TlsConnector;
-use super::service::{self, Executor, SharedExec};
-use super::uds_connector::UdsConnector;
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use super::Channel;
 #[cfg(feature = "_tls-any")]
 use super::ClientTlsConfig;
 #[cfg(feature = "_tls-any")]
-use crate::transport::error;
+use super::service::TlsConnector;
+use super::service::{self, Executor, SharedExec};
+use super::uds_connector::UdsConnector;
 use crate::transport::Error;
+#[cfg(feature = "_tls-any")]
+use crate::transport::error;
 use bytes::Bytes;
-use http::{uri::Uri, HeaderValue};
+use http::{HeaderValue, uri::Uri};
 use hyper::rt;
 use hyper_util::client::legacy::connect::HttpConnector;
+#[cfg(feature = "_tls-any")]
+use std::sync::Arc;
 use std::{fmt, future::Future, net::IpAddr, pin::Pin, str, str::FromStr, time::Duration};
+#[cfg(feature = "_tls-any")]
+use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use tower_service::Service;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -38,6 +66,7 @@ pub struct Endpoint {
     pub(crate) buffer_size: Option<usize>,
     pub(crate) init_stream_window_size: Option<u32>,
     pub(crate) init_connection_window_size: Option<u32>,
+    pub(crate) max_frame_size: Option<u32>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_keepalive_interval: Option<Duration>,
     pub(crate) tcp_keepalive_retries: Option<u32>,
@@ -45,6 +74,7 @@ pub struct Endpoint {
     pub(crate) http2_keep_alive_interval: Option<Duration>,
     pub(crate) http2_keep_alive_timeout: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: Option<bool>,
+    pub(crate) http2_header_table_size: Option<u32>,
     pub(crate) http2_max_header_list_size: Option<u32>,
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) http2_adaptive_window: Option<bool>,
@@ -63,10 +93,11 @@ impl Endpoint {
     {
         let me = dst.try_into().map_err(|e| Error::from_source(e.into()))?;
         #[cfg(feature = "_tls-any")]
-        if let EndpointType::Uri(uri) = &me.uri {
-            if me.tls.is_none() && uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-                return me.tls_config(ClientTlsConfig::new().with_enabled_roots());
-            }
+        if let EndpointType::Uri(uri) = &me.uri
+            && me.tls.is_none()
+            && uri.scheme() == Some(&http::uri::Scheme::HTTPS)
+        {
+            return me.tls_config(ClientTlsConfig::new().with_enabled_roots());
         }
         Ok(me)
     }
@@ -85,6 +116,7 @@ impl Endpoint {
             buffer_size: None,
             init_stream_window_size: None,
             init_connection_window_size: None,
+            max_frame_size: None,
             tcp_keepalive: None,
             tcp_keepalive_interval: None,
             tcp_keepalive_retries: None,
@@ -92,6 +124,7 @@ impl Endpoint {
             http2_keep_alive_interval: None,
             http2_keep_alive_timeout: None,
             http2_keep_alive_while_idle: None,
+            http2_header_table_size: None,
             http2_max_header_list_size: None,
             connect_timeout: None,
             http2_adaptive_window: None,
@@ -114,6 +147,7 @@ impl Endpoint {
             buffer_size: None,
             init_stream_window_size: None,
             init_connection_window_size: None,
+            max_frame_size: None,
             tcp_keepalive: None,
             tcp_keepalive_interval: None,
             tcp_keepalive_retries: None,
@@ -121,6 +155,7 @@ impl Endpoint {
             http2_keep_alive_interval: None,
             http2_keep_alive_timeout: None,
             http2_keep_alive_while_idle: None,
+            http2_header_table_size: None,
             http2_max_header_list_size: None,
             connect_timeout: None,
             http2_adaptive_window: None,
@@ -374,6 +409,46 @@ impl Endpoint {
         }
     }
 
+    /// Configures TLS for the endpoint, replacing the default WebPKI server
+    /// certificate verifier with a custom implementation.
+    ///
+    /// **Warning:** A misconfigured verifier can silently disable peer
+    /// validation. Only use this if you understand rustls' verifier contract.
+    ///
+    /// The custom verifier replaces the default verifier, so any
+    /// [`ClientTlsConfig`] method that configures the default verifier —
+    /// [`ca_certificate`](ClientTlsConfig::ca_certificate),
+    /// [`ca_certificates`](ClientTlsConfig::ca_certificates),
+    /// [`trust_anchor`](ClientTlsConfig::trust_anchor),
+    /// [`trust_anchors`](ClientTlsConfig::trust_anchors),
+    /// `with_native_roots`, `with_webpki_roots`, or
+    /// [`with_enabled_roots`](ClientTlsConfig::with_enabled_roots) — must
+    /// not be set on `tls_config`. Mixing produces an error.
+    ///
+    /// SNI ([`domain_name`](ClientTlsConfig::domain_name)), client identity
+    /// ([`identity`](ClientTlsConfig::identity)),
+    /// [`timeout`](ClientTlsConfig::timeout),
+    /// [`use_key_log`](ClientTlsConfig::use_key_log), and
+    /// [`assume_http2`](ClientTlsConfig::assume_http2) continue to apply.
+    #[cfg(feature = "_tls-any")]
+    pub fn tls_config_with_verifier(
+        self,
+        tls_config: ClientTlsConfig,
+        verifier: Arc<dyn ServerCertVerifier>,
+    ) -> Result<Self, Error> {
+        match &self.uri {
+            EndpointType::Uri(uri) => Ok(Endpoint {
+                tls: Some(
+                    tls_config
+                        .into_tls_connector_with_verifier(uri, verifier)
+                        .map_err(Error::from_source)?,
+                ),
+                ..self
+            }),
+            EndpointType::Uds(_) => Err(Error::new(error::Kind::InvalidTlsConfigForUds)),
+        }
+    }
+
     /// Set the value of `TCP_NODELAY` option for accepted connections. Enabled by default.
     pub fn tcp_nodelay(self, enabled: bool) -> Self {
         Endpoint {
@@ -414,12 +489,46 @@ impl Endpoint {
         }
     }
 
+    /// Sets the `SETTINGS_HEADER_TABLE_SIZE` option for HTTP2 connections.
+    ///
+    /// Informs the peer of the maximum size of the header compression
+    /// table used to decode header blocks, in octets.
+    ///
+    /// Default is 4,096.
+    pub fn http2_header_table_size(self, size: u32) -> Self {
+        Endpoint {
+            http2_header_table_size: Some(size),
+            ..self
+        }
+    }
+
     /// Sets the max size of received header frames.
     ///
     /// This will default to whatever the default in hyper is. As of v1.4.1, it is 16 KiB.
     pub fn http2_max_header_list_size(self, size: u32) -> Self {
         Endpoint {
             http2_max_header_list_size: Some(size),
+            ..self
+        }
+    }
+
+    /// Sets the maximum frame size to use for HTTP2.
+    ///
+    /// Passing `None` will do nothing.
+    ///
+    /// If not set, will default from underlying transport.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tonic::transport::Endpoint;
+    /// # let builder = Endpoint::from_static("https://example.com");
+    /// let endpoint = builder.max_frame_size(1024 * 1024u32);
+    /// ```
+    #[must_use]
+    pub fn max_frame_size(self, frame_size: impl Into<Option<u32>>) -> Self {
+        Endpoint {
+            max_frame_size: frame_size.into(),
             ..self
         }
     }

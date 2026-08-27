@@ -1,0 +1,33 @@
+[package]
+name = "grpc-protobuf"
+version = "0.10.0"
+authors = ["gRPC authors"]
+license = "MIT"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = "Protobuf integration for the grpc crate"
+readme = "README.md"
+keywords = ["rpc", "grpc", "async", "protobuf", "proto"]
+categories = ["web-programming", "network-programming", "asynchronous"]
+rust-version = { workspace = true }
+edition = "2024"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "grpc::*",
+    "protobuf::*",
+]
+
+[features]
+
+[dependencies]
+bytes = "1.11.1"
+grpc = { version = "0.10.0", path = "../grpc", default-features = false }
+protobuf = "4.35.1-release"
+protobuf-well-known-types = "4.35.1-release"
+
+[dev-dependencies]
+
+[build-dependencies]
+grpc-protobuf-build = { version = "0.10.0", path = "../grpc-protobuf-build", default-features = false }
+protobuf-well-known-types = "4.35.1-release"

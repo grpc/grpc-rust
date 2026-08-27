@@ -1,0 +1,90 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+use std::fmt;
+
+use thiserror::Error;
+use url::Url;
+
+/// Error type for parsing xDS URIs.
+#[derive(Debug, Error)]
+pub enum XdsUriError {
+    /// The URI scheme is not "xds".
+    #[error("URI scheme must be 'xds', got '{0}'")]
+    InvalidScheme(String),
+    /// The URI could not be parsed.
+    #[error("invalid URI: {0}")]
+    InvalidUri(#[from] url::ParseError),
+}
+
+/// An xDS target URI (e.g., `xds:///my-service`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XdsUri {
+    /// The target service name extracted from the URI.
+    pub target: String,
+}
+
+const XDS_SCHEME: &str = "xds";
+
+impl XdsUri {
+    /// Parses an xDS URI from a string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URI cannot be parsed as a valid URI ([`XdsUriError::InvalidUri`])
+    /// - The URI scheme is not `xds` ([`XdsUriError::InvalidScheme`])
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tonic_xds::XdsUri;
+    ///
+    /// let uri = XdsUri::parse("xds:///my-service").expect("Failed to parse valid xDS URI");
+    /// assert_eq!(uri.target, "my-service");
+    ///
+    /// let invalid_uri = XdsUri::parse("http:///my-service");
+    /// assert!(invalid_uri.is_err());
+    /// assert_eq!(invalid_uri.unwrap_err().to_string(), "URI scheme must be 'xds', got 'http'");
+    /// ```
+    pub fn parse(uri: &str) -> Result<Self, XdsUriError> {
+        let uri = Url::parse(uri)?;
+
+        if uri.scheme() != XDS_SCHEME {
+            return Err(XdsUriError::InvalidScheme(uri.scheme().to_string()));
+        }
+
+        let target = uri.path().trim_start_matches('/').to_string();
+
+        Ok(Self { target })
+    }
+}
+
+impl fmt::Display for XdsUri {
+    /// Formats as the canonical xDS URI string (e.g. `xds:///my-service`).
+    /// Round-trips with [`XdsUri::parse`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{XDS_SCHEME}:///{}", self.target)
+    }
+}

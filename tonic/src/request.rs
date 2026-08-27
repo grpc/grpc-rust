@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use crate::metadata::{MetadataMap, MetadataValue};
 #[cfg(feature = "server")]
 use crate::transport::server::TcpConnectInfo;
@@ -9,9 +33,11 @@ use std::net::SocketAddr;
 #[cfg(all(feature = "server", feature = "_tls-any"))]
 use std::sync::Arc;
 use std::time::Duration;
+
 #[cfg(all(feature = "server", feature = "_tls-any"))]
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 
 /// A gRPC request and metadata from an RPC call.
 #[derive(Debug)]
@@ -350,6 +376,22 @@ impl<T> Request<T> {
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.extensions
     }
+
+    /// Get a cancellation handle for this request.
+    ///
+    /// Cancellation is only supported on the client side. Calling `cancel` on
+    /// the handle will abort the request by sending an HTTP/2 RST_STREAM.
+    pub fn cancellation_handle(&mut self) -> CancellationHandle {
+        self.extensions
+            .get_or_insert(CancellationHandle {
+                token: CancellationToken::new(),
+            })
+            .clone()
+    }
+
+    pub(crate) fn remove_cancellation_handle(&mut self) -> Option<CancellationHandle> {
+        self.extensions_mut().remove()
+    }
 }
 
 impl<T> IntoRequest<T> for T {
@@ -435,6 +477,33 @@ pub(crate) enum SanitizeHeaders {
     No,
 }
 
+/// A handle that allows triggering the cancellation of an outbound request
+/// stream.
+///
+/// This handle can be stored by the user and invoked to abort the request.
+///
+/// Cancellation is only supported on the client side.
+#[derive(Debug, Clone)]
+pub struct CancellationHandle {
+    token: CancellationToken,
+}
+
+impl CancellationHandle {
+    /// Cancel the stream.
+    ///
+    /// This will result in the outbound stream getting cancelled with an
+    /// RST_STREAM frame, if it hasn't gracefully closed.
+    ///
+    /// Consumes `self` to ensure cancellation is only requested once.
+    pub fn cancel(self) {
+        self.token.cancel();
+    }
+
+    pub(crate) fn into_token(self) -> CancellationToken {
+        self.token
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +569,35 @@ mod tests {
         let one_hour = Duration::from_secs(60 * 60);
         let value = duration_to_grpc_timeout(one_hour);
         assert_eq!(value, format!("{}m", one_hour.as_millis()));
+    }
+
+    #[test]
+    fn test_cancellation() {
+        let mut req = Request::new(());
+        let handle = req.cancellation_handle();
+
+        let token = req.cancellation_handle().into_token();
+
+        assert!(!token.is_cancelled());
+
+        handle.cancel();
+
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_clone() {
+        let mut req = Request::new(());
+        let handle1 = req.cancellation_handle();
+        let handle2 = req.cancellation_handle();
+
+        let token = req.cancellation_handle().into_token();
+
+        assert!(!token.is_cancelled());
+
+        handle1.cancel();
+
+        assert!(token.is_cancelled());
+        assert!(handle2.into_token().is_cancelled());
     }
 }

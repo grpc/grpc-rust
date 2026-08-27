@@ -323,10 +323,6 @@ impl IdleState {
     }
 
     fn exit_idle(self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
-        if self.addresses.is_empty() {
-            ctx.controller.request_resolution();
-            return PickFirstState::Idle(self);
-        }
         FirstPassState::fresh_enter(ctx, self.addresses)
     }
 }
@@ -1946,6 +1942,46 @@ mod test {
 
         // 3. Verify subchannels created and connection initiates immediately without
         //    exit_idle.
+        expect_new_subchannel(&rx);
+        expect_new_subchannel(&rx);
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr1");
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+    }
+
+    // Tests that calling exit_idle on an empty IdleState transitions to Transient Failure,
+    // requests resolution, and immediately starts connecting once valid endpoints arrive.
+    #[tokio::test]
+    async fn test_pick_first_exit_idle_with_empty_addresses_transitions_to_transient_failure_and_recovers()
+     {
+        let (rx, mut policy, mut controller) = setup();
+
+        // 1. Calling exit_idle before any resolver update.
+        policy.exit_idle(controller.as_mut());
+
+        // 2. Expect TransientFailure and resolution request.
+        let state = expect_picker_update(&rx);
+        assert_eq!(
+            state.connectivity_state,
+            ConnectivityState::TransientFailure
+        );
+        expect_request_resolution(&rx);
+
+        // 3. Name resolution completes with [addr1, addr2].
+        let endpoints = create_endpoints(vec!["addr1", "addr2"], None);
+        policy
+            .resolver_update(
+                ResolverUpdate {
+                    endpoints: Ok(endpoints),
+                    ..Default::default()
+                },
+                None,
+                controller.as_mut(),
+            )
+            .unwrap();
+
+        // 4. Verify that subchannels are created and connection initiates immediately.
         expect_new_subchannel(&rx);
         expect_new_subchannel(&rx);
         let addr = expect_connect(&rx);

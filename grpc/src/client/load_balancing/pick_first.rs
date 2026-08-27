@@ -1950,8 +1950,9 @@ mod test {
         assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
     }
 
-    // Tests that calling exit_idle on an empty IdleState transitions to Transient Failure,
-    // requests resolution, and immediately starts connecting once valid endpoints arrive.
+    // Tests that calling exit_idle on an empty IdleState transitions to Transient
+    // Failure, requests resolution, and immediately starts connecting once valid
+    // endpoints arrive.
     #[tokio::test]
     async fn test_pick_first_exit_idle_with_empty_addresses_transitions_to_transient_failure_and_recovers()
      {

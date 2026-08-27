@@ -46,7 +46,7 @@
 //! cargo run -p tonic-xds --example xds_server
 //!
 //! # Terminal 3: xDS client
-//! GRPC_XDS_BOOTSTRAP_CONFIG='{"xds_servers":[{"server_uri":"http://localhost:18000"}],"node":{"id":"test"}}' \
+//! GRPC_XDS_BOOTSTRAP_CONFIG='{"xds_servers":[{"server_uri":"http://localhost:18000","channel_creds":[{"type":"insecure"}]}],"node":{"id":"test"}}' \
 //!     cargo run -p tonic-xds --example channel --features testutil
 //! ```
 //!

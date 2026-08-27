@@ -94,7 +94,7 @@ async fn run_mock_tls_server(listener: TcpListener, creds: RustlsServerCredentia
     let stream = StreamEndpoint::new_from_tcp(stream).unwrap();
     let runtime = GrpcRuntime::new(TokioRuntime::default());
     let handshake_res = creds
-        .accept(stream, runtime, private::Internal)
+        .accept(Box::new(stream), runtime, private::Internal)
         .await
         .unwrap();
 

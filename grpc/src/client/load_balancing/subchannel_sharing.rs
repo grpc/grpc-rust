@@ -31,6 +31,7 @@ use std::sync::Mutex;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbState;
@@ -41,9 +42,8 @@ use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::WeakSubchannel;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::core::RequestHeaders;
+use crate::core::Address;
 
 /// Implements subchannel sharing for T.  Whenever T creates a subchannel, this
 /// policy wraps what the channel returns, and if another subchannel is created
@@ -306,8 +306,8 @@ mod tests {
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::load_balancing::test_utils::new_request_headers;
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::ResolverUpdate;
+    use crate::core::Address;
     use crate::metadata::MetadataMap;
     use crate::rt::default_runtime;
 

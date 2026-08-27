@@ -29,9 +29,9 @@ use tokio::sync::oneshot;
 use crate::client::CallOptions;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::interceptor::Intercept;
 use crate::client::interceptor::InterceptOnce;
-use crate::core::RequestHeaders;
 use crate::metadata::MetadataMap;
 
 /// An interceptor that attaches metadata to outgoing RPC headers.
@@ -189,11 +189,11 @@ impl<R: RecvStream> RecvStream for CaptureTrailersRecvStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ResponseHeaders;
     use crate::client::ResponseStreamItem;
+    use crate::client::Trailers;
     use crate::client::test_util::MockInvoker;
     use crate::client::test_util::NopRecvMessage;
-    use crate::core::ResponseHeaders;
-    use crate::core::Trailers;
     use crate::metadata::BinaryMetadataValue;
 
     #[tokio::test]
@@ -250,7 +250,7 @@ mod tests {
         // Send a Headers response on the call.
         let mut resp_md = MetadataMap::new();
         resp_md.insert("x-resp-header", "resp-value".parse().unwrap());
-        let mut headers = ResponseHeaders::default();
+        let mut headers = ResponseHeaders::new(crate::core::test_connection_info());
         *headers.metadata_mut() = resp_md;
         controller
             .send_resp(ResponseStreamItem::Headers(headers))

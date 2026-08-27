@@ -37,7 +37,6 @@
 
 pub mod call;
 pub(crate) mod client;
-pub(crate) mod dyn_wrapper;
 mod local;
 #[cfg(feature = "tls-rustls")]
 pub mod rustls;
@@ -50,13 +49,13 @@ pub use local::LocalChannelCredentials;
 pub use local::LocalServerCredentials;
 use tonic::async_trait;
 
+use crate::attributes::Attributes;
 use crate::credentials::call::CallCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
 use crate::rt::BoxEndpoint;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
 /// Client-side trait for all live gRPC wire protocols and supported transport
@@ -100,11 +99,8 @@ pub trait ChannelCredentials: Send + Sync + 'static {
 
 /// Server-side trait for all live gRPC wire protocols and supported
 /// transport security protocols (e.g., TLS, ALTS).
-#[trait_variant::make(Send)]
-pub trait ServerCredentials: Sync + 'static {
-    #[doc(hidden)]
-    type Output<I>;
-
+#[async_trait]
+pub trait ServerCredentials: Send + Sync + 'static {
     /// Provides the ProtocolInfo of these credentials.
     fn info(&self) -> &ProtocolInfo;
 
@@ -113,12 +109,12 @@ pub trait ServerCredentials: Sync + 'static {
     /// This method wraps the incoming raw `source` connection with the configured
     /// security protocol (e.g., TLS).
     #[doc(hidden)]
-    async fn accept<Input: GrpcEndpoint>(
+    async fn accept(
         &self,
-        source: Input,
+        source: BoxEndpoint,
         runtime: GrpcRuntime,
         token: private::Internal,
-    ) -> Result<server::HandshakeOutput<Self::Output<Input>>, String>;
+    ) -> Result<server::HandshakeOutput, String>;
 }
 
 /// Defines the level of protection provided by an established connection.
@@ -138,6 +134,52 @@ pub enum SecurityLevel {
     ///
     /// This is the standard level for secure transports like TLS.
     PrivacyAndIntegrity,
+}
+
+/// Represents the security state of an established connection.
+#[derive(Debug, Clone)]
+pub struct SecurityInfo {
+    security_protocol: &'static str,
+    security_level: SecurityLevel,
+    /// Stores extra data derived from the underlying protocol.
+    attributes: Attributes,
+}
+
+impl SecurityInfo {
+    /// Creates a new SecurityInfo for the security protocol given.
+    pub fn new(security_protocol: &'static str) -> Self {
+        Self {
+            security_protocol,
+            security_level: SecurityLevel::NoSecurity,
+            attributes: Attributes::new(),
+        }
+    }
+
+    /// Sets the security level of this `SecurityInfo`.
+    pub fn with_security_level(mut self, security_level: SecurityLevel) -> Self {
+        self.security_level = security_level;
+        self
+    }
+
+    /// Returns the security protocol of this `SecurityInfo`.
+    pub fn security_protocol(&self) -> &'static str {
+        self.security_protocol
+    }
+
+    /// Returns the security level of this `SecurityInfo`.
+    pub fn security_level(&self) -> SecurityLevel {
+        self.security_level
+    }
+
+    /// Returns the attributes of this `SecurityInfo`.
+    pub fn attributes(&self) -> &Attributes {
+        &self.attributes
+    }
+
+    /// Returns the mutable attributes of this `SecurityInfo`.
+    pub fn attributes_mut(&mut self) -> &mut Attributes {
+        &mut self.attributes
+    }
 }
 
 pub(crate) mod common {

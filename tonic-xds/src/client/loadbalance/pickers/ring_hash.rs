@@ -223,6 +223,7 @@ mod tests {
         r.extensions_mut().insert(RouteDecision {
             cluster: "c".to_string(),
             request_hash: hash,
+            retry_config: None,
         });
         r
     }

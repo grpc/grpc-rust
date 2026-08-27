@@ -36,7 +36,7 @@ use crate::client::name_resolution::ResolverOptions;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
-use crate::client::service_config::ServiceConfig;
+use crate::client::service_config::ParseResult;
 use crate::client::transport::ProxyOptions;
 use crate::credentials::common::Authority;
 
@@ -228,7 +228,7 @@ impl<'a> ChannelController for InterceptingController<'a> {
         self.inner.update(update)
     }
 
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
+    fn parse_service_config(&self, config: &str) -> ParseResult {
         self.inner.parse_service_config(config)
     }
 }
@@ -263,9 +263,9 @@ mod tests {
     use super::*;
     use crate::attributes::Attributes;
     use crate::byte_str::ByteStr;
-    use crate::client::name_resolution::Address;
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
+    use crate::core::Address;
     use crate::rt;
     use crate::rt::GrpcEndpoint;
     use crate::rt::GrpcRuntime;
@@ -324,6 +324,21 @@ mod tests {
             opts: TcpOptions,
         ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
             self.inner.tcp_stream(target, opts)
+        }
+
+        fn tcp_listener(
+            &self,
+            addr: std::net::SocketAddr,
+        ) -> rt::BoxFuture<Result<Box<dyn rt::EndpointListener>, String>> {
+            self.inner.tcp_listener(addr)
+        }
+
+        fn unix_listener(
+            &self,
+            path: std::path::PathBuf,
+            opts: rt::UnixSocketOptions,
+        ) -> rt::BoxFuture<Result<Box<dyn rt::EndpointListener>, String>> {
+            self.inner.unix_listener(path, opts)
         }
     }
 

@@ -34,11 +34,11 @@ use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
 use crate::core::SendMessage;
 
 /// Implements a stream that sinks writes and only returns StreamClosed.

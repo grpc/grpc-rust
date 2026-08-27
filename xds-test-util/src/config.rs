@@ -127,6 +127,48 @@ pub fn build_route_config(name: &str, cluster: &str) -> RouteConfiguration {
     }
 }
 
+/// Builds a route configuration referencing `count` generated clusters
+/// (`cluster-0` .. `cluster-{count-1}`), one prefix route per cluster.
+///
+/// With `count = 1` this is the generated-name equivalent of
+/// [`build_route_config`]. Larger counts mirror control planes that share one
+/// route config across many services (e.g. Istio's per-port route configs).
+pub fn build_route_config_with_cluster_count(name: &str, count: usize) -> RouteConfiguration {
+    let clusters: Vec<String> = (0..count).map(|i| format!("cluster-{i}")).collect();
+    build_route_config_with_clusters(name, &clusters)
+}
+
+/// Builds a route configuration with one prefix route per cluster
+/// (`/<cluster>` -> that cluster), all in one virtual host.
+///
+/// Mirrors control planes that share one route config across many services
+/// (e.g. Istio's per-port route configs).
+pub fn build_route_config_with_clusters(name: &str, clusters: &[String]) -> RouteConfiguration {
+    RouteConfiguration {
+        name: name.to_string(),
+        virtual_hosts: vec![VirtualHost {
+            name: "default".to_string(),
+            domains: vec!["*".to_string()],
+            routes: clusters
+                .iter()
+                .map(|cluster| Route {
+                    r#match: Some(RouteMatch {
+                        path_specifier: Some(PathSpecifier::Prefix(format!("/{cluster}"))),
+                        ..Default::default()
+                    }),
+                    action: Some(Action::Route(RouteAction {
+                        cluster_specifier: Some(ClusterSpecifier::Cluster(cluster.to_string())),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
 /// Builds an EDS-discovered cluster named `name`.
 pub fn build_cluster(name: &str) -> Cluster {
     Cluster {
@@ -170,5 +212,60 @@ fn lb_endpoint(host: &str, port: u16) -> LbEndpoint {
             ..Default::default()
         })),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route_clusters(rc: &RouteConfiguration) -> Vec<(String, String)> {
+        rc.virtual_hosts[0]
+            .routes
+            .iter()
+            .map(|r| {
+                let prefix = match r.r#match.as_ref().and_then(|m| m.path_specifier.as_ref()) {
+                    Some(PathSpecifier::Prefix(p)) => p.clone(),
+                    other => panic!("expected prefix match, got {other:?}"),
+                };
+                let cluster = match r.action.as_ref() {
+                    Some(Action::Route(a)) => match a.cluster_specifier.as_ref() {
+                        Some(ClusterSpecifier::Cluster(c)) => c.clone(),
+                        other => panic!("expected cluster specifier, got {other:?}"),
+                    },
+                    other => panic!("expected route action, got {other:?}"),
+                };
+                (prefix, cluster)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn route_config_with_clusters_builds_one_route_per_cluster() {
+        let clusters = vec!["a".to_string(), "b".to_string()];
+        let rc = build_route_config_with_clusters("rc", &clusters);
+        assert_eq!(rc.name, "rc");
+        assert_eq!(
+            route_clusters(&rc),
+            vec![
+                ("/a".to_string(), "a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn route_config_with_cluster_count_generates_names() {
+        let rc = build_route_config_with_cluster_count("rc", 3);
+        let routes = route_clusters(&rc);
+        assert_eq!(routes.len(), 3);
+        assert_eq!(
+            routes[0],
+            ("/cluster-0".to_string(), "cluster-0".to_string())
+        );
+        assert_eq!(
+            routes[2],
+            ("/cluster-2".to_string(), "cluster-2".to_string())
+        );
     }
 }

@@ -28,8 +28,8 @@ use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::SendStream;
-use crate::core::RequestHeaders;
 
 /// A trait which allows intercepting an RPC [`Invoke`] operation.  The trait is
 /// generic on `I` which should either be implemented as [`InvokeOnce`] (for
@@ -322,13 +322,13 @@ mod test {
     use crate::client::CallOptions;
     use crate::client::Invoke;
     use crate::client::RecvStream;
+    use crate::client::ResponseHeaders;
     use crate::client::ResponseStreamItem;
     use crate::client::SendOptions;
     use crate::client::SendStream;
+    use crate::client::Trailers;
     use crate::core::RecvMessage;
-    use crate::core::ResponseHeaders;
     use crate::core::SendMessage;
-    use crate::core::Trailers;
 
     #[derive(Clone)]
     struct Reusable;
@@ -563,7 +563,9 @@ mod test {
             .unwrap();
         assert_eq!(controller.recv_req().await.0, one);
         controller
-            .send_resp(ResponseStreamItem::Headers(ResponseHeaders::default()))
+            .send_resp(ResponseStreamItem::Headers(ResponseHeaders::new(
+                crate::core::test_connection_info(),
+            )))
             .await;
 
         let resp = rx.recv(&mut ByteRecvMsg::new()).await;

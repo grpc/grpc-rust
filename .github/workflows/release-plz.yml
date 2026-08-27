@@ -12,7 +12,7 @@ permissions:
 jobs:
   release-plz-release:
     name: release-plz (release)
-    if: github.repository_owner == 'hyperium'
+    if: github.repository_owner == 'grpc'
     runs-on: ubuntu-latest
     concurrency:
       group: release-plz-release
@@ -33,7 +33,7 @@ jobs:
 
   release-plz-pr:
     name: release-plz (PR)
-    if: github.repository_owner == 'hyperium'
+    if: github.repository_owner == 'grpc'
     needs: release-plz-release
     runs-on: ubuntu-latest
     concurrency:

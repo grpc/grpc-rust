@@ -697,7 +697,12 @@ where
                 }
             };
 
-            match self.run_connected(stream, &mut healthy).await {
+            if !healthy {
+                self.recorder.record_connected(true);
+                healthy = true;
+            }
+
+            match self.run_connected(stream).await {
                 ConnectedOutcome::Shutdown => return,
                 ConnectedOutcome::Failed { saw_response } => {
                     // gRFC A78: a server goes unhealthy (one `server_failure`) on
@@ -769,11 +774,7 @@ where
     /// (command channel closed), or [`ConnectedOutcome::Failed`] if the stream
     /// failed and the worker should reconnect (carrying whether a response was
     /// seen, per gRFC A78).
-    async fn run_connected<S: TransportStream>(
-        &mut self,
-        mut stream: S,
-        healthy: &mut bool,
-    ) -> ConnectedOutcome {
+    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> ConnectedOutcome {
         // Whether at least one response was received on this stream. Per gRFC
         // A78 a stream that fails *after* receiving a response is not counted as
         // a server failure.
@@ -791,13 +792,7 @@ where
                 result = stream.recv(), if pending.is_none() => {
                     match result {
                         Ok(Some(bytes)) => {
-                            if !saw_response {
-                                if !*healthy {
-                                    self.recorder.record_connected(true);
-                                    *healthy = true;
-                                }
-                                saw_response = true;
-                            }
+                            saw_response = true;
                             match self.handle_response(&mut stream, bytes).await {
                                 Ok(dispatch) => pending = dispatch,
                                 Err(_) => return ConnectedOutcome::Failed { saw_response },

@@ -37,8 +37,7 @@ use crate::client::load_balancing::ParsedJsonLbConfig;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceConfigSerde {
     pub(crate) load_balancing_policy: Option<String>,
-    #[serde(default)]
-    pub(crate) load_balancing_config: LbConfigSerde,
+    pub(crate) load_balancing_config: Option<LbConfigSerde>,
     pub(crate) method_config: Option<Vec<MethodConfigSerde>>,
     pub(crate) retry_throttling: Option<RetryThrottlingPolicySerde>,
     pub(crate) health_check_config: Option<HealthCheckConfigSerde>,
@@ -89,26 +88,9 @@ fn default_max_connections_per_subchannel() -> SerdeU32 {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LbInnerConfig {
+pub(crate) struct LbConfigSerde {
     pub(crate) builder: Arc<DynLbPolicyBuilder>,
     pub(crate) config: Option<DynLbConfig>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct LbConfigSerde(Option<LbInnerConfig>);
-
-impl LbConfigSerde {
-    pub(crate) fn as_ref(&self) -> Option<&LbInnerConfig> {
-        self.0.as_ref()
-    }
-
-    pub(crate) fn is_none(&self) -> bool {
-        self.0.is_none()
-    }
-
-    pub(crate) fn is_some(&self) -> bool {
-        self.0.is_some()
-    }
 }
 
 impl<'de> Deserialize<'de> for LbConfigSerde {
@@ -119,10 +101,6 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
         let raw_entries =
             Option::<Vec<HashMap<String, serde_json::Value>>>::deserialize(deserializer)?
                 .unwrap_or_default();
-
-        if raw_entries.is_empty() {
-            return Ok(LbConfigSerde(None));
-        }
 
         for map in raw_entries {
             let mut iter = map.into_iter();
@@ -137,10 +115,10 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
                 let parsed_config = builder
                     .parse_config(&parsed_json)
                     .map_err(serde::de::Error::custom)?;
-                return Ok(LbConfigSerde(Some(LbInnerConfig {
+                return Ok(LbConfigSerde {
                     builder,
                     config: parsed_config,
-                })));
+                });
             }
         }
 
@@ -381,24 +359,17 @@ mod test {
     fn test_load_balancing_config_serde() {
         use crate::client::load_balancing::pick_first::PickFirstConfig;
 
-        #[derive(Deserialize, Debug)]
-        #[serde(rename_all = "camelCase")]
-        struct TestConfig {
-            #[serde(default)]
-            load_balancing_config: LbConfigSerde,
-        }
-
         // Single supported policy without config (round_robin)
-        let val: TestConfig = serde_json::from_value(json!({
+        let val: ServiceConfigSerde = serde_json::from_value(json!({
             "loadBalancingConfig": [{ "round_robin": {} }]
         }))
         .unwrap();
-        let selected = val.load_balancing_config.as_ref().unwrap();
+        let selected = val.load_balancing_config.unwrap();
         assert_eq!(selected.builder.name(), "round_robin");
         assert!(selected.config.is_none());
 
         // Multiple policies; picks first supported with parsed config (pick_first)
-        let val: TestConfig = serde_json::from_value(json!({
+        let val: ServiceConfigSerde = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_1": { "key": "val" } },
                 { "pick_first": { "shuffleAddressList": true } },
@@ -417,13 +388,13 @@ mod test {
         assert!(pf_cfg.shuffle_address_list);
 
         // Invalid config for supported policy fails deserialization
-        let res: Result<TestConfig, _> = serde_json::from_value(json!({
+        let res: Result<ServiceConfigSerde, _> = serde_json::from_value(json!({
             "loadBalancingConfig": [{ "pick_first": { "shuffleAddressList": "not_a_bool" } }]
         }));
         assert!(res.is_err());
 
         // Non-empty array with no supported policies -> fails deserialization
-        let res: Result<TestConfig, _> = serde_json::from_value(json!({
+        let res: Result<ServiceConfigSerde, _> = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "unsupported_1": {} },
                 { "unsupported_2": {} }
@@ -431,25 +402,24 @@ mod test {
         }));
         assert!(res.is_err());
 
-        // Empty array -> collapses to None
-        let val: TestConfig = serde_json::from_value(json!({
+        // Empty array -> Error
+        let res: Result<ServiceConfigSerde, _> = serde_json::from_value(json!({
             "loadBalancingConfig": []
-        }))
-        .unwrap();
-        assert!(val.load_balancing_config.is_none());
+        }));
+        assert!(res.is_err());
 
         // Null or absent -> None
-        let val: TestConfig = serde_json::from_value(json!({
+        let val: ServiceConfigSerde = serde_json::from_value(json!({
             "loadBalancingConfig": null
         }))
         .unwrap();
         assert!(val.load_balancing_config.is_none());
 
-        let val: TestConfig = serde_json::from_value(json!({})).unwrap();
+        let val: ServiceConfigSerde = serde_json::from_value(json!({})).unwrap();
         assert!(val.load_balancing_config.is_none());
 
         // Multiple policies; trailing entries after first supported are ignored
-        let val: TestConfig = serde_json::from_value(json!({
+        let val: ServiceConfigSerde = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "pick_first": { "shuffleAddressList": true } },
                 { "unsupported": { "invalid": 123 }, "other": {} },
@@ -461,7 +431,7 @@ mod test {
         assert_eq!(selected.builder.name(), "pick_first");
 
         // Invalid entry with multiple keys in single object -> Error
-        let res: Result<TestConfig, _> = serde_json::from_value(json!({
+        let res: Result<ServiceConfigSerde, _> = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "round_robin": {}, "pick_first": {} }
             ]
@@ -469,7 +439,7 @@ mod test {
         assert!(res.is_err());
 
         // Invalid entry with empty object -> Error
-        let res: Result<TestConfig, _> = serde_json::from_value(json!({
+        let res: Result<ServiceConfigSerde, _> = serde_json::from_value(json!({
             "loadBalancingConfig": [{}]
         }));
         assert!(res.is_err());

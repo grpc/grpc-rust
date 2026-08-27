@@ -207,11 +207,8 @@ impl LbPolicy for PickFirstPolicy {
                 let addresses = match self.compile_address(endpoints, config) {
                     Ok(addrs) => addrs,
                     Err(e) => {
-                        self.state = PickFirstState::Idle(IdleState {
-                            addresses: Vec::new(),
-                        });
-                        ctx.set_failing_picker(&e);
-                        ctx.controller.request_resolution();
+                        self.state =
+                            SteadyState::enter(&mut ctx, Vec::new(), Vec::new(), e.clone());
                         return Err(e);
                     }
                 };
@@ -220,17 +217,13 @@ impl LbPolicy for PickFirstPolicy {
                 Ok(())
             }
             Err(error) => {
-                let has_addresses = match &self.state {
-                    PickFirstState::Idle(s) => !s.addresses.is_empty(),
-                    PickFirstState::FirstPass(s) => !s.addresses.is_empty(),
-                    PickFirstState::SteadyState(s) => !s.addresses.is_empty(),
-                    PickFirstState::Ready(s) => !s.addresses.is_empty(),
-                };
+                let is_idle_without_addresses =
+                    matches!(&self.state, PickFirstState::Idle(s) if s.addresses.is_empty());
                 let is_tf = matches!(self.state, PickFirstState::SteadyState(_));
 
-                if !has_addresses || is_tf {
-                    ctx.set_failing_picker(&error);
-                    ctx.controller.request_resolution();
+                if is_idle_without_addresses || is_tf {
+                    self.state =
+                        SteadyState::enter(&mut ctx, Vec::new(), Vec::new(), error.clone());
                     return Err(error);
                 }
                 Ok(())
@@ -1910,6 +1903,53 @@ mod test {
         expect_new_subchannel(&rx);
         let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr3");
+        let state = expect_picker_update(&rx);
+        assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+    }
+
+    // Tests that when in Transient Failure, receiving a valid resolver update
+    // immediately transitions to connecting without waiting for exit_idle.
+    #[tokio::test]
+    async fn test_pick_first_resolver_update_in_transient_failure_starts_connecting_immediately() {
+        let (rx, mut policy, mut controller) = setup();
+
+        // 1. Initial resolution failure sets Transient Failure.
+        let res = policy.resolver_update(
+            ResolverUpdate {
+                endpoints: Err("resolver unavailable".to_string()),
+                ..Default::default()
+            },
+            None,
+            controller.as_mut(),
+        );
+        assert!(res.is_err());
+
+        let state = expect_picker_update(&rx);
+        assert_eq!(
+            state.connectivity_state,
+            ConnectivityState::TransientFailure
+        );
+        expect_request_resolution(&rx);
+
+        // 2. A valid resolver update arrives [addr1, addr2].
+        let endpoints = create_endpoints(vec!["addr1", "addr2"], None);
+        policy
+            .resolver_update(
+                ResolverUpdate {
+                    endpoints: Ok(endpoints),
+                    ..Default::default()
+                },
+                None,
+                controller.as_mut(),
+            )
+            .unwrap();
+
+        // 3. Verify subchannels created and connection initiates immediately without
+        //    exit_idle.
+        expect_new_subchannel(&rx);
+        expect_new_subchannel(&rx);
+        let addr = expect_connect(&rx);
+        assert_eq!(addr.address.to_string(), "addr1");
         let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
     }

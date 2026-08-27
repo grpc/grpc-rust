@@ -1,0 +1,68 @@
+[package]
+name = "xds-client"
+description = "An xDS client implementation in Rust"
+version = "0.1.0-alpha.3"
+edition = "2024"
+homepage = "https://github.com/hyperium/tonic"
+repository = "https://github.com/hyperium/tonic"
+license = "MIT"
+rust-version = { workspace = true }
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.11.0"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "macros"] }
+rand = "0.10"
+
+# Optional dependencies for tonic transport
+tonic = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
+
+# Optional dependencies for prost codec
+envoy-types = { version = "0.7", optional = true }
+prost = { version = "0.14", optional = true }
+
+[features]
+default = ["transport-tonic", "codegen-prost"]
+transport-tonic = [
+    "rt-tokio",
+    "dep:tonic",
+    "tonic/codegen",
+    "dep:tokio-stream",
+    "dep:http",
+]
+tonic-tls-ring = ["transport-tonic", "tonic/tls-ring"]
+tonic-tls-aws-lc = ["transport-tonic", "tonic/tls-aws-lc"]
+rt-tokio = ["tokio/rt", "tokio/time"]
+codegen-prost = ["dep:envoy-types", "dep:prost"]
+test-util = []
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+] }
+tonic = { version = "0.14" }
+async-stream = "0.3"
+envoy-types = "0.7"
+prost = "0.14"
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+required-features = ["tonic-tls-ring"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # major released
+    "bytes::*",
+    # Re-exported in the public API behind the transport-tonic / codegen-prost features.
+    "tonic::*",
+    "prost::*",
+]

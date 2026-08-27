@@ -1,17 +1,17 @@
 [package]
-authors = ["Lucio Franco <luciofranco14@gmail.com>"]
+authors = ["gRPC authors"]
 categories = ["network-programming", "asynchronous"]
 description = """
 Codegen module of `tonic` gRPC implementation.
 """
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/hyperium/tonic"
 keywords = ["rpc", "grpc", "async", "codegen", "protobuf"]
 license = "MIT"
 name = "tonic-build"
 readme = "README.md"
 repository = "https://github.com/hyperium/tonic"
-version = "0.14.1"
+version = "0.14.6"
 rust-version = { workspace = true }
 
 [dependencies]

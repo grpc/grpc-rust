@@ -1,0 +1,391 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+//! Prost-based codec using envoy-types.
+
+use crate::codec::XdsCodec;
+use crate::error::{Error, Result};
+use crate::message::{DiscoveryRequest, DiscoveryResponse, MetadataValue, ResourceAny};
+use bytes::Bytes;
+use prost::Message;
+
+/// A codec that uses prost/envoy-types for serialization.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProstCodec;
+
+impl XdsCodec for ProstCodec {
+    fn encode_request(&self, request: &DiscoveryRequest<'_>) -> Result<Bytes> {
+        use envoy_types::pb::envoy::config::core::v3 as core;
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        use envoy_types::pb::google::protobuf::Struct;
+        use envoy_types::pb::google::rpc::Status;
+
+        let metadata = if request.node.metadata.is_empty() {
+            None
+        } else {
+            Some(Struct {
+                fields: request
+                    .node
+                    .metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), metadata_to_proto(v)))
+                    .collect(),
+            })
+        };
+
+        let proto_request = discovery::DiscoveryRequest {
+            version_info: request.version_info.to_owned(),
+            node: Some(core::Node {
+                id: request.node.id.clone().unwrap_or_default(),
+                cluster: request.node.cluster.clone().unwrap_or_default(),
+                user_agent_name: request.node.user_agent_name.clone(),
+                user_agent_version_type: Some(core::node::UserAgentVersionType::UserAgentVersion(
+                    request.node.user_agent_version.clone(),
+                )),
+                locality: request.node.locality.as_ref().map(|l| core::Locality {
+                    region: l.region.clone(),
+                    zone: l.zone.clone(),
+                    sub_zone: l.sub_zone.clone(),
+                }),
+                metadata,
+                ..Default::default()
+            }),
+            resource_names: request.resource_names.to_vec(),
+            type_url: request.type_url.to_owned(),
+            response_nonce: request.response_nonce.to_owned(),
+            error_detail: request.error_detail.as_ref().map(|e| Status {
+                code: e.code,
+                message: e.message.clone(),
+                details: vec![],
+            }),
+            ..Default::default()
+        };
+
+        Ok(proto_request.encode_to_vec().into())
+    }
+
+    fn decode_response(&self, bytes: Bytes) -> Result<DiscoveryResponse> {
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+
+        let proto_response = discovery::DiscoveryResponse::decode(bytes).map_err(Error::Decode)?;
+
+        Ok(DiscoveryResponse {
+            version_info: proto_response.version_info,
+            resources: proto_response
+                .resources
+                .into_iter()
+                .map(|any| ResourceAny {
+                    type_url: any.type_url,
+                    value: any.value.into(),
+                })
+                .collect(),
+            type_url: proto_response.type_url,
+            nonce: proto_response.nonce,
+        })
+    }
+}
+
+/// Convert a [`MetadataValue`] to its `google.protobuf.Value` wire form.
+fn metadata_to_proto(value: &MetadataValue) -> envoy_types::pb::google::protobuf::Value {
+    use envoy_types::pb::google::protobuf::{ListValue, Struct, Value, value::Kind};
+
+    let kind = match value {
+        MetadataValue::Null => Kind::NullValue(0),
+        MetadataValue::Bool(b) => Kind::BoolValue(*b),
+        MetadataValue::Number(n) => Kind::NumberValue(*n),
+        MetadataValue::String(s) => Kind::StringValue(s.clone()),
+        MetadataValue::Array(items) => Kind::ListValue(ListValue {
+            values: items.iter().map(metadata_to_proto).collect(),
+        }),
+        MetadataValue::Object(fields) => Kind::StructValue(Struct {
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.clone(), metadata_to_proto(v)))
+                .collect(),
+        }),
+    };
+    Value { kind: Some(kind) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{ErrorDetail, Locality, Node};
+
+    #[test]
+    fn test_encode_request_minimal() {
+        let codec = ProstCodec;
+        let node = Node::new("grpc", "1.0");
+        let resource_names = vec!["listener-1".to_string()];
+        let request = DiscoveryRequest {
+            version_info: "",
+            node: &node,
+            type_url: "type.googleapis.com/envoy.config.listener.v3.Listener",
+            resource_names: &resource_names,
+            response_nonce: "",
+            error_detail: None,
+        };
+
+        let bytes = codec.encode_request(&request).unwrap();
+        assert!(!bytes.is_empty());
+
+        // Verify we can decode it back with prost
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        let decoded = discovery::DiscoveryRequest::decode(bytes).unwrap();
+        assert_eq!(decoded.type_url, request.type_url);
+        assert_eq!(decoded.resource_names, request.resource_names);
+    }
+
+    #[test]
+    fn test_encode_request_with_node() {
+        let codec = ProstCodec;
+        let node = Node::new("grpc", "1.0")
+            .with_id("node-1")
+            .with_cluster("cluster-1")
+            .with_locality(Locality {
+                region: "us-west".to_string(),
+                zone: "us-west-1a".to_string(),
+                sub_zone: "rack-1".to_string(),
+            });
+        let resource_names: Vec<String> = Vec::new();
+        let request = DiscoveryRequest {
+            version_info: "",
+            node: &node,
+            type_url: "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+            resource_names: &resource_names,
+            response_nonce: "",
+            error_detail: None,
+        };
+
+        let bytes = codec.encode_request(&request).unwrap();
+
+        use envoy_types::pb::envoy::config::core::v3 as core;
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        let decoded = discovery::DiscoveryRequest::decode(bytes).unwrap();
+        let node = decoded.node.unwrap();
+        assert_eq!(node.id, "node-1");
+        assert_eq!(node.cluster, "cluster-1");
+        assert_eq!(node.user_agent_name, "grpc");
+        // Verify user_agent_version is properly encoded
+        match node.user_agent_version_type {
+            Some(core::node::UserAgentVersionType::UserAgentVersion(version)) => {
+                assert_eq!(version, "1.0");
+            }
+            _ => panic!("Expected UserAgentVersion to be set"),
+        }
+        let locality = node.locality.unwrap();
+        assert_eq!(locality.region, "us-west");
+        assert_eq!(locality.zone, "us-west-1a");
+        assert_eq!(locality.sub_zone, "rack-1");
+    }
+
+    #[test]
+    fn test_encode_request_with_metadata() {
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        use envoy_types::pb::google::protobuf::value::Kind;
+        use std::collections::HashMap;
+
+        let codec = ProstCodec;
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "GENERATOR".to_string(),
+            MetadataValue::String("grpc".to_string()),
+        );
+        let node = Node::new("grpc", "1.0").with_metadata(metadata);
+        let resource_names: Vec<String> = Vec::new();
+        let request = DiscoveryRequest {
+            version_info: "",
+            node: &node,
+            type_url: "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+            resource_names: &resource_names,
+            response_nonce: "",
+            error_detail: None,
+        };
+
+        let bytes = codec.encode_request(&request).unwrap();
+        let decoded = discovery::DiscoveryRequest::decode(bytes).unwrap();
+        let metadata_struct = decoded.node.unwrap().metadata.unwrap();
+
+        let value = metadata_struct.fields.get("GENERATOR").unwrap();
+        match &value.kind {
+            Some(Kind::StringValue(s)) => assert_eq!(s, "grpc"),
+            other => panic!("expected StringValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encode_request_with_nested_metadata() {
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        use envoy_types::pb::google::protobuf::value::Kind;
+        use std::collections::HashMap;
+
+        let codec = ProstCodec;
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "istio.io/rev".to_string(),
+            MetadataValue::String("default".to_string()),
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "ANNOTATIONS".to_string(),
+            MetadataValue::Object(annotations),
+        );
+        metadata.insert(
+            "ENVOY_PROMETHEUS_PORT".to_string(),
+            MetadataValue::Number(15090.0),
+        );
+        metadata.insert(
+            "PILOT_SAN".to_string(),
+            MetadataValue::Array(vec![MetadataValue::String(
+                "istiod.istio-system.svc".to_string(),
+            )]),
+        );
+
+        let node = Node::new("grpc", "1.0").with_metadata(metadata);
+        let resource_names: Vec<String> = Vec::new();
+        let request = DiscoveryRequest {
+            version_info: "",
+            node: &node,
+            type_url: "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+            resource_names: &resource_names,
+            response_nonce: "",
+            error_detail: None,
+        };
+
+        let bytes = codec.encode_request(&request).unwrap();
+        let decoded = discovery::DiscoveryRequest::decode(bytes).unwrap();
+        let fields = decoded.node.unwrap().metadata.unwrap().fields;
+
+        match &fields.get("ANNOTATIONS").unwrap().kind {
+            Some(Kind::StructValue(s)) => match &s.fields.get("istio.io/rev").unwrap().kind {
+                Some(Kind::StringValue(v)) => assert_eq!(v, "default"),
+                other => panic!("expected StringValue, got {other:?}"),
+            },
+            other => panic!("expected StructValue, got {other:?}"),
+        }
+
+        match &fields.get("ENVOY_PROMETHEUS_PORT").unwrap().kind {
+            Some(Kind::NumberValue(n)) => assert_eq!(*n, 15090.0),
+            other => panic!("expected NumberValue, got {other:?}"),
+        }
+
+        match &fields.get("PILOT_SAN").unwrap().kind {
+            Some(Kind::ListValue(l)) => {
+                assert_eq!(l.values.len(), 1);
+                match &l.values[0].kind {
+                    Some(Kind::StringValue(s)) => assert_eq!(s, "istiod.istio-system.svc"),
+                    other => panic!("expected StringValue, got {other:?}"),
+                }
+            }
+            other => panic!("expected ListValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encode_request_empty_metadata_omits_struct() {
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+
+        let codec = ProstCodec;
+        let node = Node::new("grpc", "1.0");
+        let resource_names: Vec<String> = Vec::new();
+        let request = DiscoveryRequest {
+            version_info: "",
+            node: &node,
+            type_url: "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+            resource_names: &resource_names,
+            response_nonce: "",
+            error_detail: None,
+        };
+
+        let bytes = codec.encode_request(&request).unwrap();
+        let decoded = discovery::DiscoveryRequest::decode(bytes).unwrap();
+        assert!(decoded.node.unwrap().metadata.is_none());
+    }
+
+    #[test]
+    fn test_decode_response() {
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        use envoy_types::pb::google::protobuf::Any;
+
+        let proto_response = discovery::DiscoveryResponse {
+            version_info: "1".to_string(),
+            type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+            nonce: "nonce-1".to_string(),
+            resources: vec![Any {
+                type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+                value: b"fake-listener-bytes".to_vec(),
+            }],
+            ..Default::default()
+        };
+
+        let bytes: Bytes = proto_response.encode_to_vec().into();
+
+        let codec = ProstCodec;
+        let response = codec.decode_response(bytes).unwrap();
+
+        assert_eq!(response.version_info, "1");
+        assert_eq!(
+            response.type_url,
+            "type.googleapis.com/envoy.config.listener.v3.Listener"
+        );
+        assert_eq!(response.nonce, "nonce-1");
+        assert_eq!(response.resources.len(), 1);
+        assert_eq!(
+            response.resources[0].type_url,
+            "type.googleapis.com/envoy.config.listener.v3.Listener"
+        );
+        assert_eq!(response.resources[0].value.as_ref(), b"fake-listener-bytes");
+    }
+
+    #[test]
+    fn test_roundtrip() {
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+
+        let codec = ProstCodec;
+
+        let node = Node::new("grpc", "1.0");
+        let resource_names = vec!["res-1".to_string(), "res-2".to_string()];
+        let request = DiscoveryRequest {
+            version_info: "42",
+            node: &node,
+            type_url: "type.googleapis.com/test.Resource",
+            resource_names: &resource_names,
+            response_nonce: "nonce-abc",
+            error_detail: Some(ErrorDetail {
+                code: 3, // INVALID_ARGUMENT
+                message: "validation failed".to_string(),
+            }),
+        };
+
+        let request_bytes = codec.encode_request(&request).unwrap();
+
+        let proto_request = discovery::DiscoveryRequest::decode(request_bytes).unwrap();
+        assert_eq!(proto_request.version_info, "42");
+        assert_eq!(proto_request.response_nonce, "nonce-abc");
+        let error = proto_request.error_detail.unwrap();
+        assert_eq!(error.code, 3);
+        assert_eq!(error.message, "validation failed");
+    }
+}

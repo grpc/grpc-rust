@@ -1,0 +1,72 @@
+[workspace]
+changelog_update = true
+dependencies_update = true
+git_release_enable = true
+git_release_type = "auto"
+publish_timeout = "30m"
+pr_labels = ["release"]
+release_always = false
+semver_check = true
+
+# tonic group (shared version)
+[[package]]
+name = "tonic"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-build"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-prost"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-prost-build"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-types"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-health"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-reflection"
+version_group = "tonic"
+
+[[package]]
+name = "tonic-web"
+version_group = "tonic"
+
+# xds crates: published manually for now
+[[package]]
+name = "xds-client"
+release = false
+
+[[package]]
+name = "tonic-xds"
+release = false
+
+[[package]]
+name = "xds-client-opentelemetry"
+release = false
+
+# grpc crates: published manually for now
+[[package]]
+name = "grpc"
+release = false
+
+[[package]]
+name = "grpc-protobuf"
+release = false
+
+[[package]]
+name = "grpc-protobuf-build"
+release = false
+
+[[package]]
+name = "protoc-gen-rust-grpc"
+release = false

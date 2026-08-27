@@ -31,14 +31,16 @@ echo "Running for OS: ${OSTYPE}"
 case "$OSTYPE" in
   darwin*)  OS="darwin"; EXT="" ;;
   linux*)   OS="linux"; EXT="" ;;
+  cygwin*)  OS="windows"; EXT=".exe" ;;
   msys*)    OS="windows"; EXT=".exe" ;;
   *)        exit 2 ;;
 esac
 
 ARG="${1:-""}"
 
-
-(cd interop && cargo build --bins)
+if [ -z "${GITHUB_ACTIONS:-}" ]; then
+  (cd interop && cargo build --bins)
+fi
 
 SERVER="interop/bin/server_${OS}_amd64${EXT}"
 
@@ -60,12 +62,13 @@ cleanup() {
 # regardless of why (errors, SIGTERM, etc).
 trap cleanup EXIT
 
-sleep 1
+sleep 3
 
-./target/debug/client --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
+TARGET_DIR="$(cargo metadata --format-version 1 | jq -r '.target_directory')"
+"${TARGET_DIR}/debug/client" --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
 
 # Test a grpc rust client against a Go server.
-./target/debug/client --codec=protobuf --test_case="${JOINED_TEST_CASES}" ${ARG}
+"${TARGET_DIR}/debug/client" --codec=protobuf --test_case="${JOINED_TEST_CASES}" ${ARG}
 
 echo ":; killing test server"; kill "${SERVER_PID}";
 echo "Waiting for test server to exit..."
@@ -77,13 +80,13 @@ CODECS=("prost" "protobuf")
 
 for CODEC in "${CODECS[@]}"; do
     # run the test server
-    ./target/debug/server "${ARG}" --codec "${CODEC}" &
+    "${TARGET_DIR}/debug/server" "${ARG}" --codec "${CODEC}" &
     SERVER_PID=$!
     echo ":; started tonic test server with the ${CODEC} codec."
 
-    sleep 1
+    sleep 3
 
-    ./target/debug/client --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
+    "${TARGET_DIR}/debug/client" --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
 
     # Run client test cases
     if [ -n "${ARG:-}" ]; then

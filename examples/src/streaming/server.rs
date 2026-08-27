@@ -1,11 +1,35 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 pub mod pb {
     tonic::include_proto!("grpc.examples.echo");
 }
 
 use std::{error::Error, io::ErrorKind, net::ToSocketAddrs, pin::Pin, time::Duration};
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
-use tonic::{transport::Server, Request, Response, Status, Streaming};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tonic::{Request, Response, Status, Streaming, transport::Server};
 
 use pb::{EchoRequest, EchoResponse};
 
@@ -22,10 +46,10 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 
         // h2::Error do not expose std::io::Error with `source()`
         // https://github.com/hyperium/h2/pull/462
-        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
-            if let Some(io_err) = h2_err.get_io() {
-                return Some(io_err);
-            }
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>()
+            && let Some(io_err) = h2_err.get_io()
+        {
+            return Some(io_err);
         }
 
         err = err.source()?;
@@ -63,7 +87,7 @@ impl pb::echo_server::Echo for EchoServer {
             while let Some(item) = stream.next().await {
                 match tx.send(Result::<_, Status>::Ok(item)).await {
                     Ok(_) => {
-                        // item (server response) was queued to be send to client
+                        // item (server response) was queued to be sent to client
                     }
                     Err(_item) => {
                         // output_stream was build from rx and both are dropped
@@ -110,13 +134,13 @@ impl pb::echo_server::Echo for EchoServer {
                         .await
                         .expect("working rx"),
                     Err(err) => {
-                        if let Some(io_err) = match_for_io_error(&err) {
-                            if io_err.kind() == ErrorKind::BrokenPipe {
-                                // here you can handle special case when client
-                                // disconnected in unexpected way
-                                eprintln!("\tclient disconnected: broken pipe");
-                                break;
-                            }
+                        if let Some(io_err) = match_for_io_error(&err)
+                            && io_err.kind() == ErrorKind::BrokenPipe
+                        {
+                            // here you can handle special case when client
+                            // disconnected in unexpected way
+                            eprintln!("\tclient disconnected: broken pipe");
+                            break;
                         }
 
                         match tx.send(Err(err)).await {
@@ -139,13 +163,12 @@ impl pb::echo_server::Echo for EchoServer {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let server = EchoServer {};
     Server::builder()
         .add_service(pb::echo_server::EchoServer::new(server))
-        .serve("[::1]:50051".to_socket_addrs().unwrap().next().unwrap())
-        .await
-        .unwrap();
+        .serve("[::1]:50051".to_socket_addrs()?.next().unwrap())
+        .await?;
 
     Ok(())
 }

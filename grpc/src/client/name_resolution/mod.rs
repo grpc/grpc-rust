@@ -27,22 +27,39 @@
 //! Name Resolution is the process by which a channel's target is converted into
 //! network addresses (typically IP addresses) used by the channel to connect to
 //! a service.
-use core::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::hash::Hash;
+use std::str::FromStr;
+use std::sync::Arc;
 
-use super::service_config::ServiceConfig;
-use crate::{attributes::Attributes, byte_str::ByteStr, rt::Runtime};
-use std::{
-    fmt::{Display, Formatter},
-    hash::Hash,
-    str::FromStr,
-    sync::Arc,
-};
+use percent_encoding::AsciiSet;
+use percent_encoding::NON_ALPHANUMERIC;
+use percent_encoding::percent_decode_str;
+use percent_encoding::utf8_percent_encode;
+use url::Url;
+
+use crate::attributes::Attributes;
+use crate::client::service_config::ParseResult;
+use crate::client::service_config::ServiceConfig;
+use crate::core::Address;
+use crate::rt::GrpcRuntime;
 
 mod backoff;
-mod dns;
-mod registry;
+pub mod registry;
+
+pub(crate) mod dns;
 pub(crate) use registry::global_registry;
-use url::Url;
+
+#[cfg(test)]
+mod test_utils;
+
+pub(crate) mod proxy_resolver;
+
+#[cfg(unix)]
+pub(crate) mod unix;
+#[cfg(target_os = "linux")]
+pub(crate) mod unix_abstract;
 
 /// Target represents a target for gRPC, as specified in:
 /// https://github.com/grpc/grpc/blob/master/doc/naming.md.
@@ -55,24 +72,21 @@ use url::Url;
 /// (i.e. no corresponding resolver available to resolve the endpoint), we will
 /// apply the default scheme, and will attempt to reparse it.
 #[derive(Debug, Clone)]
-pub(crate) struct Target {
+pub struct Target {
     url: Url,
+    decoded_path: String,
 }
 
 impl FromStr for Target {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.parse::<Url>() {
-            Ok(url) => Ok(Target { url }),
-            Err(err) => Err(err.to_string()),
-        }
-    }
-}
-
-impl From<url::Url> for Target {
-    fn from(url: url::Url) -> Self {
-        Target { url }
+        let url = s.parse::<Url>().map_err(|err| err.to_string())?;
+        let decoded_path = percent_decode_str(url.path())
+            .decode_utf8()
+            .map_err(|err| format!("invalid UTF-8 character in target path: {err}"))?
+            .into_owned();
+        Ok(Target { url, decoded_path })
     }
 }
 
@@ -113,9 +127,9 @@ impl Target {
         }
     }
 
-    /// Retrieves endpoint from `Url.path()`.
+    /// Retrieves the percent-decoded endpoint from `Url.path()`.
     pub fn path(&self) -> &str {
-        self.url.path()
+        &self.decoded_path
     }
 }
 
@@ -126,14 +140,14 @@ impl Display for Target {
             "{}://{}{}",
             self.scheme(),
             self.authority_host_port(),
-            self.path()
+            self.url.path()
         )
     }
 }
 
 /// A name resolver factory that produces Resolver instances used by the channel
 /// to resolve network addresses for the target URI.
-pub(crate) trait ResolverBuilder: Send + Sync {
+pub trait ResolverBuilder: Send + Sync {
     /// Builds a name resolver instance.
     ///
     /// Note that build must not fail.  Instead, an erroring Resolver may be
@@ -150,10 +164,36 @@ pub(crate) trait ResolverBuilder: Send + Sync {
     /// the name of an external server used for name resolution.
     ///
     /// By default, this method returns the path portion of the target URI,
-    /// with the leading prefix removed.
+    /// with the leading prefix removed and percent-encoded based on
+    /// https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.
     fn default_authority(&self, target: &Target) -> String {
+        static CUSTOM_AUTHORITY_SET: &AsciiSet = &NON_ALPHANUMERIC
+            // Unreserved characters
+            .remove(b'-')
+            .remove(b'_')
+            .remove(b'.')
+            .remove(b'~')
+            // Subdelim characters
+            .remove(b'!')
+            .remove(b'$')
+            .remove(b'&')
+            .remove(b'\'')
+            .remove(b'(')
+            .remove(b')')
+            .remove(b'*')
+            .remove(b'+')
+            .remove(b',')
+            .remove(b';')
+            .remove(b'=')
+            // Authority related delimiters
+            .remove(b':')
+            .remove(b'[')
+            .remove(b']')
+            .remove(b'@');
+
         let path = target.path();
-        path.strip_prefix("/").unwrap_or(path).to_string()
+        let path = path.strip_prefix("/").unwrap_or(path).to_string();
+        utf8_percent_encode(&path, CUSTOM_AUTHORITY_SET).to_string()
     }
 
     /// Returns a bool indicating whether the input uri is valid to create a
@@ -164,7 +204,7 @@ pub(crate) trait ResolverBuilder: Send + Sync {
 /// A collection of data configured on the channel that is constructing this
 /// name resolver.
 #[non_exhaustive]
-pub(crate) struct ResolverOptions {
+pub struct ResolverOptions {
     /// The authority that will be used for the channel by default. This refers
     /// to the `:authority` value sent in HTTP/2 requests — the dataplane
     /// authority — and not the authority portion of the target URI, which is
@@ -176,7 +216,7 @@ pub(crate) struct ResolverOptions {
     pub authority: String,
 
     /// The runtime which provides utilities to do async work.
-    pub runtime: Arc<dyn Runtime>,
+    pub runtime: GrpcRuntime,
 
     /// A hook into the channel's work scheduler that allows the Resolver to
     /// request the ability to perform operations on the ChannelController.
@@ -184,7 +224,7 @@ pub(crate) struct ResolverOptions {
 }
 
 /// Used to asynchronously request a call into the Resolver's work method.
-pub(crate) trait WorkScheduler: Send + Sync {
+pub trait WorkScheduler: Send + Sync {
     // Schedules a call into the Resolver's work method.  If there is already a
     // pending work call that has not yet started, this may not schedule another
     // call.
@@ -196,7 +236,7 @@ pub(crate) trait WorkScheduler: Send + Sync {
 // This trait may not need the Sync sub-trait if the channel implementation can
 // ensure that the resolver is accessed serially. The sub-trait can be removed
 // in that case.
-pub(crate) trait Resolver: Send + Sync {
+pub trait Resolver: Send + Sync {
     /// Asks the resolver to obtain an updated resolver result, if applicable.
     ///
     /// This is useful for polling resolvers to decide when to re-resolve.
@@ -215,7 +255,7 @@ pub(crate) trait Resolver: Send + Sync {
 
 /// The `ChannelController` trait provides the resolver with functionality
 /// to interact with the channel.
-pub(crate) trait ChannelController: Send + Sync {
+pub trait ChannelController: Send + Sync {
     /// Notifies the channel about the current state of the name resolver.  If
     /// an error value is returned, the name resolver should attempt to
     /// re-resolve, if possible.  The resolver is responsible for applying an
@@ -225,14 +265,14 @@ pub(crate) trait ChannelController: Send + Sync {
 
     /// Parses the provided JSON service config and returns an instance of a
     /// ParsedServiceConfig.
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String>;
+    fn parse_service_config(&self, config: &str) -> ParseResult;
 }
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 /// ResolverUpdate contains the current Resolver state relevant to the
 /// channel.
-pub(crate) struct ResolverUpdate {
+pub struct ResolverUpdate {
     /// Attributes contains arbitrary data about the resolver intended for
     /// consumption by the load balancing policy.
     pub attributes: Attributes,
@@ -271,7 +311,7 @@ impl Default for ResolverUpdate {
 /// which the server can be reached, e.g. via IPv4 and IPv6 addresses.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) struct Endpoint {
+pub struct Endpoint {
     /// Addresses contains a list of addresses used to access this endpoint.
     pub addresses: Vec<Address>,
 
@@ -286,67 +326,65 @@ impl Hash for Endpoint {
     }
 }
 
-/// An Address is an identifier that indicates how to connect to a server.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default, Ord, PartialOrd)]
-pub(crate) struct Address {
-    /// The network type is used to identify what kind of transport to create
-    /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.
-    pub network_type: &'static str,
-
-    /// The address itself is passed to the transport in order to create a
-    /// connection to it.
-    pub address: ByteStr,
-
-    /// Attributes contains arbitrary data about this address intended for
-    /// consumption by the subchannel.
-    pub attributes: Attributes,
-}
-
-impl Eq for Address {}
-
-impl PartialEq for Address {
-    fn eq(&self, other: &Self) -> bool {
-        self.network_type == other.network_type && self.address == other.address
-    }
-}
-
-impl Hash for Address {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.network_type.hash(state);
-        self.address.hash(state);
-    }
-}
-
-impl Display for Address {
-    #[allow(clippy::to_string_in_format_args)]
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.network_type, self.address.to_string())
-    }
-}
-
 /// Indicates the address is an IPv4 or IPv6 address that should be connected to
 /// via TCP/IP.
-pub(crate) static TCP_IP_NETWORK_TYPE: &str = "tcp";
+pub static TCP_IP_NETWORK_TYPE: &str = "tcp";
+
+/// Indicates the address is a local filesystem path or abstract name that
+/// should be connected to via a UNIX domain socket.
+pub static UNIX_NETWORK_TYPE: &str = "unix";
 
 // A resolver that returns the same result every time its work method is called.
 // It can be used to return an error to the channel when a resolver fails to
 // build.
 struct NopResolver {
-    pub update: ResolverUpdate,
+    pub update: Option<ResolverUpdate>,
 }
 
 impl Resolver for NopResolver {
     fn resolve_now(&mut self) {}
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        let _ = channel_controller.update(self.update.clone());
+        if let Some(update) = self.update.take() {
+            let _ = channel_controller.update(update);
+        }
+    }
+}
+
+impl NopResolver {
+    fn new_with_err(err: String, options: ResolverOptions) -> Box<dyn Resolver> {
+        options.work_scheduler.schedule_work();
+        Box::new(NopResolver {
+            update: Some(ResolverUpdate {
+                endpoints: Err(err),
+                ..Default::default()
+            }),
+        })
+    }
+
+    fn new_with_addr(addr: Address, options: ResolverOptions) -> Box<dyn Resolver> {
+        options.work_scheduler.schedule_work();
+        Box::new(NopResolver {
+            update: Some(ResolverUpdate {
+                endpoints: Ok(vec![Endpoint {
+                    addresses: vec![addr],
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+        })
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::Target;
+    use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    use super::*;
+    use crate::byte_str::ByteStr;
 
     #[test]
     pub fn parse_target() {
@@ -397,6 +435,15 @@ mod test {
                 want_path: "/run/containerd/containerd.sock",
                 want_str: "unix:///run/containerd/containerd.sock",
             },
+            TestCase {
+                input: "dns:///foo%20bar",
+                want_scheme: "dns",
+                want_host_port: "",
+                want_host: "",
+                want_port: None,
+                want_path: "/foo bar",
+                want_str: "dns:///foo%20bar",
+            },
         ];
 
         for tc in test_cases {
@@ -407,6 +454,169 @@ mod test {
             assert_eq!(target.authority_host_port(), tc.want_host_port);
             assert_eq!(target.path(), tc.want_path);
             assert_eq!(&target.to_string(), tc.want_str);
+        }
+    }
+
+    #[test]
+    fn parse_target_invalid_utf8() {
+        let input = "dns:///foo%FFbar";
+        let target: Result<Target, _> = input.parse();
+        assert!(target.is_err());
+        assert!(
+            target
+                .unwrap_err()
+                .contains("invalid UTF-8 character in target path")
+        );
+    }
+
+    // This test ensures that the Address struct correctly maintains its
+    // asymmetric PartialEq and Hash contracts.
+    // Specifically, two addresses with the same physical coordinates but
+    // different metadata attributes must hash to the same HashMap bucket
+    // (intentional collision) but fail strict equality, forcing collection
+    // layers (e.g., load balancers and connection pools) to safely treat them
+    // as distinct endpoints without corrupting the map.
+    #[test]
+    fn test_address_hashmap_asymmetric_collision() {
+        let addr_base = "127.0.0.1:8080";
+
+        // Address A: without metadata attributes
+        let addr_a = Address {
+            network_type: "tcp",
+            address: ByteStr::from(addr_base.to_string()),
+            attributes: Attributes::new(),
+        };
+
+        // Address B: with metadata attributes
+        let attrs = Attributes::new().add("metadata_payload".to_string());
+        let addr_b = Address {
+            network_type: "tcp",
+            address: ByteStr::from(addr_base.to_string()),
+            attributes: attrs,
+        };
+
+        // Hashing must ignore attributes (intentional collision)
+        let mut hasher_a = DefaultHasher::new();
+        let mut hasher_b = DefaultHasher::new();
+        addr_a.hash(&mut hasher_a);
+        addr_b.hash(&mut hasher_b);
+        assert_eq!(
+            hasher_a.finish(),
+            hasher_b.finish(),
+            "Identical Address hashes must route to the same HashMap memory bucket!"
+        );
+
+        let hash_a = hasher_a.finish();
+
+        // Verify that changing network_type changes the hash
+        let addr_diff_net = Address {
+            network_type: "uds",
+            address: ByteStr::from(addr_base.to_string()),
+            attributes: Attributes::new(),
+        };
+        let mut hasher_diff_net = DefaultHasher::new();
+        addr_diff_net.hash(&mut hasher_diff_net);
+        assert_ne!(
+            hash_a,
+            hasher_diff_net.finish(),
+            "Changing network_type must change the hash!"
+        );
+
+        // Verify that changing address changes the hash
+        let addr_diff_addr = Address {
+            network_type: "tcp",
+            address: ByteStr::from("127.0.0.1:8081".to_string()),
+            attributes: Attributes::new(),
+        };
+        let mut hasher_diff_addr = DefaultHasher::new();
+        addr_diff_addr.hash(&mut hasher_diff_addr);
+        assert_ne!(
+            hash_a,
+            hasher_diff_addr.finish(),
+            "Changing address must change the hash!"
+        );
+
+        // Map Functional Verification
+        let mut map = HashMap::new();
+        map.insert(addr_a.clone(), "subchannel_a");
+
+        // Removing using B (different attributes) should fail.
+        assert!(
+            map.remove(&addr_b).is_none(),
+            "HashMap incorrectly matched key despite mismatched attributes!"
+        );
+
+        // Removing using A (same attributes) should succeed.
+        assert_eq!(map.remove(&addr_a), Some("subchannel_a"));
+        assert!(map.is_empty());
+    }
+
+    struct TestResolverBuilder;
+    impl ResolverBuilder for TestResolverBuilder {
+        fn build(&self, _target: &Target, _options: ResolverOptions) -> Box<dyn Resolver> {
+            unimplemented!()
+        }
+        fn scheme(&self) -> &str {
+            "test"
+        }
+        fn is_valid_uri(&self, _uri: &Target) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_default_authority() {
+        struct TestCase {
+            name: &'static str,
+            input_path: &'static str,
+            want_path: &'static str,
+            want_authority: &'static str,
+        }
+        let test_cases = vec![
+            TestCase {
+                name: "ipv6_authority",
+                input_path: "%5B::1%5D",
+                want_path: "/[::1]",
+                want_authority: "[::1]",
+            },
+            TestCase {
+                name: "with_user_and_host",
+                input_path: "userinfo%40host:10001",
+                want_path: "/userinfo@host:10001",
+                want_authority: "userinfo@host:10001",
+            },
+            TestCase {
+                name: "with_multiple_slashes",
+                input_path: "projects/123/network/abc/service",
+                want_path: "/projects/123/network/abc/service",
+                want_authority: "projects%2F123%2Fnetwork%2Fabc%2Fservice",
+            },
+            TestCase {
+                name: "all_possible_allowed_chars",
+                input_path: "abc123-._~!$&'()*+,;=%40:%5B%5D",
+                want_path: "/abc123-._~!$&'()*+,;=@:[]",
+                want_authority: "abc123-._~!$&'()*+,;=@:[]",
+            },
+        ];
+
+        let builder = TestResolverBuilder;
+        for tc in test_cases {
+            let target_str = format!("dns:///{}", tc.input_path);
+            let target: Target = target_str
+                .parse()
+                .unwrap_or_else(|e| panic!("{}: failed to parse target: {}", tc.name, e));
+            assert_eq!(
+                target.path(),
+                tc.want_path,
+                "test case {} failed on path",
+                tc.name
+            );
+            let got = builder.default_authority(&target);
+            assert_eq!(
+                got, tc.want_authority,
+                "test case {} failed on authority",
+                tc.name
+            );
         }
     }
 }

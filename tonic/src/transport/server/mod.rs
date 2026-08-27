@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Server implementation and builder.
 
 mod conn;
@@ -57,20 +81,20 @@ use std::{
     future::{self, Future},
     marker::PhantomData,
     net::SocketAddr,
-    pin::{pin, Pin},
+    pin::{Pin, pin},
     sync::Arc,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::Stream;
 use tower::{
-    layer::util::{Identity, Stack},
+    Service, ServiceBuilder, ServiceExt,
     layer::Layer,
+    layer::util::{Identity, Stack},
     limit::concurrency::ConcurrencyLimitLayer,
     load_shed::LoadShedLayer,
     util::BoxCloneService,
-    Service, ServiceBuilder, ServiceExt,
 };
 
 type BoxService = tower::util::BoxCloneService<Request<Body>, Response<Body>, crate::BoxError>;
@@ -98,6 +122,8 @@ pub struct Server<L = Identity> {
     init_connection_window_size: Option<u32>,
     max_concurrent_streams: Option<u32>,
     tcp_keepalive: Option<Duration>,
+    tcp_keepalive_interval: Option<Duration>,
+    tcp_keepalive_retries: Option<u32>,
     tcp_nodelay: bool,
     http2_keepalive_interval: Option<Duration>,
     http2_keepalive_timeout: Duration,
@@ -109,6 +135,7 @@ pub struct Server<L = Identity> {
     accept_http1: bool,
     service_builder: ServiceBuilder<L>,
     max_connection_age: Option<Duration>,
+    max_connection_age_grace: Option<Duration>,
 }
 
 impl Default for Server<Identity> {
@@ -124,6 +151,8 @@ impl Default for Server<Identity> {
             init_connection_window_size: None,
             max_concurrent_streams: None,
             tcp_keepalive: None,
+            tcp_keepalive_interval: None,
+            tcp_keepalive_retries: None,
             tcp_nodelay: true,
             http2_keepalive_interval: None,
             http2_keepalive_timeout: DEFAULT_HTTP2_KEEPALIVE_TIMEOUT,
@@ -135,13 +164,14 @@ impl Default for Server<Identity> {
             accept_http1: false,
             service_builder: Default::default(),
             max_connection_age: None,
+            max_connection_age_grace: None,
         }
     }
 }
 
 /// A stack based [`Service`] router.
 #[cfg(feature = "router")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Router<L = Identity> {
     server: Server<L>,
     routes: Routes,
@@ -282,6 +312,36 @@ impl<L> Server<L> {
         }
     }
 
+    /// Sets the maximum duration that a connection may continue to exist
+    /// **after** the graceful shutdown period (`max_connection_age`) has elapsed.
+    ///
+    /// This timeout only takes effect *after* a connection has exceeded its
+    /// configured `max_connection_age`. Once that happens, the server will begin
+    /// graceful shutdown for the connection. If the connection does not close
+    /// gracefully within the `max_connection_age_grace` duration, the server will then
+    /// forcefully terminate it.
+    ///
+    /// If no `max_connection_age` is configured, this forced shutdown timeout will
+    /// **never trigger**, because the server will not know when to begin the
+    /// graceful shutdown phase.
+    ///
+    /// Default is no limit (`None`).
+    ///
+    /// ```
+    /// # use tonic::transport::Server;
+    /// # use tower_service::Service;
+    /// # use std::time::Duration;
+    /// # let builder = Server::builder();
+    /// builder.max_connection_age_grace(Duration::from_secs(60));
+    /// ```
+    #[must_use]
+    pub fn max_connection_age_grace(self, max_connection_age_grace: Duration) -> Self {
+        Server {
+            max_connection_age_grace: Some(max_connection_age_grace),
+            ..self
+        }
+    }
+
     /// Set whether HTTP2 Ping frames are enabled on accepted connections.
     ///
     /// If `None` is specified, HTTP2 keepalive is disabled, otherwise the duration
@@ -363,6 +423,43 @@ impl<L> Server<L> {
     pub fn tcp_keepalive(self, tcp_keepalive: Option<Duration>) -> Self {
         Server {
             tcp_keepalive,
+            ..self
+        }
+    }
+
+    /// Set the value of `TCP_KEEPINTVL` option for accepted connections.
+    ///
+    /// This option specifies the time interval between subsequent keepalive probes.
+    /// This setting only takes effect if [`tcp_keepalive`](Self::tcp_keepalive) is also set.
+    ///
+    /// Important: This setting is ignored when using `serve_with_incoming`.
+    ///
+    /// Default is `None` (system default).
+    ///
+    /// Note: This option is only available on some platforms (Linux, macOS, Windows, etc.).
+    #[must_use]
+    pub fn tcp_keepalive_interval(self, tcp_keepalive_interval: Option<Duration>) -> Self {
+        Server {
+            tcp_keepalive_interval,
+            ..self
+        }
+    }
+
+    /// Set the value of `TCP_KEEPCNT` option for accepted connections.
+    ///
+    /// This option specifies the maximum number of keepalive probes that should be sent
+    /// before dropping the connection.
+    /// This setting only takes effect if [`tcp_keepalive`](Self::tcp_keepalive) is also set.
+    ///
+    /// Important: This setting is ignored when using `serve_with_incoming`.
+    ///
+    /// Default is `None` (system default).
+    ///
+    /// Note: This option is only available on some platforms (Linux, macOS, Windows, etc.).
+    #[must_use]
+    pub fn tcp_keepalive_retries(self, tcp_keepalive_retries: Option<u32>) -> Self {
+        Server {
+            tcp_keepalive_retries,
             ..self
         }
     }
@@ -561,6 +658,8 @@ impl<L> Server<L> {
             init_connection_window_size: self.init_connection_window_size,
             max_concurrent_streams: self.max_concurrent_streams,
             tcp_keepalive: self.tcp_keepalive,
+            tcp_keepalive_interval: self.tcp_keepalive_interval,
+            tcp_keepalive_retries: self.tcp_keepalive_retries,
             tcp_nodelay: self.tcp_nodelay,
             http2_keepalive_interval: self.http2_keepalive_interval,
             http2_keepalive_timeout: self.http2_keepalive_timeout,
@@ -571,6 +670,7 @@ impl<L> Server<L> {
             max_frame_size: self.max_frame_size,
             accept_http1: self.accept_http1,
             max_connection_age: self.max_connection_age,
+            max_connection_age_grace: self.max_connection_age_grace,
         }
     }
 
@@ -578,7 +678,9 @@ impl<L> Server<L> {
         Ok(TcpIncoming::bind(addr)
             .map_err(super::Error::from_source)?
             .with_nodelay(Some(self.tcp_nodelay))
-            .with_keepalive(self.tcp_keepalive))
+            .with_keepalive(self.tcp_keepalive)
+            .with_keepalive_interval(self.tcp_keepalive_interval)
+            .with_keepalive_retries(self.tcp_keepalive_retries))
     }
 
     /// Serve the service.
@@ -643,6 +745,10 @@ impl<L> Server<L> {
     }
 
     /// Serve the service with the signal on the provided incoming stream.
+    ///
+    /// When `signal` completes, this function drops `incoming`.
+    /// If `incoming` is a [`TcpIncoming`], drop closes the listen socket.
+    /// The function then waits for accepted connections to close.
     pub async fn serve_with_incoming_shutdown<S, I, F, IO, IE, ResBody>(
         self,
         svc: S,
@@ -701,6 +807,7 @@ impl<L> Server<L> {
         let http2_max_pending_accept_reset_streams = self.http2_max_pending_accept_reset_streams;
         let http2_max_local_error_reset_streams = self.http2_max_local_error_reset_streams;
         let max_connection_age = self.max_connection_age;
+        let max_connection_age_grace = self.max_connection_age_grace;
 
         let svc = self.service_builder.service(svc);
 
@@ -750,37 +857,44 @@ impl<L> Server<L> {
 
         let graceful = signal.is_some();
         let mut sig = pin!(Fuse { inner: signal });
-        let mut incoming = pin!(incoming);
 
-        loop {
-            tokio::select! {
-                _ = &mut sig => {
-                    trace!("signal received, shutting down");
-                    break;
-                },
-                io = incoming.next() => {
-                    let io = match io {
-                        Some(Ok(io)) => io,
-                        Some(Err(e)) => {
-                            trace!("error accepting connection: {}", DisplayErrorStack(&*e));
-                            continue;
-                        },
-                        None => {
-                            break
-                        },
-                    };
+        // Scope the accept loop so `incoming` is dropped as soon as we stop
+        // accepting. For `TcpIncoming` that closes the listen socket immediately
+        // (kernel stops SYN-ACKing). Holding it until after drain leaves the
+        // port bound: new clients complete TCP, then hang until their deadline.
+        {
+            let mut incoming = pin!(incoming);
 
-                    trace!("connection accepted");
+            loop {
+                tokio::select! {
+                    _ = &mut sig => {
+                        trace!("signal received, shutting down");
+                        break;
+                    },
+                    io = incoming.next() => {
+                        let io = match io {
+                            Some(Ok(io)) => io,
+                            Some(Err(e)) => {
+                                trace!("error accepting connection: {}", DisplayErrorStack(&*e));
+                                continue;
+                            },
+                            None => {
+                                break
+                            },
+                        };
 
-                    let req_svc = svc
-                        .call(&io)
-                        .await
-                        .map_err(super::Error::from_source)?;
+                        trace!("connection accepted");
 
-                    let hyper_io = TokioIo::new(io);
-                    let hyper_svc = TowerToHyperService::new(req_svc.map_request(|req: Request<Incoming>| req.map(Body::new)));
+                        let req_svc = svc
+                            .call(&io)
+                            .await
+                            .map_err(super::Error::from_source)?;
 
-                    serve_connection(hyper_io, hyper_svc, server.clone(), graceful.then(|| signal_rx.clone()), max_connection_age);
+                        let hyper_io = TokioIo::new(io);
+                        let hyper_svc = TowerToHyperService::new(req_svc.map_request(|req: Request<Incoming>| req.map(Body::new)));
+
+                        serve_connection(hyper_io, hyper_svc, server.clone(), graceful.then(|| signal_rx.clone()), max_connection_age, max_connection_age_grace);
+                    }
                 }
             }
         }
@@ -801,6 +915,29 @@ impl<L> Server<L> {
     }
 }
 
+enum TimeoutAction {
+    GracefulShutdown,
+    ForcefulShutdown,
+}
+
+async fn connection_timeout_future(
+    max_connection_age: Option<Duration>,
+    max_connection_age_grace: Option<Duration>,
+) -> TimeoutAction {
+    if let Some(age) = max_connection_age {
+        tokio::time::sleep(age).await;
+
+        if let Some(grace) = max_connection_age_grace {
+            tokio::time::sleep(grace).await;
+            TimeoutAction::ForcefulShutdown
+        } else {
+            TimeoutAction::GracefulShutdown
+        }
+    } else {
+        future::pending().await
+    }
+}
+
 // This is moved to its own function as a way to get around
 // https://github.com/rust-lang/rust/issues/102211
 fn serve_connection<B, IO, S, E>(
@@ -809,6 +946,7 @@ fn serve_connection<B, IO, S, E>(
     builder: ConnectionBuilder<E>,
     mut watcher: Option<tokio::sync::watch::Receiver<()>>,
     max_connection_age: Option<Duration>,
+    max_connection_age_grace: Option<Duration>,
 ) where
     B: http_body::Body + Send + 'static,
     B::Data: Send,
@@ -827,7 +965,12 @@ fn serve_connection<B, IO, S, E>(
 
             let mut conn = pin!(builder.serve_connection(hyper_io, hyper_svc));
 
-            let mut sleep = pin!(sleep_or_pending(max_connection_age));
+            let mut connection_timeout = pin!(Fuse {
+                inner: Some(connection_timeout_future(
+                    max_connection_age,
+                    max_connection_age_grace,
+                )),
+            });
 
             loop {
                 tokio::select! {
@@ -837,13 +980,20 @@ fn serve_connection<B, IO, S, E>(
                         }
                         break;
                     },
-                    _ = &mut sleep  => {
-                        conn.as_mut().graceful_shutdown();
-                        sleep.set(sleep_or_pending(None));
+                    timeout_action = &mut connection_timeout => {
+                        match timeout_action {
+                            TimeoutAction::GracefulShutdown => {
+                                conn.as_mut().graceful_shutdown();
+                            },
+                            TimeoutAction::ForcefulShutdown => {
+                                debug!("forcefully closed connection");
+                                break;
+                            }
+                        }
                     },
                     _ = &mut sig => {
                         conn.as_mut().graceful_shutdown();
-                    }
+                    },
                 }
             }
         }
@@ -851,13 +1001,6 @@ fn serve_connection<B, IO, S, E>(
         drop(watcher);
         trace!("connection closed");
     });
-}
-
-async fn sleep_or_pending(wait_for: Option<Duration>) {
-    match wait_for {
-        Some(wait) => tokio::time::sleep(wait).await,
-        None => future::pending().await,
-    };
 }
 
 #[cfg(feature = "router")]
@@ -965,7 +1108,6 @@ impl<L> Router<L> {
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
         IE: Into<crate::BoxError>,
         L: Layer<Routes>,
-
         L::Service: Service<Request<Body>, Response = Response<ResBody>> + Clone + Send + 'static,
         <<L as Layer<Routes>>::Service as Service<Request<Body>>>::Future: Send,
         <<L as Layer<Routes>>::Service as Service<Request<Body>>>::Error:
@@ -982,6 +1124,9 @@ impl<L> Router<L> {
     /// on the provided incoming stream of `AsyncRead + AsyncWrite`. Similar to
     /// `serve_with_shutdown` this method will also take a signal future to
     /// gracefully shutdown the server.
+    ///
+    /// When `signal` completes, `incoming` is dropped immediately (closing a
+    /// TCP listener) and already-accepted connections are then drained.
     ///
     /// This method discards any provided [`Server`] TCP configuration.
     ///
@@ -1173,30 +1318,122 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::transport::Server;
     use std::time::Duration;
 
-    use crate::transport::Server;
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_timeout_no_max_age() {
+        let future = connection_timeout_future(None, None);
+
+        tokio::select! {
+            _ = future => {
+                panic!("timeout future should never complete when max_connection_age is None");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1000)) => {
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_timeout_with_max_connection_age() {
+        let future = connection_timeout_future(Some(Duration::from_secs(10)), None);
+
+        let action = future.await;
+        assert!(matches!(action, TimeoutAction::GracefulShutdown));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_timeout_with_max_connection_age_grace() {
+        let mut future = pin!(connection_timeout_future(
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(5)),
+        ));
+
+        tokio::select! {
+            _ = &mut future => {
+                panic!("should not complete before max_connection_age");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(9)) => {}
+        }
+
+        tokio::select! {
+            _ = &mut future => {
+                panic!("should not complete before max_connection_age_grace");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+        }
+
+        let action = future.await;
+        assert!(matches!(action, TimeoutAction::ForcefulShutdown));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_timeout_polled_after_graceful_shutdown() {
+        // Reproduce #2522: connection_timeout polled after GracefulShutdown
+        let mut future = pin!(Fuse {
+            inner: Some(connection_timeout_future(
+                Some(Duration::from_secs(10)),
+                None,
+            ))
+        });
+
+        // First poll: should return GracefulShutdown after 10s
+        let action = tokio::select! {
+            action = &mut future => action,
+            _ = tokio::time::sleep(Duration::from_secs(11)) => {
+                panic!("timeout future should complete after max_connection_age");
+            }
+        };
+        assert!(matches!(action, TimeoutAction::GracefulShutdown));
+
+        // Second poll: Fuse should return Pending, not panic
+        tokio::select! {
+            _ = &mut future => {
+                panic!("fused future should not complete again");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                // OK: future is fused, returns Pending
+            }
+        }
+    }
 
     #[test]
     fn server_tcp_defaults() {
         const EXAMPLE_TCP_KEEPALIVE: Duration = Duration::from_secs(10);
+        const EXAMPLE_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+        const EXAMPLE_TCP_KEEPALIVE_RETRIES: u32 = 3;
 
         // Using ::builder() or ::default() should do the same thing
         let server_via_builder = Server::builder();
         assert!(server_via_builder.tcp_nodelay);
         assert_eq!(server_via_builder.tcp_keepalive, None);
+        assert_eq!(server_via_builder.tcp_keepalive_interval, None);
+        assert_eq!(server_via_builder.tcp_keepalive_retries, None);
         let server_via_default = Server::default();
         assert!(server_via_default.tcp_nodelay);
         assert_eq!(server_via_default.tcp_keepalive, None);
+        assert_eq!(server_via_default.tcp_keepalive_interval, None);
+        assert_eq!(server_via_default.tcp_keepalive_retries, None);
 
         // overriding should be possible
         let server_via_builder = Server::builder()
             .tcp_nodelay(false)
-            .tcp_keepalive(Some(EXAMPLE_TCP_KEEPALIVE));
+            .tcp_keepalive(Some(EXAMPLE_TCP_KEEPALIVE))
+            .tcp_keepalive_interval(Some(EXAMPLE_TCP_KEEPALIVE_INTERVAL))
+            .tcp_keepalive_retries(Some(EXAMPLE_TCP_KEEPALIVE_RETRIES));
         assert!(!server_via_builder.tcp_nodelay);
         assert_eq!(
             server_via_builder.tcp_keepalive,
             Some(EXAMPLE_TCP_KEEPALIVE)
+        );
+        assert_eq!(
+            server_via_builder.tcp_keepalive_interval,
+            Some(EXAMPLE_TCP_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(
+            server_via_builder.tcp_keepalive_retries,
+            Some(EXAMPLE_TCP_KEEPALIVE_RETRIES)
         );
     }
 }

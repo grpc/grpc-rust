@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.7](https://github.com/grpc/grpc-rust/compare/tonic-prost-v0.14.6...tonic-prost-v0.14.7) - 2026-08-28
+
+### Fixed
+
+- fix/silence all clippy warnings ([#2807](https://github.com/grpc/grpc-rust/pull/2807))
+
+### Other
+
+- License update ([#2749](https://github.com/grpc/grpc-rust/pull/2749))
+
 ## [0.14.6](https://github.com/hyperium/tonic/compare/tonic-prost-v0.14.5...tonic-prost-v0.14.6) - 2026-05-06
 
 ### Other

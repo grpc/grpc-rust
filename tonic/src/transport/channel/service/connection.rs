@@ -102,7 +102,12 @@ impl Connection {
         let make_service =
             MakeSendRequestService::new(connector, endpoint.executor.clone(), settings);
 
-        let conn = Reconnect::new(make_service, endpoint.uri().clone(), is_lazy);
+        let conn = Reconnect::new(
+            make_service,
+            endpoint.uri().clone(),
+            is_lazy,
+            endpoint.eager_connect_errors,
+        );
 
         Self {
             inner: BoxService::new(stack.layer(conn)),

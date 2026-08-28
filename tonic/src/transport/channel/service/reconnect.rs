@@ -44,6 +44,7 @@ where
     error: Option<crate::BoxError>,
     has_been_connected: bool,
     is_lazy: bool,
+    fail_early: bool,
 }
 
 #[derive(Debug)]
@@ -58,7 +59,7 @@ where
     M: Service<Target>,
     M::Error: Into<crate::BoxError>,
 {
-    pub(crate) fn new(mk_service: M, target: Target, is_lazy: bool) -> Self {
+    pub(crate) fn new(mk_service: M, target: Target, is_lazy: bool, fail_early: bool) -> Self {
         Reconnect {
             mk_service,
             state: State::Idle,
@@ -66,6 +67,7 @@ where
             error: None,
             has_been_connected: false,
             is_lazy,
+            fail_early,
         }
     }
 }
@@ -121,7 +123,9 @@ where
 
                             state = State::Idle;
 
-                            if !(self.has_been_connected || self.is_lazy) {
+                            if self.fail_early {
+                                return Poll::Ready(Err(e.into()));
+                            } else if !(self.has_been_connected || self.is_lazy) {
                                 return Poll::Ready(Err(e.into()));
                             } else {
                                 let error = e.into();

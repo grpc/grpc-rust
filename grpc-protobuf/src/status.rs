@@ -162,6 +162,12 @@ pub type StatusOr<T> = Result<T, StatusError>;
 /// Represents either a failing gRPC status or a successful result. This is expected to be replaced
 /// with absl::Status when it becomes available.
 pub type Status = StatusOr<()>;
+/// Represents either a failing gRPC status or a successful result containing
+/// `T`.
+pub type ServerStatusOr<T> = Result<T, ServerStatusError>;
+/// Represents either a failing gRPC status or a successful result produced by
+/// a server handler.
+pub type ServerStatus = ServerStatusOr<()>;
 
 /// Represents a gRPC status. This is expected to be replaced with absl::StatusError when it becomes
 /// available.
@@ -214,6 +220,55 @@ impl StatusError {
         impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
     ) {
         (self.code, self.message, self.payloads.into_iter())
+    }
+}
+
+/// Represents a gRPC error status on the server.
+#[derive(Debug, Clone)]
+pub struct ServerStatusError(StatusError);
+
+impl std::ops::Deref for ServerStatusError {
+    type Target = StatusError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ServerStatusError {
+    /// Creates a new [`ServerStatusError`] with the given code and message.
+    pub fn new(code: StatusCodeError, message: impl Into<String>) -> Self {
+        ServerStatusError(StatusError::new(code, message))
+    }
+
+    /// Creates a new [`ServerStatusError`] from a [`StatusError`].
+    pub fn from_status(status: StatusError) -> Self {
+        ServerStatusError(status)
+    }
+
+    /// Returns the [`StatusCodeError`] of this [`ServerStatusError`].
+    pub fn code(&self) -> StatusCodeError {
+        self.0.code()
+    }
+
+    /// Returns the message of this [`ServerStatusError`].
+    pub fn message(&self) -> &str {
+        self.0.message()
+    }
+
+    /// Gets the value for `type_url`.
+    pub fn get_payload<'a>(&'a self, type_url: &[u8]) -> Option<&'a [u8]> {
+        self.0.get_payload(type_url)
+    }
+
+    /// Sets the value for `type_url`.
+    pub fn set_payload(&mut self, type_url: &[u8], payload: &[u8]) {
+        self.0.set_payload(type_url, payload);
+    }
+
+    /// Converts the [`ServerStatusError`] to a [`StatusError`] for client responses.
+    pub(crate) fn into_status(self) -> StatusError {
+        self.0
     }
 }
 

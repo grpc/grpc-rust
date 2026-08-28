@@ -33,9 +33,9 @@ use std::sync::Weak;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::async_trait;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
-use tonic::async_trait;
 
 use crate::StatusCodeError;
 use crate::StatusError;

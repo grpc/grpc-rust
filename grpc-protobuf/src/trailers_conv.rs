@@ -23,6 +23,7 @@
  */
 
 use grpc::client::Trailers;
+use grpc::server::Trailers as ServerTrailers;
 use protobuf::Parse;
 use protobuf::Serialize;
 use protobuf_well_known_types::Any;
@@ -101,11 +102,11 @@ fn parse_rpc_status(buf: &[u8]) -> StatusOr<StatusError> {
 }
 
 /// Converts the status to trailers and inserts grpc-status-details-bin into the metadata.
-#[allow(dead_code)]
-pub(crate) fn trailers_from_status(s: Status) -> Trailers {
+pub(crate) fn trailers_from_status(s: ServerStatus) -> ServerTrailers {
     match s {
-        Ok(()) => Trailers::new(Ok(())),
-        Err(status_err) => {
+        Ok(()) => ServerTrailers::new(Ok(())),
+        Err(server_status_err) => {
+            let status_err = server_status_err.into_status();
             let has_payloads = status_err.has_payloads();
             let (code, message, payloads) = status_err.into_parts();
             let mut m = grpc::metadata::MetadataMap::new();
@@ -113,7 +114,7 @@ pub(crate) fn trailers_from_status(s: Status) -> Trailers {
                 let code_i32 = code as i32;
                 let bytes = match encode_rpc_status(code_i32, &message, payloads) {
                     Ok(bytes) => bytes,
-                    Err(err) => return Trailers::new(Err(err)),
+                    Err(err) => return ServerTrailers::new(Err(err)),
                 };
                 m.insert_bin(
                     "grpc-status-details-bin",
@@ -123,7 +124,7 @@ pub(crate) fn trailers_from_status(s: Status) -> Trailers {
                 );
             }
             let grpc_code = grpc::StatusCodeError::from(code as i32);
-            Trailers::new(Err(grpc::StatusError::new(grpc_code, message))).with_metadata(m)
+            ServerTrailers::new(Err(grpc::StatusError::new(grpc_code, message))).with_metadata(m)
         }
     }
 }
@@ -163,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_trailers_from_status_details_copied_to_grpc_status() {
-        let mut err = StatusError::new(StatusCodeError::NotFound, "not found detail");
+        let mut err = ServerStatusError::new(StatusCodeError::NotFound, "not found detail");
         err.set_payload(b"type.googleapis.com/test", b"hello world");
 
         let trailers = trailers_from_status(Err(err));
@@ -192,11 +193,11 @@ mod tests {
 
     #[test]
     fn test_trailers_from_status_empty_payload_skips_metadata() {
-        let err = StatusError::new(
+        let err = ServerStatusError::new(
             StatusCodeError::NotFound,
             "Resource missing without details",
         );
-        let status_or: Status = Err(err);
+        let status_or: ServerStatus = Err(err);
 
         let trailers = trailers_from_status(status_or);
         assert!(trailers.status().is_err());
@@ -210,12 +211,12 @@ mod tests {
 
     #[test]
     fn test_roundtrip_payload() {
-        let mut og_err = StatusError::new(StatusCodeError::NotFound, "not found detail");
+        let mut og_err = ServerStatusError::new(StatusCodeError::NotFound, "not found detail");
         og_err.set_payload(b"type.googleapis.com/foo", b"hello");
         og_err.set_payload(b"type.googleapis.com/bar", b"world");
 
         let trailers = trailers_from_status(Err(og_err.clone()));
-        let rt_err = status_from_trailers(trailers).unwrap_err();
+        let rt_err = status_from_trailers(client_trailers(trailers)).unwrap_err();
         assert_eq!(rt_err.code(), og_err.code());
         assert_eq!(rt_err.message(), og_err.message());
         assert_eq!(
@@ -230,13 +231,13 @@ mod tests {
 
     #[test]
     fn test_roundtrip_invalid_utf8_dropped() {
-        let mut og_err = StatusError::new(StatusCodeError::NotFound, "not found detail");
+        let mut og_err = ServerStatusError::new(StatusCodeError::NotFound, "not found detail");
         og_err.set_payload(b"type.googleapis.com/foo", b"world");
         og_err.set_payload(b"type.googleapis.com/bar\x80", b"ain't gonna work");
         og_err.set_payload(b"type.googleapis.com/bar", b"hello");
 
         let trailers = trailers_from_status(Err(og_err.clone()));
-        let rt_err = status_from_trailers(trailers).unwrap_err();
+        let rt_err = status_from_trailers(client_trailers(trailers)).unwrap_err();
         assert_eq!(rt_err.code(), og_err.code());
         assert_eq!(rt_err.message(), og_err.message());
         // Other payloads are preserved
@@ -254,10 +255,10 @@ mod tests {
 
     #[test]
     fn test_roundtrip_no_payload() {
-        let og_err = StatusError::new(StatusCodeError::NotFound, "not found detail");
+        let og_err = ServerStatusError::new(StatusCodeError::NotFound, "not found detail");
 
         let trailers = trailers_from_status(Err(og_err.clone()));
-        let rt_err = status_from_trailers(trailers).unwrap_err();
+        let rt_err = status_from_trailers(client_trailers(trailers)).unwrap_err();
         assert_eq!(rt_err.code(), og_err.code());
         assert_eq!(rt_err.message(), og_err.message());
         assert!(!rt_err.has_payloads());
@@ -266,7 +267,7 @@ mod tests {
     #[test]
     fn test_roundtrip_ok() {
         let trailers = trailers_from_status(Ok(()));
-        let status = status_from_trailers(trailers);
+        let status = status_from_trailers(client_trailers(trailers));
         assert!(status.is_ok());
     }
 
@@ -424,5 +425,9 @@ mod tests {
             err.message()
                 .contains("Failed to parse grpc-status-details-bin:")
         );
+    }
+
+    fn client_trailers(trailers: ServerTrailers) -> Trailers {
+        Trailers::new(trailers.status().clone()).with_metadata(trailers.metadata().clone())
     }
 }

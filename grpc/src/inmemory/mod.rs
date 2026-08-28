@@ -72,7 +72,6 @@ use crate::core::SendMessage;
 use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::rt::GrpcRuntime;
-use crate::server::BoxedRecvStream;
 use crate::server::DynHandle;
 use crate::server::GracefulConnection;
 use crate::server::Listener;
@@ -236,7 +235,7 @@ impl ServerTransport for InMemoryServerCall {
         _token: crate::private::Internal,
     ) -> InMemoryServingConnection {
         let mut send = InMemoryServerSendStream { tx: self.resp_tx };
-        let recv = BoxedRecvStream(Box::new(InMemoryServerRecvStream { rx: self.req_rx }));
+        let recv = Box::new(InMemoryServerRecvStream { rx: self.req_rx });
         let options = crate::server::CallOptions::default();
         let trailers_tx = self.trailer_tx;
 

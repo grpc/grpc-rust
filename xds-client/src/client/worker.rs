@@ -559,7 +559,7 @@ pub(crate) struct AdsWorker<TB, C, R> {
     backoff: Backoff,
     /// Priority-ordered list of xDS servers.
     /// Index 0 has the highest priority.
-    servers: Vec<ServerConfig>,
+    servers: Vec<Arc<ServerConfig>>,
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
     /// Sender for timer callback commands.
@@ -625,7 +625,7 @@ where
             runtime,
             node: config.node,
             backoff: Backoff::new(config.retry_policy),
-            servers: config.servers,
+            servers: config.servers.into_iter().map(Arc::new).collect(),
             resource_initial_timeout: config.resource_initial_timeout,
             command_tx,
             command_rx,
@@ -668,12 +668,12 @@ where
             // Connect to server.
             // Future extension (gRFC A71): Try servers in priority order with fallback.
             let server = match self.servers.first() {
-                Some(s) => s,
+                Some(s) => Arc::clone(s),
                 None => return, // No servers configured
             };
             self.recorder.set_server(Arc::from(server.uri()));
 
-            let transport = match self.transport_builder.build(server).await {
+            let transport = match self.transport_builder.build(&server).await {
                 Ok(t) => t,
                 Err(_) => {
                     self.record_unhealthy(&mut healthy);

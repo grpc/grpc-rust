@@ -84,7 +84,7 @@ pub mod resource;
 pub mod runtime;
 pub mod transport;
 
-pub use client::config::{ClientConfig, ServerConfig};
+pub use client::config::{ClientConfig, ServerConfig, TransportConfig};
 pub use client::retry::{Backoff, RetryPolicy};
 pub use client::watch::{ProcessingDone, ResourceEvent, ResourceWatcher};
 pub use client::{XdsClient, XdsClientBuilder};

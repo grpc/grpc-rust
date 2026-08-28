@@ -70,6 +70,10 @@ where
             fail_early,
         }
     }
+
+    fn return_connection_errors_on_poll(&self) -> bool {
+        self.fail_early || !(self.has_been_connected || self.is_lazy)
+    }
 }
 
 impl<M, Target, S, Request> Service<Request> for Reconnect<M, Target>
@@ -123,9 +127,7 @@ where
 
                             state = State::Idle;
 
-                            if self.fail_early {
-                                return Poll::Ready(Err(e.into()));
-                            } else if !(self.has_been_connected || self.is_lazy) {
+                            if self.return_connection_errors_on_poll() {
                                 return Poll::Ready(Err(e.into()));
                             } else {
                                 let error = e.into();

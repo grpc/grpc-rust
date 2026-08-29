@@ -22,8 +22,11 @@
  *
  */
 
+use crate::client::circuit_breaking::{
+    CircuitBreakingClusterDiscovery, CircuitBreakingEndpointService, ClusterCircuitBreakerRegistry,
+};
 use crate::client::cluster::ClusterClientRegistry;
-use crate::client::endpoint::{EndpointAddress, MakeConnector};
+use crate::client::endpoint::{EndpointAddress, EndpointChannel, MakeConnector};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
@@ -42,7 +45,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::{body::Body as TonicBody, client::GrpcService};
+use tonic::{body::Body as TonicBody, client::GrpcService, transport::Channel};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
@@ -487,12 +490,51 @@ impl XdsChannelBuilder {
     /// feature) and reconstructs each endpoint request body as [`TonicBody`].
     /// Separated so tests can inject a disconnected `XdsClient` and a
     /// pre-populated cache via [`XdsRuntimeParts`].
+    ///
+    /// Circuit breaking is gRPC-only: [`CircuitBreakingEndpointService`] holds
+    /// the permit against a [`TonicBody`] response. Transport-generic channels
+    /// go through [`build_channel`](Self::build_channel) without this wrapper.
     fn build_grpc_channel_from_runtime(&self, parts: XdsRuntimeParts) -> XdsChannelGrpc {
-        self.build_channel::<GrpcMakeConnector, TonicBody, TonicBody, TonicBody, _>(
-            parts,
-            GrpcMakeConnector::new(),
+        let cache = parts.cache.clone();
+        let router: Arc<dyn Router> = Arc::new(match self.retry_classifier_factory.clone() {
+            Some(factory) => XdsRouter::with_retry_factory(&parts.cache, factory),
+            None => XdsRouter::new(&parts.cache),
+        });
+        let retry_layer = RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default()));
+
+        #[cfg(feature = "_tls-any")]
+        let inner: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>> =
+            Arc::new(XdsClusterDiscovery::new(
+                parts.cache,
+                GrpcMakeConnector::new(),
+                parts.cert_provider_registry,
+            ));
+        #[cfg(not(feature = "_tls-any"))]
+        let inner: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>> = Arc::new(
+            XdsClusterDiscovery::new(parts.cache, GrpcMakeConnector::new()),
+        );
+
+        let discovery = Arc::new(
+            CircuitBreakingClusterDiscovery::new(inner, ClusterCircuitBreakerRegistry::default())
+                .with_cluster_cache(cache),
+        );
+        let resources = Arc::new(XdsChannelResources {
+            _resource_manager: parts.resource_manager,
+            _xds_client: parts.xds_client,
+        });
+        let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
+        self.assemble_channel_stack::<
+            CircuitBreakingEndpointService<EndpointChannel<Channel>>,
+            TonicBody,
+            TonicBody,
+            TonicBody,
+            _,
+        >(
+            routing_layer,
+            retry_layer,
+            discovery,
             |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
-            Arc::new(RetrySharedConfig::grpc_default()),
+            Some(resources),
         )
     }
 
@@ -622,6 +664,10 @@ mod tests {
     use super::{XdsChannelBuilder, XdsChannelConfig};
     use crate::XdsUri;
     use crate::client::channel::XdsChannelGrpc;
+    use crate::client::circuit_breaking::{
+        CircuitBreakingClusterDiscovery, CircuitBreakingEndpointService,
+        ClusterCircuitBreakerRegistry,
+    };
     use crate::client::endpoint::EndpointAddress;
     use crate::client::endpoint::EndpointChannel;
 
@@ -639,6 +685,7 @@ mod tests {
     use crate::testutil::grpc::TestServer;
     use crate::xds::cache::XdsCache;
     use crate::xds::resource::EndpointsResource;
+    use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::route_config::RouteConfigResource;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -656,15 +703,45 @@ mod tests {
             retry: Arc<RetrySharedConfig>,
             interceptor: Option<Arc<dyn PreRouteInterceptor>>,
         ) -> XdsChannelGrpc {
+            self.build_grpc_channel_from_parts_with_circuit_breakers(
+                router,
+                discovery,
+                retry,
+                interceptor,
+                ClusterCircuitBreakerRegistry::new_for_test(),
+                None,
+            )
+        }
+
+        pub(crate) fn build_grpc_channel_from_parts_with_circuit_breakers(
+            &self,
+            router: Arc<dyn Router>,
+            discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
+            retry: Arc<RetrySharedConfig>,
+            interceptor: Option<Arc<dyn PreRouteInterceptor>>,
+            circuit_breakers: ClusterCircuitBreakerRegistry,
+            cluster_cache: Option<Arc<XdsCache>>,
+        ) -> XdsChannelGrpc {
             use crate::client::retry::RetryLayer;
             use crate::client::route::XdsRoutingLayer;
             use http::Request;
             use shared_http_body::SharedBody;
             use tonic::body::Body as TonicBody;
 
+            let mut wrapped = CircuitBreakingClusterDiscovery::new(discovery, circuit_breakers);
+            if let Some(cache) = cluster_cache {
+                wrapped = wrapped.with_cluster_cache(cache);
+            }
+            let discovery = Arc::new(wrapped);
             let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
             let retry_layer = RetryLayer::new(retry);
-            self.assemble_channel_stack::<EndpointChannel<Channel>, TonicBody, TonicBody, TonicBody, _>(
+            self.assemble_channel_stack::<
+                CircuitBreakingEndpointService<EndpointChannel<Channel>>,
+                TonicBody,
+                TonicBody,
+                TonicBody,
+                _,
+            >(
                 routing_layer,
                 retry_layer,
                 discovery,
@@ -904,16 +981,222 @@ mod tests {
         assert_eq!(response.into_inner().message, "retry-server: retry-test");
     }
 
+    #[tokio::test]
+    async fn test_xds_channel_enforces_injected_circuit_breaking_limit() {
+        use crate::client::retry::{GrpcRetryClassifier, RetryConfig};
+
+        let (_, servers) = setup_grpc_servers(1).await;
+        let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
+        let circuit_breakers = ClusterCircuitBreakerRegistry::new_for_test();
+        circuit_breakers.set_config("test-cluster", CircuitBreakingConfig { max_requests: 0 });
+
+        let retry = Arc::new(RetrySharedConfig::new(
+            RetryConfig::new().num_retries(1),
+            Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
+        ));
+        let xds_channel = XdsChannelBuilder::new(test_config())
+            .build_grpc_channel_from_parts_with_circuit_breakers(
+                xds_manager.clone(),
+                xds_manager.clone(),
+                retry,
+                None,
+                circuit_breakers,
+                None,
+            );
+        let mut client = GreeterClient::new(xds_channel);
+
+        let error = client
+            .say_hello(HelloRequest {
+                name: "limited".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("max_requests limit 0"));
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_xds_channel_uses_cds_circuit_breaking_config() {
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(1).await;
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(
+                cluster_name,
+                CircuitBreakingConfig { max_requests: 0 },
+            ),
+        );
+        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+
+        let channel = build_xds_channel_from_cache(cache).await;
+        let mut client = GreeterClient::new(channel);
+        let error = client
+            .say_hello(HelloRequest {
+                name: "cds-limited".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("max_requests limit 0"));
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_xds_channel_waits_for_cds_before_circuit_breaking() {
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(1).await;
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+
+        let channel = build_xds_channel_from_cache(cache.clone()).await;
+        let mut client = GreeterClient::new(channel);
+        let mut request = Box::pin(client.say_hello(HelloRequest {
+            name: "wait-for-cds".to_string(),
+        }));
+
+        let early =
+            tokio::time::timeout(tokio::time::Duration::from_millis(20), request.as_mut()).await;
+        assert!(
+            early.is_err(),
+            "request should wait for CDS before acquiring a circuit-breaking permit",
+        );
+
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(
+                cluster_name,
+                CircuitBreakingConfig { max_requests: 0 },
+            ),
+        );
+
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), request)
+            .await
+            .expect("request should complete after CDS update");
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("max_requests limit 0"));
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_xds_channel_recovers_cluster_after_remove_and_readd() {
+        let cluster_name = "test-cluster-remove-readd";
+        let (_, servers) = setup_grpc_servers(2).await;
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(
+                cluster_name,
+                CircuitBreakingConfig { max_requests: 1 },
+            ),
+        );
+        cache.update_endpoints(
+            cluster_name,
+            make_test_endpoints(cluster_name, &servers[..1]),
+        );
+
+        let channel = build_xds_channel_from_cache(cache.clone()).await;
+        let mut client = GreeterClient::new(channel);
+        let first = client
+            .say_hello(HelloRequest {
+                name: "before-removal".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(first.into_inner().message.starts_with("server-0:"));
+
+        cache.remove_cluster(cluster_name);
+        cache.remove_endpoints(cluster_name);
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(
+                cluster_name,
+                CircuitBreakingConfig { max_requests: 0 },
+            ),
+        );
+        cache.update_endpoints(
+            cluster_name,
+            make_test_endpoints(cluster_name, &servers[1..]),
+        );
+
+        let limited = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            client.say_hello(HelloRequest {
+                name: "readded-limited".to_string(),
+            }),
+        )
+        .await
+        .expect("re-added cluster should become ready")
+        .unwrap_err();
+        assert_eq!(limited.code(), tonic::Code::Unavailable);
+        assert!(limited.message().contains("max_requests limit 0"));
+
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(
+                cluster_name,
+                CircuitBreakingConfig { max_requests: 1 },
+            ),
+        );
+        tokio::task::yield_now().await;
+
+        let second = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            client.say_hello(HelloRequest {
+                name: "after-readd".to_string(),
+            }),
+        )
+        .await
+        .expect("updated cluster should serve requests")
+        .unwrap();
+        assert!(second.into_inner().message.starts_with("server-1:"));
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
     /// Helper: creates a minimal plaintext `ClusterResource` for tests that
     /// drive `XdsClusterDiscovery`. The cluster watch in `discover_cluster`
     /// blocks until a cluster is in the cache.
     fn make_test_cluster(cluster_name: &str) -> Arc<crate::xds::resource::ClusterResource> {
+        make_test_cluster_with_circuit_breaking(cluster_name, CircuitBreakingConfig::default())
+    }
+
+    fn make_test_cluster_with_circuit_breaking(
+        cluster_name: &str,
+        circuit_breaking: CircuitBreakingConfig,
+    ) -> Arc<crate::xds::resource::ClusterResource> {
         use crate::xds::resource::cluster::{ClusterResource, LbPolicy};
         Arc::new(ClusterResource {
             name: cluster_name.to_string(),
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: None,
+            circuit_breaking,
         })
     }
 
@@ -981,7 +1264,7 @@ mod tests {
                     .unwrap(),
             );
             Arc::new(XdsClusterDiscovery::new(
-                cache,
+                cache.clone(),
                 GrpcMakeConnector::new(),
                 registry,
             ))
@@ -989,14 +1272,19 @@ mod tests {
         #[cfg(not(feature = "_tls-any"))]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
+        > = Arc::new(XdsClusterDiscovery::new(
+            cache.clone(),
+            GrpcMakeConnector::new(),
+        ));
 
         let builder = XdsChannelBuilder::new(test_config());
-        builder.build_grpc_channel_from_parts(
+        builder.build_grpc_channel_from_parts_with_circuit_breakers(
             router,
             discovery,
             Arc::new(RetrySharedConfig::grpc_default()),
             None,
+            ClusterCircuitBreakerRegistry::new_for_test(),
+            Some(cache),
         )
     }
 

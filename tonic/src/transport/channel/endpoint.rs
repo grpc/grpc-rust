@@ -470,6 +470,15 @@ impl Endpoint {
     /// initial connection error immediately; it only matters for lazily-connecting channels
     /// (see [`Endpoint::connect_lazy`] and [`Endpoint::connect_with_connector_lazy`]).
     ///
+    /// For endpoints used with
+    /// [`Channel::balance_channel`](crate::transport::Channel::balance_channel) or
+    /// [`Channel::balance_list`](crate::transport::Channel::balance_list), enabling this
+    /// lets the load balancer identify a broken backend immediately and skip it rather
+    /// than routing a call to it. Such a backend is removed from the balancer as soon
+    /// as its connection attempt fails; it automatically rejoins the balancer shortly
+    /// after (on a short, fixed backoff) rather than being lost until the caller
+    /// explicitly re-adds it.
+    ///
     /// Defaults to `false`.
     pub fn eager_connect_errors(self, enabled: bool) -> Self {
         Endpoint {

@@ -30,9 +30,12 @@
 
 use crate::client::config::ServerConfig;
 use crate::error::{Error, Result};
+
 use crate::transport::{Transport, TransportBuilder, TransportStream};
 use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -185,6 +188,48 @@ impl TonicTransport {
     }
 }
 
+/// I/O returned by a custom ADS connector.
+pub trait AdsIo: hyper::rt::Read + hyper::rt::Write + Send + Unpin {}
+impl<T: hyper::rt::Read + hyper::rt::Write + Send + Unpin> AdsIo for T {}
+
+type ErasedConnect =
+    Arc<dyn Fn(Endpoint) -> Pin<Box<dyn Future<Output = Result<Channel>> + Send>> + Send + Sync>;
+
+fn connect_with<C>(
+    connector: &C,
+    endpoint: Endpoint,
+) -> Pin<Box<dyn Future<Output = Result<Channel>> + Send>>
+where
+    C: tower_service::Service<tonic::transport::Uri> + Clone + Send + Sync + 'static,
+    C::Response: AdsIo + 'static,
+    C::Future: Send + 'static,
+    Box<dyn std::error::Error + Send + Sync>: From<C::Error>,
+{
+    let connector = connector.clone();
+    Box::pin(async move {
+        endpoint
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))
+    })
+}
+
+#[derive(Clone, Default)]
+enum Connect {
+    #[default]
+    Default,
+    Custom(ErasedConnect),
+}
+
+impl std::fmt::Debug for Connect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str("Default"),
+            Self::Custom(_) => f.write_str("Custom(<user connector>)"),
+        }
+    }
+}
+
 /// Builder for creating [`TonicTransport`] instances.
 ///
 /// This implements [`TransportBuilder`] and can be used with
@@ -213,6 +258,8 @@ impl TonicTransport {
 /// ```
 #[derive(Debug, Clone)]
 pub struct TonicTransportBuilder {
+    connect: Connect,
+
     // Future extensions:
     // - Connection pooling settings
     // - Per-server credential overrides (via ServerConfig.extensions)
@@ -235,6 +282,7 @@ pub struct TonicTransportBuilder {
 impl Default for TonicTransportBuilder {
     fn default() -> Self {
         Self {
+            connect: Connect::Default,
             #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
             tls_config: None,
             call_creds: None,
@@ -249,6 +297,24 @@ impl TonicTransportBuilder {
     /// Create a new transport builder with default (plaintext) settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Uses a custom connector for ADS connections, cloned per connection.
+    ///
+    /// The server URI is passed through unchanged. The connector owns transport
+    /// security, so
+    /// [`requires_secure_transport`](TonicCallCredentials::requires_secure_transport)
+    /// is not checked.
+    pub fn with_connector<C>(mut self, connector: C) -> Self
+    where
+        C: tower_service::Service<tonic::transport::Uri> + Clone + Send + Sync + 'static,
+        C::Response: AdsIo + 'static,
+        C::Future: Send + 'static,
+        Box<dyn std::error::Error + Send + Sync>: From<C::Error>,
+    {
+        self.connect =
+            Connect::Custom(Arc::new(move |endpoint| connect_with(&connector, endpoint)));
+        self
     }
 
     /// Set the timeout for establishing the connection to the xDS server.
@@ -314,7 +380,12 @@ impl TransportBuilder for TonicTransportBuilder {
         #[cfg(not(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc")))]
         let tls_configured = false;
 
-        let uri = Self::ensure_secure_server_uri(server.uri(), tls_configured);
+        let user_owns_transport = matches!(self.connect, Connect::Custom(_));
+        let uri = if user_owns_transport {
+            server.uri().to_string()
+        } else {
+            Self::ensure_secure_server_uri(server.uri(), tls_configured)
+        };
 
         // tonic handshakes for an `https` URI alone, so the scheme decides
         // whether the channel is encrypted.
@@ -325,13 +396,13 @@ impl TransportBuilder for TonicTransportBuilder {
         // Require the scheme and the TLS config to agree, so the caller gets
         // the channel they asked for. `ensure_secure_server_uri` has already
         // upgraded the scheme-less form, leaving only real conflicts here.
-        if tls_configured && !secure {
+        if !user_owns_transport && tls_configured && !secure {
             return Err(Error::Connection(format!(
                 "TLS is configured but server URI '{uri}' connects in plaintext; \
                  use an `https://` or scheme-less URI"
             )));
         }
-        if secure && !tls_configured {
+        if !user_owns_transport && secure && !tls_configured {
             return Err(Error::Connection(format!(
                 "server URI '{uri}' requires TLS but no TLS config is set"
             )));
@@ -341,6 +412,7 @@ impl TransportBuilder for TonicTransportBuilder {
         if let Some(creds) = &self.call_creds
             && creds.requires_secure_transport()
             && !secure
+            && !user_owns_transport
         {
             return Err(Error::CallCredentials(
                 "call credentials require a secure transport".into(),
@@ -367,10 +439,13 @@ impl TransportBuilder for TonicTransportBuilder {
             None => endpoint,
         };
 
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let channel = match &self.connect {
+            Connect::Default => endpoint
+                .connect()
+                .await
+                .map_err(|e| Error::Connection(e.to_string()))?,
+            Connect::Custom(connect) => connect(endpoint).await?,
+        };
 
         Ok(TonicTransport {
             channel,
@@ -655,6 +730,82 @@ mod tests {
             err.to_string()
                 .contains("requires TLS but no TLS config is set")
         );
+    }
+
+    fn redirecting_connector(
+        addr: std::net::SocketAddr,
+    ) -> impl tower_service::Service<
+        tonic::transport::Uri,
+        Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>,
+        Error = std::io::Error,
+        Future: Send,
+    > + Clone
+    + Send
+    + Sync
+    + 'static {
+        tower::service_fn(move |_uri: tonic::transport::Uri| async move {
+            Ok(hyper_util::rt::TokioIo::new(
+                tokio::net::TcpStream::connect(addr).await?,
+            ))
+        })
+    }
+
+    #[tokio::test]
+    async fn user_connector_carries_ads_stream_with_call_credentials() {
+        let addr = start_mock_server(Some("******")).await;
+
+        let builder = TonicTransportBuilder::new()
+            .with_call_credentials(Arc::new(MockCreds {
+                pairs: vec![("authorization".into(), "******".into())],
+                requires_secure: false,
+            }))
+            .with_connector(redirecting_connector(addr));
+        let server = ServerConfig::new("http://127.0.0.1:1".to_string());
+
+        for attempt in 0..2 {
+            let transport = builder
+                .build(&server)
+                .await
+                .unwrap_or_else(|e| panic!("build {attempt} failed: {e:?}"));
+
+            let request = DiscoveryRequest {
+                type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+                ..Default::default()
+            };
+            let request_bytes: Bytes = request.encode_to_vec().into();
+            let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
+            let response = stream.recv().await.unwrap().unwrap();
+            let response = DiscoveryResponse::decode(response).unwrap();
+            assert_eq!(response.version_info, "1");
+        }
+    }
+
+    #[tokio::test]
+    async fn user_connector_takes_over_the_security_judgement() {
+        let addr = start_mock_server(None).await;
+        let strict = Arc::new(MockCreds {
+            pairs: vec![],
+            requires_secure: true,
+        });
+
+        assert!(
+            matches!(
+                TonicTransportBuilder::new()
+                    .with_call_credentials(strict.clone())
+                    .build(&ServerConfig::new("http://127.0.0.1:1"))
+                    .await
+                    .unwrap_err(),
+                Error::CallCredentials(_)
+            ),
+            "the built-in path must still refuse them"
+        );
+
+        TonicTransportBuilder::new()
+            .with_call_credentials(strict)
+            .with_connector(redirecting_connector(addr))
+            .build(&ServerConfig::new("http://127.0.0.1:1"))
+            .await
+            .expect("the credential guard must be skipped once a connector is set");
     }
 
     #[test]

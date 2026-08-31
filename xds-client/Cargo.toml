@@ -22,6 +22,8 @@ rand = "0.10"
 tonic = { version = "0.14", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 http = { version = "1", optional = true }
+tower-service = { version = "0.3", optional = true }
+hyper = { version = "1", optional = true }
 
 # Optional dependencies for prost codec
 envoy-types = { version = "0.7", optional = true }
@@ -35,6 +37,8 @@ transport-tonic = [
     "tonic/codegen",
     "dep:tokio-stream",
     "dep:http",
+    "dep:tower-service",
+    "dep:hyper",
 ]
 tonic-tls-ring = ["transport-tonic", "tonic/tls-ring"]
 tonic-tls-aws-lc = ["transport-tonic", "tonic/tls-aws-lc"]
@@ -50,6 +54,8 @@ tokio = { version = "1", features = [
 ] }
 tonic = { version = "0.14" }
 async-stream = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 envoy-types = "0.7"
 prost = "0.14"
 
@@ -65,4 +71,10 @@ allowed_external_types = [
     # Re-exported in the public API behind the transport-tonic / codegen-prost features.
     "tonic::*",
     "prost::*",
+    # Bounds on a user-supplied ADS connector, imposed by tonic's own
+    # `Endpoint::connect_with_connector` signature.
+    "tower_service::Service",
+    "http::uri::Uri",
+    "hyper::rt::io::Read",
+    "hyper::rt::io::Write",
 ]

@@ -56,7 +56,7 @@ mod test_utils;
 
 pub(crate) mod proxy_resolver;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod unix;
 #[cfg(target_os = "linux")]
 pub(crate) mod unix_abstract;

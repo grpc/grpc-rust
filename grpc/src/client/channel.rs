@@ -603,7 +603,7 @@ fn setup_registeries() {
     pick_first::reg();
     round_robin::reg();
     dns::reg();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     name_resolution::unix::reg();
     #[cfg(target_os = "linux")]
     name_resolution::unix_abstract::reg();

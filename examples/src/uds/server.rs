@@ -22,14 +22,14 @@
  *
  */
 
-#![cfg_attr(not(unix), allow(unused_imports))]
+#![cfg_attr(not(any(unix, windows)), allow(unused_imports))]
 
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::net::UnixListener;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio_stream::wrappers::UnixListenerStream;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tonic::transport::server::UdsConnectInfo;
 use tonic::{Request, Response, Status, transport::Server};
 
@@ -51,7 +51,7 @@ impl Greeter for MyGreeter {
         &self,
         request: Request<HelloRequest>,
     ) -> Result<Response<HelloReply>, Status> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let conn_info = request.extensions().get::<UdsConnectInfo>().unwrap();
             println!("Got a request {request:?} with info {conn_info:?}");
@@ -64,7 +64,7 @@ impl Greeter for MyGreeter {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = "/tmp/tonic/helloworld";
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    panic!("The `uds` example only works on unix systems!");
+    panic!("The `uds` example only works on unix or windows systems!");
 }

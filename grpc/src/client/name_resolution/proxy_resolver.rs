@@ -519,7 +519,7 @@ mod tests {
         assert!(err.contains("invalid target host in URL"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn unix_path_bypass() {
         crate::client::name_resolution::unix::reg();

@@ -308,7 +308,7 @@ async fn grpc_invoke_tonic_unary() {
     server_handle.await.unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod unix_tests {
     use std::path::Component;
     use std::path::Path;

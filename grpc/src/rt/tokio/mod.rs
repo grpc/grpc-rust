@@ -131,7 +131,7 @@ impl Runtime for TokioRuntime {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn unix_stream(
         &self,
         path: std::path::PathBuf,
@@ -158,6 +158,15 @@ impl Runtime for TokioRuntime {
         })
     }
 
+    #[cfg(not(any(unix, windows)))]
+    fn unix_stream(
+        &self,
+        _path: std::path::PathBuf,
+        _opts: super::UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn super::GrpcEndpoint>, String>> {
+        Box::pin(async move { Err("Unix streams are not supported on this platform".to_string()) })
+    }
+
     fn tcp_listener(
         &self,
         addr: SocketAddr,
@@ -170,7 +179,7 @@ impl Runtime for TokioRuntime {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn unix_listener(
         &self,
         path: std::path::PathBuf,
@@ -182,7 +191,7 @@ impl Runtime for TokioRuntime {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn unix_listener(
         &self,
         _path: std::path::PathBuf,
@@ -248,12 +257,12 @@ impl super::EndpointListener for TokioTcpListener {
 // TokioUnixListener — EndpointListener for Unix sockets
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct TokioUnixListener {
     listener: tokio::net::UnixListener,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tonic::async_trait]
 impl super::EndpointListener for TokioUnixListener {
     async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {

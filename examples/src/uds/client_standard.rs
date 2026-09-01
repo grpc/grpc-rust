@@ -22,7 +22,7 @@
  *
  */
 
-#![cfg_attr(not(unix), allow(unused_imports))]
+#![cfg_attr(not(any(unix, windows)), allow(unused_imports))]
 
 pub mod hello_world {
     tonic::include_proto!("helloworld");
@@ -30,7 +30,7 @@ pub mod hello_world {
 
 use hello_world::{HelloRequest, greeter_client::GreeterClient};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Unix socket URI follows [RFC-3986](https://datatracker.ietf.org/doc/html/rfc3986)
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    panic!("The `uds` example only works on unix systems!");
+    panic!("The `uds` example only works on unix or windows systems!");
 }

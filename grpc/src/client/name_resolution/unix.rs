@@ -146,6 +146,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unix_resolver_success_windows_path() {
+        run_success("unix:C:/path/to/socket", "C:/path/to/socket").await;
+    }
+
+    #[tokio::test]
+    async fn unix_resolver_success_windows_path_with_slashes() {
+        run_success("unix:///C:/path/to/socket", "/C:/path/to/socket").await;
+    }
+
+    #[tokio::test]
     async fn unix_resolver_error_with_authority() {
         reg();
 

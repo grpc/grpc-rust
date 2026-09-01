@@ -22,19 +22,19 @@
  *
  */
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
-use super::ResolverBuilder;
+use crate::client::name_resolution::ResolverBuilder;
 
 static GLOBAL_RESOLVER_REGISTRY: OnceLock<ResolverRegistry> = OnceLock::new();
 
 /// A registry to store and retrieve name resolvers.  Resolvers are indexed by
 /// the URI scheme they are intended to handle.
 #[derive(Default)]
-pub(crate) struct ResolverRegistry {
+pub struct ResolverRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<dyn ResolverBuilder>>>>,
 }
 
@@ -90,6 +90,6 @@ impl ResolverRegistry {
 }
 
 /// Global registry for resolver builders.
-pub(crate) fn global_registry() -> &'static ResolverRegistry {
+pub fn global_registry() -> &'static ResolverRegistry {
     GLOBAL_RESOLVER_REGISTRY.get_or_init(ResolverRegistry::new)
 }

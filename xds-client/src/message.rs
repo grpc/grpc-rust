@@ -1,26 +1,55 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Crate-owned xDS message types.
 //!
 //! These types are codegen-agnostic and serve as the interface between
 //! the xDS client logic and the codec layer. The codec converts these
 //! to/from the wire format (e.g., prost/envoy-types or google-protobuf).
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 
 /// A discovery request to send to the xDS server.
-#[derive(Debug, Clone, Default)]
-pub struct DiscoveryRequest {
+///
+/// This struct borrows data to avoid unnecessary allocations when encoding.
+/// The data only needs to live long enough for the codec to encode it.
+#[derive(Debug, Clone)]
+pub struct DiscoveryRequest<'a> {
     /// The version_info provided in the most recent successfully processed
     /// response for this type, or empty for the first request.
-    pub version_info: String,
+    pub version_info: &'a str,
     /// The node making the request.
-    pub node: Option<Node>,
+    pub node: &'a Node,
     /// List of resource names to subscribe to.
-    pub resource_names: Vec<String>,
+    pub resource_names: &'a [String],
     /// Type URL of the resource being requested.
-    pub type_url: String,
+    pub type_url: &'a str,
     /// The nonce from the most recent successfully processed response,
     /// or empty for the first request.
-    pub response_nonce: String,
+    pub response_nonce: &'a str,
     /// Error details if this is a NACK (negative acknowledgment).
     pub error_detail: Option<ErrorDetail>,
 }
@@ -48,14 +77,89 @@ pub struct ResourceAny {
 }
 
 /// Node identification for the client.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Node {
     /// An opaque node identifier.
-    pub id: String,
+    pub id: Option<String>,
     /// The cluster the node belongs to.
-    pub cluster: String,
+    pub cluster: Option<String>,
     /// Locality specifying where the node is running.
     pub locality: Option<Locality>,
+    /// Free-form string identifying the client type (e.g., "envoy", "grpc").
+    pub user_agent_name: String,
+    /// Version of the client.
+    pub user_agent_version: String,
+    /// Free-form metadata (`google.protobuf.Struct` on the wire).
+    ///
+    /// Some control planes use this to vary the served config — e.g. Istio
+    /// reads `GENERATOR = "grpc"` to switch from sidecar-style to
+    /// proxyless gRPC config (gRFC A27).
+    pub metadata: HashMap<String, MetadataValue>,
+}
+
+/// A `google.protobuf.Value` mirror — any JSON-compatible value carried in
+/// `Node.metadata`.
+///
+/// Mirrors the six variants of `google.protobuf.Value` (and therefore JSON):
+/// null, bool, number, string, list, and struct. Marked `#[non_exhaustive]`
+/// as a forward-compatibility safety belt; the variant set is anchored to
+/// the JSON data model and is not expected to grow.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum MetadataValue {
+    /// JSON `null`.
+    Null,
+    /// JSON `true` / `false`.
+    Bool(bool),
+    /// JSON number (canonical f64; precision-limited above 2^53).
+    Number(f64),
+    /// JSON string.
+    String(String),
+    /// JSON array.
+    Array(Vec<MetadataValue>),
+    /// JSON object.
+    Object(HashMap<String, MetadataValue>),
+}
+
+impl Node {
+    /// Create a new Node with the required user agent fields.
+    ///
+    /// Other fields (id, cluster, locality, metadata) can be set using
+    /// builder methods.
+    pub fn new(user_agent_name: impl Into<String>, user_agent_version: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            cluster: None,
+            locality: None,
+            user_agent_name: user_agent_name.into(),
+            user_agent_version: user_agent_version.into(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Set the node ID.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Set the cluster.
+    pub fn with_cluster(mut self, cluster: impl Into<String>) -> Self {
+        self.cluster = Some(cluster.into());
+        self
+    }
+
+    /// Set the locality.
+    pub fn with_locality(mut self, locality: Locality) -> Self {
+        self.locality = Some(locality);
+        self
+    }
+
+    /// Replace the node metadata.
+    pub fn with_metadata(mut self, metadata: HashMap<String, MetadataValue>) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Locality information identifying where a node is running.

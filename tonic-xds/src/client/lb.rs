@@ -1,12 +1,50 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use crate::client::cluster::ClusterClientRegistry;
+use crate::client::route::RouteDecision;
 use crate::common::async_util::BoxFuture;
-use crate::xds::route::RouteDecision;
-use crate::xds::xds_manager::XdsClusterDiscovery;
 use http::Request;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::ServiceExt;
-use tower::{load::Load, BoxError, Service};
+use tower::{BoxError, Service, discover::Change, load::Load};
+
+/// A pinned, boxed stream of endpoint changes for Tower's `Discover`-based
+/// load balancers.
+pub(crate) type BoxDiscover<Endpoint, S> =
+    Pin<Box<dyn futures_core::Stream<Item = Result<Change<Endpoint, S>, BoxError>> + Send>>;
+
+/// Trait for discovering cluster endpoints.
+///
+/// Implementations resolve a cluster name into a stream of endpoint changes
+/// (`Change::Insert` / `Change::Remove`). The xDS-backed implementation is
+/// [`XdsClusterDiscovery`](crate::xds::cluster_discovery::XdsClusterDiscovery).
+pub(crate) trait ClusterDiscovery<Endpoint, S>: Send + Sync + 'static {
+    fn discover_cluster(&self, cluster_name: &str) -> BoxDiscover<Endpoint, S>;
+}
 
 /// Errors that can occur during load balancing.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -15,7 +53,7 @@ pub(crate) enum LoadBalancingError {
     NoRoutingDecision,
 }
 
-/// A Tower Service that performs load balancing based on routing decisions and xDS configuration.
+/// A Tower Service that performs load balancing based on routing decisions.
 pub(crate) struct XdsLbService<Req, Endpoint, S>
 where
     Req: Send + 'static,
@@ -23,7 +61,7 @@ where
     S::Response: Send + 'static,
 {
     cluster_registry: Arc<ClusterClientRegistry<Req, S::Response>>,
-    cluster_discovery: Arc<dyn XdsClusterDiscovery<Endpoint, S>>,
+    cluster_discovery: Arc<dyn ClusterDiscovery<Endpoint, S>>,
 }
 
 impl<Req, Endpoint, S> XdsLbService<Req, Endpoint, S>
@@ -32,11 +70,10 @@ where
     S: Service<Req>,
     S::Response: Send + 'static,
 {
-    /// Creates a new `XdsLbService` with the given cluster client registry and xDS cluster discovery.
-    #[allow(dead_code)]
+    /// Creates a new `XdsLbService` with the given cluster client registry and cluster discovery.
     pub(crate) fn new(
         cluster_registry: Arc<ClusterClientRegistry<Req, S::Response>>,
-        cluster_discovery: Arc<dyn XdsClusterDiscovery<Endpoint, S>>,
+        cluster_discovery: Arc<dyn ClusterDiscovery<Endpoint, S>>,
     ) -> Self {
         Self {
             cluster_registry,
@@ -96,7 +133,7 @@ where
             });
 
         // Get the transport channel for the target xDS cluster.
-        // The actual load-balancing will be performeed by the channel.
+        // The actual load-balancing will be performed by the cluster's balancer.
         let mut channel = cluster_client.channel();
 
         Box::pin(async move {

@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use std::fmt;
 use std::{sync::Arc, time::Duration};
 
@@ -5,17 +29,18 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time;
 use tokio_rustls::{
+    TlsConnector as RustlsConnector,
     rustls::{
+        ClientConfig, ConfigBuilder, RootCertStore, WantsVerifier,
+        client::danger::ServerCertVerifier,
         crypto,
         pki_types::{ServerName, TrustAnchor},
-        ClientConfig, ConfigBuilder, RootCertStore, WantsVerifier,
     },
-    TlsConnector as RustlsConnector,
 };
 
 use super::io::BoxedIo;
 use crate::transport::service::tls::{
-    convert_certificate_to_pki_types, convert_identity_to_pki_types, TlsError, ALPN_H2,
+    ALPN_H2, TlsError, convert_certificate_to_pki_types, convert_identity_to_pki_types,
 };
 use crate::transport::tls::{Certificate, Identity};
 
@@ -33,6 +58,7 @@ impl TlsConnector {
         ca_certs: Vec<Certificate>,
         trust_anchors: Vec<TrustAnchor<'static>>,
         identity: Option<Identity>,
+        server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
         domain: &str,
         assume_http2: bool,
         use_key_log: bool,
@@ -59,31 +85,53 @@ impl TlsConnector {
             _ => ClientConfig::builder(),
         };
 
-        let mut roots = RootCertStore::from_iter(trust_anchors);
+        let builder = match server_cert_verifier {
+            Some(verifier) => {
+                if !ca_certs.is_empty() || !trust_anchors.is_empty() {
+                    return Err(TlsError::VerifierConflict.into());
+                }
+                #[cfg(feature = "tls-native-roots")]
+                if with_native_roots {
+                    return Err(TlsError::VerifierConflict.into());
+                }
+                #[cfg(feature = "tls-webpki-roots")]
+                if with_webpki_roots {
+                    return Err(TlsError::VerifierConflict.into());
+                }
 
-        #[cfg(feature = "tls-native-roots")]
-        if with_native_roots {
-            let rustls_native_certs::CertificateResult { certs, errors, .. } =
-                rustls_native_certs::load_native_certs();
-            if !errors.is_empty() {
-                tracing::debug!("errors occurred when loading native certs: {errors:?}");
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
             }
-            if certs.is_empty() {
-                return Err(TlsError::NativeCertsNotFound.into());
+            None => {
+                let mut roots = RootCertStore::from_iter(trust_anchors);
+
+                #[cfg(feature = "tls-native-roots")]
+                if with_native_roots {
+                    let rustls_native_certs::CertificateResult { certs, errors, .. } =
+                        rustls_native_certs::load_native_certs();
+                    if !errors.is_empty() {
+                        tracing::debug!("errors occurred when loading native certs: {errors:?}");
+                    }
+                    if certs.is_empty() {
+                        return Err(TlsError::NativeCertsNotFound.into());
+                    }
+                    roots.add_parsable_certificates(certs);
+                }
+
+                #[cfg(feature = "tls-webpki-roots")]
+                if with_webpki_roots {
+                    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                }
+
+                for cert in ca_certs {
+                    roots.add_parsable_certificates(convert_certificate_to_pki_types(&cert)?);
+                }
+
+                builder.with_root_certificates(roots)
             }
-            roots.add_parsable_certificates(certs);
-        }
+        };
 
-        #[cfg(feature = "tls-webpki-roots")]
-        if with_webpki_roots {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
-
-        for cert in ca_certs {
-            roots.add_parsable_certificates(convert_certificate_to_pki_types(&cert)?);
-        }
-
-        let builder = builder.with_root_certificates(roots);
         let mut config = match identity {
             Some(identity) => {
                 let (client_cert, client_key) = convert_identity_to_pki_types(&identity)?;

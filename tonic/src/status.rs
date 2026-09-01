@@ -1,12 +1,36 @@
-use crate::metadata::MetadataMap;
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use crate::metadata::GRPC_CONTENT_TYPE;
+use crate::metadata::MetadataMap;
 use base64::Engine as _;
 use bytes::Bytes;
 use http::{
-    header::{HeaderMap, HeaderValue},
     HeaderName,
+    header::{HeaderMap, HeaderValue},
 };
-use percent_encoding::{percent_decode, percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode, percent_encode};
 use std::{borrow::Cow, error::Error, fmt, sync::Arc};
 use tracing::{debug, trace, warn};
 
@@ -393,11 +417,14 @@ impl Status {
     fn code_from_h2(err: &h2::Error) -> Code {
         // See https://github.com/grpc/grpc/blob/3977c30/doc/PROTOCOL-HTTP2.md#errors
         match err.reason() {
+            // NO_ERROR on a RST_STREAM means the peer reset the stream without a gRPC status.
+            // Per the spec this is still a protocol violation and must be mapped to INTERNAL.
             Some(h2::Reason::NO_ERROR)
             | Some(h2::Reason::PROTOCOL_ERROR)
             | Some(h2::Reason::INTERNAL_ERROR)
             | Some(h2::Reason::FLOW_CONTROL_ERROR)
             | Some(h2::Reason::SETTINGS_TIMEOUT)
+            | Some(h2::Reason::FRAME_SIZE_ERROR)
             | Some(h2::Reason::COMPRESSION_ERROR)
             | Some(h2::Reason::CONNECT_ERROR) => Code::Internal,
             Some(h2::Reason::REFUSED_STREAM) => Code::Unavailable,
@@ -776,13 +803,13 @@ pub(crate) fn infer_grpc_status(
     trailers: Option<&HeaderMap>,
     status_code: http::StatusCode,
 ) -> Result<(), Option<Status>> {
-    if let Some(trailers) = trailers {
-        if let Some(status) = Status::from_header_map(trailers) {
-            if status.code() == Code::Ok {
-                return Ok(());
-            } else {
-                return Err(status.into());
-            }
+    if let Some(trailers) = trailers
+        && let Some(status) = Status::from_header_map(trailers)
+    {
+        if status.code() == Code::Ok {
+            return Ok(());
+        } else {
+            return Err(status.into());
         }
     }
     trace!("trailers missing grpc-status");
@@ -796,13 +823,37 @@ pub(crate) fn infer_grpc_status(
         | http::StatusCode::BAD_GATEWAY
         | http::StatusCode::SERVICE_UNAVAILABLE
         | http::StatusCode::GATEWAY_TIMEOUT => Code::Unavailable,
-        // We got a 200 but no trailers, we can infer that this request is finished.
+        // We got a 200 but no grpc-status trailer.
         //
-        // This can happen when a streaming response sends two Status but
-        // gRPC requires that we end the stream after the first status.
+        // Per the gRPC-over-HTTP/2 protocol, grpc-status MUST be present in Trailers
+        // even when the HTTP status is 200 OK. A clean end-of-stream without a
+        // grpc-status trailer is therefore a protocol violation.
         //
-        // https://github.com/hyperium/tonic/issues/681
-        http::StatusCode::OK => return Err(None),
+        // Tonic attempts to follow the RST_STREAM error-code mapping defined in the
+        // gRPC-over-HTTP/2 spec (see `code_from_h2` and the h2 error handling in
+        // `from_hyper_error`):
+        //   https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#errors
+        //
+        // However, hyper intentionally converts RST_STREAM frames with reason NO_ERROR
+        // or CANCEL into a clean end-of-stream (Poll::Ready(None)) instead of surfacing
+        // them as errors — see hyper's `Incoming::poll_frame` for h2 bodies. By the time
+        // tonic observes the body termination, the h2 reset reason has been discarded and
+        // is no longer accessible. Tonic therefore has no way to distinguish a legitimate
+        // graceful close from a proxy/load-balancer reset (e.g. an Envoy timeout that
+        // issues RST_STREAM(NO_ERROR)) via the h2 error path.
+        //
+        // The only signal available at this point is the absence of a grpc-status
+        // trailer on an otherwise-successful (HTTP 200) stream. We map this to Unknown,
+        // which the gRPC spec defines as the appropriate code when a final status is
+        // absent or indeterminate. This matches the behaviour of grpc-go:
+        //   https://github.com/grpc/grpc-go/pull/8702
+        //
+        // https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#responses
+        http::StatusCode::OK => {
+            return Err(Some(Status::unknown(
+                "protocol error: missing grpc-status trailer, stream was terminated without a final status (possible truncation by a proxy or load balancer)",
+            )));
+        }
         _ => Code::Unknown,
     };
 
@@ -979,6 +1030,13 @@ mod tests {
             .and_then(|err| err.downcast_ref::<h2::Error>())
             .unwrap();
         assert_eq!(source.reason(), Some(h2::Reason::CANCEL));
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn code_from_h2_frame_size_error() {
+        let err = h2::Error::from(h2::Reason::FRAME_SIZE_ERROR);
+        assert_eq!(Status::code_from_h2(&err), Code::Internal);
     }
 
     #[test]

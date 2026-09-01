@@ -1,8 +1,43 @@
-use interop::client::{InteropTest, InteropTestUnimplemented};
-use interop::{client_prost, client_protobuf};
-use std::{str::FromStr, time::Duration};
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use grpc::credentials::LocalChannelCredentials;
+use grpc::credentials::rustls::RootCertificates;
+use grpc::credentials::rustls::StaticProvider;
+use grpc::credentials::rustls::client::ClientTlsConfig as GrpcClientTlsConfig;
+use grpc::credentials::rustls::client::RustlsChannelCredentials;
+use interop::client::InteropTest;
+use interop::client::InteropTestUnimplemented;
+use interop::client_prost;
+use interop::client_protobuf;
+use tonic::transport::Certificate;
+use tonic::transport::ClientTlsConfig;
 use tonic::transport::Endpoint;
-use tonic::transport::{Certificate, ClientTlsConfig};
 
 #[derive(Debug)]
 struct Opts {
@@ -50,37 +85,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let test_cases = matches.test_case;
 
-    let scheme = if matches.use_tls { "https" } else { "http" };
-
-    #[allow(unused_mut)]
-    let mut endpoint = Endpoint::try_from(format!("{scheme}://localhost:10000"))?
-        .timeout(Duration::from_secs(5))
-        .concurrency_limit(30);
-
-    if matches.use_tls {
-        let pem = std::fs::read_to_string("interop/data/ca.pem")?;
-        let ca = Certificate::from_pem(pem);
-        endpoint = endpoint.tls_config(
-            ClientTlsConfig::new()
-                .ca_certificate(ca)
-                .domain_name("foo.test.google.fr"),
-        )?;
-    }
-
-    let channel = endpoint.connect().await?;
-
     let (mut client, mut unimplemented_client): (
         Box<dyn InteropTest>,
         Box<dyn InteropTestUnimplemented>,
     ) = match matches.codec {
-        Codec::Prost => (
-            Box::new(client_prost::TestClient::new(channel.clone())),
-            Box::new(client_prost::UnimplementedClient::new(channel)),
-        ),
-        Codec::Protobuf => (
-            Box::new(client_protobuf::TestClient::new(channel.clone())),
-            Box::new(client_protobuf::UnimplementedClient::new(channel)),
-        ),
+        Codec::Prost => {
+            let scheme = if matches.use_tls { "https" } else { "http" };
+            let mut endpoint = Endpoint::try_from(format!("{scheme}://localhost:10000"))?
+                .timeout(Duration::from_secs(5))
+                .concurrency_limit(30);
+
+            if matches.use_tls {
+                let pem = std::fs::read_to_string("interop/data/ca.pem")?;
+                let ca = Certificate::from_pem(pem);
+                endpoint = endpoint.tls_config(
+                    ClientTlsConfig::new()
+                        .ca_certificate(ca)
+                        .domain_name("foo.test.google.fr"),
+                )?;
+            }
+
+            let channel = endpoint.connect().await?;
+
+            (
+                Box::new(client_prost::TestClient::new(channel.clone())),
+                Box::new(client_prost::UnimplementedClient::new(channel)),
+            )
+        }
+        Codec::Protobuf => {
+            let channel = if matches.use_tls {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+
+                let pem = std::fs::read_to_string("interop/data/ca.pem")?;
+                let root_certs = RootCertificates::from_pem(pem);
+                let creds = RustlsChannelCredentials::new(
+                    GrpcClientTlsConfig::new()
+                        .with_root_certificates_provider(StaticProvider::new(root_certs)),
+                )?;
+                grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
+                    .authority("test.test.google.fr")
+                    .build()
+            } else {
+                grpc::client::Channel::builder(
+                    "dns:///localhost:10000",
+                    Arc::new(LocalChannelCredentials::new()),
+                )
+                .build()
+            };
+            (
+                Box::new(client_protobuf::TestClient::new(channel.clone())),
+                Box::new(client_protobuf::UnimplementedClient::new(channel)),
+            )
+        }
     };
 
     let mut failures = Vec::new();

@@ -1,20 +1,29 @@
 [package]
 name = "grpc"
-version = "0.9.0-alpha.1"
-edition = "2021"
-authors = ["gRPC Authors"]
+version = "0.10.0"
+authors = ["gRPC authors"]
 license = "MIT"
-rust-version = "1.86"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = """
+The official Rust implementation of gRPC: a high performance, open source, universal RPC framework.
+"""
+readme = "README.md"
+keywords = ["rpc", "grpc", "async", "protobuf", "proto"]
+categories = ["web-programming", "network-programming", "asynchronous"]
+rust-version = { workspace = true }
+edition = "2024"
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
+    "bytes::*",
     "tonic::*",
     "futures_core::stream::Stream",
-    "tokio::sync::oneshot::Sender",
+    "tokio::sync::oneshot::*",
 ]
 
 [features]
-default = ["dns", "_runtime-tokio"]
+default = ["dns", "_runtime-tokio", "tls-rustls"]
 dns = ["dep:hickory-resolver", "_runtime-tokio"]
 # The following feature is used to ensure all modules use the runtime
 # abstraction instead of using tokio directly.
@@ -30,23 +39,54 @@ _runtime-tokio = [
 # Used for testing with udeps as it wants this feature to exist
 # to be able to do its checks.
 tower = ["_runtime-tokio"]
+tls-rustls = [
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:rustls-pki-types",
+    "dep:tokio-rustls",
+    "dep:rustls-platform-verifier",
+    "dep:rustls-webpki",
+]
+__unstable = []
+gzip = ["dep:flate2"]
 
 [dependencies]
+base64 = "0.22"
 bytes = "1.10.1"
-hickory-resolver = { version = "0.25.1", optional = true }
+flate2 = { version = "1.0", optional = true, default-features = false, features = [
+    "zlib-rs",
+] }
+hickory-resolver = { version = "0.26.1", optional = true }
 http = "1.1.0"
+httparse = "1.9"
 http-body = "1.0.1"
 hyper = { version = "1.6.0", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["client-proxy"] }
+itoa = "1.0"
 parking_lot = "0.12.4"
+percent-encoding = "2.3"
 pin-project-lite = "0.2.16"
-rand = "0.9"
+rand = "0.10"
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "tls12",
+    "logging",
+    "std",
+] }
+rustls-pemfile = { version = "2.1", optional = true, default-features = false, features = [
+    "std",
+] }
+rustls-pki-types = { version = "1.8", optional = true, default-features = false }
+rustls-platform-verifier = { version = "0.7", optional = true, default-features = false }
+rustls-webpki = { version = "0.103", optional = true, default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 socket2 = { version = "0.6", optional = true }
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false }
 tokio-stream = { version = "0.1.17", default-features = false }
-tonic = { version = "0.14.0", path = "../tonic", default-features = false, features = [
+tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = [
     "codegen",
+    "h2",
 ] }
 tower = { version = "0.5.2", features = [
     "limit",
@@ -54,14 +94,25 @@ tower = { version = "0.5.2", features = [
     "buffer",
 ], optional = true }
 tower-service = "0.3.3"
+trait-variant = "0.1.2"
 url = "2.5.0"
 
 [dev-dependencies]
+h2 = "0.4"
+tokio = { version = "1.37.0", features = ["test-util"] }
 async-stream = "0.3.6"
-hickory-server = "0.25.2"
+criterion = "0.8"
+hickory-server = "0.26.1"
 prost = "0.14.0"
-tonic = { version = "0.14.0", path = "../tonic", default-features = false, features = [
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tempfile = "3.26"
+tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = [
     "server",
     "router",
+    "tls-ring",
 ] }
-tonic-prost = { version = "0.14.0", path = "../tonic-prost" }
+tonic-prost = { version = "0.14.6", path = "../tonic-prost" }
+
+[[bench]]
+name = "metadata"
+harness = false

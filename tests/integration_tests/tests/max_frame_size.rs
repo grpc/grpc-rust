@@ -1,0 +1,76 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+
+use integration_tests::pb::{test_client::TestClient, test_server, Input, Output};
+use tonic::transport::{server::TcpIncoming, Channel, Server};
+use tonic::{Request, Response, Status};
+
+struct Svc;
+
+#[tonic::async_trait]
+impl test_server::Test for Svc {
+    async fn unary_call(&self, _: Request<Input>) -> Result<Response<Output>, Status> {
+        Ok(Response::new(Output {}))
+    }
+}
+
+#[tokio::test]
+async fn max_frame_size_on_client_endpoint() {
+    let svc = test_server::TestServer::new(Svc {});
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+
+    let jh = tokio::spawn(async move {
+        Server::builder()
+            .max_frame_size(1024 * 1024u32) // 1 MB
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async { drop(rx.await) })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Set client-side max_frame_size to match server
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .max_frame_size(1024 * 1024u32)
+        .connect()
+        .await
+        .unwrap();
+    let mut client = TestClient::new(channel);
+
+    let res = client.unary_call(Request::new(Input {})).await;
+
+    assert!(res.is_ok());
+
+    tx.send(()).unwrap();
+    jh.await.unwrap();
+}

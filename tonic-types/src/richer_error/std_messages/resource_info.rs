@@ -1,9 +1,33 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use prost::{DecodeError, Message};
 use prost_types::Any;
 
 use crate::richer_error::FromAnyRef;
 
-use super::super::{pb, FromAny, IntoAny};
+use super::super::{FromAny, IntoAny, pb};
 
 /// Used to encode/decode the `ResourceInfo` standard error message described
 /// in [error_details.proto]. Describes the resource that is being accessed.
@@ -124,8 +148,7 @@ mod tests {
 
         let formatted = format!("{gen_any:?}");
 
-        let expected =
-            "Any { type_url: \"type.googleapis.com/google.rpc.ResourceInfo\", value: [10, 13, 114, 101, 115, 111, 117, 114, 99, 101, 45, 116, 121, 112, 101, 18, 13, 114, 101, 115, 111, 117, 114, 99, 101, 45, 110, 97, 109, 101, 26, 5, 111, 119, 110, 101, 114, 34, 11, 100, 101, 115, 99, 114, 105, 112, 116, 105, 111, 110] }";
+        let expected = "Any { type_url: \"type.googleapis.com/google.rpc.ResourceInfo\", value: [10, 13, 114, 101, 115, 111, 117, 114, 99, 101, 45, 116, 121, 112, 101, 18, 13, 114, 101, 115, 111, 117, 114, 99, 101, 45, 110, 97, 109, 101, 26, 5, 111, 119, 110, 101, 114, 34, 11, 100, 101, 115, 99, 114, 105, 112, 116, 105, 111, 110] }";
 
         assert!(
             formatted.eq(expected),

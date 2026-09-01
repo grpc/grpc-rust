@@ -1,0 +1,456 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+/// Library providing build integration for the gRPC protobuf compiler.
+///
+/// ## Usage Information
+///
+/// Please see [our website] for everything you should need to get started using
+/// gRPC!
+///
+/// [our website]: https://grpc.io/docs/languages/rust
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+
+use syn::parse_file;
+
+/// Details about a crate containing proto files with symbols referenced in
+/// the file being compiled currently.
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    crate_name: String,
+    proto_import_paths: Vec<PathBuf>,
+    proto_files: Vec<String>,
+}
+
+impl Dependency {
+    pub fn builder() -> DependencyBuilder {
+        DependencyBuilder::default()
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct DependencyBuilder {
+    crate_name: Option<String>,
+    proto_import_paths: Vec<PathBuf>,
+    proto_files: Vec<String>,
+}
+
+impl DependencyBuilder {
+    /// Name of the external crate.
+    pub fn crate_name(mut self, name: impl Into<String>) -> Self {
+        self.crate_name = Some(name.into());
+        self
+    }
+
+    /// List of paths .proto files whose codegen is present in the crate. This
+    /// is used to re-run the build command if required.
+    pub fn proto_import_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.proto_import_paths.push(path.into());
+        self
+    }
+
+    /// List of .proto file names whose codegen is present in the crate.
+    pub fn proto_import_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.proto_import_paths = paths;
+        self
+    }
+
+    pub fn proto_file(mut self, file: impl Into<String>) -> Self {
+        self.proto_files.push(file.into());
+        self
+    }
+
+    pub fn proto_files(mut self, files: Vec<String>) -> Self {
+        self.proto_files = files;
+        self
+    }
+
+    pub fn build(self) -> Result<Dependency, &'static str> {
+        let crate_name = self.crate_name.ok_or("crate_name is required")?;
+        Ok(Dependency {
+            crate_name,
+            proto_import_paths: self.proto_import_paths,
+            proto_files: self.proto_files,
+        })
+    }
+}
+
+impl From<&Dependency> for protobuf_codegen::Dependency {
+    fn from(val: &Dependency) -> Self {
+        protobuf_codegen::Dependency {
+            crate_name: val.crate_name.clone(),
+            proto_import_paths: val.proto_import_paths.clone(),
+            proto_files: val.proto_files.clone(),
+        }
+    }
+}
+
+impl From<protobuf_codegen::Dependency> for Dependency {
+    fn from(val: protobuf_codegen::Dependency) -> Self {
+        Dependency {
+            crate_name: val.crate_name,
+            proto_import_paths: val.proto_import_paths,
+            proto_files: val.proto_files,
+        }
+    }
+}
+
+fn check_runnable(binary: &Path) -> Result<(), String> {
+    let out = Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Binary '{}' failed to execute: {e}", binary.display()))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Err(format!(
+            "Binary '{}' is not runnable. Status: {}. Stdout: {}. Stderr: {}",
+            binary.display(),
+            out.status,
+            stdout.trim(),
+            stderr.trim()
+        ))
+    }
+}
+
+/// Service generator builder.
+#[derive(Debug, Clone)]
+pub struct CodeGen {
+    inputs: Vec<PathBuf>,
+    output_dir: PathBuf,
+    includes: Vec<PathBuf>,
+    dependencies: Vec<Dependency>,
+    message_module_path: Option<String>,
+    // Whether to generate message code, defaults to true.
+    generate_message_code: bool,
+    should_format_code: bool,
+    client_only: bool,
+    prebuilt_binaries: Option<(PathBuf, PathBuf)>,
+}
+
+impl CodeGen {
+    pub fn new() -> Self {
+        Self {
+            inputs: Vec::new(),
+            // TODO: Delay this check until the field is read in order to allow
+            // it to be set via `output_dir()` if it isn't in the environment.
+            output_dir: PathBuf::from(std::env::var("OUT_DIR").unwrap()),
+            includes: Vec::new(),
+            dependencies: Vec::new(),
+            message_module_path: None,
+            generate_message_code: true,
+            should_format_code: true,
+            client_only: false,
+            prebuilt_binaries: None,
+        }
+    }
+
+    pub fn client_only(&mut self) -> &mut Self {
+        self.client_only = true;
+        self
+    }
+
+    /// Sets explicit paths to the `protoc` and `protoc-gen-rust-grpc` plugin binaries.
+    pub fn prebuilt_binaries(
+        &mut self,
+        protoc: impl Into<PathBuf>,
+        plugin: impl Into<PathBuf>,
+    ) -> &mut Self {
+        self.prebuilt_binaries = Some((protoc.into(), plugin.into()));
+        self
+    }
+
+    /// Sets whether to generate the message code. This can be disabled if the
+    /// message code is being generated independently.
+    pub fn generate_message_code(&mut self, enable: bool) -> &mut Self {
+        self.generate_message_code = enable;
+        self
+    }
+
+    /// Adds a proto file to compile.
+    pub fn input(&mut self, input: impl AsRef<Path>) -> &mut Self {
+        self.inputs.push(input.as_ref().to_owned());
+        self
+    }
+
+    /// Adds a proto file to compile.
+    pub fn inputs(&mut self, inputs: impl IntoIterator<Item = impl AsRef<Path>>) -> &mut Self {
+        self.inputs
+            .extend(inputs.into_iter().map(|input| input.as_ref().to_owned()));
+        self
+    }
+
+    /// Enables or disables formatting of generated code.
+    pub fn should_format_code(&mut self, enable: bool) -> &mut Self {
+        self.should_format_code = enable;
+        self
+    }
+
+    /// Sets the directory for the files generated by protoc. The generated code
+    /// will be present in a subdirectory corresponding to the path of the
+    /// proto file withing the included directories.
+    pub fn output_dir(&mut self, output_dir: impl AsRef<Path>) -> &mut Self {
+        self.output_dir = output_dir.as_ref().to_owned();
+        self
+    }
+
+    /// Add a directory for protoc to scan for .proto files.
+    pub fn include(&mut self, include: impl AsRef<Path>) -> &mut Self {
+        self.includes.push(include.as_ref().to_owned());
+        self
+    }
+
+    /// Add a directory for protoc to scan for .proto files.
+    pub fn includes(&mut self, includes: impl IntoIterator<Item = impl AsRef<Path>>) -> &mut Self {
+        self.includes.extend(
+            includes
+                .into_iter()
+                .map(|include| include.as_ref().to_owned()),
+        );
+        self
+    }
+
+    /// Adds a list of Rust crates along with the proto files whose generated
+    /// messages they contains.
+    pub fn dependencies(&mut self, deps: Vec<Dependency>) -> &mut Self {
+        self.dependencies.extend(deps);
+        self
+    }
+
+    /// Sets path of the module containing the generated message code. This is
+    /// "self" by default, i.e. the service code expects the message structs to
+    /// be present in the same module. Set this if the message and service
+    /// codegen needs to live in separate modules.
+    pub fn message_module_path(&mut self, message_path: &str) -> &mut Self {
+        self.message_module_path = Some(message_path.to_string());
+        self
+    }
+
+    fn resolve_binaries(&self) -> Result<(PathBuf, PathBuf), String> {
+        let (protoc, plugin) = self.resolve_binaries_impl()?;
+        check_runnable(&protoc)?;
+        check_runnable(&plugin)?;
+        Ok((protoc, plugin))
+    }
+
+    fn resolve_binaries_impl(&self) -> Result<(PathBuf, PathBuf), String> {
+        // 1. Explicit configuration
+        if let Some((protoc, plugin)) = &self.prebuilt_binaries {
+            return Ok((protoc.clone(), plugin.clone()));
+        }
+
+        // 2. Compiled via protoc-gen-rust-grpc
+        #[cfg(feature = "protoc-gen-rust-grpc")]
+        {
+            let compiled_protoc = protoc_gen_rust_grpc::protoc();
+            let compiled_plugin = protoc_gen_rust_grpc::protoc_gen_rust_grpc();
+            if compiled_protoc.exists() && compiled_plugin.exists() {
+                // The files may not exist if a build setting instructed protoc-gen-rust-grpc to
+                // skip the C++ build (DOCS_RS / our CI setting).
+                return Ok((compiled_protoc, compiled_plugin));
+            }
+        }
+
+        let protoc_filename = if cfg!(windows) {
+            "protoc.exe"
+        } else {
+            "protoc"
+        };
+        let plugin_filename = if cfg!(windows) {
+            "protoc-gen-rust-grpc.exe"
+        } else {
+            "protoc-gen-rust-grpc"
+        };
+
+        // 3. Prebuilt binaries environment variable
+        if let Ok(dir) = std::env::var("GRPC_RUST_PROTOC_DIR") {
+            let path_dir = Path::new(&dir);
+            let protoc = path_dir.join(protoc_filename);
+            let plugin = path_dir.join(plugin_filename);
+            if protoc.exists() && plugin.exists() {
+                return Ok((protoc, plugin));
+            }
+        }
+
+        // 4. Discovery from PATH
+        if let (Ok(protoc), Ok(plugin)) =
+            (which::which(protoc_filename), which::which(plugin_filename))
+        {
+            return Ok((protoc, plugin));
+        }
+
+        Err(
+            "Could not locate the protoc and/or protoc-gen-rust-grpc plugin binaries.
+Please do one of the following:
+  1. Enable the \"build-plugin\" feature to compile from source.
+  2. Set the \"GRPC_RUST_PROTOC_DIR\" environment variable to a path
+     containing both binaries.
+  3. Ensure both binaries are in your system PATH.
+  4. Supply paths via CodeGen::prebuilt_binaries() method in build.rs."
+                .to_string(),
+        )
+    }
+
+    pub fn compile(&self) -> Result<(), String> {
+        let (protoc, plugin) = self.resolve_binaries()?;
+
+        // Generate the message code.
+        if self.generate_message_code {
+            protobuf_codegen::CodeGen::new()
+                .protoc_path(&protoc)
+                .inputs(self.inputs.clone())
+                .output_dir(self.output_dir.clone())
+                .includes(self.includes.iter())
+                .dependency(self.dependencies.iter().map(|d| d.into()).collect())
+                .generate_and_compile()
+                .unwrap();
+        }
+        let crate_mapping_path = if self.generate_message_code {
+            self.output_dir.join("crate_mapping.txt")
+        } else {
+            self.generate_crate_mapping_file()
+        };
+
+        // Generate the service code.
+        let mut cmd = Command::new(&protoc);
+        cmd.arg(format!(
+            "--plugin=protoc-gen-rust-grpc={}",
+            plugin.display()
+        ));
+        if self.client_only {
+            cmd.arg("--rust-grpc_opt=client_only=true");
+        }
+        for input in &self.inputs {
+            cmd.arg(input);
+        }
+        if !self.output_dir.exists() {
+            // Attempt to make the directory if it doesn't exist
+            let _ = std::fs::create_dir(&self.output_dir);
+        }
+
+        if !self.generate_message_code {
+            for include in &self.includes {
+                println!("cargo:rerun-if-changed={}", include.display());
+            }
+            for dep in &self.dependencies {
+                for path in &dep.proto_import_paths {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
+            }
+        }
+
+        cmd.arg(format!("--rust-grpc_out={}", self.output_dir.display()));
+        cmd.arg(format!(
+            "--rust-grpc_opt=crate_mapping={}",
+            crate_mapping_path.display()
+        ));
+        if let Some(message_path) = &self.message_module_path {
+            cmd.arg(format!(
+                "--rust-grpc_opt=message_module_path={message_path}",
+            ));
+        }
+
+        for include in &self.includes {
+            cmd.arg(format!("--proto_path={}", include.display()));
+        }
+        for dep in &self.dependencies {
+            for path in &dep.proto_import_paths {
+                cmd.arg(format!("--proto_path={}", path.display()));
+            }
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run protoc: {e}"))?;
+        println!("{}", std::str::from_utf8(&output.stdout).unwrap());
+        eprintln!("{}", std::str::from_utf8(&output.stderr).unwrap());
+        assert!(output.status.success());
+
+        if self.should_format_code {
+            self.format_code();
+        }
+
+        if crate_mapping_path.exists() {
+            let _ = fs::remove_file(&crate_mapping_path);
+        }
+
+        Ok(())
+    }
+
+    fn format_code(&self) {
+        let mut generated_file_paths = Vec::new();
+        let output_dir = &self.output_dir;
+        if self.generate_message_code {
+            generated_file_paths.push(output_dir.join("generated.rs"));
+        }
+        for proto_path in &self.inputs {
+            let Some(stem) = proto_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            generated_file_paths.push(output_dir.join(format!("{stem}_grpc.pb.rs")));
+            if self.generate_message_code {
+                generated_file_paths.push(output_dir.join(format!("{stem}.u.pb.rs")));
+            }
+        }
+
+        for path in &generated_file_paths {
+            // The path may not exist if there are no services present in the
+            // proto file.
+            if path.exists() {
+                let src = fs::read_to_string(path).expect("Failed to read generated file");
+                let syntax = parse_file(&src).unwrap();
+                let formatted = prettyplease::unparse(&syntax);
+                fs::write(path, formatted).unwrap();
+            }
+        }
+    }
+
+    fn generate_crate_mapping_file(&self) -> PathBuf {
+        let crate_mapping_path = self.output_dir.join("crate_mapping.txt");
+        let mut file = fs::File::create(crate_mapping_path.clone()).unwrap();
+        for dep in &self.dependencies {
+            file.write_all(format!("{}\n", dep.crate_name).as_bytes())
+                .unwrap();
+            file.write_all(format!("{}\n", dep.proto_files.len()).as_bytes())
+                .unwrap();
+            for f in &dep.proto_files {
+                file.write_all(format!("{f}\n").as_bytes()).unwrap();
+            }
+        }
+        crate_mapping_path
+    }
+}
+
+impl Default for CodeGen {
+    fn default() -> Self {
+        Self::new()
+    }
+}

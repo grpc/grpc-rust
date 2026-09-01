@@ -23,22 +23,42 @@
  */
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::Path;
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    let proto_path = Path::new("third_party/googleapis/google/rpc/status.proto");
+    let generated_dir = Path::new("generated");
+    let gen_marker = Path::new("generated/google/rpc/generated.rs");
 
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", proto_path.display());
+    println!("cargo:rerun-if-changed={}", gen_marker.display());
     println!("cargo:rerun-if-env-changed=GRPC_RUST_REGENERATE_PROTO");
-    if env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some() {
-        let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+
+    let force_regenerate = env::var_os("GRPC_RUST_REGENERATE_PROTO").is_some();
+    let generated_missing = !generated_dir.exists() || !gen_marker.exists();
+    let proto_newer = match (fs::metadata(proto_path), fs::metadata(gen_marker)) {
+        (Ok(p_meta), Ok(g_meta)) => match (p_meta.modified(), g_meta.modified()) {
+            (Ok(p_time), Ok(g_time)) => p_time > g_time,
+            _ => true,
+        },
+        _ => true,
+    };
+
+    if force_regenerate || generated_missing || proto_newer {
+        if generated_dir.exists() {
+            let _ = fs::remove_dir_all(generated_dir);
+        }
+
         let dependencies = protobuf_well_known_types::get_dependency("protobuf_well_known_types")
             .into_iter()
-            .map(|d| d.into())
+            .map(std::convert::Into::into)
             .collect();
 
         grpc_protobuf_build::CodeGen::new()
-            .output_dir(manifest_dir.join("generated"))
-            .include(manifest_dir.join("third_party/googleapis"))
+            .output_dir(generated_dir)
+            .include("third_party/googleapis")
             .inputs(["google/rpc/status.proto"])
             .dependencies(dependencies)
             .client_only()

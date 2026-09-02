@@ -106,13 +106,13 @@ impl Channel {
     /// by the user. Valid examples of target names include:
     ///
     /// "foo.googleapis.com:8080"
-    /// "dns:///foo.googleapis.com:8080"
-    /// "dns:///foo.googleapis.com"
-    /// "dns:///10.0.0.213:8080"
-    /// "dns:///%5B2001:db8:85a3:8d3:1319:8a2e:370:7348%5D:443"
-    /// "dns://8.8.8.8/foo.googleapis.com:8080"
-    /// "dns://8.8.8.8/foo.googleapis.com"
-    /// "zookeeper://zk.example.com:9900/example_service"
+    /// "<dns:///foo.googleapis.com:8080>"
+    /// "<dns:///foo.googleapis.com>"
+    /// "<dns:///10.0.0.213:8080>"
+    /// "<dns:///%5B2001:db8:85a3:8d3:1319:8a2e:370:7348%5D:443>"
+    /// "<dns://8.8.8.8/foo.googleapis.com:8080>"
+    /// "<dns://8.8.8.8/foo.googleapis.com>"
+    /// "<zookeeper://zk.example.com:9900/example_service>"
     ///
     /// Credentials must implement the [`ChannelCredentials`] trait.
     ///
@@ -326,7 +326,7 @@ impl ActiveChannel {
             while let Some(w) = wqrx.recv().await {
                 match w {
                     WorkQueueItem::ScheduleResolver => {
-                        resolver.work(&mut resolver_channel_controller)
+                        resolver.work(&mut resolver_channel_controller);
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
                     WorkQueueItem::ScheduleLbPolicy(data) => {

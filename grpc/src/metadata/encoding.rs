@@ -39,7 +39,7 @@ use crate::private;
 pub struct InvalidMetadataValue {}
 
 pub trait ValueEncoding: Clone + Eq + PartialEq + Hash {
-    /// Returns true if the provided key is valid for this ValueEncoding type.
+    /// Returns true if the provided key is valid for this `ValueEncoding` type.
     /// For example, `Ascii::is_valid_key("a") == true`,
     /// `Ascii::is_valid_key("a-bin") == false`.
     fn is_valid_key(key: &str) -> bool;

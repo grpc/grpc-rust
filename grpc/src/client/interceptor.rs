@@ -588,14 +588,14 @@ mod test {
     }
 
     /// An Invoke impl that can be controlled via its paired
-    /// MockInvokerController.
+    /// `MockInvokerController`.
     #[derive(Clone)]
     struct MockInvoker {
         resp_tx: broadcast::Sender<ResponseStreamItem>,
         req_tx: mpsc::Sender<(Bytes, SendOptions)>,
     }
-    /// A controller used to control the behavior of its paired MockInvoker's
-    /// SendStream and RecvStream.
+    /// A controller used to control the behavior of its paired `MockInvoker`'s
+    /// `SendStream` and `RecvStream`.
     struct MockInvokerController {
         resp_tx: broadcast::Sender<ResponseStreamItem>,
         req_rx: mpsc::Receiver<(Bytes, SendOptions)>,
@@ -884,7 +884,7 @@ mod test {
                 RecvStreamState::Done(_) => Some(fut.await),
             }
         }
-        /// Resolves `self`: either returns the already-Done() result of the
+        /// Resolves `self`: either returns the `already-Done()` result of the
         /// recv operation or awaits the future and returns the result.
         async fn resolve(self) -> ResponseStreamItem {
             match self {
@@ -917,7 +917,7 @@ mod test {
             Self { data }
         }
     }
-    impl<'a> SendMessage for ByteSendMsg<'a> {
+    impl SendMessage for ByteSendMsg<'_> {
         fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
             Ok(Box::new(self.data.clone()))
         }

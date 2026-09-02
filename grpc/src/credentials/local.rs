@@ -82,7 +82,7 @@ impl ValidateAuthority for LocalConnectionAuthorityValidator {
 
 /// Returns the security level for a local connection.
 /// It returns an error if a connection is not local.
-/// Refer to L62: https://github.com/grpc/proposal/blob/master/L62-core-call-credential-security-level.md
+/// Refer to L62: <https://github.com/grpc/proposal/blob/master/L62-core-call-credential-security-level.md>
 fn security_level_for_endpoint(
     peer_addr: &str,
     network_type: &str,

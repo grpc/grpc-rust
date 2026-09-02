@@ -171,7 +171,7 @@ pub trait DynInvoke: Send + Sync {
     /// Starts an RPC, returning the send and receive streams to interact with
     /// it.
     ///
-    /// Note that dyn_invoke is asynchronous, and may block as needed if the
+    /// Note that `dyn_invoke` is asynchronous, and may block as needed if the
     /// channel is still connecting or if the connection the RPC is routed to
     /// has reached its maximum stream limit.
     async fn dyn_invoke(
@@ -205,7 +205,7 @@ pub trait InvokeOnce: Sync {
     /// Starts an RPC, returning the send and receive streams to interact with
     /// it.
     ///
-    /// Note that invoke_once is asynchronous, and may block as needed if the
+    /// Note that `invoke_once` is asynchronous, and may block as needed if the
     /// channel is still connecting or if the connection the RPC is routed to
     /// has reached its maximum stream limit.
     async fn invoke_once(
@@ -238,13 +238,13 @@ impl<T: Invoke> InvokeOnce for &T {
 pub trait SendStream {
     /// Sends `msg` on the stream.  If `Err(())` is returned, the message could
     /// not be delivered because the stream was closed.  Future calls to
-    /// SendStream will do nothing.
+    /// `SendStream` will do nothing.
     ///
     /// # Cancel safety
     ///
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
-    /// to the SendStream are undefined and data may be lost.
+    /// to the `SendStream` are undefined and data may be lost.
     async fn send(&mut self, msg: &dyn SendMessage, options: SendOptions) -> Result<(), ()>;
 }
 
@@ -262,7 +262,7 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'a> SendStream for Box<dyn DynSendStream + 'a> {
+impl SendStream for Box<dyn DynSendStream + '_> {
     async fn send(&mut self, msg: &dyn SendMessage, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(msg, options).await
     }
@@ -309,11 +309,11 @@ impl SendOptions {
 ///
 /// A response stream must always contain items exactly as follows:
 ///
-/// [Headers *Message] Trailers *StreamClosed
+/// [Headers *Message] Trailers *`StreamClosed`
 ///
 /// That is: optionally, a Headers value and any number of Message values
 /// (including zero), followed by a required Trailers value.  A response stream
-/// should not be used after Trailers, but reads should return StreamClosed if
+/// should not be used after Trailers, but reads should return `StreamClosed` if
 /// it is.
 #[derive(Debug, Clone)]
 pub enum ResponseStreamItem {
@@ -343,7 +343,7 @@ pub trait RecvStream {
     ///
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
-    /// to the RecvStream are undefined and data may be lost.
+    /// to the `RecvStream` are undefined and data may be lost.
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem;
 }
 
@@ -361,7 +361,7 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         (**self).dyn_recv(msg).await
     }
@@ -375,7 +375,7 @@ pub struct ResponseHeaders {
 }
 
 impl ResponseHeaders {
-    /// Returns a default ResponseHeaders instance.
+    /// Returns a default `ResponseHeaders` instance.
     pub fn new(connection_info: ConnectionInfo) -> Self {
         Self {
             metadata: MetadataMap::default(),
@@ -409,7 +409,7 @@ impl ResponseHeaders {
         self
     }
 
-    /// Returns a reference to the connection_info in these headers.
+    /// Returns a reference to the `connection_info` in these headers.
     pub fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
     }
@@ -425,7 +425,7 @@ pub struct RequestHeaders {
 }
 
 impl RequestHeaders {
-    /// Returns a default RequestHeaders instance.
+    /// Returns a default `RequestHeaders` instance.
     pub fn new() -> Self {
         Self::default()
     }
@@ -457,7 +457,7 @@ impl RequestHeaders {
         &mut self.metadata
     }
 
-    /// Returns the owned fields in the RequestHeaders.
+    /// Returns the owned fields in the `RequestHeaders`.
     // TODO: make public once fields are fixed.
     pub(crate) fn into_parts(self) -> (String, MetadataMap) {
         (self.method_name, self.metadata)
@@ -525,7 +525,7 @@ impl Trailers {
     /// information will not be available in trailers in any the following
     /// circumstances:
     ///
-    /// 1. A ResponseHeaders was already present on the response stream.
+    /// 1. A `ResponseHeaders` was already present on the response stream.
     ///
     /// 2. The error was generated locally on the client before a connection was
     ///    chosen for the RPC.

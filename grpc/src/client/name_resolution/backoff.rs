@@ -51,7 +51,7 @@ pub(crate) struct ExponentialBackoff {
 }
 
 /// This is a backoff configuration with the default values specified
-/// at https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md.
+/// at <https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md>.
 ///
 /// This should be useful for callers who want to configure backoff with
 /// non-default values only for a subset of the options.
@@ -78,7 +78,7 @@ impl BackoffConfig {
             Err("jitter must be greater than or equal to 0")?;
         }
         if self.jitter > 1.0 {
-            Err("jitter must be less than or equal to 1")?
+            Err("jitter must be less than or equal to 1")?;
         }
         Ok(())
     }

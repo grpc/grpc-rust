@@ -42,7 +42,7 @@ impl Debug for TransportRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let m = self.inner.lock().unwrap();
         for key in m.keys() {
-            write!(f, "k: {key:?}")?
+            write!(f, "k: {key:?}")?;
         }
         Ok(())
     }

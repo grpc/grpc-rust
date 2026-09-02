@@ -143,7 +143,7 @@ impl<VE: ValueEncoding> MetadataKey<VE> {
         self.inner.as_str()
     }
 
-    /// Converts a HeaderName reference to a MetadataKey. This method assumes
+    /// Converts a `HeaderName` reference to a `MetadataKey`. This method assumes
     /// that the caller has made sure that the metadata key name has the correct
     /// "-bin" or non-"-bin" suffix, it does not validate its input.
     #[inline]

@@ -149,7 +149,7 @@ impl<VE> MetadataValue<VE> {
     }
 
     /// Mark that the metadata value represents sensitive information. Sensitive
-    /// values are not included in the [std::fmt::Debug] output.
+    /// values are not included in the [`std::fmt::Debug`] output.
     ///
     /// Metadata values are sensitive by default.
     ///
@@ -171,7 +171,7 @@ impl<VE> MetadataValue<VE> {
 
     /// Returns `true` if the value represents sensitive data.
     ///
-    /// Sensitive values are not included in the [std::fmt::Debug] output.
+    /// Sensitive values are not included in the [`std::fmt::Debug`] output.
     ///
     /// Note that sensitivity is not factored into equality or ordering.
     ///
@@ -562,13 +562,13 @@ impl Error for ToStrError {}
 
 impl Hash for MetadataValue<Ascii> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.data.hash(state)
+        self.inner.data.hash(state);
     }
 }
 
 impl Hash for MetadataValue<Binary> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.data.hash(state)
+        self.inner.data.hash(state);
     }
 }
 

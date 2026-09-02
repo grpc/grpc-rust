@@ -1207,7 +1207,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
             None => {
                 panic!("Expected RST_STREAM, got clean close (EOS)");
             }
-        };
+        }
     });
 
     let builder = GLOBAL_TRANSPORT_REGISTRY
@@ -1254,5 +1254,5 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
 
     // Verify the send stream has ended.
     let req = WrappedEchoRequest(EchoRequest::default());
-    assert!(tx.send(&req, SendOptions::default()).await.is_err())
+    assert!(tx.send(&req, SendOptions::default()).await.is_err());
 }

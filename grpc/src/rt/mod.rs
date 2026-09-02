@@ -70,9 +70,9 @@ pub trait Runtime: Send + Sync + Debug {
     /// Spawns the given asynchronous task to run in the background.
     fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> BoxedTaskHandle;
 
-    /// Creates and returns an instance of a DNSResolver, optionally
-    /// configured by the ResolverOptions struct. This method may return an
-    /// error if it fails to create the DNSResolver.
+    /// Creates and returns an instance of a `DNSResolver`, optionally
+    /// configured by the `ResolverOptions` struct. This method may return an
+    /// error if it fails to create the `DNSResolver`.
     fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String>;
 
     /// Returns a future that completes after the specified duration.
@@ -152,7 +152,7 @@ pub struct UnixSocketOptions {
     _priv: (),
 }
 
-/// GrpcEndpoint is a generic stream-oriented network connection.
+/// `GrpcEndpoint` is a generic stream-oriented network connection.
 // This trait is sealed since we may need to change the read and write
 // methods to align closely with the gRPC C++ implementations. For example,
 // the read method may be responsible for allocating the buffer and
@@ -277,7 +277,7 @@ impl<T: GrpcEndpoint> AsyncWrite for EndpointIoStream<T> {
     }
 }
 
-/// A wrapper that implements [GrpcEndpoint] for an asynchronous I/O stream.
+/// A wrapper that implements [`GrpcEndpoint`] for an asynchronous I/O stream.
 pub(crate) struct StreamEndpoint<T> {
     inner: T,
     peer_addr: Box<str>,

@@ -22,7 +22,7 @@
  *
  */
 
-//! Authentication and security credentials (e.g. TLS and OAuth2).
+//! Authentication and security credentials (e.g. TLS and `OAuth2`).
 //!
 //! This module provides traits and types for handling credentials in gRPC,
 //! including channel credentials (for securing connections) and call
@@ -65,7 +65,7 @@ use crate::rt::GrpcRuntime;
 /// [`CompositeChannelCredentials`].
 #[async_trait]
 pub trait ChannelCredentials: Send + Sync + 'static {
-    /// Provides the ProtocolInfo of these credentials.
+    /// Provides the `ProtocolInfo` of these credentials.
     fn info(&self) -> &ProtocolInfo;
 
     /// Returns call credentials to be used for all RPCs made on a connection.
@@ -101,7 +101,7 @@ pub trait ChannelCredentials: Send + Sync + 'static {
 /// transport security protocols (e.g., TLS, ALTS).
 #[async_trait]
 pub trait ServerCredentials: Send + Sync + 'static {
-    /// Provides the ProtocolInfo of these credentials.
+    /// Provides the `ProtocolInfo` of these credentials.
     fn info(&self) -> &ProtocolInfo;
 
     /// Performs the server-side authentication handshake.
@@ -146,7 +146,7 @@ pub struct SecurityInfo {
 }
 
 impl SecurityInfo {
-    /// Creates a new SecurityInfo for the security protocol given.
+    /// Creates a new `SecurityInfo` for the security protocol given.
     pub fn new(security_protocol: &'static str) -> Self {
         Self {
             security_protocol,

@@ -569,7 +569,7 @@ async fn setup_server_multi_connection(
                         let _ = stream.shutdown().await;
                     }
                     Err(err) => {
-                        println!("TLS handshake failed: {}", err)
+                        println!("TLS handshake failed: {}", err);
                     }
                 }
             });

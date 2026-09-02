@@ -86,7 +86,7 @@ impl Eq for AttributeValue {}
 /// A collection of attributes indexed by their type.
 ///
 /// `Attributes` provides a map-like interface where values are keyed by their
-/// TypeId.
+/// `TypeId`.
 ///
 /// Equality and ordering of `Attributes` are structural.
 /// This means two `Attributes` maps are equal if they contain the same set of

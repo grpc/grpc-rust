@@ -103,7 +103,7 @@ where
     key: Option<MetadataKey<VE>>,
 }
 
-impl<'a, VE> Debug for ValueIter<'a, VE>
+impl<VE> Debug for ValueIter<'_, VE>
 where
     VE: ValueEncoding,
 {
@@ -124,7 +124,7 @@ pub struct GetAll<'a, VE> {
     key: Option<MetadataKey<VE>>,
 }
 
-impl<'a, VE> std::fmt::Debug for GetAll<'a, VE>
+impl<VE> std::fmt::Debug for GetAll<'_, VE>
 where
     VE: ValueEncoding,
 {
@@ -157,7 +157,7 @@ impl MetadataMap {
         MetadataMap::with_capacity(0)
     }
 
-    /// Convert an HTTP HeaderMap to a MetadataMap
+    /// Convert an HTTP `HeaderMap` to a `MetadataMap`
     ///
     /// # Errors
     ///
@@ -186,7 +186,7 @@ impl MetadataMap {
         Ok(Self { headers: ret })
     }
 
-    /// Convert a MetadataMap into a HTTP HeaderMap.
+    /// Convert a `MetadataMap` into a HTTP `HeaderMap`.
     ///
     /// Note that the "sensitive" field is not propagated as that will disable
     /// use of dynamic table in HPACK compression. Other gRPC implementations
@@ -395,7 +395,7 @@ impl MetadataMap {
 
     /// Returns a reference to the value associated with the key. This method
     /// is for ascii metadata entries (those whose names don't end with
-    /// "-bin"). For binary entries, use get_bin.
+    /// "-bin"). For binary entries, use `get_bin`.
     ///
     /// If there are multiple values associated with the key, then the first one
     /// is returned. Use `get_all` to get all values associated with a given
@@ -473,7 +473,7 @@ impl MetadataMap {
 
     /// Returns a view of all values associated with a key. This method is for
     /// ascii metadata entries (those whose names don't end with "-bin"). For
-    /// binary entries, use get_all_bin.
+    /// binary entries, use `get_all_bin`.
     ///
     /// The returned view does not incur any allocations and allows iterating
     /// the values associated with the key.  See [`GetAll`] for more details.
@@ -519,7 +519,7 @@ impl MetadataMap {
         key.get_all(self, private::Internal)
     }
 
-    /// Like get_all, but for Binary keys (for example "trace-proto-bin").
+    /// Like `get_all`, but for Binary keys (for example "trace-proto-bin").
     ///
     /// # Examples
     ///
@@ -889,7 +889,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Ascii>,
     {
-        key.remove_all(self, private::Internal)
+        key.remove_all(self, private::Internal);
     }
 
     /// Removes all entries matching the given binary key.
@@ -901,7 +901,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Binary>,
     {
-        key.remove_all(self, private::Internal)
+        key.remove_all(self, private::Internal);
     }
 
     pub(crate) fn merge(&mut self, other: MetadataMap) {
@@ -1317,7 +1317,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for String {
     #[doc(hidden)]
     #[inline]
     fn remove_all(self, map: &mut MetadataMap, token: private::Internal) {
-        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token)
+        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token);
     }
 }
 
@@ -1343,7 +1343,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &String {
     #[doc(hidden)]
     #[inline]
     fn remove_all(self, map: &mut MetadataMap, token: private::Internal) {
-        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token)
+        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token);
     }
 }
 

@@ -98,7 +98,7 @@ impl LbPolicyBuilder for PickFirstBuilder {
 }
 
 pub(crate) fn reg() {
-    super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {})
+    super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {});
 }
 
 pub struct PickFirstPolicy {
@@ -928,7 +928,7 @@ mod test {
         let res = state.picker.pick(&RequestHeaders::default());
         match res {
             PickResult::Pick(pick) => {
-                assert_eq!(pick.subchannel.address().address.to_string(), "addr1")
+                assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
             }
             other => panic!("unexpected pick result {:?}", other),
         }

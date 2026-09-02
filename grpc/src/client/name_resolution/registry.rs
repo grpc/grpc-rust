@@ -46,7 +46,7 @@ impl ResolverRegistry {
         }
     }
 
-    /// Add a name resolver into the registry. builder.scheme() will
+    /// Add a name resolver into the registry. `builder.scheme()` will
     /// be used as the scheme registered with this builder. If multiple
     /// resolvers are registered with the same name, the one registered last
     /// will take effect.
@@ -58,7 +58,7 @@ impl ResolverRegistry {
         self.try_add_builder(builder).unwrap();
     }
 
-    /// Add a name resolver into the registry. builder.scheme() will
+    /// Add a name resolver into the registry. `builder.scheme()` will
     /// be used as the scheme registered with this builder. If multiple
     /// resolvers are registered with the same name, the one registered last
     /// will take effect.

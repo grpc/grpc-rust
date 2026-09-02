@@ -41,7 +41,7 @@ use crate::client::SendStream;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 
-/// Implements a stream that sinks writes and only returns StreamClosed.
+/// Implements a stream that sinks writes and only returns `StreamClosed`.
 pub(crate) struct NopStream;
 impl SendStream for NopStream {
     async fn send(&mut self, _item: &dyn SendMessage, _options: SendOptions) -> Result<(), ()> {
@@ -54,7 +54,7 @@ impl RecvStream for NopStream {
     }
 }
 
-/// Implements an Invoke which only returns NopStreams.
+/// Implements an Invoke which only returns `NopStreams`.
 #[derive(Clone)]
 pub(crate) struct NopInvoker;
 impl Invoke for NopInvoker {
@@ -69,7 +69,7 @@ impl Invoke for NopInvoker {
     }
 }
 
-/// Implements an InvokeOnce which only returns NopStreams.
+/// Implements an `InvokeOnce` which only returns `NopStreams`.
 pub(crate) struct NopOnceInvoker;
 impl InvokeOnce for NopOnceInvoker {
     type SendStream = NopStream;
@@ -83,7 +83,7 @@ impl InvokeOnce for NopOnceInvoker {
     }
 }
 
-/// Implements a RecvMessage that does not decode.
+/// Implements a `RecvMessage` that does not decode.
 pub(crate) struct NopRecvMessage;
 impl RecvMessage for NopRecvMessage {
     fn decode(&mut self, _data: &mut dyn Buf) -> Result<(), String> {
@@ -91,7 +91,7 @@ impl RecvMessage for NopRecvMessage {
     }
 }
 
-/// Implements a RecvMessage that simply copies the data received into `data`.
+/// Implements a `RecvMessage` that simply copies the data received into `data`.
 pub(crate) struct ByteRecvMsg {
     pub data: Option<Bytes>,
 }
@@ -107,7 +107,7 @@ impl RecvMessage for ByteRecvMsg {
     }
 }
 
-/// Implements a SendMessage that simply copies `data` as its output.
+/// Implements a `SendMessage` that simply copies `data` as its output.
 pub(crate) struct ByteSendMsg<'a> {
     pub data: &'a Bytes,
 }
@@ -116,7 +116,7 @@ impl<'a> ByteSendMsg<'a> {
         Self { data }
     }
 }
-impl<'a> SendMessage for ByteSendMsg<'a> {
+impl SendMessage for ByteSendMsg<'_> {
     fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
         Ok(Box::new(self.data.clone()))
     }
@@ -177,7 +177,7 @@ impl Invoke for MockInvoker {
     }
 }
 
-/// Implements the SendStream for MockInvoker.
+/// Implements the `SendStream` for `MockInvoker`.
 pub(crate) struct MockSendStream(pub mpsc::Sender<(Bytes, SendOptions)>);
 impl SendStream for MockSendStream {
     async fn send(&mut self, item: &dyn SendMessage, options: SendOptions) -> Result<(), ()> {
@@ -189,7 +189,7 @@ impl SendStream for MockSendStream {
     }
 }
 
-/// Implements the RecvStream for MockInvoker.
+/// Implements the `RecvStream` for `MockInvoker`.
 pub(crate) struct MockRecvStream(pub broadcast::Receiver<ResponseStreamItem>);
 impl RecvStream for MockRecvStream {
     async fn recv(&mut self, _msg: &mut dyn RecvMessage) -> ResponseStreamItem {

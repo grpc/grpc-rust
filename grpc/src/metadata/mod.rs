@@ -54,7 +54,7 @@ pub use value::AsciiMetadataValue;
 pub use value::BinaryMetadataValue;
 pub use value::MetadataValue;
 
-/// The metadata::errors module contains types for errors that can occur
+/// The `metadata::errors` module contains types for errors that can occur
 /// while handling gRPC custom metadata.
 pub mod errors {
     pub use super::encoding::InvalidMetadataValue;

@@ -201,7 +201,7 @@ impl Server {
     where
         H: Handle + Send + Sync + 'static,
     {
-        self.handler = Some(Arc::new(h))
+        self.handler = Some(Arc::new(h));
     }
 
     /// Serves on the given listener until it stops producing connections.
@@ -378,12 +378,8 @@ pub trait SendStream {
     ///
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
-    /// to the SendStream are undefined and data may be lost.
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()>;
+    /// to the `SendStream` are undefined and data may be lost.
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()>;
 }
 
 #[doc(hidden)]
@@ -407,27 +403,19 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'b> SendStream for &mut (dyn DynSendStream + 'b) {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for &mut (dyn DynSendStream + '_) {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
 
-impl<'b> SendStream for Box<dyn DynSendStream + 'b> {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for Box<dyn DynSendStream + '_> {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
 
-/// Contains settings to configure a send operation on a SendStream.
+/// Contains settings to configure a send operation on a `SendStream`.
 #[derive(Default)]
 #[non_exhaustive]
 pub struct SendOptions {
@@ -452,7 +440,7 @@ pub trait RecvStream {
     ///
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
-    /// to the RecvStream are undefined and data may be lost.
+    /// to the `RecvStream` are undefined and data may be lost.
     async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>>;
 }
 
@@ -469,7 +457,7 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
         (**self).dyn_next(msg).await
     }
@@ -482,7 +470,7 @@ pub struct ResponseHeaders {
 }
 
 impl ResponseHeaders {
-    /// Returns a default ResponseHeaders instance.
+    /// Returns a default `ResponseHeaders` instance.
     pub fn new() -> Self {
         Self::default()
     }
@@ -520,7 +508,7 @@ pub struct RequestHeaders {
 }
 
 impl RequestHeaders {
-    /// Returns a default RequestHeaders instance.
+    /// Returns a default `RequestHeaders` instance.
     pub fn new(method_name: impl Into<String>, connection_info: ConnectionInfo) -> Self {
         Self {
             method_name: method_name.into(),
@@ -556,18 +544,18 @@ impl RequestHeaders {
         &mut self.metadata
     }
 
-    /// Replaces the connection_info of self with `connection_info`.
+    /// Replaces the `connection_info` of self with `connection_info`.
     pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
         self.connection_info = connection_info;
         self
     }
 
-    /// Returns a reference to the connection_info in these headers.
+    /// Returns a reference to the `connection_info` in these headers.
     pub fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
     }
 
-    /// Returns the owned fields in the RequestHeaders.
+    /// Returns the owned fields in the `RequestHeaders`.
     // TODO: make public once fields are fixed.
     pub(crate) fn into_parts(self) -> (String, MetadataMap) {
         (self.method_name, self.metadata)
@@ -918,9 +906,9 @@ mod tests {
     struct NopSendStream;
 
     impl SendStream for NopSendStream {
-        async fn send<'a>(
+        async fn send(
             &mut self,
-            _item: ResponseStreamItem<'a>,
+            _item: ResponseStreamItem<'_>,
             _options: SendOptions,
         ) -> Result<(), ()> {
             Ok(())

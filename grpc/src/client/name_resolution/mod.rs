@@ -62,7 +62,7 @@ pub(crate) mod unix;
 pub(crate) mod unix_abstract;
 
 /// Target represents a target for gRPC, as specified in:
-/// https://github.com/grpc/grpc/blob/master/doc/naming.md.
+/// <https://github.com/grpc/grpc/blob/master/doc/naming.md>.
 /// It is parsed from the target string that gets passed during channel creation
 /// by the user. gRPC passes it to the resolver and the balancer.
 ///
@@ -91,7 +91,7 @@ impl FromStr for Target {
 }
 
 /// Target represents a target for gRPC, as specified in:
-/// https://github.com/grpc/grpc/blob/master/doc/naming.md.
+/// <https://github.com/grpc/grpc/blob/master/doc/naming.md>.
 /// It is parsed from the target string that gets passed during channel creation
 /// by the user. gRPC passes it to the resolver and the balancer.
 ///
@@ -151,7 +151,7 @@ pub trait ResolverBuilder: Send + Sync {
     /// Builds a name resolver instance.
     ///
     /// Note that build must not fail.  Instead, an erroring Resolver may be
-    /// returned that calls ChannelController.update() with an Err value.
+    /// returned that calls `ChannelController.update()` with an Err value.
     fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver>;
 
     /// Reports the URI scheme handled by this name resolver.
@@ -165,7 +165,7 @@ pub trait ResolverBuilder: Send + Sync {
     ///
     /// By default, this method returns the path portion of the target URI,
     /// with the leading prefix removed and percent-encoded based on
-    /// https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.
+    /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.2>.
     fn default_authority(&self, target: &Target) -> String {
         static CUSTOM_AUTHORITY_SET: &AsciiSet = &NON_ALPHANUMERIC
             // Unreserved characters
@@ -219,7 +219,7 @@ pub struct ResolverOptions {
     pub runtime: GrpcRuntime,
 
     /// A hook into the channel's work scheduler that allows the Resolver to
-    /// request the ability to perform operations on the ChannelController.
+    /// request the ability to perform operations on the `ChannelController`.
     pub work_scheduler: Arc<dyn WorkScheduler>,
 }
 
@@ -264,13 +264,13 @@ pub trait ChannelController: Send + Sync {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String>;
 
     /// Parses the provided JSON service config and returns an instance of a
-    /// ParsedServiceConfig.
+    /// `ParsedServiceConfig`.
     fn parse_service_config(&self, config: &str) -> ParseResult;
 }
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-/// ResolverUpdate contains the current Resolver state relevant to the
+/// `ResolverUpdate` contains the current Resolver state relevant to the
 /// channel.
 pub struct ResolverUpdate {
     /// Attributes contains arbitrary data about the resolver intended for
@@ -289,7 +289,7 @@ pub struct ResolverUpdate {
     /// An optional human-readable note describing context about the
     /// resolution, to be passed along to the LB policy for inclusion in
     /// RPC failure status messages in cases where neither endpoints nor
-    /// service_config has a non-OK status.  For example, a resolver that
+    /// `service_config` has a non-OK status.  For example, a resolver that
     /// returns an empty endpoint list but a valid service config may set
     /// to this to something like "no DNS entries found for <name>".
     pub resolution_note: Option<String>,

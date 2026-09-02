@@ -220,7 +220,7 @@ impl LbPolicy for RoundRobinPolicy {
     }
 }
 
-/// Register round robin as a LbPolicy.
+/// Register round robin as a `LbPolicy`.
 pub(crate) fn reg() {
     START.call_once(|| {
         GLOBAL_LB_REGISTRY.add_builder(RoundRobinBuilder {});
@@ -358,7 +358,7 @@ mod test {
             endpoints.push(Endpoint {
                 addresses,
                 ..Default::default()
-            })
+            });
         }
         endpoints
     }
@@ -482,7 +482,7 @@ mod test {
                             channel_controller.request_resolution();
                         }
                         return Ok(());
-                    };
+                    }
                     let endpoints = update.endpoints.unwrap();
                     let new_addresses = addresses_from_endpoints(&endpoints);
                     if new_addresses.is_empty() {
@@ -583,7 +583,7 @@ mod test {
                     subchannels.push(sc);
                 }
                 other => panic!("unexpected event {:?}", other),
-            };
+            }
         }
         subchannels
     }
@@ -693,7 +693,7 @@ mod test {
         match rx_events.recv().unwrap() {
             TestEvent::RequestResolution => {}
             other => panic!("unexpected event {:?}", other),
-        };
+        }
     }
 
     fn verify_no_activity(rx_events: &mut mpsc::Receiver<TestEvent>) {
@@ -856,7 +856,7 @@ mod test {
             match picker.pick(&req) {
                 PickResult::Pick(pick) => {
                     println!("picked subchannel is {}", pick.subchannel);
-                    picked.push(pick.subchannel.clone())
+                    picked.push(pick.subchannel.clone());
                 }
                 other => panic!("unexpected pick result {}", other),
             }
@@ -942,7 +942,7 @@ mod test {
             match picker.pick(&req) {
                 PickResult::Pick(pick) => {
                     println!("picked subchannel is {}", pick.subchannel);
-                    picked.push(pick.subchannel.clone())
+                    picked.push(pick.subchannel.clone());
                 }
                 other => panic!("unexpected pick result {}", other),
             }
@@ -968,7 +968,7 @@ mod test {
             match new_picker.pick(&req) {
                 PickResult::Pick(pick) => {
                     println!("picked subchannel is {}", pick.subchannel);
-                    picked.push(pick.subchannel.clone())
+                    picked.push(pick.subchannel.clone());
                 }
                 other => panic!("unexpected pick result {}", other),
             }

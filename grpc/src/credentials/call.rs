@@ -22,7 +22,7 @@
  *
  */
 
-//! Definitions and implementations for call credentials (e.g. OAuth2).
+//! Definitions and implementations for call credentials (e.g. `OAuth2`).
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -107,7 +107,7 @@ impl ClientConnectionSecurityInfo {
 }
 
 /// A trait for credentials that need to attach security information to every
-/// individual RPC (e.g., OAuth2 tokens, JWTs).
+/// individual RPC (e.g., `OAuth2` tokens, JWTs).
 #[async_trait]
 pub trait CallCredentials: Send + Sync + Debug {
     /// Generates the authentication metadata for a specific call.

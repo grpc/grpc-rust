@@ -199,7 +199,7 @@ impl Debug for StubPolicyFuncs {
     }
 }
 
-/// Data holds test data that will be passed all to functions in PolicyFuncs
+/// Data holds test data that will be passed all to functions in `PolicyFuncs`
 #[derive(Debug)]
 pub(crate) struct StubPolicyData {
     pub lb_policy_options: LbPolicyOptions,
@@ -207,7 +207,7 @@ pub(crate) struct StubPolicyData {
 }
 
 impl StubPolicyData {
-    /// Creates an instance of StubPolicyData.
+    /// Creates an instance of `StubPolicyData`.
     pub fn new(lb_policy_options: LbPolicyOptions) -> Self {
         Self {
             test_data: None,
@@ -271,7 +271,7 @@ impl StubPolicy {
     }
 }
 
-/// StubPolicyBuilder builds a StubLbPolicy.
+/// `StubPolicyBuilder` builds a `StubLbPolicy`.
 #[derive(Debug)]
 pub(crate) struct StubPolicyBuilder {
     name: &'static str,
@@ -311,5 +311,5 @@ impl LbPolicyBuilder for StubPolicyBuilder {
 }
 
 pub(crate) fn reg_stub_policy(name: &'static str, funcs: StubPolicyFuncs) {
-    super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }))
+    super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }));
 }

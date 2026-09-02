@@ -38,7 +38,7 @@ use crate::core::Address;
 /// Represents the current state of a Subchannel.
 #[derive(Debug, Clone)]
 pub struct SubchannelState {
-    /// The connectivity state of the subchannel.  See SubChannel for a
+    /// The connectivity state of the subchannel.  See `SubChannel` for a
     /// description of the various states and their valid transitions.
     pub connectivity_state: ConnectivityState,
     // Set if connectivity state is TransientFailure to describe the most recent
@@ -119,13 +119,13 @@ pub(crate) mod private {
 ///
 /// - Subchannels start IDLE.
 ///
-/// - IDLE transitions to CONNECTING when connect() is called.
+/// - IDLE transitions to CONNECTING when `connect()` is called.
 ///
-/// - CONNECTING transitions to READY on success or TRANSIENT_FAILURE on error.
+/// - CONNECTING transitions to READY on success or `TRANSIENT_FAILURE` on error.
 ///
 /// - READY transitions to IDLE when the connection is lost.
 ///
-/// - TRANSIENT_FAILURE transitions to IDLE when the reconnect backoff timer has
+/// - `TRANSIENT_FAILURE` transitions to IDLE when the reconnect backoff timer has
 ///   expired.  This timer scales exponentially and is reset when the subchannel
 ///   becomes READY.
 ///
@@ -238,7 +238,7 @@ pub trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
     }
 
     fn connect(&self) {
-        self.delegate().connect()
+        self.delegate().connect();
     }
 }
 
@@ -252,7 +252,7 @@ impl<T: ForwardingSubchannel> Subchannel for T {
     }
 
     fn connect(&self) {
-        self.connect()
+        self.connect();
     }
 }
 impl<T: ForwardingSubchannel> private::Sealed for T {}

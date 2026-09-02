@@ -69,17 +69,17 @@ pub struct Child<T> {
     work_scheduler: Arc<ChildWorkScheduler>,
 }
 
-/// A collection of data sent to a child of the ChildManager.
+/// A collection of data sent to a child of the `ChildManager`.
 pub struct ChildUpdate<'a, T> {
-    /// The identifier the ChildManager should use for this child.
+    /// The identifier the `ChildManager` should use for this child.
     pub child_identifier: T,
-    /// The builder the ChildManager should use to create this child if it does
-    /// not exist.  The child_policy_builder's name is effectively a part of the
-    /// child_identifier.  If two identifiers are identical but have different
+    /// The builder the `ChildManager` should use to create this child if it does
+    /// not exist.  The `child_policy_builder`'s name is effectively a part of the
+    /// `child_identifier`.  If two identifiers are identical but have different
     /// builder names, they are treated as different children.
     pub child_policy_builder: Arc<DynLbPolicyBuilder>,
-    /// The relevant ResolverUpdate and LbConfig to send to this child.  If
-    /// None, then resolver_update will not be called on the child.  Should
+    /// The relevant `ResolverUpdate` and `LbConfig` to send to this child.  If
+    /// None, then `resolver_update` will not be called on the child.  Should
     /// generally be Some for any new children, otherwise they will not be
     /// called.
     pub child_update: Option<(ResolverUpdate, Option<&'a DynLbConfig>)>,
@@ -89,8 +89,8 @@ impl<T> ChildManager<T>
 where
     T: Debug + PartialEq + Hash + Eq + Send + Sync + 'static,
 {
-    /// Creates a new ChildManager LB policy.  shard_update is called whenever a
-    /// resolver_update operation occurs.
+    /// Creates a new `ChildManager` LB policy.  `shard_update` is called whenever a
+    /// `resolver_update` operation occurs.
     pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
         Self {
             subchannel_to_child_idx: Default::default(),
@@ -163,18 +163,18 @@ where
         if let Some(state) = channel_controller.picker_update {
             self.children[child_idx].state = state;
             self.updated = true;
-        };
+        }
     }
 
     /// Returns true if any child has updated its picker since the last call to
-    /// child_updated.
+    /// `child_updated`.
     pub fn child_updated(&mut self) -> bool {
         mem::take(&mut self.updated)
     }
 
     /// Retains only the child policies specified by the iterator.
     ///
-    /// If an ID is provided that does not exist in the ChildManager, it will be
+    /// If an ID is provided that does not exist in the `ChildManager`, it will be
     /// ignored.
     pub fn retain_children(
         &mut self,
@@ -184,8 +184,8 @@ where
     }
 
     /// Resets the children and all state related to tracking them in accordance
-    /// with the iterator provided.  When retain_only is true, any entry in
-    /// ids_builders that is not in the current set of children will be ignored;
+    /// with the iterator provided.  When `retain_only` is true, any entry in
+    /// `ids_builders` that is not in the current set of children will be ignored;
     /// otherwise a new child will be built for it.
     fn reset_children(
         &mut self,
@@ -270,17 +270,17 @@ where
                     policy,
                     work_scheduler,
                 });
-            };
+            }
         }
         // Anything left in old_children will just be Dropped and cleaned up.
     }
 
-    /// Updates the ChildManager's children.
+    /// Updates the `ChildManager`'s children.
     ///
     /// `child_updates` is used to determine which children should exist (one
     /// for each item), how to construct them if they don't already, and what to
     /// send to their `resolver_update` methods, if anything.  Any existing
-    /// children not present in child_updates will be removed.
+    /// children not present in `child_updates` will be removed.
     pub fn update<'a>(
         &mut self,
         child_updates: impl IntoIterator<Item = ChildUpdate<'a, T>>,
@@ -360,7 +360,7 @@ where
         }
     }
 
-    /// Forwards the incoming subchannel_update to the child that created the
+    /// Forwards the incoming `subchannel_update` to the child that created the
     /// subchannel being updated.
     pub fn subchannel_update(
         &mut self,
@@ -407,7 +407,7 @@ where
         }
     }
 
-    /// Calls exit_idle on all children.
+    /// Calls `exit_idle` on all children.
     pub fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
         for child_idx in 0..self.children.len() {
             let child = &mut self.children[child_idx];
@@ -566,7 +566,7 @@ mod test {
             endpoints.push(Endpoint {
                 addresses,
                 ..Default::default()
-            })
+            });
         }
         endpoints
     }
@@ -617,7 +617,7 @@ mod test {
                     subchannels.push(sc);
                 }
                 other => panic!("unexpected event {:?}", other),
-            };
+            }
         }
         subchannels
     }

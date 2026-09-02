@@ -89,7 +89,7 @@ where
 }
 
 impl dyn SendMessage + '_ {
-    /// Downcasts the SendMessage to T::Target if the SendMessage contains a T.
+    /// Downcasts the `SendMessage` to `T::Target` if the `SendMessage` contains a T.
     pub fn downcast_ref<T: MessageType>(&self) -> Option<&T::Target<'_>>
     where
         T::Target<'static>: 'static,
@@ -106,7 +106,7 @@ impl dyn SendMessage + '_ {
 
 #[allow(unused)]
 impl dyn RecvMessage + '_ {
-    /// Downcasts the RecvMessage to T::Target if the RecvMessage contains a T.
+    /// Downcasts the `RecvMessage` to `T::Target` if the `RecvMessage` contains a T.
     pub fn downcast_mut<T: MessageType>(&mut self) -> Option<&mut T::Target<'_>>
     where
         T::Target<'static>: 'static,
@@ -126,7 +126,7 @@ impl dyn RecvMessage + '_ {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Address {
     /// The network type is used to identify what kind of transport to create
-    /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.
+    /// when connecting to this address.  Typically `TCP_IP_ADDRESS_TYPE`.
     pub network_type: &'static str,
 
     /// The address itself is passed to the transport in order to create a

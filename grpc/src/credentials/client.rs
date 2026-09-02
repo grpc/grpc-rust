@@ -92,7 +92,7 @@ impl ClientHandshakeInfo {
 
 /// A credential that combines [`ChannelCredentials`] with [`CallCredentials`].
 ///
-/// This is used to attach per-call authentication (like OAuth2 tokens) to a
+/// This is used to attach per-call authentication (like `OAuth2` tokens) to a
 /// secure channel (like TLS).
 pub struct CompositeChannelCredentials<T> {
     channel_creds: T,

@@ -412,7 +412,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// Implements both LbPolicyBuilder and LbPolicy to send events on a
+    /// Implements both `LbPolicyBuilder` and `LbPolicy` to send events on a
     /// channel.
     #[derive(Debug, Clone)]
     struct MockPolicy {

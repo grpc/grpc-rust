@@ -54,7 +54,7 @@ pub use registry::GLOBAL_LB_REGISTRY;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-/// An LB policy factory that produces LbPolicy instances used by the channel
+/// An LB policy factory that produces `LbPolicy` instances used by the channel
 /// to manage connections and pick connections for RPCs.
 pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     type LbPolicy: LbPolicy;
@@ -62,9 +62,9 @@ pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     /// Builds and returns a new LB policy instance.
     ///
     /// Note that build must not fail.  Any optional configuration is delivered
-    /// via the LbPolicy's resolver_update method.
+    /// via the `LbPolicy`'s `resolver_update` method.
     ///
-    /// An LbPolicy instance is assumed to begin in a Connecting state that
+    /// An `LbPolicy` instance is assumed to begin in a Connecting state that
     /// queues RPCs until its first update.
     fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy;
 
@@ -110,20 +110,20 @@ pub trait LbPolicy: Send + Sync + Debug + 'static {
     );
 
     /// Called by the channel in response to a call from the LB policy to the
-    /// WorkScheduler's request_work method.
+    /// `WorkScheduler`'s `request_work` method.
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController);
 
-    /// Called by the channel when an LbPolicy goes idle and the channel
+    /// Called by the channel when an `LbPolicy` goes idle and the channel
     /// wants it to start connecting to subchannels again.
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController);
 }
 
 /// A collection of data configured on the channel that is constructing this
-/// LbPolicy.
+/// `LbPolicy`.
 #[derive(Debug)]
 pub struct LbPolicyOptions {
-    /// A hook into the channel's work scheduler that allows the LbPolicy to
-    /// request the ability to perform operations on the ChannelController.
+    /// A hook into the channel's work scheduler that allows the `LbPolicy` to
+    /// request the ability to perform operations on the `ChannelController`.
     pub work_scheduler: Arc<dyn WorkScheduler>,
     pub runtime: GrpcRuntime,
 }
@@ -168,8 +168,8 @@ impl dyn WorkDataTrait {
 /// associated policy's [`work`](LbPolicy::work) method.
 pub type WorkData = Box<dyn WorkDataTrait>;
 
-/// Used to asynchronously request a call into the LbPolicy's work method if
-/// the LbPolicy needs to provide an update without waiting for an update
+/// Used to asynchronously request a call into the `LbPolicy`'s work method if
+/// the `LbPolicy` needs to provide an update without waiting for an update
 /// from the channel first.
 pub trait WorkScheduler: Send + Sync + Debug {
     // Schedules a call into the LbPolicy's work method.  If there is already a
@@ -187,7 +187,7 @@ pub struct ParsedJsonLbConfig {
 }
 
 impl ParsedJsonLbConfig {
-    /// Creates a new ParsedJsonLbConfig from the provided JSON string.
+    /// Creates a new `ParsedJsonLbConfig` from the provided JSON string.
     pub fn new(json: &str) -> Result<Self, String> {
         match serde_json::from_str(json) {
             Ok(value) => Ok(ParsedJsonLbConfig { value }),
@@ -232,25 +232,25 @@ pub trait ChannelController: Send + Sync {
 }
 
 /// A Picker is responsible for deciding what Subchannel to use for any given
-/// request.  A Picker is only used once for any RPC.  If pick() returns Queue,
+/// request.  A Picker is only used once for any RPC.  If `pick()` returns Queue,
 /// the channel will queue the RPC until a new Picker is produced by the
-/// LbPolicy, and will call pick() on the new Picker for the request.
+/// `LbPolicy`, and will call `pick()` on the new Picker for the request.
 ///
-/// Pickers are always paired with a ConnectivityState which the channel will
+/// Pickers are always paired with a `ConnectivityState` which the channel will
 /// expose to applications so they can predict what might happens when
 /// performing RPCs:
 ///
-/// If the ConnectivityState is Idle, the Picker should ensure connections are
-/// initiated by the LbPolicy that produced the Picker, and return a Queue
+/// If the `ConnectivityState` is Idle, the Picker should ensure connections are
+/// initiated by the `LbPolicy` that produced the Picker, and return a Queue
 /// result so the request is attempted the next time a Picker is produced.
 ///
-/// If the ConnectivityState is Connecting, the Picker should return a Queue
+/// If the `ConnectivityState` is Connecting, the Picker should return a Queue
 /// result and continue to wait for pending connections.
 ///
-/// If the ConnectivityState is Ready, the Picker should return a Ready
+/// If the `ConnectivityState` is Ready, the Picker should return a Ready
 /// Subchannel.
 ///
-/// If the ConnectivityState is TransientFailure, the Picker should return an
+/// If the `ConnectivityState` is `TransientFailure`, the Picker should return an
 /// Err with an error that describes why connections are failing.
 pub trait Picker: Send + Sync + Debug {
     /// Picks a connection to use for the request.
@@ -258,7 +258,7 @@ pub trait Picker: Send + Sync + Debug {
     /// This function should not block.  If the Picker needs to do blocking or
     /// time-consuming work to service this request, it should return Queue, and
     /// the Pick call will be repeated by the channel when a new Picker is
-    /// produced by the LbPolicy.
+    /// produced by the `LbPolicy`.
     fn pick(&self, request: &RequestHeaders) -> PickResult;
 }
 
@@ -266,7 +266,7 @@ pub trait Picker: Send + Sync + Debug {
 pub enum PickResult {
     /// Indicates the Subchannel in the Pick should be used for the request.
     Pick(Pick),
-    /// Indicates the LbPolicy is attempting to connect to a server to use for
+    /// Indicates the `LbPolicy` is attempting to connect to a server to use for
     /// the request.
     Queue,
     /// Indicates that the request should fail with the included error status
@@ -332,7 +332,7 @@ pub struct LbState {
 }
 
 impl PartialEq for LbState {
-    /// Equality for two LbStates.
+    /// Equality for two `LbStates`.
     ///
     /// Two `LbState`s are equal if and only if they have the same connectivity
     /// state and the same Picker allocation.  Even if two Pickers have the same
@@ -347,7 +347,7 @@ impl PartialEq for LbState {
 impl Eq for LbState {}
 
 impl LbState {
-    /// Returns a generic initial LbState which is Connecting and a picker which
+    /// Returns a generic initial `LbState` which is Connecting and a picker which
     /// queues all picks.
     pub fn initial() -> Self {
         Self {
@@ -380,7 +380,7 @@ impl Debug for Pick {
     }
 }
 
-/// OneSubchannelPicker always returns a single subchannel.
+/// `OneSubchannelPicker` always returns a single subchannel.
 #[derive(Debug)]
 pub(crate) struct OneSubchannelPicker {
     sc: Arc<dyn Subchannel>,
@@ -396,7 +396,7 @@ impl Picker for OneSubchannelPicker {
     }
 }
 
-/// QueuingPicker always returns Queue.  LB policies that are not actively
+/// `QueuingPicker` always returns Queue.  LB policies that are not actively
 /// Connecting should not use this picker.
 #[derive(Debug)]
 pub(crate) struct QueuingPicker;
@@ -457,6 +457,6 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        (**self).exit_idle(channel_controller)
+        (**self).exit_idle(channel_controller);
     }
 }

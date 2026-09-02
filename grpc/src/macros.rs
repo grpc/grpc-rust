@@ -52,7 +52,7 @@
 /// ```
 ///
 /// If you have modified the output directory or message path, you should use
-/// the include_generated_proto macro below instead of using this macro or
+/// the `include_generated_proto` macro below instead of using this macro or
 /// manually include it yourself.
 ///
 /// ```rust,ignore
@@ -111,7 +111,7 @@ macro_rules! include_proto {
 }
 
 /// Includes generated proto message, client, and server code. This macro is for
-/// if you manually set output_dir instead of using the default OUT_DIR.
+/// if you manually set `output_dir` instead of using the default `OUT_DIR`.
 ///
 /// You must specify the path to the `.proto` file **relative to the proto root
 /// directory**,  without the `.proto` extension.  

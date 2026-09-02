@@ -134,7 +134,7 @@ pub struct RustlsChannelCredentials {
 pub type RustlsChannelCredendials = RustlsChannelCredentials;
 
 impl RustlsChannelCredentials {
-    /// Constructs a new [RustlsChannelCredentials] instance from the provided
+    /// Constructs a new [`RustlsChannelCredentials`] instance from the provided
     /// configuration.
     pub fn new(config: ClientTlsConfig) -> Result<RustlsChannelCredentials, String> {
         let provider = if let Some(p) = CryptoProvider::get_default() {
@@ -188,7 +188,7 @@ impl RustlsChannelCredentials {
         client_config.alpn_protocols = vec![ALPN_PROTO_STR_H2.to_vec()];
         client_config.resumption = rustls::client::Resumption::disabled();
         if let Some(path) = config.key_log_path {
-            client_config.key_log = Arc::new(KeyLogFile::new(&path))
+            client_config.key_log = Arc::new(KeyLogFile::new(&path));
         }
 
         Ok(RustlsChannelCredentials {

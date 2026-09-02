@@ -351,7 +351,7 @@ fn parse_endpoint_and_authority(target: &Target) -> Result<ParseResult, String> 
 
 /// Takes the user input string of the format "host:port" and default port,
 /// returns the parsed host and port. If string doesn't specify a port, the
-/// default_port is returned. If the string doesn't specify the host,
+/// `default_port` is returned. If the string doesn't specify the host,
 /// Ok(None) is returned.
 fn parse_host_port(host_and_port: &str, default_port: u16) -> Result<Option<HostPort>, String> {
     // We need to use the https scheme otherwise url::Url::parse doesn't convert

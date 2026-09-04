@@ -57,7 +57,7 @@ impl ServiceConfig {
     // Chooses load balancing configuration per gRPC specification rules.
     pub(crate) fn lb_config(&self) -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
         // Choose LbConfig if present.
-        if let Some(selected) = self.inner.load_balancing_config.as_ref() {
+        if let Some(selected) = self.inner.load_balancing_config.lb_config.as_ref() {
             return (selected.builder.clone(), selected.config.clone());
         }
 
@@ -235,7 +235,7 @@ mod test {
             sc.inner.load_balancing_policy,
             Some("round_robin".to_string())
         );
-        assert!(sc.inner.load_balancing_config.is_none());
+        assert!(sc.inner.load_balancing_config.lb_config.is_none());
     }
 
     #[test]

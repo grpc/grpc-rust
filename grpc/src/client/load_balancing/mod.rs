@@ -460,3 +460,22 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
         (**self).exit_idle(channel_controller)
     }
 }
+
+impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
+    type LbPolicy = B::LbPolicy;
+
+    fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
+        (**self).build(options)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn parse_config(
+        &self,
+        config: &ParsedJsonLbConfig,
+    ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
+        (**self).parse_config(config)
+    }
+}

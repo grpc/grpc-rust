@@ -566,6 +566,14 @@ impl Status {
         Ok(header_map)
     }
 
+    /// Success trailers carry only the `grpc-status` header, so build the map without
+    /// constructing and serializing a `Status`.
+    pub(crate) fn ok_header_map() -> HeaderMap {
+        let mut map = HeaderMap::with_capacity(1);
+        map.insert(Self::GRPC_STATUS, Code::Ok.to_header_value());
+        map
+    }
+
     /// Add headers from this `Status` into `header_map`.
     pub fn add_header(&self, header_map: &mut HeaderMap) -> Result<(), Self> {
         header_map.extend(self.0.metadata.clone().into_sanitized_headers());
@@ -803,6 +811,15 @@ pub(crate) fn infer_grpc_status(
     trailers: Option<&HeaderMap>,
     status_code: http::StatusCode,
 ) -> Result<(), Option<Status>> {
+    if let Some(trailers) = trailers
+        && let Some(raw) = trailers.get(Status::GRPC_STATUS)
+        && !trailers.contains_key(Status::GRPC_MESSAGE)
+        && Code::from_bytes(raw.as_ref()) == Code::Ok
+    {
+        // grpc-status alone decides the code here. A grpc-message can fail to decode,
+        // and from_header_map then reports Unknown, so any grpc-message skips this path.
+        return Ok(());
+    }
     if let Some(trailers) = trailers
         && let Some(status) = Status::from_header_map(trailers)
     {
@@ -1108,6 +1125,29 @@ mod tests {
         let status = Status::from_header_map(&header_map).unwrap();
 
         assert_eq!(status.details(), DETAILS);
+    }
+
+    #[test]
+    fn infer_grpc_status_fast_path() {
+        let ok_map = Status::ok_header_map();
+        assert_eq!(ok_map.len(), 1);
+        assert_eq!(ok_map.get(Status::GRPC_STATUS).unwrap(), "0");
+        assert!(infer_grpc_status(Some(&ok_map), http::StatusCode::OK).is_ok());
+
+        // A grpc-message that is not valid percent-encoded UTF-8 downgrades the code in
+        // from_header_map, so grpc-status:0 with such a message stays an error.
+        let mut bad_map = HeaderMap::new();
+        bad_map.insert(Status::GRPC_STATUS, HeaderValue::from_static("0"));
+        bad_map.insert(
+            Status::GRPC_MESSAGE,
+            HeaderValue::from_bytes(b"%FF").unwrap(),
+        );
+        let status = match infer_grpc_status(Some(&bad_map), http::StatusCode::OK) {
+            Ok(()) => panic!("malformed grpc-message must be an error"),
+            Err(Some(status)) => status,
+            Err(None) => panic!("expected a status for present grpc-status header"),
+        };
+        assert_eq!(status.code(), Code::Unknown);
     }
 }
 

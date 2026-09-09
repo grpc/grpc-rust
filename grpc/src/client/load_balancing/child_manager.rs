@@ -34,9 +34,9 @@ use std::sync::Arc;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::DynLbConfig;
-use crate::client::load_balancing::DynLbPolicy;
 use crate::client::load_balancing::DynLbPolicyBuilder;
+use crate::client::load_balancing::LbPolicy;
+use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::Subchannel;
@@ -50,10 +50,10 @@ use crate::rt::GrpcRuntime;
 
 // An LbPolicy implementation that manages multiple children.
 #[derive(Debug)]
-pub struct ChildManager<T: Debug> {
+pub struct ChildManager<T: Debug, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
     subchannel_to_child_idx: HashMap<WeakSubchannel, usize>,
     handle_to_child_idx: HashMap<ChildHandle, usize>,
-    children: Vec<Child<T>>,
+    children: Vec<Child<T, B>>,
     runtime: GrpcRuntime,
     updated: bool, // Set when any child updates its picker; cleared when accessed.
     work_scheduler: Arc<dyn WorkScheduler>,
@@ -61,33 +61,37 @@ pub struct ChildManager<T: Debug> {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct Child<T> {
+pub struct Child<T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
     pub identifier: T,
-    pub builder: Arc<DynLbPolicyBuilder>,
+    pub builder: B,
     pub state: LbState,
-    policy: Box<DynLbPolicy>,
+    policy: B::LbPolicy,
     work_scheduler: Arc<ChildWorkScheduler>,
 }
 
 /// A collection of data sent to a child of the ChildManager.
-pub struct ChildUpdate<'a, T> {
+pub struct ChildUpdate<'a, T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
     /// The identifier the ChildManager should use for this child.
     pub child_identifier: T,
     /// The builder the ChildManager should use to create this child if it does
     /// not exist.  The child_policy_builder's name is effectively a part of the
     /// child_identifier.  If two identifiers are identical but have different
     /// builder names, they are treated as different children.
-    pub child_policy_builder: Arc<DynLbPolicyBuilder>,
+    pub child_policy_builder: B,
     /// The relevant ResolverUpdate and LbConfig to send to this child.  If
     /// None, then resolver_update will not be called on the child.  Should
     /// generally be Some for any new children, otherwise they will not be
     /// called.
-    pub child_update: Option<(ResolverUpdate, Option<&'a DynLbConfig>)>,
+    pub child_update: Option<(
+        ResolverUpdate,
+        Option<&'a <B::LbPolicy as LbPolicy>::LbConfig>,
+    )>,
 }
 
-impl<T> ChildManager<T>
+impl<T, B> ChildManager<T, B>
 where
     T: Debug + PartialEq + Hash + Eq + Send + Sync + 'static,
+    B: LbPolicyBuilder,
 {
     /// Creates a new ChildManager LB policy.  shard_update is called whenever a
     /// resolver_update operation occurs.
@@ -103,7 +107,7 @@ where
     }
 
     /// Returns data for all current children.
-    pub fn children(&self) -> impl Iterator<Item = &Child<T>> {
+    pub fn children(&self) -> impl Iterator<Item = &Child<T, B>> {
         self.children.iter()
     }
 
@@ -176,10 +180,7 @@ where
     ///
     /// If an ID is provided that does not exist in the ChildManager, it will be
     /// ignored.
-    pub fn retain_children(
-        &mut self,
-        ids_builders: impl IntoIterator<Item = (T, Arc<DynLbPolicyBuilder>)>,
-    ) {
+    pub fn retain_children(&mut self, ids_builders: impl IntoIterator<Item = (T, B)>) {
         self.reset_children(ids_builders, true);
     }
 
@@ -189,7 +190,7 @@ where
     /// otherwise a new child will be built for it.
     fn reset_children(
         &mut self,
-        ids_builders: impl IntoIterator<Item = (T, Arc<DynLbPolicyBuilder>)>,
+        ids_builders: impl IntoIterator<Item = (T, B)>,
         retain_only: bool,
     ) {
         // Replace self.children with an empty vec.
@@ -283,7 +284,7 @@ where
     /// children not present in child_updates will be removed.
     pub fn update<'a>(
         &mut self,
-        child_updates: impl IntoIterator<Item = ChildUpdate<'a, T>>,
+        child_updates: impl IntoIterator<Item = ChildUpdate<'a, T, B>>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         // Split the child updates into the IDs and builders, and the
@@ -332,7 +333,7 @@ where
     pub fn resolver_update(
         &mut self,
         resolver_update: ResolverUpdate,
-        config: Option<&DynLbConfig>,
+        config: Option<&<B::LbPolicy as LbPolicy>::LbConfig>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut errs = Vec::with_capacity(self.children.len());
@@ -497,6 +498,7 @@ mod test {
     use std::sync::Mutex;
     use std::sync::mpsc;
 
+    use crate::attributes::Attributes;
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::ChannelController;
     use crate::client::load_balancing::DynLbConfig;
@@ -508,11 +510,11 @@ mod test {
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::child_manager::ChildUpdate;
+    use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
-    use crate::client::load_balancing::test_utils::{self};
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
     use crate::core::Address;
@@ -583,7 +585,7 @@ mod test {
             child_policy_builder: builder.clone(),
             child_update: Some((
                 ResolverUpdate {
-                    attributes: crate::attributes::Attributes::default(),
+                    attributes: Attributes::default(),
                     endpoints: Ok(vec![e.clone()]),
                     service_config: Ok(None),
                     resolution_note: None,

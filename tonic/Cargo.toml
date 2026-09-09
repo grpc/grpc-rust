@@ -99,6 +99,7 @@ tokio-util = "0.7"
 
 [dev-dependencies]
 bencher = "0.1.5"
+criterion = "0.8"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 static_assertions = "1.0"
@@ -141,3 +142,7 @@ allowed_external_types = [
 [[bench]]
 harness = false
 name = "decode"
+
+[[bench]]
+name = "unary"
+harness = false

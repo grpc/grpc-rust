@@ -45,7 +45,7 @@ const DEFAULT_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/clou
 
 /// An abstraction for fetching authentication tokens.
 #[trait_variant::make(Send)]
-pub trait TokenProvider: Sync + Debug + 'static {
+trait TokenProvider: Sync + Debug + 'static {
     /// Returns an authentication token.
     async fn get_token(&self) -> Result<String, String>;
 }

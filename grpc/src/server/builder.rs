@@ -118,7 +118,6 @@ mod tests {
     use crate::server::Server;
     use crate::server::Trailers;
     use crate::server::descriptor::MethodDescriptor;
-    use crate::server::descriptor::MethodType;
     use crate::server::descriptor::ServiceDescriptor;
     use crate::server::interceptor::Intercept;
     use crate::server::interceptor::InterceptExt;
@@ -187,7 +186,7 @@ mod tests {
         fn descriptor(&self) -> ServiceDescriptor {
             ServiceDescriptor::new(
                 "test.Svc",
-                vec![MethodDescriptor::new("/test.Svc/Method", MethodType::Unary)],
+                vec![MethodDescriptor::new("/test.Svc/Method")],
             )
         }
 

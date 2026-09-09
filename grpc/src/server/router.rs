@@ -194,7 +194,6 @@ mod test {
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
     use crate::server::descriptor::MethodDescriptor;
-    use crate::server::descriptor::MethodType;
     use crate::server::descriptor::ServiceDescriptor;
 
     struct MockSendStream;
@@ -243,7 +242,7 @@ mod test {
 
         let router = RouterBuilder::new()
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Method"),
                 handler,
             )
             .build();
@@ -300,11 +299,11 @@ mod test {
 
         let router = RouterBuilder::new()
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Method"),
                 first_handler,
             )
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Method"),
                 second_handler,
             )
             .build();
@@ -350,8 +349,8 @@ mod test {
                 ServiceDescriptor::new(
                     "mock.MockService",
                     vec![
-                        MethodDescriptor::new("/mock.MockService/MethodA", MethodType::Unary),
-                        MethodDescriptor::new("/mock.MockService/MethodB", MethodType::Unary),
+                        MethodDescriptor::new("/mock.MockService/MethodA"),
+                        MethodDescriptor::new("/mock.MockService/MethodB"),
                     ],
                 )
             }
@@ -480,7 +479,7 @@ mod test {
         let router = RouterBuilder::new()
             .chain_interceptor(interceptor)
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Method"),
                 handler,
             )
             .build();
@@ -519,7 +518,7 @@ mod test {
             .chain_interceptor(auth)
             .chain_interceptor(logging)
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Method"),
                 handler,
             )
             .build();
@@ -554,10 +553,7 @@ mod test {
             fn descriptor(&self) -> ServiceDescriptor {
                 ServiceDescriptor::new(
                     "test.InterceptedService",
-                    vec![MethodDescriptor::new(
-                        "/test.InterceptedService/Method",
-                        MethodType::Unary,
-                    )],
+                    vec![MethodDescriptor::new("/test.InterceptedService/Method")],
                 )
             }
 
@@ -606,7 +602,7 @@ mod test {
         let router = RouterBuilder::new()
             .chain_interceptor(interceptor)
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Known", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Known"),
                 OrderHandler {
                     order: order.clone(),
                 },
@@ -651,7 +647,7 @@ mod test {
             .chain_interceptor(first)
             .chain_interceptor(second)
             .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method", MethodType::Unary),
+                MethodDescriptor::new("/pkg.Svc/Method"),
                 handler,
             )
             .build();
@@ -692,7 +688,7 @@ mod test {
             fn descriptor(&self) -> ServiceDescriptor {
                 ServiceDescriptor::new(
                     "test.Svc",
-                    vec![MethodDescriptor::new("/test.Svc/Method", MethodType::Unary)],
+                    vec![MethodDescriptor::new("/test.Svc/Method")],
                 )
             }
 

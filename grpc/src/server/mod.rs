@@ -997,7 +997,6 @@ mod tests {
         use crate::server::SendStream;
         use crate::server::Trailers;
         use crate::server::descriptor::MethodDescriptor;
-        use crate::server::descriptor::MethodType;
         use crate::server::descriptor::ServiceDescriptor;
         use crate::server::service::Service;
 
@@ -1037,10 +1036,7 @@ mod tests {
             fn descriptor(&self) -> ServiceDescriptor {
                 ServiceDescriptor::new(
                     "test.Draining",
-                    vec![MethodDescriptor::new(
-                        "/test.Draining/Method",
-                        MethodType::Unary,
-                    )],
+                    vec![MethodDescriptor::new("/test.Draining/Method")],
                 )
             }
 

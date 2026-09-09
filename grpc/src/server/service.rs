@@ -112,7 +112,6 @@ mod tests {
     use crate::server::SendStream;
     use crate::server::Trailers;
     use crate::server::descriptor::MethodDescriptor;
-    use crate::server::descriptor::MethodType;
     use crate::server::descriptor::ServiceDescriptor;
     use crate::server::interceptor::Intercept;
     use crate::server::router::RouterBuilder;
@@ -183,10 +182,7 @@ mod tests {
         fn descriptor(&self) -> ServiceDescriptor {
             ServiceDescriptor::new(
                 "test.MockService",
-                vec![MethodDescriptor::new(
-                    "/test.MockService/Method",
-                    MethodType::Unary,
-                )],
+                vec![MethodDescriptor::new("/test.MockService/Method")],
             )
         }
 

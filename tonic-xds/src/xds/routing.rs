@@ -280,19 +280,26 @@ fn match_domain(authority: &str, pattern: &str) -> Option<DomainMatchScore> {
         return Some(DomainMatchScore(DomainMatchType::Universal, Reverse(0)));
     }
 
-    let authority_lower = authority.to_ascii_lowercase();
-    let pattern_lower = pattern.to_ascii_lowercase();
-
-    if authority_lower == pattern_lower {
+    if authority.eq_ignore_ascii_case(pattern) {
         return Some(DomainMatchScore(
             DomainMatchType::Exact,
             Reverse(pattern.len()),
         ));
     }
 
-    if let Some(suffix) = pattern_lower.strip_prefix(WILDCARD)
-        && authority_lower.ends_with(suffix)
-        && authority_lower.len() > suffix.len()
+    // The wildcard must absorb at least one authority byte, so the
+    // authority has to be strictly longer than the pattern tail.
+    if let Some(suffix) = pattern.strip_prefix(WILDCARD)
+        && authority
+            .len()
+            .checked_sub(suffix.len())
+            .is_some_and(|start| {
+                start > 0
+                    && authority
+                        .as_bytes()
+                        .get(start..)
+                        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix.as_bytes()))
+            })
     {
         return Some(DomainMatchScore(
             DomainMatchType::Suffix,
@@ -300,9 +307,12 @@ fn match_domain(authority: &str, pattern: &str) -> Option<DomainMatchScore> {
         ));
     }
 
-    if let Some(prefix) = pattern_lower.strip_suffix(WILDCARD)
-        && authority_lower.starts_with(prefix)
-        && authority_lower.len() > prefix.len()
+    if let Some(prefix) = pattern.strip_suffix(WILDCARD)
+        && authority.len() > prefix.len()
+        && authority
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
     {
         return Some(DomainMatchScore(
             DomainMatchType::Prefix,

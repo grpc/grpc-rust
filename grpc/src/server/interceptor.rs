@@ -63,16 +63,15 @@ where
     H: Handle + 'static,
     I: Intercept + 'static,
 {
-    async fn handle(
+    fn handle(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
-    ) -> Trailers {
+    ) -> impl std::future::Future<Output = Trailers> + Send {
         self.intercept
             .intercept(headers, options, tx, rx, &self.handle)
-            .await
     }
 }
 
@@ -97,15 +96,15 @@ impl<T: Handle + Sized> HandleExt for T {}
 pub struct Identity;
 
 impl Intercept for Identity {
-    async fn intercept(
+    fn intercept(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
         next: &impl Handle,
-    ) -> Trailers {
-        next.handle(headers, options, tx, rx).await
+    ) -> impl std::future::Future<Output = Trailers> + Send {
+        next.handle(headers, options, tx, rx)
     }
 }
 
@@ -174,16 +173,15 @@ where
     B: Intercept,
     N: Handle,
 {
-    async fn handle(
+    fn handle(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
-    ) -> Trailers {
+    ) -> impl std::future::Future<Output = Trailers> + Send {
         self.second
             .intercept(headers, options, tx, rx, self.next)
-            .await
     }
 }
 

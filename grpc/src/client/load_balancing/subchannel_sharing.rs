@@ -126,7 +126,7 @@ impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
 
         for ext in ext_subchannels {
             self.delegate
-                .subchannel_update(ext, state, &mut channel_controller)
+                .subchannel_update(ext, state, &mut channel_controller);
         }
     }
 
@@ -208,7 +208,7 @@ struct SharingChannelController<'a> {
     delegate: &'a mut dyn ChannelController,
 }
 
-impl<'a> ChannelController for SharingChannelController<'a> {
+impl ChannelController for SharingChannelController<'_> {
     fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
         let mut inner = self.balancer_inner.lock().unwrap();
 

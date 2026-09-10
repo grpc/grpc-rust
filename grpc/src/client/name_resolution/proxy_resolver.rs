@@ -216,7 +216,7 @@ struct InterceptingController<'a> {
     proxy_options: &'a Arc<ProxyOptions>,
 }
 
-impl<'a> ChannelController for InterceptingController<'a> {
+impl ChannelController for InterceptingController<'_> {
     fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
         if let Ok(endpoints) = &mut update.endpoints {
             for endpoint in endpoints {

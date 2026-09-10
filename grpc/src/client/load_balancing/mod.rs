@@ -457,7 +457,7 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        (**self).exit_idle(channel_controller)
+        (**self).exit_idle(channel_controller);
     }
 }
 

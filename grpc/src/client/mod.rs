@@ -262,7 +262,7 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'a> SendStream for Box<dyn DynSendStream + 'a> {
+impl SendStream for Box<dyn DynSendStream + '_> {
     async fn send(&mut self, msg: &dyn SendMessage, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(msg, options).await
     }
@@ -361,7 +361,7 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         (**self).dyn_recv(msg).await
     }

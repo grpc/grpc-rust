@@ -388,11 +388,7 @@ pub trait SendStream {
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
     /// to the SendStream are undefined and data may be lost.
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()>;
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()>;
 }
 
 #[doc(hidden)]
@@ -416,22 +412,14 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'b> SendStream for &mut (dyn DynSendStream + 'b) {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for &mut (dyn DynSendStream + '_) {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
 
-impl<'b> SendStream for Box<dyn DynSendStream + 'b> {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for Box<dyn DynSendStream + '_> {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
@@ -478,7 +466,7 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
         (**self).dyn_next(msg).await
     }
@@ -926,9 +914,9 @@ mod tests {
     struct NopSendStream;
 
     impl SendStream for NopSendStream {
-        async fn send<'a>(
+        async fn send(
             &mut self,
-            _item: ResponseStreamItem<'a>,
+            _item: ResponseStreamItem<'_>,
             _options: SendOptions,
         ) -> Result<(), ()> {
             Ok(())

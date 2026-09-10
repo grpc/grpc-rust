@@ -62,10 +62,10 @@ impl<I: InvokeOnce> Intercept<I> for AttachHeadersInterceptor {
         for kv in self.md.iter() {
             match kv {
                 crate::metadata::KeyAndValueRef::Ascii(key, value) => {
-                    incoming_meta.append(key, value.clone())
+                    incoming_meta.append(key, value.clone());
                 }
                 crate::metadata::KeyAndValueRef::Binary(key, value) => {
-                    incoming_meta.append_bin(key, value.clone())
+                    incoming_meta.append_bin(key, value.clone());
                 }
             }
         }

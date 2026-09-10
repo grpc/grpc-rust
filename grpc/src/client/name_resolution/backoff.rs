@@ -78,7 +78,7 @@ impl BackoffConfig {
             Err("jitter must be greater than or equal to 0")?;
         }
         if self.jitter > 1.0 {
-            Err("jitter must be less than or equal to 1")?
+            Err("jitter must be less than or equal to 1")?;
         }
         Ok(())
     }

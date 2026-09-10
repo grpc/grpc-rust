@@ -238,7 +238,7 @@ pub trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
     }
 
     fn connect(&self) {
-        self.delegate().connect()
+        self.delegate().connect();
     }
 }
 
@@ -252,7 +252,7 @@ impl<T: ForwardingSubchannel> Subchannel for T {
     }
 
     fn connect(&self) {
-        self.connect()
+        self.connect();
     }
 }
 impl<T: ForwardingSubchannel> private::Sealed for T {}

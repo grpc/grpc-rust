@@ -70,7 +70,7 @@ impl TestChannelController {
     }
 
     pub(crate) fn set_update_result(&mut self, update_result: Result<(), String>) {
-        self.update_result = update_result
+        self.update_result = update_result;
     }
 }
 

@@ -289,7 +289,7 @@ mod test {
             endpoints.push(Endpoint {
                 addresses,
                 ..Default::default()
-            })
+            });
         }
         endpoints
     }
@@ -517,7 +517,7 @@ mod test {
         match rx_events.recv().unwrap() {
             TestEvent::RequestResolution => {}
             other => panic!("unexpected event {:?}", other),
-        };
+        }
     }
 
     fn verify_no_activity(rx_events: &mut mpsc::Receiver<TestEvent>) {
@@ -650,7 +650,7 @@ mod test {
             match picker.pick(&req) {
                 PickResult::Pick(pick) => {
                     println!("picked subchannel is {}", pick.subchannel);
-                    picked.push(pick.subchannel.clone())
+                    picked.push(pick.subchannel.clone());
                 }
                 other => panic!("unexpected pick result {}", other),
             }
@@ -718,7 +718,7 @@ mod test {
             match picker.pick(&req) {
                 PickResult::Pick(pick) => {
                     println!("picked subchannel is {}", pick.subchannel);
-                    picked.push(pick.subchannel.clone())
+                    picked.push(pick.subchannel.clone());
                 }
                 other => panic!("unexpected pick result {}", other),
             }
@@ -744,7 +744,7 @@ mod test {
             match new_picker.pick(&req) {
                 PickResult::Pick(pick) => {
                     println!("picked subchannel is {}", pick.subchannel);
-                    picked.push(pick.subchannel.clone())
+                    picked.push(pick.subchannel.clone());
                 }
                 other => panic!("unexpected pick result {}", other),
             }

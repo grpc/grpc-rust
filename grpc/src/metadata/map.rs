@@ -103,7 +103,7 @@ where
     key: Option<MetadataKey<VE>>,
 }
 
-impl<'a, VE> Debug for ValueIter<'a, VE>
+impl<VE> Debug for ValueIter<'_, VE>
 where
     VE: ValueEncoding,
 {
@@ -124,7 +124,7 @@ pub struct GetAll<'a, VE> {
     key: Option<MetadataKey<VE>>,
 }
 
-impl<'a, VE> std::fmt::Debug for GetAll<'a, VE>
+impl<VE> std::fmt::Debug for GetAll<'_, VE>
 where
     VE: ValueEncoding,
 {
@@ -889,7 +889,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Ascii>,
     {
-        key.remove_all(self, private::Internal)
+        key.remove_all(self, private::Internal);
     }
 
     /// Removes all entries matching the given binary key.
@@ -901,7 +901,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Binary>,
     {
-        key.remove_all(self, private::Internal)
+        key.remove_all(self, private::Internal);
     }
 
     pub(crate) fn merge(&mut self, other: MetadataMap) {
@@ -1317,7 +1317,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for String {
     #[doc(hidden)]
     #[inline]
     fn remove_all(self, map: &mut MetadataMap, token: private::Internal) {
-        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token)
+        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token);
     }
 }
 
@@ -1343,7 +1343,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &String {
     #[doc(hidden)]
     #[inline]
     fn remove_all(self, map: &mut MetadataMap, token: private::Internal) {
-        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token)
+        AsMetadataKey::<VE>::remove_all(self.as_str(), map, token);
     }
 }
 

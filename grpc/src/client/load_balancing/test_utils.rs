@@ -311,5 +311,5 @@ impl LbPolicyBuilder for StubPolicyBuilder {
 }
 
 pub(crate) fn reg_stub_policy(name: &'static str, funcs: StubPolicyFuncs) {
-    super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }))
+    super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }));
 }

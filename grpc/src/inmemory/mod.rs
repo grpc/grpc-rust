@@ -255,9 +255,9 @@ pub struct InMemoryServerSendStream {
 }
 
 impl ServerSendStream for InMemoryServerSendStream {
-    async fn send<'a>(
+    async fn send(
         &mut self,
-        item: ServerResponseStreamItem<'a>,
+        item: ServerResponseStreamItem<'_>,
         _options: ServerSendOptions,
     ) -> Result<(), ()> {
         let inmemory_item = match item {

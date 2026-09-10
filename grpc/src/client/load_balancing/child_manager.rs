@@ -167,7 +167,7 @@ where
         if let Some(state) = channel_controller.picker_update {
             self.children[child_idx].state = state;
             self.updated = true;
-        };
+        }
     }
 
     /// Returns true if any child has updated its picker since the last call to
@@ -271,7 +271,7 @@ where
                     policy,
                     work_scheduler,
                 });
-            };
+            }
         }
         // Anything left in old_children will just be Dropped and cleaned up.
     }
@@ -568,7 +568,7 @@ mod test {
             endpoints.push(Endpoint {
                 addresses,
                 ..Default::default()
-            })
+            });
         }
         endpoints
     }
@@ -619,7 +619,7 @@ mod test {
                     subchannels.push(sc);
                 }
                 other => panic!("unexpected event {:?}", other),
-            };
+            }
         }
         subchannels
     }

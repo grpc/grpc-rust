@@ -54,6 +54,19 @@ release = false
 name = "xds-client-opentelemetry"
 release = false
 
-# grpc group (single crate)
-#[[package]]
-#name = "grpc"
+# grpc crates: published manually for now
+[[package]]
+name = "grpc"
+release = false
+
+[[package]]
+name = "grpc-protobuf"
+release = false
+
+[[package]]
+name = "grpc-protobuf-build"
+release = false
+
+[[package]]
+name = "protoc-gen-rust-grpc"
+release = false

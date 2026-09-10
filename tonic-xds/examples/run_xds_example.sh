@@ -25,5 +25,5 @@ XDS_PID=$!
 sleep 2
 
 # 3. Run xDS-aware client
-GRPC_XDS_BOOTSTRAP_CONFIG='{"xds_servers":[{"server_uri":"http://localhost:18000"}],"node":{"id":"test"}}' \
+GRPC_XDS_BOOTSTRAP_CONFIG='{"xds_servers":[{"server_uri":"http://localhost:18000","channel_creds":[{"type":"insecure"}]}],"node":{"id":"test"}}' \
     cargo run -p tonic-xds --example channel --features testutil 2>&1 | prefix "client"

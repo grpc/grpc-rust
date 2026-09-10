@@ -22,7 +22,7 @@
  *
  */
 
-#[allow(unused)]
+#[allow(unused, clippy::all)]
 mod generated {
     pub mod helloworld {
         grpc::include_generated_proto!("generated/helloworld", "helloworld");

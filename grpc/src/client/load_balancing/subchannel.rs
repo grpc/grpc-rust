@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use crate::client::ConnectivityState;
-use crate::client::name_resolution::Address;
+use crate::core::Address;
 
 /// Represents the current state of a Subchannel.
 #[derive(Debug, Clone)]

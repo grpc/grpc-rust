@@ -102,8 +102,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::client::CallOptions;
     use crate::core::RecvMessage;
+    use crate::core::test_connection_info;
+    use crate::server::CallOptions;
     use crate::server::Handle;
     use crate::server::RecvStream;
     use crate::server::RequestHeaders;
@@ -228,7 +229,7 @@ mod tests {
         let router = RouterBuilder::new().add_service(intercepted).build();
 
         // Invoke the handler.
-        let headers = RequestHeaders::new().with_method_name("/test.MockService/Method");
+        let headers = RequestHeaders::new("/test.MockService/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
         let trailers = router
@@ -260,7 +261,7 @@ mod tests {
         let intercepted = svc.with_interceptor(int_a).with_interceptor(int_b);
         let router = RouterBuilder::new().add_service(intercepted).build();
 
-        let headers = RequestHeaders::new().with_method_name("/test.MockService/Method");
+        let headers = RequestHeaders::new("/test.MockService/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
         let trailers = router
@@ -281,7 +282,7 @@ mod tests {
 
         let router = RouterBuilder::new().add_service(svc).build();
 
-        let headers = RequestHeaders::new().with_method_name("/test.MockService/Method");
+        let headers = RequestHeaders::new("/test.MockService/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
         let trailers = router

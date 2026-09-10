@@ -2,6 +2,7 @@
 pub mod route_guide_client {
     use grpc::client::*;
     use grpc_protobuf::*;
+    use grpc_protobuf::client::*;
     /// Interface exported by the server.
     #[derive(Debug, Clone)]
     pub struct RouteGuideClient<T> {

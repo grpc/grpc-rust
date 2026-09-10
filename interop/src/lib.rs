@@ -31,19 +31,12 @@ pub mod server_prost;
 pub mod server_protobuf;
 
 pub mod pb {
-    #![allow(dead_code, unused_imports)]
+    #![allow(dead_code, unused_imports, clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/grpc.testing.rs"));
 }
 
 pub mod grpc_pb {
-    #![allow(
-        dead_code,
-        unused_imports,
-        clippy::clone_on_copy,
-        clippy::useless_conversion,
-        clippy::unnecessary_fallible_conversions,
-        clippy::derivable_impls
-    )]
+    #![allow(dead_code, unused_imports, clippy::all)]
     grpc::include_proto!("test");
 }
 

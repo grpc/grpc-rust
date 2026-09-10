@@ -34,7 +34,7 @@ tonic-prost = { version = "0.14.6", path = "../tonic-prost", default-features = 
 
 [dev-dependencies]
 tokio-stream = {version = "0.1", default-features = false, features = ["net"]}
-tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = ["transport"] }
+tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = ["transport", "router"] }
 
 [lints]
 workspace = true

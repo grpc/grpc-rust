@@ -97,10 +97,10 @@ impl XdsServerCertVerifier {
     /// parse unless the provider has rotated to a new `Arc`.
     fn root_store(&self, data: &Arc<CertificateData>) -> Result<Arc<RootCertStore>, RustlsError> {
         let cached = self.roots_cache.load();
-        if let Some(cached) = cached.as_ref() {
-            if Arc::ptr_eq(&cached.data, data) {
-                return Ok(Arc::clone(&cached.store));
-            }
+        if let Some(cached) = cached.as_ref()
+            && Arc::ptr_eq(&cached.data, data)
+        {
+            return Ok(Arc::clone(&cached.store));
         }
 
         let roots_pem = data

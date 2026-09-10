@@ -27,7 +27,6 @@
 //! Name Resolution is the process by which a channel's target is converted into
 //! network addresses (typically IP addresses) used by the channel to connect to
 //! a service.
-use core::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
@@ -41,8 +40,9 @@ use percent_encoding::utf8_percent_encode;
 use url::Url;
 
 use crate::attributes::Attributes;
-use crate::byte_str::ByteStr;
+use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
+use crate::core::Address;
 use crate::rt::GrpcRuntime;
 
 mod backoff;
@@ -265,7 +265,7 @@ pub trait ChannelController: Send + Sync {
 
     /// Parses the provided JSON service config and returns an instance of a
     /// ParsedServiceConfig.
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String>;
+    fn parse_service_config(&self, config: &str) -> ParseResult;
 }
 
 #[derive(Clone, Debug)]
@@ -323,37 +323,6 @@ pub struct Endpoint {
 impl Hash for Endpoint {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.addresses.hash(state);
-    }
-}
-
-/// An Address is an identifier that indicates how to connect to a server.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Ord, PartialOrd)]
-pub struct Address {
-    /// The network type is used to identify what kind of transport to create
-    /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.
-    pub network_type: &'static str,
-
-    /// The address itself is passed to the transport in order to create a
-    /// connection to it.
-    pub address: ByteStr,
-
-    /// Attributes contains arbitrary data about this address intended for
-    /// consumption by the subchannel.
-    pub attributes: Attributes,
-}
-
-impl Hash for Address {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.network_type.hash(state);
-        self.address.hash(state);
-    }
-}
-
-impl Display for Address {
-    #[allow(clippy::to_string_in_format_args)]
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.network_type, self.address.to_string())
     }
 }
 
@@ -415,6 +384,7 @@ mod test {
     use std::hash::Hasher;
 
     use super::*;
+    use crate::byte_str::ByteStr;
 
     #[test]
     pub fn parse_target() {

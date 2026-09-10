@@ -148,7 +148,7 @@ pub use async_trait::async_trait;
 pub use codec::Streaming;
 pub use extensions::GrpcMethod;
 pub use http::Extensions;
-pub use request::{IntoRequest, IntoStreamingRequest, Request};
+pub use request::{CancellationHandle, IntoRequest, IntoStreamingRequest, Request};
 pub use response::Response;
 pub use status::{Code, ConnectError, Status, TimeoutExpired};
 

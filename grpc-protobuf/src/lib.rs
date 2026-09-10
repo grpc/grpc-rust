@@ -28,20 +28,9 @@
 //! [`protoc-gen-rust-grpc`](https://docs.rs/protoc-gen-rust-grpc).  See our
 //! [Quick Start Guide](docs/languages/rust/quickstart/) for more information.
 //!
-//! ## Basic usage
+//! # Modules
 //!
-//! There are four basic RPC (Remote Procedure Call) types and a corresponding
-//! call builder for each.
-//!
-//! * Unary: [`UnaryCallBuilder`]
-//! * Client Streaming: [`ClientStreamingCallBuilder`]
-//! * Server Streaming: [`ServerStreamingCallBuilder`]
-//! * Bidirectional Streaming: [`BidiCallBuilder`]
-//!
-//! Each call builder implements [`CallBuilder`] which can be used to configure
-//! the call.  Each one also provides an [`IntoFuture`] implementation to
-//! actually begin the call.  See the documentation for each type for additional
-//! usage information.
+//! * [`client`] - Client-side types and call builders for RPCs.
 
 use std::any::TypeId;
 
@@ -58,14 +47,9 @@ use protobuf::MutProxied;
 use protobuf::Proxied;
 use protobuf::Serialize;
 
-mod client;
+pub mod client;
 mod status;
 mod trailers_conv;
-pub use client::bidi::*;
-pub use client::client_streaming::*;
-pub use client::server_streaming::*;
-pub use client::unary::*;
-pub use client::*;
 pub use status::*;
 
 /// Implements [`SendMessage`] for protobuf message views.

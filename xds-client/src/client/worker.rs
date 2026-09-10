@@ -686,10 +686,7 @@ where
             };
 
             let stream = match transport.new_stream(self.build_initial_requests()).await {
-                Ok(s) => {
-                    self.backoff.reset();
-                    s
-                }
+                Ok(s) => s,
                 Err(_) => {
                     self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
@@ -712,7 +709,9 @@ where
                     // a connectivity failure or when the ADS stream fails
                     // *without* seeing a response message. A stream that failed
                     // after receiving a response is not counted; just reconnect.
-                    if !saw_response {
+                    if saw_response {
+                        self.backoff.reset();
+                    } else {
                         self.record_unhealthy(&mut healthy);
                     }
                     match self.backoff.next_backoff() {

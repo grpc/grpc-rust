@@ -211,10 +211,11 @@ impl EndpointsResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::core::v3::{Address, SocketAddress};
     use envoy_types::pb::envoy::config::endpoint::v3::{Endpoint, LocalityLbEndpoints};
     use envoy_types::pb::google::protobuf::UInt32Value;
+
+    use super::*;
 
     fn make_lb_endpoint(ip: &str, port: u32, health: i32) -> LbEndpoint {
         LbEndpoint {
@@ -277,13 +278,6 @@ mod tests {
         };
         let err = EndpointsResource::validate(cla).unwrap_err();
         assert!(err.to_string().contains("cluster_name"));
-    }
-
-    #[test]
-    fn test_eds_allows_partial_responses_in_sotw() {
-        // EDS resources are per-cluster, so SotW responses may contain only a subset.
-        // Unlike LDS/CDS which require all resources in every SotW response.
-        assert!(!EndpointsResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
     }
 
     #[test]

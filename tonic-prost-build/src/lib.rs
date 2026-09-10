@@ -777,6 +777,7 @@ impl Builder {
         };
 
         config.out_dir(&out_dir);
+        config.type_attribute(".", "#[allow(clippy::all)]");
 
         for (proto_path, rust_path) in &self.extern_path {
             config.extern_path(proto_path, rust_path);

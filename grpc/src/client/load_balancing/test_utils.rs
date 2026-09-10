@@ -45,8 +45,8 @@ use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::core::Address;
 
 pub(crate) fn new_request_headers() -> RequestHeaders {
     RequestHeaders::default()

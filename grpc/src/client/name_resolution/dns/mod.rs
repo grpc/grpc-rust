@@ -38,7 +38,6 @@ use tokio::sync::Notify;
 use url::Host;
 
 use crate::byte_str::ByteStr;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ChannelController;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::NopResolver;
@@ -52,6 +51,7 @@ use crate::client::name_resolution::backoff::BackoffConfig;
 use crate::client::name_resolution::backoff::DEFAULT_EXPONENTIAL_CONFIG;
 use crate::client::name_resolution::backoff::ExponentialBackoff;
 use crate::client::name_resolution::global_registry;
+use crate::core::Address;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::{self};
 

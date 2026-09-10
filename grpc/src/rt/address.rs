@@ -83,8 +83,9 @@ impl ListenerAddress for UnixListenerAddress {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::SocketAddr;
+
+    use super::*;
 
     // -- TcpAddress as ListenerAddress --
 

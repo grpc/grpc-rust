@@ -22,17 +22,27 @@
  *
  */
 
-/// An in-memory representation of a service config, usually provided to gRPC as
-/// a JSON object.
-// TODO: complete this and ensure it meets all our requirements.
-#[derive(Debug, Default, Clone)]
-pub struct ServiceConfig {
-    pub(crate) load_balancing_policy: Option<LbPolicyType>,
-}
+//! The xDS data model layer: validated, owned representations of the raw
+//! discovery-protocol resources (LDS/RDS/CDS/EDS), each implementing
+//! [`xds_client::Resource`] so it can be deserialized, named, and validated
+//! (gRFC A27) independently of any live xDS traffic.
+//! The dependency manager assembles these into an [`crate::xds_config::XdsConfig`].
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub enum LbPolicyType {
-    #[default]
-    PickFirst,
-    RoundRobin,
-}
+// TODO: remove once the xDS dependency manager subscribes to these resource
+// types and assembles them into an XdsConfig.
+#![allow(dead_code, unused_imports)]
+
+mod cluster;
+mod endpoint;
+mod listener;
+mod route;
+
+pub(crate) use cluster::{ClusterDiscovery, ClusterResource};
+pub(crate) use endpoint::{
+    EndpointAddress, EndpointsResource, HealthStatus, LbEndpoint, Locality, LocalityLbEndpoints,
+};
+pub(crate) use listener::{ListenerResource, RouteSource};
+pub(crate) use route::{
+    HeaderMatchSpecifier, HeaderMatcher, PathSpecifier, Route, RouteAction, RouteConfigResource,
+    RouteMatch, StringMatcher, VirtualHost, WeightedCluster,
+};

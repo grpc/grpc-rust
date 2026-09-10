@@ -37,8 +37,16 @@
 //!   messages.
 
 use std::any::TypeId;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::hash::Hash;
 
 use bytes::Buf;
+
+use crate::attributes::Attributes;
+use crate::byte_str::ByteStr;
+use crate::credentials::SecurityInfo;
 
 /// Represents a message sent by either a client or a server.
 #[allow(unused)]
@@ -110,5 +118,92 @@ impl dyn RecvMessage + '_ {
                 None
             }
         }
+    }
+}
+
+/// An Address is an identifier that indicates how to connect to a server.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Address {
+    /// The network type is used to identify what kind of transport to create
+    /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.
+    pub network_type: &'static str,
+
+    /// The address itself is passed to the transport in order to create a
+    /// connection to it.
+    pub address: ByteStr,
+
+    /// Attributes contains arbitrary data about this address intended for
+    /// consumption by the subchannel.
+    pub attributes: Attributes,
+}
+
+impl Hash for Address {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.network_type.hash(state);
+        self.address.hash(state);
+    }
+}
+
+impl Display for Address {
+    #[allow(clippy::to_string_in_format_args)]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}:{}", self.network_type, self.address.to_string())
+    }
+}
+
+/// Information about the connection to the RPC's peer (from the client/server
+/// pair).
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
+    local_address: Address,
+    remote_address: Address,
+    security_info: SecurityInfo,
+}
+
+impl ConnectionInfo {
+    /// Constructs a new instance with the given fields.
+    pub fn new(
+        local_address: Address,
+        remote_address: Address,
+        security_info: SecurityInfo,
+    ) -> Self {
+        Self {
+            local_address,
+            remote_address,
+            security_info,
+        }
+    }
+
+    /// Returns the connection's local address.
+    pub fn local_address(&self) -> &Address {
+        &self.local_address
+    }
+
+    /// Returns the peer's address.
+    pub fn remote_address(&self) -> &Address {
+        &self.remote_address
+    }
+
+    /// Returns the connection's security information (e.g. TLS parameters).
+    pub fn security_info(&self) -> &SecurityInfo {
+        &self.security_info
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_connection_info() -> ConnectionInfo {
+    ConnectionInfo {
+        local_address: Address {
+            network_type: "",
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        },
+        remote_address: Address {
+            network_type: "",
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        },
+        security_info: SecurityInfo::new(""),
     }
 }

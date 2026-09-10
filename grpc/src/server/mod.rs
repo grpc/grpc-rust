@@ -51,7 +51,7 @@ use std::sync::Arc;
 
 use tonic::async_trait;
 
-use crate::client::CallOptions;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -62,6 +62,21 @@ pub mod descriptor;
 pub(crate) mod interceptor;
 pub(crate) mod router;
 pub mod service;
+
+/// Settings to configure RPCs sent using the [`Handle`] trait.
+///
+/// Most applications will not need this type, and will set options via the
+/// generated (e.g. protobuf) APIs instead.
+#[derive(Default, Clone)]
+#[non_exhaustive]
+pub struct CallOptions {}
+
+impl CallOptions {
+    /// Constructs a new [`CallOptions`] with the default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// A serving connection that supports graceful shutdown.
 ///
@@ -503,18 +518,24 @@ impl ResponseHeaders {
 }
 
 /// Contains all information transmitted in the request headers of an RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestHeaders {
     /// The full (e.g. "/Service/Method") method name specified for the call.
     method_name: String,
     /// The application-specified metadata for the call.
     metadata: MetadataMap,
+    /// Information about the client.
+    connection_info: ConnectionInfo,
 }
 
 impl RequestHeaders {
     /// Returns a default RequestHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(method_name: impl Into<String>, connection_info: ConnectionInfo) -> Self {
+        Self {
+            method_name: method_name.into(),
+            connection_info,
+            metadata: MetadataMap::default(),
+        }
     }
 
     /// Replaces the method name of self with `method_name`.
@@ -542,6 +563,17 @@ impl RequestHeaders {
     /// Returns a mutable reference to the metadata in these headers.
     pub fn metadata_mut(&mut self) -> &mut MetadataMap {
         &mut self.metadata
+    }
+
+    /// Replaces the connection_info of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 
     /// Returns the owned fields in the RequestHeaders.
@@ -616,7 +648,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-
+    use crate::core::test_connection_info;
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
     struct MockConnection {
@@ -945,7 +977,7 @@ mod tests {
                 let rx = BoxedRecvStream(Box::new(NopRecvStream));
                 let _ = handler
                     .dyn_handle(
-                        RequestHeaders::new().with_method_name("/test.Draining/Method"),
+                        RequestHeaders::new("/test.Draining/Method", test_connection_info()),
                         CallOptions::new(),
                         &mut tx,
                         rx,
@@ -991,7 +1023,6 @@ mod tests {
 
     #[tokio::test]
     async fn listener_dropped_immediately_while_connections_drain() {
-        use crate::client::CallOptions;
         use crate::server::RecvStream;
         use crate::server::RequestHeaders;
         use crate::server::SendStream;

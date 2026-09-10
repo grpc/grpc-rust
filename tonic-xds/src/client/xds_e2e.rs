@@ -63,7 +63,7 @@ mod test {
     /// target resolves the listener `listener_name`.
     fn build_channel(cp_addr: SocketAddr, listener_name: &str) -> XdsChannelGrpc {
         let bootstrap_json = format!(
-            r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}"}}],"node":{{"id":"test"}}}}"#
+            r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
         );
         let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
         let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");

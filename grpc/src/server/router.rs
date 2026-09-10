@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::client::CallOptions;
 use crate::server::BoxedRecvStream;
+use crate::server::CallOptions;
 use crate::server::DynHandle;
 use crate::server::DynRecvStream;
 use crate::server::DynSendStream;
@@ -188,8 +188,9 @@ mod test {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::client::CallOptions;
     use crate::core::RecvMessage;
+    use crate::core::test_connection_info;
+    use crate::server::CallOptions;
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
@@ -244,7 +245,7 @@ mod test {
             .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
+        let headers = RequestHeaders::new("/pkg.Svc/Method", test_connection_info());
 
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
@@ -264,7 +265,7 @@ mod test {
     async fn test_unregistered_method_returns_unimplemented() {
         let router = RouterBuilder::new().build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/NoSuchMethod");
+        let headers = RequestHeaders::new("/pkg.Svc/NoSuchMethod", test_connection_info());
 
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
@@ -299,7 +300,7 @@ mod test {
             .add_method(MethodDescriptor::new("/pkg.Svc/Method"), second_handler)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
+        let headers = RequestHeaders::new("/pkg.Svc/Method", test_connection_info());
 
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
@@ -368,7 +369,7 @@ mod test {
         let router = RouterBuilder::new().add_service(service).build();
 
         // Dispatch to MethodA.
-        let headers_a = RequestHeaders::new().with_method_name("/mock.MockService/MethodA");
+        let headers_a = RequestHeaders::new("/mock.MockService/MethodA", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
         let trailers = router
@@ -381,7 +382,7 @@ mod test {
         );
 
         // Dispatch to MethodB.
-        let headers_b = RequestHeaders::new().with_method_name("/mock.MockService/MethodB");
+        let headers_b = RequestHeaders::new("/mock.MockService/MethodB", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
         let trailers = router
@@ -398,7 +399,7 @@ mod test {
     async fn test_router_builder_default() {
         let router = RouterBuilder::default().build();
 
-        let headers = RequestHeaders::new().with_method_name("/any.Service/AnyMethod");
+        let headers = RequestHeaders::new("/any.Service/AnyMethod", test_connection_info());
 
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
@@ -472,7 +473,7 @@ mod test {
             .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
+        let headers = RequestHeaders::new("/pkg.Svc/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
 
@@ -508,7 +509,7 @@ mod test {
             .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
+        let headers = RequestHeaders::new("/pkg.Svc/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
 
@@ -561,7 +562,8 @@ mod test {
             .add_service(service)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/test.InterceptedService/Method");
+        let headers =
+            RequestHeaders::new("/test.InterceptedService/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
 
@@ -594,7 +596,7 @@ mod test {
             )
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Unknown");
+        let headers = RequestHeaders::new("/pkg.Svc/Unknown", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
 
@@ -634,7 +636,7 @@ mod test {
             .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
+        let headers = RequestHeaders::new("/pkg.Svc/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
 
@@ -688,7 +690,7 @@ mod test {
             .add_service(service)
             .build();
 
-        let headers = RequestHeaders::new().with_method_name("/test.Svc/Method");
+        let headers = RequestHeaders::new("/test.Svc/Method", test_connection_info());
         let mut tx = MockSendStream;
         let rx = MockRecvStream;
 

@@ -35,8 +35,8 @@ use crate::client::ConnectivityState;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
@@ -458,5 +458,24 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
         (**self).exit_idle(channel_controller)
+    }
+}
+
+impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
+    type LbPolicy = B::LbPolicy;
+
+    fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
+        (**self).build(options)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn parse_config(
+        &self,
+        config: &ParsedJsonLbConfig,
+    ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
+        (**self).parse_config(config)
     }
 }

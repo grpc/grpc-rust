@@ -22,6 +22,22 @@
  *
  */
 
+//! Client-side types and call builders for RPCs (Remote Procedure Calls).
+//!
+//! # Basic usage
+//!
+//! There are four basic RPCs types and a corresponding call builder for each.
+//!
+//! * Unary: [`UnaryCallBuilder`]
+//! * Client Streaming: [`ClientStreamingCallBuilder`]
+//! * Server Streaming: [`ServerStreamingCallBuilder`]
+//! * Bidirectional Streaming: [`BidiCallBuilder`]
+//!
+//! Each call builder implements [`CallBuilder`] which can be used to configure
+//! the call.  Each one also provides an [`IntoFuture`] implementation to
+//! actually begin the call.  See the documentation for each type for additional
+//! usage information.
+
 use std::marker::PhantomData;
 use std::time::Duration;
 use std::time::Instant;
@@ -42,8 +58,6 @@ use grpc::client::stream_util::RecvStreamValidator;
 use grpc::core::RecvMessage;
 use protobuf::AsMut;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
 
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
@@ -51,10 +65,15 @@ use crate::Status;
 use crate::private::Internal;
 use crate::trailers_conv::status_from_trailers;
 
-pub(crate) mod bidi;
-pub(crate) mod client_streaming;
-pub(crate) mod server_streaming;
-pub(crate) mod unary;
+mod bidi;
+mod client_streaming;
+mod server_streaming;
+mod unary;
+
+pub use bidi::*;
+pub use client_streaming::*;
+pub use server_streaming::*;
+pub use unary::*;
 
 /// Allows sending streaming RPC protobuf request messages.
 ///
@@ -70,7 +89,6 @@ impl<M, Tx> GrpcStreamingRequest<M, Tx>
 where
     Tx: SendStream,
     M: Message,
-    for<'b> M::View<'b>: MessageView<'b>,
 {
     fn new(tx: Tx) -> Self {
         Self {
@@ -117,7 +135,6 @@ impl<M, Rx> GrpcStreamingResponse<M, Rx>
 where
     Rx: ClientRecvStream,
     M: Message,
-    for<'b> M::Mut<'b>: MessageMut<'b>,
 {
     fn new(rx: Rx) -> Self {
         Self {

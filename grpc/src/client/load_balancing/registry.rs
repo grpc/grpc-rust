@@ -81,12 +81,15 @@ impl Default for LbPolicyRegistry {
     }
 }
 
-/// The registry used if a local registry is not provided to a channel or if it
-/// does not exist in the local registry.
-pub static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> = LazyLock::new(LbPolicyRegistry::new);
+pub static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> = LazyLock::new(|| {
+    let registry = LbPolicyRegistry::new();
+    registry.add_builder(super::pick_first::PickFirstBuilder {});
+    registry.add_builder(super::round_robin::RoundRobinBuilder {});
+    registry
+});
 
-/// Implements DynLbPolicy and DynLbPolicyBuilder around the enclosed LbPolicy
-/// or LbPolicyBuilder, respectively.
+/// Implements `DynLbPolicy` and `DynLbPolicyBuilder` around the enclosed
+/// `LbPolicy` or `LbPolicyBuilder`, respectively.
 #[derive(Debug)]
 struct DynAdapter<T>(T);
 

@@ -36,15 +36,14 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::TlsStream as RustlsStream;
 use tonic::async_trait;
 
-use crate::attributes::Attributes;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ChannelSecurityContext;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
+use crate::credentials::client::ValidateAuthority;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::ALPN_PROTO_STR_H2;
 use crate::credentials::rustls::Identity;
@@ -201,7 +200,14 @@ impl RustlsChannelCredentials {
         &self,
         authority: &Authority,
         source: BoxEndpoint,
-    ) -> Result<(TlsStream<BoxEndpoint>, ChannelSecurityInfo), String> {
+    ) -> Result<
+        (
+            TlsStream<BoxEndpoint>,
+            SecurityInfo,
+            Box<dyn ValidateAuthority>,
+        ),
+        String,
+    > {
         let server_name = ServerName::try_from(authority.host())
             .map_err(|e| format!("invalid authority: {}", e))?
             .to_owned();
@@ -227,25 +233,26 @@ impl RustlsChannelCredentials {
             .and_then(|certs| certs.first())
             .map(|c| c.clone().into_owned());
 
-        let cs_info = ChannelSecurityInfo::new(
-            "tls",
-            SecurityLevel::PrivacyAndIntegrity,
-            Box::new(ClientTlsSecurityContext {
+        let cs_info =
+            SecurityInfo::new("tls").with_security_level(SecurityLevel::PrivacyAndIntegrity);
+        let ep = TlsStream::new(RustlsStream::Client(tls_stream));
+        Ok((
+            ep,
+            cs_info,
+            Box::new(ClientTlsAuthorityValidator {
                 verified_peer_cert: peer_cert,
             }),
-            Attributes::new(),
-        );
-        let ep = TlsStream::new(RustlsStream::Client(tls_stream));
-        Ok((ep, cs_info))
+        ))
     }
 }
 
-/// Security context for [`rustls`]-based gRPC [`ChannelCredentials`].
-pub struct ClientTlsSecurityContext {
+/// Authority validator for [`rustls`]-based gRPC [`ChannelCredentials`].
+#[derive(Debug)]
+pub struct ClientTlsAuthorityValidator {
     verified_peer_cert: Option<CertificateDer<'static>>,
 }
 
-impl ChannelSecurityContext for ClientTlsSecurityContext {
+impl ValidateAuthority for ClientTlsAuthorityValidator {
     fn validate_authority(&self, authority: &Authority) -> bool {
         let server_name = match ServerName::try_from(authority.host()) {
             Ok(n) => n,
@@ -276,10 +283,11 @@ impl ChannelCredentials for RustlsChannelCredentials {
         _rt: &GrpcRuntime,
         _token: private::Internal,
     ) -> Result<HandshakeOutput, String> {
-        let (ep, cs_info) = self.connect_tls(authority, source).await?;
+        let (ep, security_info, authority_validator) = self.connect_tls(authority, source).await?;
         Ok(HandshakeOutput {
             endpoint: Box::new(ep),
-            security: cs_info,
+            security_info,
+            authority_validator,
         })
     }
 

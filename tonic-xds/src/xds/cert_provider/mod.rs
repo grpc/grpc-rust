@@ -281,7 +281,10 @@ mod tests {
     #[test]
     fn unknown_plugin_rejected_at_registry_build() {
         let json = r#"{
-            "xds_servers": [{"server_uri": "localhost:5000"}],
+            "xds_servers": [{
+                "server_uri": "localhost:5000",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "certificate_providers": {
                 "test": {
                     "plugin_name": "unknown_plugin",

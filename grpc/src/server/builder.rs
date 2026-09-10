@@ -106,8 +106,8 @@ mod tests {
 
     use tokio::sync::Mutex;
 
-    use crate::client::CallOptions;
     use crate::core::RecvMessage;
+    use crate::server::CallOptions;
     use crate::server::DynHandle;
     use crate::server::Handle;
     use crate::server::RecvStream;

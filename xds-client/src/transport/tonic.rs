@@ -308,14 +308,36 @@ impl TransportBuilder for TonicTransportBuilder {
     type Transport = TonicTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        // The channel is secure only when TLS is configured; with no TLS backend
-        // compiled in, it can never be secure.
+        // With no TLS backend compiled in, `tls_configured` stays false.
         #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
-        let secure = self.tls_config.is_some();
+        let tls_configured = self.tls_config.is_some();
         #[cfg(not(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc")))]
-        let secure = false;
+        let tls_configured = false;
 
-        // Refuse before connecting: never send credentials over an insecure channel.
+        let uri = Self::ensure_secure_server_uri(server.uri(), tls_configured);
+
+        // tonic handshakes for an `https` URI alone, so the scheme decides
+        // whether the channel is encrypted.
+        let secure = uri
+            .parse::<http::Uri>()
+            .is_ok_and(|uri| uri.scheme_str() == Some("https"));
+
+        // Require the scheme and the TLS config to agree, so the caller gets
+        // the channel they asked for. `ensure_secure_server_uri` has already
+        // upgraded the scheme-less form, leaving only real conflicts here.
+        if tls_configured && !secure {
+            return Err(Error::Connection(format!(
+                "TLS is configured but server URI '{uri}' connects in plaintext; \
+                 use an `https://` or scheme-less URI"
+            )));
+        }
+        if secure && !tls_configured {
+            return Err(Error::Connection(format!(
+                "server URI '{uri}' requires TLS but no TLS config is set"
+            )));
+        }
+
+        // Fail before connecting, so credentials stay off an insecure channel.
         if let Some(creds) = &self.call_creds
             && creds.requires_secure_transport()
             && !secure
@@ -327,8 +349,7 @@ impl TransportBuilder for TonicTransportBuilder {
 
         // `Endpoint::from_shared` routes `unix://` URIs to tonic's UDS connector.
         // Required for control planes like Istio's grpc-agent that ship `unix:///etc/istio/proxy/XDS`.
-        let endpoint = Endpoint::from_shared(Self::ensure_secure_server_uri(server.uri(), secure))
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let endpoint = Endpoint::from_shared(uri).map_err(|e| Error::Connection(e.to_string()))?;
 
         let mut endpoint = endpoint.connect_timeout(self.connect_timeout);
         if let Some(interval) = self.keep_alive_interval {
@@ -598,6 +619,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::CallCredentials(_)));
+    }
+
+    #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
+    #[tokio::test]
+    async fn tls_config_and_plaintext_uri_are_rejected() {
+        // A URI that keeps a non-`https` scheme stays plaintext despite the TLS
+        // config, so the build fails and the call credentials below stay put.
+        for uri in [
+            "http://127.0.0.1:1",
+            "unix:///etc/istio/proxy/XDS",
+            "foo://127.0.0.1:1",
+        ] {
+            let err = TonicTransportBuilder::new()
+                .with_tls_config(tonic::transport::ClientTlsConfig::new())
+                .with_call_credentials(Arc::new(MockCreds {
+                    pairs: vec![],
+                    requires_secure: true,
+                }))
+                .build(&ServerConfig::new(uri))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("connects in plaintext"), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_uri_without_a_tls_config_is_rejected() {
+        // Without a TLS backend tonic connects to this in the clear.
+        let err = TonicTransportBuilder::new()
+            .build(&ServerConfig::new("https://127.0.0.1:1"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires TLS but no TLS config is set")
+        );
     }
 
     #[test]

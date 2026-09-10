@@ -288,16 +288,16 @@ async fn test_tls_validate_authority() {
         .await
         .expect("Handshake failed");
 
-    let context = result.security.security_context();
+    let av = result.authority_validator;
 
     // Validate correct authorities
-    assert!(context.validate_authority(&Authority::new("localhost".to_string(), None)));
-    assert!(context.validate_authority(&Authority::new("example.com".to_string(), None)));
-    assert!(context.validate_authority(&Authority::new("127.0.0.1".to_string(), None)));
+    assert!(av.validate_authority(&Authority::new("localhost".to_string(), None)));
+    assert!(av.validate_authority(&Authority::new("example.com".to_string(), None)));
+    assert!(av.validate_authority(&Authority::new("127.0.0.1".to_string(), None)));
 
     // Validate incorrect authorities
-    assert!(!context.validate_authority(&Authority::new("wrong.host".to_string(), None)));
-    assert!(!context.validate_authority(&Authority::new("grpc.io".to_string(), None)));
+    assert!(!av.validate_authority(&Authority::new("wrong.host".to_string(), None)));
+    assert!(!av.validate_authority(&Authority::new("grpc.io".to_string(), None)));
 }
 
 #[tokio::test]
@@ -431,7 +431,7 @@ async fn check_client_resumption_disabled(
             .unwrap();
         let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
-        let (tls_stream, _security) = creds
+        let (tls_stream, _security, _authority_validator) = creds
             .connect_tls(&authority, endpoint)
             .await
             .expect("Handshake failed");

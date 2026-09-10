@@ -14,6 +14,11 @@ categories = ["web-programming", "network-programming", "asynchronous"]
 rust-version = { workspace = true }
 edition = "2024"
 
+[lints.clippy]
+elidable_lifetime_names = "warn"
+semicolon_if_nothing_returned = "warn"
+unnecessary_semicolon = "warn"
+
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
     "bytes::*",

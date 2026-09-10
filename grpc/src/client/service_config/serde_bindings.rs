@@ -22,7 +22,6 @@
  *
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -31,7 +30,6 @@ use super::duration::GrpcDuration;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,37 +114,34 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw_entries =
-            Option::<Vec<HashMap<String, serde_json::Value>>>::deserialize(deserializer)?
-                .unwrap_or_default();
-
-        if raw_entries.is_empty() {
-            return Ok(LbConfigSerde(None));
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawOrValue<'a> {
+            #[serde(borrow)]
+            Raw(&'a serde_json::value::RawValue),
+            Value(serde_json::Value),
         }
 
-        for map in raw_entries {
-            let mut iter = map.into_iter();
-            let (Some((name, raw_config)), None) = (iter.next(), iter.next()) else {
-                return Err(serde::de::Error::custom(
-                    "Each load balancing config entry must contain exactly one policy name.",
-                ));
-            };
-
-            if let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&name) {
-                let parsed_json = ParsedJsonLbConfig::from_value(raw_config);
-                let parsed_config = builder
-                    .parse_config(&parsed_json)
-                    .map_err(serde::de::Error::custom)?;
-                return Ok(LbConfigSerde(Some(LbInnerConfig {
-                    builder,
-                    config: parsed_config,
-                })));
+        let raw_opt = Option::<RawOrValue<'de>>::deserialize(deserializer)?;
+        let raw_str = match raw_opt {
+            None => return Ok(LbConfigSerde(None)),
+            Some(RawOrValue::Raw(raw)) => std::borrow::Cow::Borrowed(raw.get()),
+            Some(RawOrValue::Value(val)) => {
+                if val.is_null() {
+                    return Ok(LbConfigSerde(None));
+                }
+                std::borrow::Cow::Owned(val.to_string())
             }
-        }
+        };
 
-        Err(serde::de::Error::custom(
-            "No supported load balancing policy found in config.",
-        ))
+        match GLOBAL_LB_REGISTRY.select_candidate(raw_str.as_ref()) {
+            Ok(Some(parsed)) => Ok(LbConfigSerde(Some(LbInnerConfig {
+                builder: parsed.builder,
+                config: parsed.config,
+            }))),
+            Ok(None) => Ok(LbConfigSerde(None)),
+            Err(e) => Err(serde::de::Error::custom(e)),
+        }
     }
 }
 

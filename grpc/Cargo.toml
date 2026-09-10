@@ -79,7 +79,7 @@ rustls-pki-types = { version = "1.8", optional = true, default-features = false 
 rustls-platform-verifier = { version = "0.7", optional = true, default-features = false }
 rustls-webpki = { version = "0.103", optional = true, default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["raw_value"] }
 socket2 = { version = "0.6", optional = true }
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false }

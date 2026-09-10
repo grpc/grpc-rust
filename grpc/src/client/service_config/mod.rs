@@ -26,12 +26,23 @@ pub(crate) mod duration;
 pub(crate) mod serde_bindings;
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::pick_first;
+
+static DEFAULT_PICK_FIRST: LazyLock<(Arc<DynLbPolicyBuilder>, Option<DynLbConfig>)> =
+    LazyLock::new(|| {
+        let builder = GLOBAL_LB_REGISTRY
+            .get_policy(pick_first::POLICY_NAME)
+            .expect("pick_first policy must be registered");
+        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
+        let parsed_config = builder.parse_config(&default_json).ok().flatten();
+        (builder, parsed_config)
+    });
 
 pub type ParseResult = Result<ServiceConfig, String>;
 
@@ -76,12 +87,7 @@ impl ServiceConfig {
 
     // Returns the default load balancing policy (`pick_first`).
     pub(crate) fn default_lb_policy() -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
-        let builder = GLOBAL_LB_REGISTRY
-            .get_policy(pick_first::POLICY_NAME)
-            .expect("pick_first policy must be registered");
-        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-        let parsed_config = builder.parse_config(&default_json).ok().flatten();
-        (builder, parsed_config)
+        DEFAULT_PICK_FIRST.clone()
     }
 }
 

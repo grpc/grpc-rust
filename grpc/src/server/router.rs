@@ -241,10 +241,7 @@ mod test {
         };
 
         let router = RouterBuilder::new()
-            .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method"),
-                handler,
-            )
+            .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
         let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
@@ -298,14 +295,8 @@ mod test {
         };
 
         let router = RouterBuilder::new()
-            .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method"),
-                first_handler,
-            )
-            .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method"),
-                second_handler,
-            )
+            .add_method(MethodDescriptor::new("/pkg.Svc/Method"), first_handler)
+            .add_method(MethodDescriptor::new("/pkg.Svc/Method"), second_handler)
             .build();
 
         let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
@@ -478,10 +469,7 @@ mod test {
 
         let router = RouterBuilder::new()
             .chain_interceptor(interceptor)
-            .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method"),
-                handler,
-            )
+            .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
         let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
@@ -517,10 +505,7 @@ mod test {
         let router = RouterBuilder::new()
             .chain_interceptor(auth)
             .chain_interceptor(logging)
-            .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method"),
-                handler,
-            )
+            .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
         let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
@@ -646,10 +631,7 @@ mod test {
         let router = RouterBuilder::new()
             .chain_interceptor(first)
             .chain_interceptor(second)
-            .add_method(
-                MethodDescriptor::new("/pkg.Svc/Method"),
-                handler,
-            )
+            .add_method(MethodDescriptor::new("/pkg.Svc/Method"), handler)
             .build();
 
         let headers = RequestHeaders::new().with_method_name("/pkg.Svc/Method");
@@ -686,10 +668,7 @@ mod test {
 
         impl Service for SingleMethodService {
             fn descriptor(&self) -> ServiceDescriptor {
-                ServiceDescriptor::new(
-                    "test.Svc",
-                    vec![MethodDescriptor::new("/test.Svc/Method")],
-                )
+                ServiceDescriptor::new("test.Svc", vec![MethodDescriptor::new("/test.Svc/Method")])
             }
 
             fn register_methods(self) -> Vec<(String, Arc<dyn DynHandle>)> {

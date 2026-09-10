@@ -180,8 +180,7 @@ where
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
     ) -> impl std::future::Future<Output = Trailers> + Send {
-        self.second
-            .intercept(headers, options, tx, rx, self.next)
+        self.second.intercept(headers, options, tx, rx, self.next)
     }
 }
 

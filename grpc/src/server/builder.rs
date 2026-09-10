@@ -184,10 +184,7 @@ mod tests {
 
     impl Service for TestService {
         fn descriptor(&self) -> ServiceDescriptor {
-            ServiceDescriptor::new(
-                "test.Svc",
-                vec![MethodDescriptor::new("/test.Svc/Method")],
-            )
+            ServiceDescriptor::new("test.Svc", vec![MethodDescriptor::new("/test.Svc/Method")])
         }
 
         fn register_methods(self) -> Vec<(String, Arc<dyn DynHandle>)> {

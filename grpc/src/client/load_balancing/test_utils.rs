@@ -35,11 +35,11 @@ use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicy;
+use crate::client::load_balancing::LbConfigPayload;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
@@ -299,13 +299,9 @@ impl LbPolicyBuilder for StubPolicyBuilder {
         self.name
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<DynLbConfig>, String> {
-        let cfg: MockConfig = match config.convert_to() {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!("failed to parse JSON config: {}", e));
-            }
-        };
+    fn parse_config(&self, config: &LbConfigPayload<'_>) -> Result<Option<DynLbConfig>, String> {
+        let cfg: MockConfig = serde_json::from_str(config.as_str())
+            .map_err(|e| format!("failed to parse JSON config: {e}"))?;
         Ok(Some(Arc::new(cfg)))
     }
 }

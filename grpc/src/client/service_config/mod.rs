@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
-use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::LbConfigPayload;
 use crate::client::load_balancing::pick_first;
 
 pub type ParseResult = Result<ServiceConfig, String>;
@@ -65,8 +65,10 @@ impl ServiceConfig {
         if let Some(ref policy) = self.inner.load_balancing_policy
             && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(policy)
         {
-            let empty_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-            let parsed_config = builder.parse_config(&empty_json).ok().flatten();
+            let parsed_config = builder
+                .parse_config(&LbConfigPayload::empty())
+                .ok()
+                .flatten();
             return (builder, parsed_config);
         }
 
@@ -79,8 +81,10 @@ impl ServiceConfig {
         let builder = GLOBAL_LB_REGISTRY
             .get_policy(pick_first::POLICY_NAME)
             .expect("pick_first policy must be registered");
-        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-        let parsed_config = builder.parse_config(&default_json).ok().flatten();
+        let parsed_config = builder
+            .parse_config(&LbConfigPayload::empty())
+            .ok()
+            .flatten();
         (builder, parsed_config)
     }
 }

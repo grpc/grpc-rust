@@ -35,11 +35,11 @@ use crate::client::ConnectivityState;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
+use crate::client::load_balancing::LbConfigPayload;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
@@ -91,8 +91,12 @@ impl LbPolicyBuilder for PickFirstBuilder {
         POLICY_NAME
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<PickFirstConfig>, String> {
-        let config: PickFirstConfig = config.convert_to().map_err(|e| e.to_string())?;
+    fn parse_config(
+        &self,
+        config: &LbConfigPayload<'_>,
+    ) -> Result<Option<PickFirstConfig>, String> {
+        let config: PickFirstConfig = serde_json::from_str(config.as_str())
+            .map_err(|e| format!("Invalid pick_first config: {e}"))?;
         Ok(Some(config))
     }
 }

@@ -24,7 +24,6 @@
 
 use core::panic;
 use std::any::Any;
-use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -77,7 +76,7 @@ pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     /// default implementation returns Ok(None).
     fn parse_config(
         &self,
-        _config: &ParsedJsonLbConfig,
+        _config: &LbConfigPayload<'_>,
     ) -> Result<Option<<Self::LbPolicy as LbPolicy>::LbConfig>, String> {
         Ok(None)
     }
@@ -178,43 +177,37 @@ pub trait WorkScheduler: Send + Sync + Debug {
     fn schedule_work(&self, data: Option<WorkData>);
 }
 
-/// Abstract representation of the configuration for any LB policy, stored as
-/// JSON.  Hides internal storage details and includes a method to deserialize
-/// the JSON into a concrete policy struct.
-#[derive(Debug)]
-pub struct ParsedJsonLbConfig {
-    value: serde_json::Value,
+/// Borrowed JSON payload containing the configuration for an LB policy.
+///
+/// Hides internal serialization libraries and guarantees zero-allocation access.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct LbConfigPayload<'a>(&'a str);
+
+impl<'a> LbConfigPayload<'a> {
+    pub const EMPTY: Self = Self("{}");
+
+    #[inline]
+    pub const fn new(raw_json: &'a str) -> Self {
+        Self(raw_json)
+    }
+
+    #[inline]
+    pub const fn empty() -> Self {
+        Self::EMPTY
+    }
+
+    #[inline]
+    pub const fn as_str(&self) -> &'a str {
+        self.0
+    }
 }
 
-impl ParsedJsonLbConfig {
-    /// Creates a new ParsedJsonLbConfig from the provided JSON string.
-    pub fn new(json: &str) -> Result<Self, String> {
-        match serde_json::from_str(json) {
-            Ok(value) => Ok(ParsedJsonLbConfig { value }),
-            Err(e) => Err(format!("failed to parse LB config JSON: {e}")),
-        }
-    }
-
-    pub fn from_value(value: serde_json::Value) -> Self {
-        Self { value }
-    }
-
-    /// Converts the JSON configuration into a concrete type that represents the
-    /// configuration of an LB policy.
-    ///
-    /// This will typically be used by the LB policy builder to parse the
-    /// configuration into a type that can be used by the LB policy.
-    pub fn convert_to<T: serde::de::DeserializeOwned>(
-        &self,
-    ) -> Result<T, Box<dyn Error + Send + Sync>> {
-        let res: T = match serde_json::from_value(self.value.clone()) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(format!("{e}").into());
-            }
-        };
-        Ok(res)
-    }
+/// A successfully resolved load balancing policy builder and its parsed configuration.
+#[derive(Clone, Debug)]
+pub struct ParsedLbConfig {
+    pub builder: Arc<DynLbPolicyBuilder>,
+    pub config: Option<DynLbConfig>,
 }
 
 /// Controls channel behaviors.
@@ -474,7 +467,7 @@ impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
 
     fn parse_config(
         &self,
-        config: &ParsedJsonLbConfig,
+        config: &LbConfigPayload<'_>,
     ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
         (**self).parse_config(config)
     }

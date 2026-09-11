@@ -32,27 +32,24 @@ use crate::client::name_resolution::Endpoint;
 
 #[derive(Clone)]
 struct ArcSlice {
-    data: Arc<Vec<String>>,
+    data: Arc<[String]>,
     start: usize,
-    end: usize,
 }
 
 impl ArcSlice {
     fn new(vec: Vec<String>) -> Self {
         let len = vec.len();
         Self {
-            data: Arc::new(vec),
+            data: Arc::from(vec),
             start: 0,
-            end: len,
         }
     }
 
     fn pop_front(&self) -> Self {
-        assert!(self.end - self.start > 0);
+        assert!(self.data.len() - self.start > 0);
         Self {
             data: Arc::clone(&self.data),
             start: self.start + 1,
-            end: self.end,
         }
     }
 }
@@ -60,7 +57,7 @@ impl ArcSlice {
 impl Deref for ArcSlice {
     type Target = [String];
     fn deref(&self) -> &[String] {
-        &self.data[self.start..self.end]
+        &self.data[self.start..]
     }
 }
 
@@ -74,10 +71,7 @@ impl PartialEq for ArcSlice {
     fn eq(&self, other: &Self) -> bool {
         // Fast path: if they point to the exact same Arc allocation and have
         // identical bounds.
-        if Arc::ptr_eq(&self.data, &other.data)
-            && self.start == other.start
-            && self.end == other.end
-        {
+        if Arc::ptr_eq(&self.data, &other.data) && self.start == other.start {
             return true;
         }
 
@@ -103,38 +97,38 @@ impl HierarchicalPath {
     fn new_with_arc_slice(parts: ArcSlice) -> Self {
         Self { parts }
     }
-}
 
-/// Returns the hierarchical path of endpoint.
-fn from_endpoint(endpoint: &Endpoint) -> Option<&HierarchicalPath> {
-    endpoint.attributes.get::<HierarchicalPath>()
-}
+    /// Returns the hierarchical path of endpoint.
+    fn from_endpoint(endpoint: &Endpoint) -> Option<&Self> {
+        endpoint.attributes.get::<Self>()
+    }
 
-fn set_in_endpoint_path(mut endpoint: Endpoint, path: HierarchicalPath) -> Endpoint {
-    endpoint.attributes = endpoint.attributes.add(path);
-    endpoint
+    fn set_in_endpoint(self, mut endpoint: Endpoint) -> Endpoint {
+        endpoint.attributes = endpoint.attributes.add(self);
+        endpoint
+    }
 }
 
 /// Overrides the hierarchical path in endpoint with path.
-pub fn set_in_endpoint(endpoint: Endpoint, path: Vec<String>) -> Endpoint {
-    set_in_endpoint_path(endpoint, HierarchicalPath::new(path))
+pub fn set_path_in_endpoint(endpoint: Endpoint, path: Vec<String>) -> Endpoint {
+    HierarchicalPath::new(path).set_in_endpoint(endpoint)
 }
 
-/// Group splits a slice of endpoints into groups based on the first hierarchy
-/// path. The first hierarchy path will be removed from the result.
+/// Splits a slice of endpoints into groups based on the first hierarchy path.
+/// The first hierarchy path will be removed from the result.
 ///
 /// If hierarchical path is not set, or has no path in it, the endpoint is
 /// dropped.
-pub fn group(endpoints: Vec<Endpoint>) -> HashMap<String, Vec<Endpoint>> {
+pub fn group_by_path(endpoints: Vec<Endpoint>) -> HashMap<String, Vec<Endpoint>> {
     let mut ret = HashMap::new();
     for endpoint in endpoints {
-        if let Some(path) = from_endpoint(&endpoint) {
+        if let Some(path) = HierarchicalPath::from_endpoint(&endpoint) {
             if path.parts.is_empty() {
                 continue;
             }
             let cur_path = path.parts[0].clone();
             let new_path = HierarchicalPath::new_with_arc_slice(path.parts.pop_front());
-            let new_endpoint = set_in_endpoint_path(endpoint, new_path);
+            let new_endpoint = new_path.set_in_endpoint(endpoint);
             ret.entry(cur_path)
                 .or_insert_with(Vec::new)
                 .push(new_endpoint);
@@ -164,11 +158,12 @@ mod test {
     #[test]
     fn test_from_endpoint() {
         let ep_not_set = test_endpoint("a");
-        assert_eq!(from_endpoint(&ep_not_set), None);
+        assert_eq!(HierarchicalPath::from_endpoint(&ep_not_set), None);
 
-        let ep_set = set_in_endpoint(test_endpoint("a"), vec!["a".to_string(), "b".to_string()]);
+        let ep_set =
+            set_path_in_endpoint(test_endpoint("a"), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(
-            from_endpoint(&ep_set),
+            HierarchicalPath::from_endpoint(&ep_set),
             Some(&HierarchicalPath::new(vec![
                 "a".to_string(),
                 "b".to_string()
@@ -181,39 +176,42 @@ mod test {
         // before is not set
         let ep = test_endpoint("a");
         let path = vec!["a".to_string(), "b".to_string()];
-        let new_ep = set_in_endpoint(ep, path.clone());
+        let new_ep = set_path_in_endpoint(ep, path.clone());
         assert_eq!(
-            from_endpoint(&new_ep),
+            HierarchicalPath::from_endpoint(&new_ep),
             Some(&HierarchicalPath::new(path.clone()))
         );
 
         // before is set
-        let ep = set_in_endpoint(
+        let ep = set_path_in_endpoint(
             test_endpoint("a"),
             vec!["before".to_string(), "a".to_string(), "b".to_string()],
         );
         let path = vec!["a".to_string(), "b".to_string()];
-        let new_ep = set_in_endpoint(ep, path.clone());
-        assert_eq!(from_endpoint(&new_ep), Some(&HierarchicalPath::new(path)));
+        let new_ep = set_path_in_endpoint(ep, path.clone());
+        assert_eq!(
+            HierarchicalPath::from_endpoint(&new_ep),
+            Some(&HierarchicalPath::new(path))
+        );
     }
 
     #[test]
     fn test_group_with_hierarchy() {
         let eps = vec![
-            set_in_endpoint(
+            set_path_in_endpoint(
                 test_endpoint("a0"),
                 vec!["a".to_string(), "b".to_string(), "c".to_string()],
             ),
-            set_in_endpoint(test_endpoint("a1"), vec!["a".to_string(), "b".to_string()]),
-            set_in_endpoint(
+            set_path_in_endpoint(test_endpoint("a1"), vec!["a".to_string(), "b".to_string()]),
+            set_path_in_endpoint(
                 test_endpoint("b0"),
                 vec!["b".to_string(), "c".to_string(), "d".to_string()],
             ),
-            set_in_endpoint(test_endpoint("b1"), vec!["b".to_string(), "c".to_string()]),
+            set_path_in_endpoint(test_endpoint("b1"), vec!["b".to_string(), "c".to_string()]),
         ];
 
         // 1st group call: splits by first level ("a" and "b")
-        let mut g1 = group(eps);
+        let mut g1 = group_by_path(eps);
         assert_eq!(g1.len(), 2);
 
         let eps_a = g1.remove("a").unwrap();
@@ -222,22 +220,22 @@ mod test {
         assert_eq!(
             eps_a,
             vec![
-                set_in_endpoint(test_endpoint("a0"), vec!["b".to_string(), "c".to_string()],),
-                set_in_endpoint(test_endpoint("a1"), vec!["b".to_string()],),
+                set_path_in_endpoint(test_endpoint("a0"), vec!["b".to_string(), "c".to_string()],),
+                set_path_in_endpoint(test_endpoint("a1"), vec!["b".to_string()],),
             ]
         );
         assert_eq!(
             eps_b,
             vec![
-                set_in_endpoint(test_endpoint("b0"), vec!["c".to_string(), "d".to_string()],),
-                set_in_endpoint(test_endpoint("b1"), vec!["c".to_string()],),
+                set_path_in_endpoint(test_endpoint("b0"), vec!["c".to_string(), "d".to_string()],),
+                set_path_in_endpoint(test_endpoint("b1"), vec!["c".to_string()],),
             ]
         );
 
         // 2nd group call: splits by second level ("b" for group "a", "c" for
         // group "b")
-        let mut g2_a = group(eps_a);
-        let mut g2_b = group(eps_b);
+        let mut g2_a = group_by_path(eps_a);
+        let mut g2_b = group_by_path(eps_b);
         assert_eq!(g2_a.len(), 1);
         assert_eq!(g2_b.len(), 1);
 
@@ -247,35 +245,41 @@ mod test {
         assert_eq!(
             eps_ab,
             vec![
-                set_in_endpoint(test_endpoint("a0"), vec!["c".to_string()],),
-                set_in_endpoint(test_endpoint("a1"), vec![]),
+                set_path_in_endpoint(test_endpoint("a0"), vec!["c".to_string()],),
+                set_path_in_endpoint(test_endpoint("a1"), vec![]),
             ]
         );
         assert_eq!(
             eps_bc,
             vec![
-                set_in_endpoint(test_endpoint("b0"), vec!["d".to_string()],),
-                set_in_endpoint(test_endpoint("b1"), vec![]),
+                set_path_in_endpoint(test_endpoint("b0"), vec!["d".to_string()],),
+                set_path_in_endpoint(test_endpoint("b1"), vec![]),
             ]
         );
 
         // 3rd group call: 2-level endpoints (a1, b1) have empty hierarchy and
         // are dropped. 3-level endpoints (a0, b0) have their hierarchy become
         // empty after 3 calls.
-        let mut g3_a = group(eps_ab);
-        let mut g3_b = group(eps_bc);
+        let mut g3_a = group_by_path(eps_ab);
+        let mut g3_b = group_by_path(eps_bc);
         assert_eq!(g3_a.len(), 1);
         assert_eq!(g3_b.len(), 1);
 
         let eps_abc = g3_a.remove("c").unwrap();
         let eps_bcd = g3_b.remove("d").unwrap();
 
-        assert_eq!(eps_abc, vec![set_in_endpoint(test_endpoint("a0"), vec![],)]);
-        assert_eq!(eps_bcd, vec![set_in_endpoint(test_endpoint("b0"), vec![],)]);
+        assert_eq!(
+            eps_abc,
+            vec![set_path_in_endpoint(test_endpoint("a0"), vec![],)]
+        );
+        assert_eq!(
+            eps_bcd,
+            vec![set_path_in_endpoint(test_endpoint("b0"), vec![],)]
+        );
 
         // Calling group on endpoints that now have empty hierarchy returns an
         // empty map.
-        assert!(group(eps_abc).is_empty());
-        assert!(group(eps_bcd).is_empty());
+        assert!(group_by_path(eps_abc).is_empty());
+        assert!(group_by_path(eps_bcd).is_empty());
     }
 }

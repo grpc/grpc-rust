@@ -43,6 +43,7 @@ use crate::rt::GrpcRuntime;
 pub(crate) mod subchannel_sharing;
 
 pub mod child_manager;
+pub mod endpoint_filtering;
 pub mod graceful_switch;
 pub mod lazy;
 pub mod pick_first;

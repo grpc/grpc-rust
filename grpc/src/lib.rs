@@ -71,6 +71,8 @@ pub use status::StatusError;
 #[cfg(feature = "__unstable")]
 #[doc(hidden)]
 pub mod __unstable {
+    pub use crate::private::Internal;
+
     pub mod rt {
         pub use crate::rt::*;
     }
@@ -83,6 +85,17 @@ pub mod __unstable {
         }
         pub mod service_config {
             pub use crate::client::service_config::*;
+        }
+    }
+    pub mod credentials {
+        pub mod client {
+            pub use crate::credentials::client::*;
+        }
+        pub mod server {
+            pub use crate::credentials::server::*;
+        }
+        pub mod common {
+            pub use crate::credentials::common::*;
         }
     }
 }

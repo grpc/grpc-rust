@@ -32,7 +32,7 @@ use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicy;
 use crate::client::load_balancing::DynLbPolicyBuilder;
-use crate::client::load_balancing::LbConfigPayload;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
@@ -80,9 +80,27 @@ impl LbPolicyRegistry {
     /// Halts candidate evaluation immediately on the first supported policy
     /// if configuration parsing fails (gRFC A24).
     ///
+    /// # Return Value
+    ///
+    /// - `Ok(Some(ParsedLbConfig))` when a registered candidate passing the optional
+    ///   filter is selected and its configuration successfully parses.
+    /// - `Ok(None)` when the candidate list is empty (`[]`), `"null"`, or contains only
+    ///   whitespace. Top-level channel service configuration uses this to fall back
+    ///   to the legacy `loadBalancingPolicy` or default policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The candidate list is malformed JSON or contains invalid entries (e.g. violating
+    ///   the gRFC A24 single-property `oneOf` constraint).
+    /// - None of the candidate policies are registered or permitted by the filter.
+    /// - The first supported, permitted policy fails to parse its configuration. In
+    ///   accordance with gRFC A24, evaluation halts immediately and subsequent
+    ///   candidates are not evaluated.
+    ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```ignore (cannot be compiled as doctest because `load_balancing` is pub(crate))
     /// use grpc::client::load_balancing::GLOBAL_LB_REGISTRY;
     ///
     /// let candidates_json = r#"[
@@ -90,7 +108,7 @@ impl LbPolicyRegistry {
     ///     {"round_robin": {}}
     /// ]"#;
     ///
-    /// // A parent policy (e.g. grpclb) can filter candidates to only allow specific children.
+    /// // A parent policy (e.g. a composite LB policy) can filter candidates to only allow specific children.
     /// let selected = GLOBAL_LB_REGISTRY
     ///     .select_candidate_with_filter(
     ///         candidates_json,
@@ -136,7 +154,7 @@ impl LbPolicyRegistry {
             }
 
             if let Some(builder) = self.get_policy(candidate.policy_name) {
-                let payload = LbConfigPayload::new(candidate.raw_config);
+                let payload = LbConfigJson::new(candidate.raw_config);
                 let parsed_config = builder.parse_config(&payload).map_err(|e| {
                     format!(
                         "failed to parse config for policy '{}': {e}",
@@ -173,6 +191,10 @@ impl LbPolicyRegistry {
     }
 
     /// Evaluates an ordered candidate list against the registry without a filter.
+    ///
+    /// Returns `Ok(Some(ParsedLbConfig))` on successful selection, `Ok(None)` if the list
+    /// is empty or null, or `Err(String)` on syntax errors, unregistered policies, or
+    /// configuration parsing failures.
     pub fn select_candidate(
         &self,
         candidate_list_json: &str,
@@ -256,7 +278,7 @@ impl<T: LbPolicyBuilder> LbPolicyBuilder for DynAdapter<T> {
         self.0.name()
     }
 
-    fn parse_config(&self, config: &LbConfigPayload<'_>) -> Result<Option<DynLbConfig>, String> {
+    fn parse_config(&self, config: &LbConfigJson<'_>) -> Result<Option<DynLbConfig>, String> {
         // Call the real parse config and then wrap its result in a DynLbConfig if it is Ok(Some).
         let cfg = self.0.parse_config(config)?;
         Ok(cfg.map(|c| Arc::new(c) as DynLbConfig))

@@ -22,14 +22,11 @@
  *
  */
 
-use std::sync::Arc;
-
 use serde::Deserialize;
 
 use super::duration::GrpcDuration;
-use crate::client::load_balancing::DynLbConfig;
-use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+use crate::client::load_balancing::ParsedLbConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,17 +83,11 @@ fn default_max_connections_per_subchannel() -> SerdeU32 {
     SerdeU32(10)
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct LbInnerConfig {
-    pub(crate) builder: Arc<DynLbPolicyBuilder>,
-    pub(crate) config: Option<DynLbConfig>,
-}
-
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LbConfigSerde(Option<LbInnerConfig>);
+pub(crate) struct LbConfigSerde(Option<ParsedLbConfig>);
 
 impl LbConfigSerde {
-    pub(crate) fn as_ref(&self) -> Option<&LbInnerConfig> {
+    pub(crate) fn as_ref(&self) -> Option<&ParsedLbConfig> {
         self.0.as_ref()
     }
 
@@ -135,10 +126,7 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
         };
 
         match GLOBAL_LB_REGISTRY.select_candidate(raw_str.as_ref()) {
-            Ok(Some(parsed)) => Ok(LbConfigSerde(Some(LbInnerConfig {
-                builder: parsed.builder,
-                config: parsed.config,
-            }))),
+            Ok(Some(parsed)) => Ok(LbConfigSerde(Some(parsed))),
             Ok(None) => Ok(LbConfigSerde(None)),
             Err(e) => Err(serde::de::Error::custom(e)),
         }

@@ -76,7 +76,7 @@ pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     /// default implementation returns Ok(None).
     fn parse_config(
         &self,
-        _config: &LbConfigPayload<'_>,
+        _config: &LbConfigJson<'_>,
     ) -> Result<Option<<Self::LbPolicy as LbPolicy>::LbConfig>, String> {
         Ok(None)
     }
@@ -181,10 +181,9 @@ pub trait WorkScheduler: Send + Sync + Debug {
 ///
 /// Hides internal serialization libraries and guarantees zero-allocation access.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct LbConfigPayload<'a>(&'a str);
+pub struct LbConfigJson<'a>(&'a str);
 
-impl<'a> LbConfigPayload<'a> {
+impl<'a> LbConfigJson<'a> {
     pub const EMPTY: Self = Self("{}");
 
     #[inline]
@@ -467,7 +466,7 @@ impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
 
     fn parse_config(
         &self,
-        config: &LbConfigPayload<'_>,
+        config: &LbConfigJson<'_>,
     ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
         (**self).parse_config(config)
     }

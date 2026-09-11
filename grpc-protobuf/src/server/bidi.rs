@@ -27,16 +27,10 @@ use grpc::server::CallOptions;
 use grpc::server::DynHandle;
 use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
-use grpc::server::Handle;
-use grpc::server::RecvStream;
 use grpc::server::RequestHeaders;
-use grpc::server::SendStream;
 use grpc::server::Trailers;
-use grpc::server::interceptor::Intercept;
-use grpc::server::stream_util::RequestValidator;
 use protobuf::Message;
 
-use crate::SendFuture;
 use crate::ServerStatus;
 use crate::server::GrpcStreamingRequest;
 use crate::server::GrpcStreamingResponse;
@@ -68,15 +62,13 @@ pub trait BidiStreamingMethod: Sync + 'static {
 /// An adapter that wraps a [`BidiStreamingMethod`] to handle incoming
 /// bidirectional-streaming RPCs.
 pub struct BidiStreamingAdapter<M> {
-    handle: InnerHandler<M>,
+    method: M,
 }
 
 impl<M> BidiStreamingAdapter<M> {
     /// Creates a new [`BidiStreamingAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
-        Self {
-            handle: InnerHandler { method },
-        }
+        Self { method }
     }
 }
 
@@ -87,41 +79,16 @@ where
 {
     async fn dyn_handle(
         &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-        mut tx: &mut dyn DynSendStream,
-        rx: Box<dyn DynRecvStream + 'static>,
-    ) -> Trailers {
-        RequestValidator::new(false)
-            .intercept(headers, options, &mut tx, rx, &self.handle)
-            .make_send()
-            .await
-    }
-}
-
-struct InnerHandler<M> {
-    method: M,
-}
-
-impl<M> Handle for InnerHandler<M>
-where
-    M: BidiStreamingMethod,
-{
-    async fn handle(
-        &self,
         _headers: RequestHeaders,
         _options: CallOptions,
-        tx: &mut impl SendStream,
-        rx: impl RecvStream + 'static,
+        tx: &mut dyn DynSendStream,
+        rx: Box<dyn DynRecvStream>,
     ) -> Trailers {
         // The request stream owns `rx`; the response sink borrows `tx`. They
         // are independent, so a handler can freely interleave receives and
         // sends.
-        // TODO: See if we can avoid the Box here. Because GrpcStreamingRequest
-        // requires an owned, type-erased stream, wrapping the incoming stream
-        // with an interceptor forces a second Box allocation.
-        let requests = GrpcStreamingRequest::new(Box::new(rx));
-        let responses = GrpcStreamingResponse::new(&mut *tx);
+        let requests = GrpcStreamingRequest::new(rx);
+        let responses = GrpcStreamingResponse::new(tx);
         let status = self.method.call(requests, responses).await;
         trailers_from_status(status)
     }
@@ -137,8 +104,10 @@ mod tests {
     use grpc::core::ConnectionInfo;
     use grpc::core::RecvMessage;
     use grpc::credentials::SecurityInfo;
+    use grpc::server::RecvStream;
     use grpc::server::ResponseStreamItem;
     use grpc::server::SendOptions;
+    use grpc::server::SendStream;
     use protobuf_well_known_types::Any;
 
     use super::*;

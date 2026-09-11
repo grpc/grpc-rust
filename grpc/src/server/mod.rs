@@ -58,10 +58,9 @@ use crate::send_future::SendFuture;
 
 pub mod builder;
 pub mod descriptor;
-pub mod interceptor;
+pub(crate) mod interceptor;
 pub(crate) mod router;
 pub mod service;
-pub mod stream_util;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///

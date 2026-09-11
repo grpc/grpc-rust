@@ -27,13 +27,8 @@ use grpc::server::CallOptions;
 use grpc::server::DynHandle;
 use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
-use grpc::server::Handle;
-use grpc::server::RecvStream;
 use grpc::server::RequestHeaders;
-use grpc::server::SendStream;
 use grpc::server::Trailers;
-use grpc::server::interceptor::Intercept;
-use grpc::server::stream_util::RequestValidator;
 use protobuf::AsView;
 use protobuf::Message;
 use protobuf::Proxied;
@@ -72,15 +67,13 @@ pub trait ServerStreamingMethod: Sync + 'static {
 /// An adapter that wraps a [`ServerStreamingMethod`] to handle incoming
 /// server-streaming RPCs.
 pub struct ServerStreamingAdapter<M> {
-    handle: InnerHandler<M>,
+    method: M,
 }
 
 impl<M> ServerStreamingAdapter<M> {
     /// Creates a new [`ServerStreamingAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
-        Self {
-            handle: InnerHandler { method },
-        }
+        Self { method }
     }
 }
 
@@ -91,53 +84,34 @@ where
 {
     async fn dyn_handle(
         &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-        mut tx: &mut dyn DynSendStream,
-        rx: Box<dyn DynRecvStream + 'static>,
-    ) -> Trailers {
-        RequestValidator::new(true)
-            .intercept(headers, options, &mut tx, rx, &self.handle)
-            .make_send()
-            .await
-    }
-}
-
-struct InnerHandler<M> {
-    method: M,
-}
-
-impl<M> Handle for InnerHandler<M>
-where
-    M: ServerStreamingMethod,
-{
-    async fn handle(
-        &self,
         _headers: RequestHeaders,
         _options: CallOptions,
-        tx: &mut impl SendStream,
-        mut rx: impl RecvStream + 'static,
+        tx: &mut dyn DynSendStream,
+        mut rx: Box<dyn DynRecvStream>,
     ) -> Trailers {
         let mut req = <M::Request as Default>::default();
 
-        if rx
-            .next(&mut ProtoRecvMessage::from_mut(&mut req))
-            .await
-            .expect("ResponseValidator allowed zero messages for unary stream")
-            .is_err()
-        {
-            return trailers_from_status(Err(ServerStatusError::new(
-                StatusCodeError::Internal,
-                "stream failure",
-            )));
+        match rx.dyn_next(&mut ProtoRecvMessage::from_mut(&mut req)).await {
+            None => {
+                return trailers_from_status(Err(ServerStatusError::new(
+                    StatusCodeError::Internal,
+                    "unary stream received zero messages",
+                )));
+            }
+            Some(Err(_)) => {
+                return trailers_from_status(Err(ServerStatusError::new(
+                    StatusCodeError::Internal,
+                    "stream failure",
+                )));
+            }
+            Some(Ok(_)) => {}
         }
 
-        let responses = GrpcStreamingResponse::new(&mut *tx);
+        let responses = GrpcStreamingResponse::new(tx);
         let status = self.method.call(req.as_view(), responses).make_send().await;
         trailers_from_status(status)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -148,8 +122,10 @@ mod tests {
     use grpc::core::ConnectionInfo;
     use grpc::core::RecvMessage;
     use grpc::credentials::SecurityInfo;
+    use grpc::server::RecvStream;
     use grpc::server::ResponseStreamItem;
     use grpc::server::SendOptions;
+    use grpc::server::SendStream;
     use protobuf_well_known_types::Any;
 
     use super::*;

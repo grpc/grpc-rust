@@ -107,6 +107,22 @@ where
             Some(Ok(_)) => {}
         }
 
+        match rx.dyn_next(&mut ProtoRecvMessage::from_mut(&mut req)).await {
+            None => {}
+            Some(Err(_)) => {
+                return trailers_from_status(Err(ServerStatusError::new(
+                    StatusCodeError::Internal,
+                    "stream failure",
+                )));
+            }
+            Some(Ok(_)) => {
+                return trailers_from_status(Err(ServerStatusError::new(
+                    StatusCodeError::Internal,
+                    "unary stream received multiple messages",
+                )));
+            }
+        }
+
         let responses = GrpcStreamingResponse::new(tx);
         let status = self.method.call(req.as_view(), responses).make_send().await;
         trailers_from_status(status)
@@ -114,6 +130,7 @@ where
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -160,17 +177,28 @@ mod tests {
         }
     }
 
-    struct EmptyRecvStream;
+    struct MockRecvStream {
+        items: VecDeque<Option<Result<(), ()>>>,
+    }
 
-    impl RecvStream for EmptyRecvStream {
-        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
-            None
+    impl MockRecvStream {
+        fn new(items: impl IntoIterator<Item = Option<Result<(), ()>>>) -> Self {
+            Self {
+                items: items.into_iter().collect(),
+            }
         }
     }
 
-    #[tokio::test]
-    async fn test_server_streaming_zero_messages_returns_error() {
-        let called = Arc::new(AtomicBool::new(false));
+    impl RecvStream for MockRecvStream {
+        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+            self.items.pop_front().unwrap_or(None)
+        }
+    }
+
+    async fn run_test(
+        called: &Arc<AtomicBool>,
+        items: impl IntoIterator<Item = Option<Result<(), ()>>>,
+    ) -> Trailers {
         let adapter = ServerStreamingAdapter::new(TestServerStreamingMethod {
             called: called.clone(),
         });
@@ -183,11 +211,17 @@ mod tests {
         let headers = RequestHeaders::new("/test.TestService/TestMethod", connection_info);
 
         let mut tx = MockSendStream;
-        let rx: Box<dyn DynRecvStream> = Box::new(EmptyRecvStream);
+        let rx: Box<dyn DynRecvStream> = Box::new(MockRecvStream::new(items));
 
-        let trailers = adapter
+        adapter
             .dyn_handle(headers, CallOptions::default(), &mut tx, rx)
-            .await;
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_server_streaming_zero_messages_returns_error() {
+        let called = Arc::new(AtomicBool::new(false));
+        let trailers = run_test(&called, []).await;
 
         let status = trailers
             .status()
@@ -198,6 +232,69 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "method should not be called when request stream sends 0 messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_streaming_multiple_messages_returns_error() {
+        let called = Arc::new(AtomicBool::new(false));
+        let trailers = run_test(&called, [Some(Ok(())), Some(Ok(()))]).await;
+
+        let status = trailers
+            .status()
+            .as_ref()
+            .expect_err("expected error status in trailers when client sends multiple messages");
+        assert_eq!(status.code(), grpc::StatusCodeError::Internal);
+        assert_eq!(status.message(), "unary stream received multiple messages");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "method should not be called when request stream sends multiple messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_streaming_stream_failure_on_first_message_returns_error() {
+        let called = Arc::new(AtomicBool::new(false));
+        let trailers = run_test(&called, [Some(Err(()))]).await;
+
+        let status = trailers
+            .status()
+            .as_ref()
+            .expect_err("expected error status in trailers when stream fails on first message");
+        assert_eq!(status.code(), grpc::StatusCodeError::Internal);
+        assert_eq!(status.message(), "stream failure");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "method should not be called when request stream fails on first message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_streaming_stream_failure_on_second_message_returns_error() {
+        let called = Arc::new(AtomicBool::new(false));
+        let trailers = run_test(&called, [Some(Ok(())), Some(Err(()))]).await;
+
+        let status = trailers
+            .status()
+            .as_ref()
+            .expect_err("expected error status in trailers when stream fails after one message");
+        assert_eq!(status.code(), grpc::StatusCodeError::Internal);
+        assert_eq!(status.message(), "stream failure");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "method should not be called when request stream fails after one message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_streaming_single_message_success() {
+        let called = Arc::new(AtomicBool::new(false));
+        let trailers = run_test(&called, [Some(Ok(())), None]).await;
+
+        assert!(trailers.status().is_ok());
+        assert!(
+            called.load(Ordering::SeqCst),
+            "method should be called when request stream has exactly one message"
         );
     }
 }

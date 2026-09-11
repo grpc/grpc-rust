@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::async_trait;
 use rustls::crypto::CryptoProvider;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::ServerName;
@@ -34,7 +35,6 @@ use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::sync::watch::Receiver;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::TlsStream as RustlsStream;
-use tonic::async_trait;
 
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;

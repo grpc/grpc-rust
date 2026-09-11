@@ -49,13 +49,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::watch;
-use tonic::async_trait;
 
+use crate::async_trait;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
+use crate::send_future::SendFuture;
 
 pub mod builder;
 pub mod descriptor;
@@ -324,30 +325,11 @@ impl<T: Handle> DynHandle for T {
         mut tx: &mut dyn DynSendStream,
         rx: BoxedRecvStream,
     ) -> Trailers {
-        self.handle(headers, options, &mut tx, rx).await
+        self.handle(headers, options, &mut tx, rx).make_send().await
     }
 }
 
-// TODO: delete this type which is only needed pre-rust v1.92 due to a bug
-// handling lifetimes:
-//
-// error: implementation of `server::RecvStream` is not general enough
-//    --> grpc/src/server/mod.rs:108:5
-//     |
-// 108 |     async fn dyn_handle(
-//     |     ^^^^^ implementation of `server::RecvStream` is not general enough
-//     |
-//     = note: `Box<(dyn server::DynRecvStream + '0)>` must implement `server::RecvStream`, for any lifetime `'0`...
-//     = note: ...but `server::RecvStream` is actually implemented for the type `Box<(dyn server::DynRecvStream + 'static)>`
-#[doc(hidden)]
-pub struct BoxedRecvStream(pub Box<dyn DynRecvStream + 'static>);
-
-// Implement RecvStream for the wrapper instead of the Box directly
-impl RecvStream for BoxedRecvStream {
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
-        self.0.dyn_next(msg).await
-    }
-}
+pub(crate) type BoxedRecvStream = Box<dyn DynRecvStream>;
 
 /// An item in a response stream from the server's view.
 ///
@@ -372,9 +354,7 @@ impl Handle for DynHandleWrapper {
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
     ) -> Trailers {
-        self.0
-            .dyn_handle(headers, options, tx, BoxedRecvStream(Box::new(rx)))
-            .await
+        self.0.dyn_handle(headers, options, tx, Box::new(rx)).await
     }
 }
 /// Represents the sending side of a server stream.  See `ResponseStream`
@@ -459,6 +439,9 @@ pub trait RecvStream {
     /// `None` and `Some(Err(()))` are terminal states.
     /// Calling this method again after reaching a terminal state is unspecified
     /// and should be avoided.
+    ///
+    /// The provided `msg` must not be modified if the stream has ended, i.e. `None`
+    /// is returned.
     ///
     /// # Cancel safety
     ///
@@ -977,7 +960,7 @@ mod tests {
         ) -> Self::Connection {
             let inner = Box::pin(async move {
                 let mut tx = NopSendStream;
-                let rx = BoxedRecvStream(Box::new(NopRecvStream));
+                let rx = Box::new(NopRecvStream);
                 let _ = handler
                     .dyn_handle(
                         RequestHeaders::new("/test.Draining/Method", test_connection_info()),

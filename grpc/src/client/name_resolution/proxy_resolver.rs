@@ -282,7 +282,7 @@ mod tests {
         lookup_result: Result<Vec<IpAddr>, String>,
     }
 
-    #[tonic::async_trait]
+    #[crate::async_trait]
     impl rt::DnsResolver for FakeDns {
         async fn lookup_host_name(&self, _: &str) -> Result<Vec<IpAddr>, String> {
             self.lookup_result.clone()

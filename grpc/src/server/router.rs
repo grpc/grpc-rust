@@ -30,7 +30,6 @@ use crate::StatusError;
 use crate::server::BoxedRecvStream;
 use crate::server::CallOptions;
 use crate::server::DynHandle;
-use crate::server::DynRecvStream;
 use crate::server::DynSendStream;
 use crate::server::Handle;
 use crate::server::RecvStream;
@@ -174,7 +173,7 @@ impl Handle for DynHandleRef<'_> {
         // `impl RecvStream` → `BoxedRecvStream`, matching the blanket
         // `DynHandle for T: Handle` pattern.
         let mut dyn_tx: &mut dyn DynSendStream = tx;
-        let boxed_rx = BoxedRecvStream(Box::new(rx) as Box<dyn DynRecvStream + 'static>);
+        let boxed_rx: BoxedRecvStream = Box::new(rx);
         self.0
             .dyn_handle(headers, options, &mut dyn_tx, boxed_rx)
             .await

@@ -27,7 +27,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use tonic::async_trait;
+use crate::async_trait;
 
 use crate::StatusError;
 use crate::attributes::Attributes;

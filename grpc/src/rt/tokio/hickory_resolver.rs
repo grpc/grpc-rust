@@ -43,7 +43,7 @@ pub(super) struct DnsResolver {
     resolver: hickory_resolver::TokioResolver,
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl rt::DnsResolver for DnsResolver {
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
         let response = self

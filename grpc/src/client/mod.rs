@@ -51,7 +51,7 @@
 use std::fmt::Display;
 use std::time::Instant;
 
-use tonic::async_trait;
+use crate::async_trait;
 
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;

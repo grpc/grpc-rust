@@ -228,7 +228,7 @@ struct FakeDns {
     lookup_result: Result<Vec<std::net::IpAddr>, String>,
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl rt::DnsResolver for FakeDns {
     async fn lookup_host_name(&self, _: &str) -> Result<Vec<std::net::IpAddr>, String> {
         tokio::time::sleep(self.latency).await;

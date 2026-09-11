@@ -44,10 +44,10 @@ pub(crate) mod server;
 
 use std::sync::Arc;
 
+use crate::async_trait;
 pub use client::CompositeChannelCredentials;
 pub use local::LocalChannelCredentials;
 pub use local::LocalServerCredentials;
-use tonic::async_trait;
 
 use crate::attributes::Attributes;
 use crate::credentials::call::CallCredentials;

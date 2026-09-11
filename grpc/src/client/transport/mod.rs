@@ -44,7 +44,7 @@ mod registry;
 #[cfg(feature = "_runtime-tokio")]
 pub(crate) mod tonic;
 
-use ::tonic::async_trait;
+use crate::async_trait;
 pub(crate) use registry::GLOBAL_TRANSPORT_REGISTRY;
 pub(crate) use registry::TransportRegistry;
 use tokio::sync::oneshot;

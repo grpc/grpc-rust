@@ -22,7 +22,6 @@
  *
  */
 
-mod server_status;
 mod status_code;
 
 pub use status_code::StatusCodeError;

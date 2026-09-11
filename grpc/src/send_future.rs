@@ -64,6 +64,7 @@ use core::future::Future;
 /// [#96865]: https://github.com/rust-lang/rust/issues/96865
 /// [`Future`]: core::future::Future
 /// [`Send`]: core::marker::Send
+// TODO: delete this type once MSRV is v1.92.
 pub trait SendFuture: Future {
     /// Consumes the future and returns it as an opaque type that is guaranteed
     /// to be [`Send`].

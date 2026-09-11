@@ -52,7 +52,7 @@ struct TokioDefaultDnsResolver {
     _priv: (),
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl DnsResolver for TokioDefaultDnsResolver {
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
         let name_with_port = match name.parse::<IpAddr>() {
@@ -230,7 +230,7 @@ struct TokioTcpListener {
     listener: tokio::net::TcpListener,
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl super::EndpointListener for TokioTcpListener {
     async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
         let (stream, _addr) = self.listener.accept().await.map_err(|e| e.to_string())?;
@@ -254,7 +254,7 @@ struct TokioUnixListener {
 }
 
 #[cfg(unix)]
-#[tonic::async_trait]
+#[crate::async_trait]
 impl super::EndpointListener for TokioUnixListener {
     async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
         use crate::client::name_resolution::UNIX_NETWORK_TYPE;

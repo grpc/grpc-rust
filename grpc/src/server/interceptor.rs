@@ -89,9 +89,6 @@ pub trait HandleExt: Handle + Sized {
 impl<T: Handle + Sized> HandleExt for T {}
 
 /// A no-op interceptor that simply delegates to the next handler.
-///
-/// This is the default interceptor used by `RouterBuilder` when no interceptor
-/// has been added.
 #[derive(Clone, Copy)]
 pub struct Identity;
 

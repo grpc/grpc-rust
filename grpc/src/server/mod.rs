@@ -48,6 +48,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::sync::watch;
+
 use crate::async_trait;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
@@ -61,6 +63,9 @@ pub mod descriptor;
 pub(crate) mod interceptor;
 pub(crate) mod router;
 pub mod service;
+
+use builder::ServerBuilder;
+use interceptor::Identity;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -152,12 +157,12 @@ pub trait Transport: Send + 'static {
 /// Each connection is watched via `watch()`. When `shutdown()` is called,
 /// all watched connections receive a `graceful_shutdown()` signal.
 struct GracefulCoordinator {
-    tx: tokio::sync::watch::Sender<()>,
+    tx: watch::Sender<()>,
 }
 
 impl GracefulCoordinator {
     fn new() -> Self {
-        let (tx, _) = tokio::sync::watch::channel(());
+        let (tx, _) = watch::channel(());
         Self { tx }
     }
 
@@ -191,9 +196,9 @@ impl GracefulCoordinator {
 }
 
 impl Server {
-    /// Creates a [`ServerBuilder`](builder::ServerBuilder) with no interceptors.
-    pub fn builder() -> builder::ServerBuilder<interceptor::Identity> {
-        builder::ServerBuilder::new()
+    /// Creates a new [`ServerBuilder`] with an [`Identity`] (no-op) interceptor.
+    pub fn builder() -> ServerBuilder<Identity> {
+        ServerBuilder::new()
     }
 
     /// Creates a new server with the given handler and runtime.

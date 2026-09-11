@@ -15,9 +15,9 @@ rust-version = { workspace = true }
 edition = "2024"
 
 [lints.clippy]
-elidable_lifetime_names = "warn"
-semicolon_if_nothing_returned = "warn"
-unnecessary_semicolon = "warn"
+elidable_lifetime_names = "deny"
+semicolon_if_nothing_returned = "deny"
+unnecessary_semicolon = "deny"
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [

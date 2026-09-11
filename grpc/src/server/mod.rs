@@ -196,7 +196,7 @@ impl GracefulCoordinator {
 }
 
 impl Server {
-    /// Creates a new [`ServerBuilder`] with an [`Identity`] (no-op) interceptor.
+    /// Creates a new [`ServerBuilder`] with a no-op interceptor.
     pub fn builder() -> ServerBuilder<Identity> {
         ServerBuilder::new()
     }

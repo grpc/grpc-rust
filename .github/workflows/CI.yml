@@ -46,6 +46,9 @@ jobs:
         uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~3.28.0"
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows' && steps.cache-plugin.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
       # Building the protoc plugin from scratch takes 6–14 minutes, depending on
       # the OS. This delays the execution of workflows that use the plugin in
       # build.rs files. We try to avoid rebuilding the plugin if it hasn't

@@ -62,6 +62,7 @@ use tower::discover::{Change, Discover};
 
 use arc_swap::ArcSwap;
 
+use crate::client::circuit_breaking::is_local_pre_endpoint_response;
 use crate::client::endpoint::{Connector, EndpointAddress};
 use crate::client::loadbalance::channel_state::{
     EjectionConfig, IdleChannel, ReadyChannel, UnejectedChannel,
@@ -71,6 +72,36 @@ use crate::client::loadbalance::keyed_futures::KeyedFutures;
 use crate::client::loadbalance::outlier_detection::{OutlierDetector, OutlierStatsRegistry};
 use crate::client::loadbalance::pickers::ChannelPicker;
 use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
+
+/// Lets the generic load balancer identify responses produced locally before
+/// the selected endpoint was called, so they do not affect that endpoint's
+/// outlier statistics.
+trait LbResponseOutcome {
+    /// Returns whether this response was produced before reaching the endpoint.
+    ///
+    /// The default treats responses as endpoint outcomes; response types that
+    /// carry a local-response marker can override this classification.
+    fn is_local_pre_endpoint_response(&self) -> bool {
+        false
+    }
+}
+
+impl<B> LbResponseOutcome for http::Response<B> {
+    fn is_local_pre_endpoint_response(&self) -> bool {
+        is_local_pre_endpoint_response(self)
+    }
+}
+
+/// Maps a completed call to an outlier-detection sample: `Some(true)` records
+/// endpoint success, `Some(false)` records endpoint failure, and `None`
+/// excludes a locally produced response from the endpoint's statistics.
+fn outlier_outcome<Resp: LbResponseOutcome, Error>(result: &Result<Resp, Error>) -> Option<bool> {
+    match result {
+        Ok(response) if response.is_local_pre_endpoint_response() => None,
+        Ok(_) => Some(true),
+        Err(_) => Some(false),
+    }
+}
 
 /// Future returned by [`LoadBalancer::call`]. Either resolves
 /// immediately with an [`LbError`] or drives the selected channel.
@@ -340,7 +371,7 @@ where
     D::Error: Into<tower::BoxError>,
     C: Connector + Send + Sync + 'static,
     C::Service: Service<Req> + Clone + Send + 'static,
-    <C::Service as Service<Req>>::Response: Send + 'static,
+    <C::Service as Service<Req>>::Response: LbResponseOutcome + Send + 'static,
     <C::Service as Service<Req>>::Error: Into<tower::BoxError>,
     <C::Service as Service<Req>>::Future: Send + 'static,
     Req: Send + 'static,
@@ -393,7 +424,9 @@ where
                 .await
                 .map_err(|e| LbError::LbChannelPollReadyError(e.into()))?;
             let result = svc.call(req).await;
-            svc.record_outcome(result.is_ok());
+            if let Some(success) = outlier_outcome(&result) {
+                svc.record_outcome(success);
+            }
             result.map_err(|e| LbError::LbChannelCallError(e.into()))
         }))
     }
@@ -402,6 +435,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::circuit_breaking::LocalPreEndpointResponse;
     use crate::client::endpoint::Connector;
     use crate::client::loadbalance::pickers::p2c::P2cPicker;
     use crate::common::async_util::BoxFuture;
@@ -466,6 +500,8 @@ mod tests {
             self.load.load(Ordering::Relaxed)
         }
     }
+
+    impl LbResponseOutcome for &'static str {}
 
     // -- Mock connector --
 
@@ -609,6 +645,22 @@ mod tests {
 
     fn remove(port: u16) -> DiscoverItem {
         Ok(Change::Remove(addr(port)))
+    }
+
+    #[test]
+    fn circuit_breaker_drops_are_not_endpoint_outlier_outcomes() {
+        let normal: Result<http::Response<()>, tower::BoxError> = Ok(http::Response::new(()));
+        assert_eq!(outlier_outcome(&normal), Some(true));
+
+        let mut dropped_response = http::Response::new(());
+        dropped_response
+            .extensions_mut()
+            .insert(LocalPreEndpointResponse);
+        let dropped: Result<http::Response<()>, tower::BoxError> = Ok(dropped_response);
+        assert_eq!(outlier_outcome(&dropped), None);
+
+        let error: Result<http::Response<()>, tower::BoxError> = Err("endpoint error".into());
+        assert_eq!(outlier_outcome(&error), Some(false));
     }
 
     /// A burst of inserts drained in one poll rebuilds the ring exactly once,

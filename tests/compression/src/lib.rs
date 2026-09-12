@@ -22,6 +22,8 @@ mod bidirectional_stream;
 mod client_stream;
 mod compressing_request;
 mod compressing_response;
+#[cfg(test)]
+mod encode_body;
 mod server_stream;
 mod util;
 

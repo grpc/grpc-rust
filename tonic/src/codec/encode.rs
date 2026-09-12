@@ -245,7 +245,12 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         )
     }
 
-    pub(crate) fn new_client_with_config(
+    /// Creates a client body with explicit compression settings, such as a gzip level.
+    ///
+    /// Like [`Self::new_client`], this encodes messages and adds gRPC framing.
+    /// The caller must set the request's `grpc-encoding` header to match the
+    /// selected encoding and ensure that the server supports it.
+    pub fn new_client_with_config(
         encoder: T,
         source: U,
         compression_encoding: Option<CompressionConfig>,
@@ -285,7 +290,12 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         )
     }
 
-    pub(crate) fn new_server_with_config(
+    /// Creates a server body with explicit compression settings, such as a gzip level.
+    ///
+    /// Like [`Self::new_server`], this encodes messages, adds gRPC framing and
+    /// emits status trailers. The caller must set the response's `grpc-encoding`
+    /// header to match the selected encoding and negotiate it with the client.
+    pub fn new_server_with_config(
         encoder: T,
         source: U,
         compression_encoding: Option<CompressionConfig>,

@@ -105,6 +105,15 @@ pub(crate) fn generate_internal<T: Service>(
                     self
                 }
 
+                /// Compress requests with the given encoding and settings.
+                ///
+                /// This requires the server to support the configured encoding.
+                #[must_use]
+                pub fn send_compressed_with_config(mut self, config: tonic::codec::CompressionConfig) -> Self {
+                    self.inner = self.inner.send_compressed_with_config(config);
+                    self
+                }
+
                 /// Enable decompressing responses.
                 #[must_use]
                 pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {

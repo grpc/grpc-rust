@@ -16,10 +16,9 @@ pub(crate) const ACCEPT_ENCODING_HEADER: &str = "grpc-accept-encoding";
 /// Represents an ordered list of compression encodings that are enabled.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EnabledCompressionEncodings {
-    // One slot per unique wire name returned by CompressionEncoding::as_str(),
-    // not per enum variant. Increase this when adding a new codec; otherwise
+    // One slot per encoding. Increase this when adding a new codec; otherwise
     // enable() silently ignores it when the array is full.
-    inner: [Option<CompressionEncoding>; 3],
+    inner: [Option<CompressionConfig>; 3],
 }
 
 impl EnabledCompressionEncodings {
@@ -27,15 +26,24 @@ impl EnabledCompressionEncodings {
     ///
     /// Adds the new encoding to the end of the encoding list, or updates the
     /// settings of an already enabled encoding without changing its position.
+    // CompressionEncoding is uninhabited when no compression features are enabled.
+    #[allow(unreachable_code)]
     pub fn enable(&mut self, encoding: CompressionEncoding) {
+        self.enable_with_config(encoding.into());
+    }
+
+    /// Enable an encoding with compression settings.
+    ///
+    /// Replaces settings for an enabled encoding without changing its position.
+    pub fn enable_with_config(&mut self, config: CompressionConfig) {
         for e in self.inner.iter_mut() {
             match e {
-                Some(e) if e.as_str() == encoding.as_str() => {
-                    *e = encoding;
+                Some(e) if e.encoding == config.encoding => {
+                    *e = config;
                     return;
                 }
                 None => {
-                    *e = Some(encoding);
+                    *e = Some(config);
                     return;
                 }
                 _ => continue,
@@ -50,12 +58,13 @@ impl EnabledCompressionEncodings {
             .rev()
             .find(|entry| entry.is_some())?
             .take()
+            .map(CompressionConfig::encoding)
     }
 
     pub(crate) fn into_accept_encoding_header_value(self) -> Option<http::HeaderValue> {
         let mut value = BytesMut::new();
         for encoding in self.inner.into_iter().flatten() {
-            value.put_slice(encoding.as_str().as_bytes());
+            value.put_slice(encoding.encoding.as_str().as_bytes());
             value.put_u8(b',');
         }
 
@@ -74,12 +83,12 @@ impl EnabledCompressionEncodings {
         self.get(encoding.as_str()).is_some()
     }
 
-    pub(crate) fn get(&self, name: &str) -> Option<CompressionEncoding> {
+    pub(crate) fn get(&self, name: &str) -> Option<CompressionConfig> {
         self.inner
             .iter()
             .flatten()
             .copied()
-            .find(|encoding| encoding.as_str() == name)
+            .find(|config| config.encoding.as_str() == name)
     }
 
     /// Check if any [`CompressionEncoding`]s are enabled.
@@ -90,7 +99,7 @@ impl EnabledCompressionEncodings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CompressionSettings {
-    pub(crate) encoding: CompressionEncoding,
+    pub(crate) config: CompressionConfig,
     /// buffer_growth_interval controls memory growth for internal buffers to balance resizing cost against memory waste.
     /// The default buffer growth interval is 8 kilobytes.
     pub(crate) buffer_growth_interval: usize,
@@ -103,9 +112,9 @@ pub(crate) struct CompressionSettings {
 /// ```
 /// # #[cfg(feature = "gzip")]
 /// # {
-/// use tonic::codec::{CompressionEncoding, GzipLevel};
+/// use tonic::codec::{CompressionConfig, GzipLevel};
 ///
-/// let encoding: CompressionEncoding = GzipLevel::FAST.into();
+/// let config: CompressionConfig = GzipLevel::FAST.into();
 /// # }
 /// ```
 #[cfg(feature = "gzip")]
@@ -176,13 +185,6 @@ pub enum CompressionEncoding {
     /// ([`flate2::Compression::default()`]).
     #[cfg(feature = "gzip")]
     Gzip,
-    /// Gzip compression with a custom compression level.
-    ///
-    /// Use with `send_compressed` to configure compression of requests or
-    /// responses. The level is ignored by `accept_compressed`: all gzip levels
-    /// can be decoded, and only `gzip` is advertised to the peer.
-    #[cfg(feature = "gzip")]
-    GzipWithLevel(GzipLevel),
     #[allow(missing_docs)]
     #[cfg(feature = "deflate")]
     Deflate,
@@ -191,25 +193,7 @@ pub enum CompressionEncoding {
     Zstd,
 }
 
-#[cfg(feature = "gzip")]
-impl From<GzipLevel> for CompressionEncoding {
-    fn from(level: GzipLevel) -> Self {
-        Self::GzipWithLevel(level)
-    }
-}
-
 impl CompressionEncoding {
-    /// Returns this encoding with its default compression level.
-    ///
-    /// Encodings without a custom level are returned unchanged.
-    pub const fn without_level(self) -> Self {
-        #[cfg(feature = "gzip")]
-        if let Self::GzipWithLevel(_) = self {
-            return Self::Gzip;
-        }
-        self
-    }
-
     pub(crate) const ENCODINGS: &'static [CompressionEncoding] = &[
         #[cfg(feature = "gzip")]
         CompressionEncoding::Gzip,
@@ -224,7 +208,7 @@ impl CompressionEncoding {
     pub(crate) fn from_accept_encoding_header(
         map: &http::HeaderMap,
         enabled_encodings: EnabledCompressionEncodings,
-    ) -> Option<Self> {
+    ) -> Option<CompressionConfig> {
         if enabled_encodings.is_empty() {
             return None;
         }
@@ -249,7 +233,7 @@ impl CompressionEncoding {
             .to_str()
             .ok()
             .and_then(|name| enabled_encodings.get(name))
-            .map(Self::without_level)
+            .map(CompressionConfig::encoding)
         {
             return Ok(Some(encoding));
         }
@@ -282,19 +266,11 @@ impl CompressionEncoding {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             #[cfg(feature = "gzip")]
-            CompressionEncoding::Gzip | CompressionEncoding::GzipWithLevel(_) => "gzip",
+            CompressionEncoding::Gzip => "gzip",
             #[cfg(feature = "deflate")]
             CompressionEncoding::Deflate => "deflate",
             #[cfg(feature = "zstd")]
             CompressionEncoding::Zstd => "zstd",
-        }
-    }
-
-    #[cfg(feature = "gzip")]
-    fn gzip_level(self) -> flate2::Compression {
-        match self {
-            Self::GzipWithLevel(level) => flate2::Compression::new(level.get()),
-            _ => flate2::Compression::default(),
         }
     }
 
@@ -307,6 +283,52 @@ impl CompressionEncoding {
 impl fmt::Display for CompressionEncoding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// An encoding and its settings for compressing outgoing messages.
+///
+/// Converting a [`CompressionEncoding`] uses its default settings. With the
+/// `gzip` feature, converting a `GzipLevel` selects gzip at that level.
+/// Pass this configuration to `send_compressed_with_config` on a client or server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressionConfig {
+    encoding: CompressionEncoding,
+    #[cfg(feature = "gzip")]
+    gzip_level: Option<GzipLevel>,
+}
+
+impl CompressionConfig {
+    /// Returns the encoding without its local compression settings.
+    pub const fn encoding(self) -> CompressionEncoding {
+        self.encoding
+    }
+
+    #[cfg(feature = "gzip")]
+    fn gzip_level(self) -> flate2::Compression {
+        self.gzip_level
+            .map(|level| flate2::Compression::new(level.get()))
+            .unwrap_or_default()
+    }
+}
+
+impl From<CompressionEncoding> for CompressionConfig {
+    fn from(encoding: CompressionEncoding) -> Self {
+        Self {
+            encoding,
+            #[cfg(feature = "gzip")]
+            gzip_level: None,
+        }
+    }
+}
+
+#[cfg(feature = "gzip")]
+impl From<GzipLevel> for CompressionConfig {
+    fn from(level: GzipLevel) -> Self {
+        Self {
+            encoding: CompressionEncoding::Gzip,
+            gzip_level: Some(level),
+        }
     }
 }
 
@@ -330,11 +352,11 @@ pub(crate) fn compress(
     #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
     let mut out_writer = out_buf.writer();
 
-    match settings.encoding {
+    match settings.config.encoding {
         #[cfg(feature = "gzip")]
-        CompressionEncoding::Gzip | CompressionEncoding::GzipWithLevel(_) => {
+        CompressionEncoding::Gzip => {
             let mut gzip_encoder =
-                GzEncoder::new(&decompressed_buf[0..len], settings.encoding.gzip_level());
+                GzEncoder::new(&decompressed_buf[0..len], settings.config.gzip_level());
             std::io::copy(&mut gzip_encoder, &mut out_writer)?;
         }
         #[cfg(feature = "deflate")]
@@ -342,7 +364,7 @@ pub(crate) fn compress(
             let mut deflate_encoder = ZlibEncoder::new(
                 &decompressed_buf[0..len],
                 // FIXME: Support custom levels with a validated level type and per-codec
-                // error, following GzipWithLevel (grpc/grpc-rust#1237).
+                // error, following GzipLevel and CompressionConfig (grpc/grpc-rust#1237).
                 flate2::Compression::new(6),
             );
             std::io::copy(&mut deflate_encoder, &mut out_writer)?;
@@ -352,7 +374,7 @@ pub(crate) fn compress(
             let mut zstd_encoder = Encoder::new(
                 &decompressed_buf[0..len],
                 // FIXME: Support custom levels with a validated level type and per-codec
-                // error, following GzipWithLevel (grpc/grpc-rust#1237).
+                // error, following GzipLevel and CompressionConfig (grpc/grpc-rust#1237).
                 zstd::DEFAULT_COMPRESSION_LEVEL,
             )?;
             std::io::copy(&mut zstd_encoder, &mut out_writer)?;
@@ -384,9 +406,9 @@ pub(crate) fn decompress(
     #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
     let mut out_writer = out_buf.writer();
 
-    match settings.encoding {
+    match settings.config.encoding {
         #[cfg(feature = "gzip")]
-        CompressionEncoding::Gzip | CompressionEncoding::GzipWithLevel(_) => {
+        CompressionEncoding::Gzip => {
             let mut gzip_decoder = GzDecoder::new(&compressed_buf[0..len]);
             std::io::copy(&mut gzip_decoder, &mut out_writer)?;
         }
@@ -467,17 +489,18 @@ mod tests {
     fn gzip_level_negotiation() {
         let mut enabled = EnabledCompressionEncodings::default();
         enabled.enable(CompressionEncoding::Gzip);
-        enabled.enable(CompressionEncoding::GzipWithLevel(GzipLevel::FAST));
-        enabled.enable(CompressionEncoding::GzipWithLevel(GzipLevel::BEST));
+        enabled.enable_with_config(GzipLevel::FAST.into());
+        enabled.enable_with_config(GzipLevel::BEST.into());
 
         assert!(enabled.is_enabled(CompressionEncoding::Gzip));
-        assert!(enabled.is_enabled(CompressionEncoding::GzipWithLevel(GzipLevel::NONE)));
         assert_eq!(
             enabled.into_accept_encoding_header_value().unwrap(),
             "gzip,identity"
         );
         assert_eq!(
-            CompressionEncoding::GzipWithLevel(GzipLevel::BEST).into_header_value(),
+            CompressionConfig::from(GzipLevel::BEST)
+                .encoding()
+                .into_header_value(),
             "gzip"
         );
 
@@ -486,16 +509,13 @@ mod tests {
         headers.insert(ENCODING_HEADER, HeaderValue::from_static("gzip"));
         assert_eq!(
             CompressionEncoding::from_accept_encoding_header(&headers, enabled),
-            Some(CompressionEncoding::GzipWithLevel(GzipLevel::BEST))
+            Some(GzipLevel::BEST.into())
         );
         assert_eq!(
             CompressionEncoding::from_encoding_header(&headers, enabled).unwrap(),
             Some(CompressionEncoding::Gzip)
         );
-        assert_eq!(
-            enabled.pop(),
-            Some(CompressionEncoding::GzipWithLevel(GzipLevel::BEST))
-        );
+        assert_eq!(enabled.pop(), Some(CompressionEncoding::Gzip));
         assert!(enabled.is_empty());
     }
 
@@ -519,12 +539,12 @@ mod tests {
     #[cfg(feature = "gzip")]
     fn enable_gzip_resets_level() {
         let mut enabled = EnabledCompressionEncodings::default();
-        enabled.enable(CompressionEncoding::GzipWithLevel(GzipLevel::BEST));
+        enabled.enable_with_config(GzipLevel::BEST.into());
         #[cfg(feature = "zstd")]
         enabled.enable(CompressionEncoding::Zstd);
 
         enabled.enable(CompressionEncoding::Gzip);
-        assert_eq!(enabled.get("gzip"), Some(CompressionEncoding::Gzip));
+        assert_eq!(enabled.get("gzip"), Some(CompressionEncoding::Gzip.into()));
         #[cfg(feature = "zstd")]
         assert_eq!(enabled.pop(), Some(CompressionEncoding::Zstd));
         assert_eq!(enabled.pop(), Some(CompressionEncoding::Gzip));
@@ -543,7 +563,7 @@ mod tests {
                 _ => GzipLevel::try_from(level).unwrap(),
             };
             let settings = CompressionSettings {
-                encoding: gzip_level.into(),
+                config: gzip_level.into(),
                 buffer_growth_interval: 8192,
             };
             let mut input = BytesMut::from(data.as_slice());
@@ -563,7 +583,7 @@ mod tests {
                 let mut default_compressed = BytesMut::new();
                 compress(
                     CompressionSettings {
-                        encoding: CompressionEncoding::Gzip,
+                        config: CompressionEncoding::Gzip.into(),
                         ..settings
                     },
                     &mut BytesMut::from(data.as_slice()),
@@ -574,15 +594,12 @@ mod tests {
                 assert_eq!(compressed, default_compressed);
             }
 
-            for encoding in [CompressionEncoding::Gzip, settings.encoding] {
+            for config in [CompressionEncoding::Gzip.into(), settings.config] {
                 let mut compressed = compressed.clone();
                 let len = compressed.len();
                 let mut decompressed = BytesMut::new();
                 decompress(
-                    CompressionSettings {
-                        encoding,
-                        ..settings
-                    },
+                    CompressionSettings { config, ..settings },
                     &mut compressed,
                     (&mut decompressed).limit(data.len()),
                     len,
@@ -600,13 +617,13 @@ mod tests {
         const GZIP: HeaderValue = HeaderValue::from_static("gzip,identity");
 
         let encodings = EnabledCompressionEncodings {
-            inner: [Some(CompressionEncoding::Gzip), None, None],
+            inner: [Some(CompressionEncoding::Gzip.into()), None, None],
         };
 
         assert_eq!(encodings.into_accept_encoding_header_value().unwrap(), GZIP);
 
         let encodings = EnabledCompressionEncodings {
-            inner: [None, None, Some(CompressionEncoding::Gzip)],
+            inner: [None, None, Some(CompressionEncoding::Gzip.into())],
         };
 
         assert_eq!(encodings.into_accept_encoding_header_value().unwrap(), GZIP);
@@ -618,13 +635,13 @@ mod tests {
         const ZSTD: HeaderValue = HeaderValue::from_static("zstd,identity");
 
         let encodings = EnabledCompressionEncodings {
-            inner: [Some(CompressionEncoding::Zstd), None, None],
+            inner: [Some(CompressionEncoding::Zstd.into()), None, None],
         };
 
         assert_eq!(encodings.into_accept_encoding_header_value().unwrap(), ZSTD);
 
         let encodings = EnabledCompressionEncodings {
-            inner: [None, None, Some(CompressionEncoding::Zstd)],
+            inner: [None, None, Some(CompressionEncoding::Zstd.into())],
         };
 
         assert_eq!(encodings.into_accept_encoding_header_value().unwrap(), ZSTD);
@@ -635,9 +652,9 @@ mod tests {
     fn convert_compression_encodings_into_header_value() {
         let encodings = EnabledCompressionEncodings {
             inner: [
-                Some(CompressionEncoding::Gzip),
-                Some(CompressionEncoding::Deflate),
-                Some(CompressionEncoding::Zstd),
+                Some(CompressionEncoding::Gzip.into()),
+                Some(CompressionEncoding::Deflate.into()),
+                Some(CompressionEncoding::Zstd.into()),
             ],
         };
 
@@ -648,9 +665,9 @@ mod tests {
 
         let encodings = EnabledCompressionEncodings {
             inner: [
-                Some(CompressionEncoding::Zstd),
-                Some(CompressionEncoding::Deflate),
-                Some(CompressionEncoding::Gzip),
+                Some(CompressionEncoding::Zstd.into()),
+                Some(CompressionEncoding::Deflate.into()),
+                Some(CompressionEncoding::Gzip.into()),
             ],
         };
 

@@ -35,7 +35,7 @@ macro_rules! parametrized_tests {
 pub(crate) use parametrized_tests;
 
 pub(crate) fn compression_encoding_name(encoding: CompressionEncoding) -> &'static str {
-    match encoding.without_level() {
+    match encoding {
         CompressionEncoding::Gzip => "gzip",
         CompressionEncoding::Zstd => "zstd",
         CompressionEncoding::Deflate => "deflate",

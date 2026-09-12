@@ -72,6 +72,13 @@ pub(crate) fn generate_internal<T: Service>(
             self.send_compression_encodings.enable(encoding);
             self
         }
+
+        /// Compress responses with the given encoding and settings, if the client supports it.
+        #[must_use]
+        pub fn send_compressed_with_config(mut self, config: tonic::codec::CompressionConfig) -> Self {
+            self.send_compression_encodings.enable_with_config(config);
+            self
+        }
     };
 
     let configure_max_message_size_methods = quote! {

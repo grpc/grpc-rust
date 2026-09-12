@@ -1,23 +1,23 @@
 use super::*;
 use http_body::Body;
-use tonic::codec::{CompressionEncoding, GzipLevel};
+use tonic::codec::{CompressionConfig, CompressionEncoding, GzipLevel};
 
 util::parametrized_tests! {
     client_enabled_server_enabled,
-    zstd: CompressionEncoding::Zstd,
-    gzip: CompressionEncoding::Gzip,
+    zstd: CompressionEncoding::Zstd.into(),
+    gzip: CompressionEncoding::Gzip.into(),
     gzip_none: GzipLevel::NONE.into(),
     gzip_fast: GzipLevel::FAST.into(),
     gzip_best: GzipLevel::BEST.into(),
-    deflate: CompressionEncoding::Deflate,
+    deflate: CompressionEncoding::Deflate.into(),
 }
 
 #[allow(dead_code)]
-async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
-    let accepted_encoding = encoding.without_level();
+async fn client_enabled_server_enabled(config: CompressionConfig) {
+    let encoding = config.encoding();
     let (client, server) = tokio::io::duplex(UNCOMPRESSED_MIN_BODY_SIZE * 10);
 
-    let svc = test_server::TestServer::new(Svc::default()).accept_compressed(accepted_encoding);
+    let svc = test_server::TestServer::new(Svc::default()).accept_compressed(encoding);
 
     let request_bytes_counter = Arc::new(AtomicUsize::new(0));
 
@@ -63,8 +63,8 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
     });
 
-    let mut client =
-        test_client::TestClient::new(mock_io_channel(client).await).send_compressed(encoding);
+    let mut client = test_client::TestClient::new(mock_io_channel(client).await)
+        .send_compressed_with_config(config);
 
     for _ in 0..3 {
         client
@@ -74,7 +74,7 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
             .await
             .unwrap();
         let bytes_sent = request_bytes_counter.load(SeqCst);
-        if encoding == CompressionEncoding::GzipWithLevel(GzipLevel::NONE) {
+        if config == GzipLevel::NONE.into() {
             assert!(bytes_sent > UNCOMPRESSED_MIN_BODY_SIZE);
         } else {
             assert!(bytes_sent < UNCOMPRESSED_MIN_BODY_SIZE);

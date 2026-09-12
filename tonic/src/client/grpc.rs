@@ -1,5 +1,5 @@
 use crate::codec::EncodeBody;
-use crate::codec::{CompressionEncoding, EnabledCompressionEncodings};
+use crate::codec::{CompressionConfig, CompressionEncoding, EnabledCompressionEncodings};
 use crate::metadata::GRPC_CONTENT_TYPE;
 use crate::{
     body::Body,
@@ -39,7 +39,7 @@ struct GrpcConfig {
     /// Which compression encodings does the client accept?
     accept_compression_encodings: EnabledCompressionEncodings,
     /// The compression encoding that will be applied to requests.
-    send_compression_encodings: Option<CompressionEncoding>,
+    send_compression_encodings: Option<CompressionConfig>,
     /// Limits the maximum size of a decoded message.
     max_decoding_message_size: Option<usize>,
     /// Limits the maximum size of an encoded message.
@@ -96,7 +96,15 @@ impl<T> Grpc<T> {
     /// # };
     /// ```
     pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-        self.config.send_compression_encodings = Some(encoding);
+        self.config.send_compression_encodings = Some(encoding.into());
+        self
+    }
+
+    /// Compress requests with the provided encoding and settings.
+    ///
+    /// Requires the server to accept the configured encoding.
+    pub fn send_compressed_with_config(mut self, config: CompressionConfig) -> Self {
+        self.config.send_compression_encodings = Some(config);
         self
     }
 
@@ -296,7 +304,7 @@ impl<T> Grpc<T> {
     {
         let request = request
             .map(|s| {
-                EncodeBody::new_client(
+                EncodeBody::new_client_with_config(
                     codec.encoder(),
                     s.map(Ok),
                     self.config.send_compression_encodings,
@@ -408,7 +416,7 @@ impl GrpcConfig {
         if let Some(encoding) = self.send_compression_encodings {
             request.headers_mut().insert(
                 crate::codec::compression::ENCODING_HEADER,
-                encoding.into_header_value(),
+                encoding.encoding().into_header_value(),
             );
         }
 

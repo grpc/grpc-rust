@@ -1,19 +1,19 @@
 use super::*;
-use tonic::codec::{CompressionEncoding, GzipLevel};
+use tonic::codec::{CompressionConfig, CompressionEncoding, GzipLevel};
 
 util::parametrized_tests! {
     client_enabled_server_enabled,
-    zstd: CompressionEncoding::Zstd,
-    gzip: CompressionEncoding::Gzip,
+    zstd: CompressionEncoding::Zstd.into(),
+    gzip: CompressionEncoding::Gzip.into(),
     gzip_none: GzipLevel::NONE.into(),
     gzip_fast: GzipLevel::FAST.into(),
     gzip_best: GzipLevel::BEST.into(),
-    deflate: CompressionEncoding::Deflate,
+    deflate: CompressionEncoding::Deflate.into(),
 }
 
 #[allow(dead_code)]
-async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
-    let accepted_encoding = encoding.without_level();
+async fn client_enabled_server_enabled(config: CompressionConfig) {
+    let encoding = config.encoding();
     let (client, server) = tokio::io::duplex(UNCOMPRESSED_MIN_BODY_SIZE * 10);
 
     #[derive(Clone, Copy)]
@@ -51,7 +51,7 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
     }
 
-    let svc = test_server::TestServer::new(Svc::default()).send_compressed(encoding);
+    let svc = test_server::TestServer::new(Svc::default()).send_compressed_with_config(config);
 
     let response_bytes_counter = Arc::new(AtomicUsize::new(0));
 
@@ -80,8 +80,8 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
     });
 
-    let mut client = test_client::TestClient::new(mock_io_channel(client).await)
-        .accept_compressed(accepted_encoding);
+    let mut client =
+        test_client::TestClient::new(mock_io_channel(client).await).accept_compressed(encoding);
 
     let expected = util::compression_encoding_name(encoding);
 
@@ -89,7 +89,7 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         let res = client.compress_output_unary(()).await.unwrap();
         assert_eq!(res.metadata().get("grpc-encoding").unwrap(), expected);
         let bytes_sent = response_bytes_counter.load(SeqCst);
-        if encoding == CompressionEncoding::GzipWithLevel(GzipLevel::NONE) {
+        if config == GzipLevel::NONE.into() {
             assert!(bytes_sent > UNCOMPRESSED_MIN_BODY_SIZE);
         } else {
             assert!(bytes_sent < UNCOMPRESSED_MIN_BODY_SIZE);

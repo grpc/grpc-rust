@@ -188,10 +188,10 @@ where
         send_encodings: EnabledCompressionEncodings,
     ) -> Self {
         for &encoding in CompressionEncoding::ENCODINGS {
-            if accept_encodings.is_enabled(encoding) {
+            if let Some(encoding) = accept_encodings.get(encoding.as_str()) {
                 self = self.accept_compressed(encoding);
             }
-            if send_encodings.is_enabled(encoding) {
+            if let Some(encoding) = send_encodings.get(encoding.as_str()) {
                 self = self.send_compressed(encoding);
             }
         }

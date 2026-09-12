@@ -34,6 +34,15 @@ macro_rules! parametrized_tests {
 
 pub(crate) use parametrized_tests;
 
+pub(crate) fn compression_encoding_name(encoding: CompressionEncoding) -> &'static str {
+    match encoding.without_level() {
+        CompressionEncoding::Gzip => "gzip",
+        CompressionEncoding::Zstd => "zstd",
+        CompressionEncoding::Deflate => "deflate",
+        _ => panic!("unexpected encoding {encoding:?}"),
+    }
+}
+
 /// A body that tracks how many bytes passes through it
 #[pin_project]
 pub struct CountBytesBody<B> {

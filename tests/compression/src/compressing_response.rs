@@ -1,15 +1,19 @@
 use super::*;
-use tonic::codec::CompressionEncoding;
+use tonic::codec::{CompressionConfig, CompressionEncoding, GzipLevel};
 
 util::parametrized_tests! {
     client_enabled_server_enabled,
-    zstd: CompressionEncoding::Zstd,
-    gzip: CompressionEncoding::Gzip,
-    deflate: CompressionEncoding::Deflate,
+    zstd: CompressionEncoding::Zstd.into(),
+    gzip: CompressionEncoding::Gzip.into(),
+    gzip_none: GzipLevel::NONE.into(),
+    gzip_fast: GzipLevel::FAST.into(),
+    gzip_best: GzipLevel::BEST.into(),
+    deflate: CompressionEncoding::Deflate.into(),
 }
 
 #[allow(dead_code)]
-async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
+async fn client_enabled_server_enabled(config: CompressionConfig) {
+    let encoding = config.encoding();
     let (client, server) = tokio::io::duplex(UNCOMPRESSED_MIN_BODY_SIZE * 10);
 
     #[derive(Clone, Copy)]
@@ -34,12 +38,7 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
 
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            let expected = match self.encoding {
-                CompressionEncoding::Gzip => "gzip",
-                CompressionEncoding::Zstd => "zstd",
-                CompressionEncoding::Deflate => "deflate",
-                _ => panic!("unexpected encoding {:?}", self.encoding),
-            };
+            let expected = util::compression_encoding_name(self.encoding);
             assert_eq!(
                 req.headers()
                     .get("grpc-accept-encoding")
@@ -52,7 +51,7 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
     }
 
-    let svc = test_server::TestServer::new(Svc::default()).send_compressed(encoding);
+    let svc = test_server::TestServer::new(Svc::default()).send_compressed_with_config(config);
 
     let response_bytes_counter = Arc::new(AtomicUsize::new(0));
 
@@ -84,18 +83,17 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
     let mut client =
         test_client::TestClient::new(mock_io_channel(client).await).accept_compressed(encoding);
 
-    let expected = match encoding {
-        CompressionEncoding::Gzip => "gzip",
-        CompressionEncoding::Zstd => "zstd",
-        CompressionEncoding::Deflate => "deflate",
-        _ => panic!("unexpected encoding {encoding:?}"),
-    };
+    let expected = util::compression_encoding_name(encoding);
 
     for _ in 0..3 {
         let res = client.compress_output_unary(()).await.unwrap();
         assert_eq!(res.metadata().get("grpc-encoding").unwrap(), expected);
         let bytes_sent = response_bytes_counter.load(SeqCst);
-        assert!(bytes_sent < UNCOMPRESSED_MIN_BODY_SIZE);
+        if config == GzipLevel::NONE.into() {
+            assert!(bytes_sent > UNCOMPRESSED_MIN_BODY_SIZE);
+        } else {
+            assert!(bytes_sent < UNCOMPRESSED_MIN_BODY_SIZE);
+        }
     }
 }
 

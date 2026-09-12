@@ -22,10 +22,21 @@ mod bidirectional_stream;
 mod client_stream;
 mod compressing_request;
 mod compressing_response;
+#[cfg(test)]
+mod encode_body;
 mod server_stream;
 mod util;
 
 tonic::include_proto!("test");
+
+#[test]
+fn compression_encoding_numeric_casts_remain_supported() {
+    use tonic::codec::CompressionEncoding;
+
+    assert_eq!(CompressionEncoding::Gzip as isize, 0);
+    assert_eq!(CompressionEncoding::Deflate as isize, 1);
+    assert_eq!(CompressionEncoding::Zstd as isize, 2);
+}
 
 #[derive(Debug, Default)]
 struct Svc {

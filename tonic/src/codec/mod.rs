@@ -10,7 +10,9 @@ use crate::Status;
 use std::io;
 
 pub use self::buffer::{DecodeBuf, EncodeBuf};
-pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
+pub use self::compression::{CompressionConfig, CompressionEncoding, EnabledCompressionEncodings};
+#[cfg(feature = "gzip")]
+pub use self::compression::{GzipLevel, InvalidGzipLevel};
 pub use self::decode::Streaming;
 pub use self::encode::EncodeBody;
 

@@ -1,16 +1,20 @@
 use super::*;
 use http_body::Body;
-use tonic::codec::CompressionEncoding;
+use tonic::codec::{CompressionConfig, CompressionEncoding, GzipLevel};
 
 util::parametrized_tests! {
     client_enabled_server_enabled,
-    zstd: CompressionEncoding::Zstd,
-    gzip: CompressionEncoding::Gzip,
-    deflate: CompressionEncoding::Deflate,
+    zstd: CompressionEncoding::Zstd.into(),
+    gzip: CompressionEncoding::Gzip.into(),
+    gzip_none: GzipLevel::NONE.into(),
+    gzip_fast: GzipLevel::FAST.into(),
+    gzip_best: GzipLevel::BEST.into(),
+    deflate: CompressionEncoding::Deflate.into(),
 }
 
 #[allow(dead_code)]
-async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
+async fn client_enabled_server_enabled(config: CompressionConfig) {
+    let encoding = config.encoding();
     let (client, server) = tokio::io::duplex(UNCOMPRESSED_MIN_BODY_SIZE * 10);
 
     let svc = test_server::TestServer::new(Svc::default()).accept_compressed(encoding);
@@ -29,12 +33,7 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
 
         pub fn call<B: Body>(self, req: http::Request<B>) -> http::Request<B> {
-            let expected = match self.encoding {
-                CompressionEncoding::Gzip => "gzip",
-                CompressionEncoding::Zstd => "zstd",
-                CompressionEncoding::Deflate => "deflate",
-                _ => panic!("unexpected encoding {:?}", self.encoding),
-            };
+            let expected = util::compression_encoding_name(self.encoding);
             assert_eq!(req.headers().get("grpc-encoding").unwrap(), expected);
 
             req
@@ -64,8 +63,8 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
         }
     });
 
-    let mut client =
-        test_client::TestClient::new(mock_io_channel(client).await).send_compressed(encoding);
+    let mut client = test_client::TestClient::new(mock_io_channel(client).await)
+        .send_compressed_with_config(config);
 
     for _ in 0..3 {
         client
@@ -75,7 +74,11 @@ async fn client_enabled_server_enabled(encoding: CompressionEncoding) {
             .await
             .unwrap();
         let bytes_sent = request_bytes_counter.load(SeqCst);
-        assert!(bytes_sent < UNCOMPRESSED_MIN_BODY_SIZE);
+        if config == GzipLevel::NONE.into() {
+            assert!(bytes_sent > UNCOMPRESSED_MIN_BODY_SIZE);
+        } else {
+            assert!(bytes_sent < UNCOMPRESSED_MIN_BODY_SIZE);
+        }
     }
 }
 

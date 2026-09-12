@@ -1,5 +1,6 @@
 use super::compression::{
-    compress, CompressionEncoding, CompressionSettings, SingleMessageCompressionOverride,
+    compress, CompressionConfig, CompressionEncoding, CompressionSettings,
+    SingleMessageCompressionOverride,
 };
 use super::{BufferSettings, EncodeBuf, Encoder, DEFAULT_MAX_SEND_MESSAGE_SIZE, HEADER_SIZE};
 use crate::Status;
@@ -24,7 +25,7 @@ struct EncodedBytes<T, U> {
     #[pin]
     source: Fuse<U>,
     encoder: T,
-    compression_encoding: Option<CompressionEncoding>,
+    compression_encoding: Option<CompressionConfig>,
     max_message_size: Option<usize>,
     buf: BytesMut,
     uncompression_buf: BytesMut,
@@ -35,7 +36,7 @@ impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
     fn new(
         encoder: T,
         source: U,
-        compression_encoding: Option<CompressionEncoding>,
+        compression_encoding: Option<CompressionConfig>,
         compression_override: SingleMessageCompressionOverride,
         max_message_size: Option<usize>,
     ) -> Self {
@@ -134,7 +135,7 @@ fn encode_item<T>(
     encoder: &mut T,
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
-    compression_encoding: Option<CompressionEncoding>,
+    compression_encoding: Option<CompressionConfig>,
     max_message_size: Option<usize>,
     buffer_settings: BufferSettings,
     item: T::Item,
@@ -149,7 +150,7 @@ where
         buf.advance_mut(HEADER_SIZE);
     }
 
-    if let Some(encoding) = compression_encoding {
+    if let Some(config) = compression_encoding {
         uncompression_buf.clear();
 
         encoder
@@ -160,7 +161,7 @@ where
 
         compress(
             CompressionSettings {
-                encoding,
+                config,
                 buffer_growth_interval: buffer_settings.buffer_size,
             },
             uncompression_buf,
@@ -179,7 +180,7 @@ where
 }
 
 fn finish_encoding(
-    compression_encoding: Option<CompressionEncoding>,
+    compression_encoding: Option<CompressionConfig>,
     max_message_size: Option<usize>,
     buf: &mut [u8],
 ) -> Result<(), Status> {
@@ -236,6 +237,25 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
     ) -> Self {
+        Self::new_client_with_config(
+            encoder,
+            source,
+            compression_encoding.map(Into::into),
+            max_message_size,
+        )
+    }
+
+    /// Creates a client body with explicit compression settings, such as a gzip level.
+    ///
+    /// Like [`Self::new_client`], this encodes messages and adds gRPC framing.
+    /// The caller must set the request's `grpc-encoding` header to match the
+    /// selected encoding and ensure that the server supports it.
+    pub fn new_client_with_config(
+        encoder: T,
+        source: U,
+        compression_encoding: Option<CompressionConfig>,
+        max_message_size: Option<usize>,
+    ) -> Self {
         Self {
             inner: EncodedBytes::new(
                 encoder,
@@ -258,6 +278,27 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         encoder: T,
         source: U,
         compression_encoding: Option<CompressionEncoding>,
+        compression_override: SingleMessageCompressionOverride,
+        max_message_size: Option<usize>,
+    ) -> Self {
+        Self::new_server_with_config(
+            encoder,
+            source,
+            compression_encoding.map(Into::into),
+            compression_override,
+            max_message_size,
+        )
+    }
+
+    /// Creates a server body with explicit compression settings, such as a gzip level.
+    ///
+    /// Like [`Self::new_server`], this encodes messages, adds gRPC framing and
+    /// emits status trailers. The caller must set the response's `grpc-encoding`
+    /// header to match the selected encoding and negotiate it with the client.
+    pub fn new_server_with_config(
+        encoder: T,
+        source: U,
+        compression_encoding: Option<CompressionConfig>,
         compression_override: SingleMessageCompressionOverride,
         max_message_size: Option<usize>,
     ) -> Self {

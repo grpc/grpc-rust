@@ -1,5 +1,6 @@
 use crate::codec::compression::{
-    CompressionEncoding, EnabledCompressionEncodings, SingleMessageCompressionOverride,
+    CompressionConfig, CompressionEncoding, EnabledCompressionEncodings,
+    SingleMessageCompressionOverride,
 };
 use crate::codec::EncodeBody;
 use crate::metadata::GRPC_CONTENT_TYPE;
@@ -121,6 +122,15 @@ where
         self
     }
 
+    /// Enable sending compressed responses with the provided encoding and settings.
+    ///
+    /// Requires the client to accept the configured encoding. Replaces settings
+    /// for an enabled encoding without changing its position.
+    pub fn send_compressed_with_config(mut self, config: CompressionConfig) -> Self {
+        self.send_compression_encodings.enable_with_config(config);
+        self
+    }
+
     /// Limits the maximum size of a decoded message.
     ///
     /// # Example
@@ -191,8 +201,8 @@ where
             if accept_encodings.is_enabled(encoding) {
                 self = self.accept_compressed(encoding);
             }
-            if send_encodings.is_enabled(encoding) {
-                self = self.send_compressed(encoding);
+            if let Some(encoding) = send_encodings.get(encoding.as_str()) {
+                self = self.send_compressed_with_config(encoding);
             }
         }
 
@@ -419,7 +429,7 @@ where
     fn map_response<B>(
         &mut self,
         response: Result<crate::Response<B>, Status>,
-        accept_encoding: Option<CompressionEncoding>,
+        accept_encoding: Option<CompressionConfig>,
         compression_override: SingleMessageCompressionOverride,
         max_message_size: Option<usize>,
     ) -> http::Response<Body>
@@ -440,11 +450,11 @@ where
             // Set the content encoding
             parts.headers.insert(
                 crate::codec::compression::ENCODING_HEADER,
-                encoding.into_header_value(),
+                encoding.encoding().into_header_value(),
             );
         }
 
-        let body = EncodeBody::new_server(
+        let body = EncodeBody::new_server_with_config(
             self.codec.encoder(),
             body,
             accept_encoding,

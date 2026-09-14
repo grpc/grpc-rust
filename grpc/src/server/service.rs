@@ -119,9 +119,9 @@ mod tests {
 
     struct MockSendStream;
     impl SendStream for MockSendStream {
-        async fn send<'a>(
+        async fn send(
             &mut self,
-            _item: ResponseStreamItem<'a>,
+            _item: ResponseStreamItem<'_>,
             _options: SendOptions,
         ) -> Result<(), ()> {
             Ok(())

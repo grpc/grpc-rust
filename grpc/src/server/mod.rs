@@ -37,7 +37,6 @@
 //!
 //! # Additional Types
 //!
-//! - **[`Call`]:** Represents an incoming RPC accepted by a [`Listener`].
 //! - **[`SendStream`] / [`RecvStream`]:** Represent the sending and receiving
 //!   sides of a server-side RPC.
 //! - **[`RequestHeaders`]:** Represents gRPC headers sent by the client to
@@ -49,19 +48,24 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tonic::async_trait;
+use tokio::sync::watch;
 
+use crate::async_trait;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
+use crate::send_future::SendFuture;
 
 pub mod builder;
 pub mod descriptor;
 pub(crate) mod interceptor;
 pub(crate) mod router;
 pub mod service;
+
+use builder::ServerBuilder;
+use interceptor::Identity;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -153,12 +157,12 @@ pub trait Transport: Send + 'static {
 /// Each connection is watched via `watch()`. When `shutdown()` is called,
 /// all watched connections receive a `graceful_shutdown()` signal.
 struct GracefulCoordinator {
-    tx: tokio::sync::watch::Sender<()>,
+    tx: watch::Sender<()>,
 }
 
 impl GracefulCoordinator {
     fn new() -> Self {
-        let (tx, _) = tokio::sync::watch::channel(());
+        let (tx, _) = watch::channel(());
         Self { tx }
     }
 
@@ -192,9 +196,9 @@ impl GracefulCoordinator {
 }
 
 impl Server {
-    /// Creates a [`ServerBuilder`](builder::ServerBuilder) with no interceptors.
-    pub fn builder() -> builder::ServerBuilder<interceptor::Identity> {
-        builder::ServerBuilder::new()
+    /// Creates a new [`ServerBuilder`] with a no-op interceptor.
+    pub fn builder() -> ServerBuilder<Identity> {
+        ServerBuilder::new()
     }
 
     /// Creates a new server with the given handler and runtime.
@@ -321,30 +325,11 @@ impl<T: Handle> DynHandle for T {
         mut tx: &mut dyn DynSendStream,
         rx: BoxedRecvStream,
     ) -> Trailers {
-        self.handle(headers, options, &mut tx, rx).await
+        self.handle(headers, options, &mut tx, rx).make_send().await
     }
 }
 
-// TODO: delete this type which is only needed pre-rust v1.92 due to a bug
-// handling lifetimes:
-//
-// error: implementation of `server::RecvStream` is not general enough
-//    --> grpc/src/server/mod.rs:108:5
-//     |
-// 108 |     async fn dyn_handle(
-//     |     ^^^^^ implementation of `server::RecvStream` is not general enough
-//     |
-//     = note: `Box<(dyn server::DynRecvStream + '0)>` must implement `server::RecvStream`, for any lifetime `'0`...
-//     = note: ...but `server::RecvStream` is actually implemented for the type `Box<(dyn server::DynRecvStream + 'static)>`
-#[doc(hidden)]
-pub struct BoxedRecvStream(pub Box<dyn DynRecvStream + 'static>);
-
-// Implement RecvStream for the wrapper instead of the Box directly
-impl RecvStream for BoxedRecvStream {
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
-        self.0.dyn_next(msg).await
-    }
-}
+pub(crate) type BoxedRecvStream = Box<dyn DynRecvStream>;
 
 /// An item in a response stream from the server's view.
 ///
@@ -369,9 +354,7 @@ impl Handle for DynHandleWrapper {
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
     ) -> Trailers {
-        self.0
-            .dyn_handle(headers, options, tx, BoxedRecvStream(Box::new(rx)))
-            .await
+        self.0.dyn_handle(headers, options, tx, Box::new(rx)).await
     }
 }
 /// Represents the sending side of a server stream.  See `ResponseStream`
@@ -388,11 +371,7 @@ pub trait SendStream {
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
     /// to the SendStream are undefined and data may be lost.
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()>;
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()>;
 }
 
 #[doc(hidden)]
@@ -416,22 +395,14 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'b> SendStream for &mut (dyn DynSendStream + 'b) {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for &mut (dyn DynSendStream + '_) {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
 
-impl<'b> SendStream for Box<dyn DynSendStream + 'b> {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for Box<dyn DynSendStream + '_> {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
@@ -457,6 +428,9 @@ pub trait RecvStream {
     /// Calling this method again after reaching a terminal state is unspecified
     /// and should be avoided.
     ///
+    /// The provided `msg` must not be modified if the stream has ended, i.e. `None`
+    /// is returned.
+    ///
     /// # Cancel safety
     ///
     /// This method is not intended to be cancellation safe.  If the returned
@@ -478,7 +452,7 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
         (**self).dyn_next(msg).await
     }
@@ -926,9 +900,9 @@ mod tests {
     struct NopSendStream;
 
     impl SendStream for NopSendStream {
-        async fn send<'a>(
+        async fn send(
             &mut self,
-            _item: ResponseStreamItem<'a>,
+            _item: ResponseStreamItem<'_>,
             _options: SendOptions,
         ) -> Result<(), ()> {
             Ok(())
@@ -974,7 +948,7 @@ mod tests {
         ) -> Self::Connection {
             let inner = Box::pin(async move {
                 let mut tx = NopSendStream;
-                let rx = BoxedRecvStream(Box::new(NopRecvStream));
+                let rx = Box::new(NopRecvStream);
                 let _ = handler
                     .dyn_handle(
                         RequestHeaders::new("/test.Draining/Method", test_connection_info()),

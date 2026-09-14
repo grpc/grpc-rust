@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::async_trait;
 use rustls::crypto::CryptoProvider;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::ServerName;
@@ -34,7 +35,6 @@ use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::sync::watch::Receiver;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::TlsStream as RustlsStream;
-use tonic::async_trait;
 
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
@@ -188,7 +188,7 @@ impl RustlsChannelCredentials {
         client_config.alpn_protocols = vec![ALPN_PROTO_STR_H2.to_vec()];
         client_config.resumption = rustls::client::Resumption::disabled();
         if let Some(path) = config.key_log_path {
-            client_config.key_log = Arc::new(KeyLogFile::new(&path))
+            client_config.key_log = Arc::new(KeyLogFile::new(&path));
         }
 
         Ok(RustlsChannelCredentials {

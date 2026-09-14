@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 
+use crate::async_trait;
 use bytes::Buf;
 use bytes::Bytes;
 use h2::Reason;
@@ -48,7 +49,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Response;
 use tonic::Status as TonicStatus;
-use tonic::async_trait;
 use tonic::metadata::MetadataMap as TonicMetadata;
 use tonic::metadata::MetadataValue as TonicMetadataValue;
 use tonic::transport::Server;
@@ -1207,7 +1207,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
             None => {
                 panic!("Expected RST_STREAM, got clean close (EOS)");
             }
-        };
+        }
     });
 
     let builder = GLOBAL_TRANSPORT_REGISTRY
@@ -1254,5 +1254,5 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
 
     // Verify the send stream has ended.
     let req = WrappedEchoRequest(EchoRequest::default());
-    assert!(tx.send(&req, SendOptions::default()).await.is_err())
+    assert!(tx.send(&req, SendOptions::default()).await.is_err());
 }

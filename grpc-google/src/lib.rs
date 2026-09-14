@@ -33,13 +33,13 @@ use std::fmt::Debug;
 use google_cloud_auth::credentials::AccessTokenCredentials;
 use grpc::StatusCodeError;
 use grpc::StatusError;
+use grpc::async_trait;
 use grpc::credentials::SecurityLevel;
 use grpc::credentials::call::CallCredentials;
 use grpc::credentials::call::CallDetails;
 use grpc::credentials::call::ClientConnectionSecurityInfo;
 use grpc::metadata::AsciiMetadataValue;
 use grpc::metadata::MetadataMap;
-use tonic::async_trait;
 
 const DEFAULT_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 

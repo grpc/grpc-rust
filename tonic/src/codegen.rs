@@ -43,3 +43,11 @@ pub use http_body::Body;
 pub type BoxFuture<T, E> = self::Pin<Box<dyn self::Future<Output = Result<T, E>> + Send + 'static>>;
 pub type BoxStream<T> =
     self::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, crate::Status>> + Send + 'static>>;
+
+#[cfg(feature = "local")]
+pub type LocalBoxFuture<T, E> = self::Pin<Box<dyn self::Future<Output = Result<T, E>> + 'static>>;
+#[cfg(feature = "local")]
+pub type LocalBoxStream<T> =
+    self::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, crate::Status>> + 'static>>;
+#[cfg(feature = "local")]
+pub use std::rc::Rc;

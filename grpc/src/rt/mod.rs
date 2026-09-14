@@ -50,7 +50,7 @@ pub type BoxedTaskHandle = Box<dyn TaskHandle>;
 pub type BoxEndpoint = Box<dyn GrpcEndpoint>;
 
 /// A server-side listening socket that yields incoming connections.
-#[tonic::async_trait]
+#[crate::async_trait]
 pub(crate) trait EndpointListener: Send + Sync + 'static {
     /// Accepts the next incoming connection.
     async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String>;
@@ -125,7 +125,7 @@ pub trait TaskHandle: Send + Sync {
 }
 
 /// A trait for asynchronous DNS resolution.
-#[tonic::async_trait]
+#[crate::async_trait]
 pub trait DnsResolver: Send + Sync {
     /// Resolve an address
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<std::net::IpAddr>, String>;

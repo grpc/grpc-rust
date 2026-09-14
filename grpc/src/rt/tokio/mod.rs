@@ -52,7 +52,7 @@ struct TokioDefaultDnsResolver {
     _priv: (),
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl DnsResolver for TokioDefaultDnsResolver {
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
         let name_with_port = match name.parse::<IpAddr>() {
@@ -79,7 +79,7 @@ pub(crate) struct TokioRuntime {
 
 impl TaskHandle for JoinHandle<()> {
     fn abort(&self) {
-        self.abort()
+        self.abort();
     }
 }
 
@@ -230,7 +230,7 @@ struct TokioTcpListener {
     listener: tokio::net::TcpListener,
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl super::EndpointListener for TokioTcpListener {
     async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
         let (stream, _addr) = self.listener.accept().await.map_err(|e| e.to_string())?;
@@ -254,7 +254,7 @@ struct TokioUnixListener {
 }
 
 #[cfg(unix)]
-#[tonic::async_trait]
+#[crate::async_trait]
 impl super::EndpointListener for TokioUnixListener {
     async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
         use crate::client::name_resolution::UNIX_NETWORK_TYPE;
@@ -301,7 +301,7 @@ mod tests {
         assert!(
             !ips.is_empty(),
             "Expect localhost to resolve to more than 1 IPs."
-        )
+        );
     }
 
     #[tokio::test]
@@ -309,7 +309,7 @@ mod tests {
         let default_resolver = TokioDefaultDnsResolver::new(ResolverOptions::default()).unwrap();
 
         let txt = default_resolver.lookup_txt("google.com").await;
-        assert!(txt.is_err())
+        assert!(txt.is_err());
     }
 
     #[tokio::test]
@@ -318,6 +318,6 @@ mod tests {
             server_addr: Some("8.8.8.8:53".parse().unwrap()),
         };
         let default_resolver = TokioDefaultDnsResolver::new(opts);
-        assert!(default_resolver.is_err())
+        assert!(default_resolver.is_err());
     }
 }

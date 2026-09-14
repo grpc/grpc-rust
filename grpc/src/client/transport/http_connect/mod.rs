@@ -24,10 +24,10 @@
 
 use std::sync::Arc;
 
+use crate::async_trait;
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tonic::async_trait;
 
 use crate::client::transport::ProxyOptions;
 use crate::client::transport::http_connect::rewind::Rewind;

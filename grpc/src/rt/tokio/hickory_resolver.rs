@@ -43,7 +43,7 @@ pub(super) struct DnsResolver {
     resolver: hickory_resolver::TokioResolver,
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl rt::DnsResolver for DnsResolver {
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
         let response = self
@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(
             ips_hickory, system_resolver_ips,
             "both resolvers should produce same IPs for localhost"
-        )
+        );
     }
 
     #[tokio::test]
@@ -209,7 +209,7 @@ mod tests {
         let hickory_dns = super::DnsResolver::new(opts).unwrap();
         let ips = hickory_dns.lookup_host_name("test.local").await.unwrap();
         assert_eq!(ips, vec![Ipv4Addr::new(1, 2, 3, 4)]);
-        dns.shutdown().await
+        dns.shutdown().await;
     }
 
     struct FakeDns {

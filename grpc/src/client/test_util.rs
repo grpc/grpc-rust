@@ -116,7 +116,7 @@ impl<'a> ByteSendMsg<'a> {
         Self { data }
     }
 }
-impl<'a> SendMessage for ByteSendMsg<'a> {
+impl SendMessage for ByteSendMsg<'_> {
     fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
         Ok(Box::new(self.data.clone()))
     }

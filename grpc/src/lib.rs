@@ -55,18 +55,21 @@ pub(crate) mod codec;
 pub mod core;
 pub mod credentials;
 pub mod metadata;
+pub mod server;
 
 mod byte_str;
 mod inmemory;
 mod macros;
 mod rt;
 mod send_future;
-mod server;
 mod status;
 
 pub use status::Result;
 pub use status::StatusCodeError;
 pub use status::StatusError;
+/// A re-export of [`async-trait`](https://docs.rs/async-trait) for use with
+/// codegen.
+pub use tonic::async_trait;
 
 #[cfg(feature = "__unstable")]
 #[doc(hidden)]

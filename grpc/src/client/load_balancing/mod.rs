@@ -43,6 +43,7 @@ use crate::rt::GrpcRuntime;
 pub(crate) mod subchannel_sharing;
 
 pub mod child_manager;
+pub mod endpoint_filtering;
 pub mod graceful_switch;
 pub mod lazy;
 pub mod pick_first;
@@ -457,6 +458,25 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        (**self).exit_idle(channel_controller)
+        (**self).exit_idle(channel_controller);
+    }
+}
+
+impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
+    type LbPolicy = B::LbPolicy;
+
+    fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
+        (**self).build(options)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn parse_config(
+        &self,
+        config: &ParsedJsonLbConfig,
+    ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
+        (**self).parse_config(config)
     }
 }

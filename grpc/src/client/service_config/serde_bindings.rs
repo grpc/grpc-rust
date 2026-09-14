@@ -125,7 +125,7 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
             }
         };
 
-        match GLOBAL_LB_REGISTRY.select_candidate(raw_str.as_ref()) {
+        match GLOBAL_LB_REGISTRY.select_child(raw_str.as_ref()) {
             Ok(Some(parsed)) => Ok(LbConfigSerde(Some(parsed))),
             Ok(None) => Ok(LbConfigSerde(None)),
             Err(e) => Err(serde::de::Error::custom(e)),

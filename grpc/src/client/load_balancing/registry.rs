@@ -75,43 +75,43 @@ impl LbPolicyRegistry {
         self.m.lock().unwrap().get(name).cloned()
     }
 
-    /// Evaluates an ordered candidate list against the registry.
+    /// Evaluates an ordered child policy list against the registry.
     ///
-    /// Halts candidate evaluation immediately on the first supported policy
+    /// Halts child policy evaluation immediately on the first supported policy
     /// if configuration parsing fails (gRFC A24).
     ///
     /// # Return Value
     ///
-    /// - `Ok(Some(ParsedLbConfig))` when a registered candidate passing the optional
+    /// - `Ok(Some(ParsedLbConfig))` when a registered child policy passing the optional
     ///   filter is selected and its configuration successfully parses.
-    /// - `Ok(None)` when the candidate list is empty (`[]`), `"null"`, or contains only
+    /// - `Ok(None)` when the child policy list is empty (`[]`), `"null"`, or contains only
     ///   whitespace. Top-level channel service configuration uses this to fall back
     ///   to the legacy `loadBalancingPolicy` or default policy.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The candidate list is malformed JSON or contains invalid entries (e.g. violating
+    /// - The child policy list is malformed JSON or contains invalid entries (e.g. violating
     ///   the gRFC A24 single-property `oneOf` constraint).
-    /// - None of the candidate policies are registered or permitted by the filter.
+    /// - None of the load balancers are registered or permitted by the filter.
     /// - The first supported, permitted policy fails to parse its configuration. In
     ///   accordance with gRFC A24, evaluation halts immediately and subsequent
-    ///   candidates are not evaluated.
+    ///   child policies are not evaluated.
     ///
     /// # Example
     ///
     /// ```ignore (cannot be compiled as doctest because `load_balancing` is pub(crate))
     /// use grpc::client::load_balancing::GLOBAL_LB_REGISTRY;
     ///
-    /// let candidates_json = r#"[
+    /// let children_json = r#"[
     ///     {"xds": {}},
     ///     {"round_robin": {}}
     /// ]"#;
     ///
-    /// // A parent policy (e.g. a composite LB policy) can filter candidates to only allow specific children.
+    /// // A parent policy (e.g. a composite LB policy) can filter child policies to only allow specific children.
     /// let selected = GLOBAL_LB_REGISTRY
-    ///     .select_candidate_with_filter(
-    ///         candidates_json,
+    ///     .select_child_with_filter(
+    ///         children_json,
     ///         Some(|name: &str| name == "round_robin" || name == "pick_first"),
     ///     )
     ///     .unwrap();
@@ -119,46 +119,46 @@ impl LbPolicyRegistry {
     /// assert!(selected.is_some());
     /// assert_eq!(selected.unwrap().builder.name(), "round_robin");
     /// ```
-    pub fn select_candidate_with_filter<F>(
+    pub fn select_child_with_filter<F>(
         &self,
-        candidate_list_json: &str,
+        child_list_json: &str,
         filter: Option<F>,
     ) -> Result<Option<ParsedLbConfig>, String>
     where
         F: Fn(&str) -> bool,
     {
-        let trimmed = candidate_list_json.trim();
+        let trimmed = child_list_json.trim();
         if trimmed.is_empty() || trimmed == "null" {
             return Ok(None);
         }
 
-        let raw_candidates: Vec<&serde_json::value::RawValue> = serde_json::from_str(trimmed)
-            .map_err(|e| format!("failed to parse load balancing candidates JSON: {e}"))?;
+        let raw_children: Vec<&serde_json::value::RawValue> = serde_json::from_str(trimmed)
+            .map_err(|e| format!("failed to parse load balancer configuration JSON: {e}"))?;
 
-        if raw_candidates.is_empty() {
+        if raw_children.is_empty() {
             return Ok(None);
         }
 
         let mut unregistered = Vec::new();
         let mut filtered_out = Vec::new();
 
-        for raw_cand in raw_candidates {
-            let candidate: CandidateEntry<'_> = serde_json::from_str(raw_cand.get())
-                .map_err(|e| format!("failed to parse candidate entry: {e}"))?;
+        for raw_child in raw_children {
+            let child: ChildEntry<'_> = serde_json::from_str(raw_child.get())
+                .map_err(|e| format!("failed to parse load balancer entry: {e}"))?;
 
             if let Some(ref f) = filter
-                && !f(candidate.policy_name)
+                && !f(child.policy_name)
             {
-                filtered_out.push(candidate.policy_name);
+                filtered_out.push(child.policy_name);
                 continue;
             }
 
-            if let Some(builder) = self.get_policy(candidate.policy_name) {
-                let payload = LbConfigJson::new(candidate.raw_config);
+            if let Some(builder) = self.get_policy(child.policy_name) {
+                let payload = LbConfigJson::new(child.raw_config);
                 let parsed_config = builder.parse_config(&payload).map_err(|e| {
                     format!(
                         "failed to parse config for policy '{}': {e}",
-                        candidate.policy_name
+                        child.policy_name
                     )
                 })?;
                 return Ok(Some(ParsedLbConfig {
@@ -167,61 +167,58 @@ impl LbPolicyRegistry {
                 }));
             }
 
-            unregistered.push(candidate.policy_name);
+            unregistered.push(child.policy_name);
         }
 
         let err_msg = match (filtered_out.is_empty(), unregistered.is_empty()) {
             (false, true) => format!(
-                "None of the candidate policies were permitted by filter: [{}].",
+                "None of the load balancers were permitted by filter: [{}].",
                 filtered_out.join(", ")
             ),
             (true, false) => format!(
-                "None of the candidate policies are registered: [{}].",
+                "None of the load balancers are registered: [{}].",
                 unregistered.join(", ")
             ),
             (false, false) => format!(
-                "No supported load balancing policy selected (unregistered: [{}], filtered out: [{}]).",
+                "No supported load balancer selected (unregistered: [{}], filtered out: [{}]).",
                 unregistered.join(", "),
                 filtered_out.join(", ")
             ),
-            (true, true) => "No supported load balancing policy found in config.".to_string(),
+            (true, true) => "No supported load balancer found in config.".to_string(),
         };
 
         Err(err_msg)
     }
 
-    /// Evaluates an ordered candidate list against the registry without a filter.
+    /// Evaluates an ordered child policy list against the registry without a filter.
     ///
     /// Returns `Ok(Some(ParsedLbConfig))` on successful selection, `Ok(None)` if the list
     /// is empty or null, or `Err(String)` on syntax errors, unregistered policies, or
     /// configuration parsing failures.
-    pub fn select_candidate(
-        &self,
-        candidate_list_json: &str,
-    ) -> Result<Option<ParsedLbConfig>, String> {
-        self.select_candidate_with_filter::<fn(&str) -> bool>(candidate_list_json, None)
+    pub fn select_child(&self, child_list_json: &str) -> Result<Option<ParsedLbConfig>, String> {
+        self.select_child_with_filter::<fn(&str) -> bool>(child_list_json, None)
     }
 }
 
-/// Internal visitor to deserialize a candidate object and strictly enforce the
+/// Internal visitor to deserialize a child policy object and strictly enforce the
 /// gRFC A24 oneOf rule with zero AST allocation.
 #[derive(Debug)]
-struct CandidateEntry<'de> {
+struct ChildEntry<'de> {
     policy_name: &'de str,
     raw_config: &'de str,
 }
 
-impl<'de> serde::Deserialize<'de> for CandidateEntry<'de> {
+impl<'de> serde::Deserialize<'de> for ChildEntry<'de> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = CandidateEntry<'de>;
+            type Value = ChildEntry<'de>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a single-property object representing an LB policy candidate")
+                f.write_str("a single-property object representing a load balancer")
             }
 
             fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
@@ -239,7 +236,7 @@ impl<'de> serde::Deserialize<'de> for CandidateEntry<'de> {
                         "Each load balancing config entry must contain exactly one policy name.",
                     ));
                 }
-                Ok(CandidateEntry {
+                Ok(ChildEntry {
                     policy_name,
                     raw_config: raw_val.get(),
                 })
@@ -341,9 +338,9 @@ mod tests {
 
         // Filter rejects pick_first despite it being registered in GLOBAL_LB_REGISTRY.
         let selected = GLOBAL_LB_REGISTRY
-            .select_candidate_with_filter(json, Some(|name: &str| name == "round_robin"))
+            .select_child_with_filter(json, Some(|name: &str| name == "round_robin"))
             .expect("selection should succeed")
-            .expect("should find a supported candidate");
+            .expect("should find a supported child policy");
 
         assert_eq!(
             selected.builder.name(),
@@ -353,93 +350,86 @@ mod tests {
     }
 
     #[test]
-    fn filter_rejecting_all_registered_candidates_returns_error() {
+    fn filter_rejecting_all_registered_load_balancers_returns_error() {
         let json = r#"[
             { "pick_first": { "shuffleAddressList": true } },
             { "round_robin": {} }
         ]"#;
 
         // Filter rejects all policies.
-        let result = GLOBAL_LB_REGISTRY.select_candidate_with_filter(json, Some(|_: &str| false));
+        let result = GLOBAL_LB_REGISTRY.select_child_with_filter(json, Some(|_: &str| false));
 
         assert!(
             result.is_err(),
-            "expected error when all candidates are rejected by filter."
+            "expected error when all load balancers are rejected by filter."
         );
         let err = result.err().unwrap();
         assert_eq!(
-            err,
-            "None of the candidate policies were permitted by filter: [pick_first, round_robin].",
+            err, "None of the load balancers were permitted by filter: [pick_first, round_robin].",
             "error message should detail which policies were filtered out."
         );
     }
 
     #[test]
-    fn unregistered_candidates_returns_error() {
+    fn unregistered_load_balancers_returns_error() {
         let json = r#"[
             { "unregistered_1": {} },
             { "unregistered_2": {} }
         ]"#;
 
-        let result = GLOBAL_LB_REGISTRY.select_candidate(json);
+        let result = GLOBAL_LB_REGISTRY.select_child(json);
 
         assert!(
             result.is_err(),
-            "expected error when candidates are not registered."
+            "expected error when load balancers are not registered."
         );
         let err = result.err().unwrap();
         assert_eq!(
-            err, "None of the candidate policies are registered: [unregistered_1, unregistered_2].",
+            err, "None of the load balancers are registered: [unregistered_1, unregistered_2].",
             "error message should detail which policies were unregistered."
         );
     }
 
     #[test]
-    fn mixed_unregistered_and_filtered_candidates_returns_error() {
+    fn mixed_unregistered_and_filtered_load_balancers_returns_error() {
         let json = r#"[
             { "unregistered_1": {} },
             { "round_robin": {} }
         ]"#;
 
         let result = GLOBAL_LB_REGISTRY
-            .select_candidate_with_filter(json, Some(|name: &str| name == "unregistered_1"));
+            .select_child_with_filter(json, Some(|name: &str| name == "unregistered_1"));
 
         assert!(
             result.is_err(),
-            "expected error when candidates are either unregistered or filtered out."
+            "expected error when load balancers are either unregistered or filtered out."
         );
         let err = result.err().unwrap();
         assert_eq!(
             err,
-            "No supported load balancing policy selected (unregistered: [unregistered_1], filtered out: [round_robin]).",
+            "No supported load balancer selected (unregistered: [unregistered_1], filtered out: [round_robin]).",
             "error message should distinguish between unregistered and filtered policies."
         );
     }
 
     #[test]
-    fn empty_and_null_candidate_lists_return_none() {
+    fn empty_and_null_child_lists_return_none() {
         let empty_res = GLOBAL_LB_REGISTRY
-            .select_candidate_with_filter::<fn(&str) -> bool>("[]", None)
+            .select_child_with_filter::<fn(&str) -> bool>("[]", None)
             .expect("empty array should succeed");
-        assert!(
-            empty_res.is_none(),
-            "empty candidate list should return None."
-        );
+        assert!(empty_res.is_none(), "empty child list should return None.");
 
         let null_res = GLOBAL_LB_REGISTRY
-            .select_candidate_with_filter::<fn(&str) -> bool>("null", None)
+            .select_child_with_filter::<fn(&str) -> bool>("null", None)
             .expect("null should succeed");
-        assert!(
-            null_res.is_none(),
-            "null candidate list should return None."
-        );
+        assert!(null_res.is_none(), "null child list should return None.");
 
         let whitespace_res = GLOBAL_LB_REGISTRY
-            .select_candidate_with_filter::<fn(&str) -> bool>("   ", None)
+            .select_child_with_filter::<fn(&str) -> bool>("   ", None)
             .expect("whitespace should succeed");
         assert!(
             whitespace_res.is_none(),
-            "whitespace candidate list should return None."
+            "whitespace child list should return None."
         );
     }
 }

@@ -198,6 +198,24 @@ impl LbPolicyRegistry {
     pub fn select_child(&self, child_list_json: &str) -> Result<Option<ParsedLbConfig>, String> {
         self.select_child_with_filter::<fn(&str) -> bool>(child_list_json, None)
     }
+
+    /// Evaluates an ordered child policy list against the registry, requiring a supported policy.
+    ///
+    /// Unlike [`select_child`](Self::select_child), an empty, `"null"`, or whitespace-only list
+    /// is treated as an error rather than returning `Ok(None)`. This helper is intended for
+    /// composite load balancing policies where configuring child policies is mandatory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The child policy list is empty, `"null"`, or contains only whitespace.
+    /// - The child policy list is malformed JSON or contains invalid entries.
+    /// - None of the load balancers are registered.
+    /// - The first supported policy fails to parse its configuration.
+    pub fn select_required_child(&self, child_list_json: &str) -> Result<ParsedLbConfig, String> {
+        self.select_child(child_list_json)?
+            .ok_or_else(|| "Load balancer configuration is required.".to_string())
+    }
 }
 
 /// Internal visitor to deserialize a child policy object and strictly enforce the
@@ -430,6 +448,49 @@ mod tests {
         assert!(
             whitespace_res.is_none(),
             "whitespace child list should return None."
+        );
+    }
+
+    #[test]
+    fn select_required_child_succeeds_for_valid_config() {
+        let json = r#"[
+            { "unsupported_lb": {} },
+            { "pick_first": { "shuffleAddressList": true } }
+        ]"#;
+
+        let selected = GLOBAL_LB_REGISTRY
+            .select_required_child(json)
+            .expect("selection should succeed");
+        assert_eq!(
+            selected.builder.name(),
+            "pick_first",
+            "selected builder name does not match expected pick_first."
+        );
+    }
+
+    #[test]
+    fn select_required_child_errors_on_empty_and_null_lists() {
+        let empty_res = GLOBAL_LB_REGISTRY.select_required_child("[]");
+        assert!(
+            empty_res.is_err(),
+            "empty list should return error for select_required_child."
+        );
+        assert_eq!(
+            empty_res.err().unwrap(),
+            "Load balancer configuration is required.",
+            "error message should indicate load balancer configuration is required."
+        );
+
+        let null_res = GLOBAL_LB_REGISTRY.select_required_child("null");
+        assert!(
+            null_res.is_err(),
+            "null list should return error for select_required_child."
+        );
+
+        let whitespace_res = GLOBAL_LB_REGISTRY.select_required_child("   ");
+        assert!(
+            whitespace_res.is_err(),
+            "whitespace list should return error for select_required_child."
         );
     }
 }

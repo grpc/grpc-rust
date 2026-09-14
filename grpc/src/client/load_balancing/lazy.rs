@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crate::client::ConnectivityState;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
@@ -40,7 +41,6 @@ use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::core::RequestHeaders;
 
 /// Implements a "lazy" [`LbPolicy`].  Normally LB policies begin in a
 /// [`ConnectivityState::Connecting`] state, but [`Lazy`] waits for the first
@@ -49,7 +49,7 @@ use crate::core::RequestHeaders;
 /// Note that Lazy can only properly wrap a policy whose config is Clone, as it
 /// needs to store the config until the child is built.
 #[derive(Debug)]
-pub(crate) struct Lazy<T: LbPolicyBuilder> {
+pub struct Lazy<T: LbPolicyBuilder> {
     inner: Inner<T>,
 }
 

@@ -29,32 +29,28 @@ use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 use std::time::Instant;
-use std::vec;
 
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
+use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::pick_first;
 use crate::client::load_balancing::round_robin;
@@ -62,14 +58,14 @@ use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel_sharing::SubchannelSharing;
 use crate::client::load_balancing::{self};
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
+use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
-use crate::client::service_config::LbPolicyType;
+use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
@@ -79,78 +75,14 @@ use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
-use crate::core::RequestHeaders;
+use crate::core::Address;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
+#[cfg(feature = "_runtime-tokio")]
 use crate::rt::default_runtime;
-
-/// Configuration options for [`Channel`]s.
-#[non_exhaustive]
-pub struct ChannelOptions {
-    pub(crate) transport_options: Attributes, // ?
-    pub(crate) channel_authority: Option<String>,
-    pub(crate) connection_backoff: Option<Todo>,
-    pub(crate) default_service_config: Option<String>,
-    pub(crate) disable_proxy: bool,
-    pub(crate) disable_service_config_lookup: bool,
-    pub(crate) disable_health_checks: bool,
-    pub(crate) max_retry_memory: u32, // ?
-    pub(crate) idle_timeout: Duration,
-    // TODO: pub transport_registry: Option<TransportRegistry>,
-    // TODO: pub name_resolver_registry: Option<ResolverRegistry>,
-    // TODO: pub lb_policy_registry: Option<LbPolicyRegistry>,
-
-    // Typically we allow settings at the channel level that impact all RPCs,
-    // but can also be set per-RPC.  E.g.s:
-    //
-    // - interceptors
-    // - user-agent string override
-    // - max message sizes
-    // - max retry/hedged attempts
-    // - disable retry
-    //
-    // In gRPC-Go, we can express CallOptions as DialOptions, which is a nice
-    // pattern: https://pkg.go.dev/google.golang.org/grpc#WithDefaultCallOptions
-    //
-    // To do this in rust, all optional behavior for a request would need to be
-    // expressed through a trait that applies a mutation to a request.  We'd
-    // apply all those mutations before the user's options so the user's options
-    // would override the defaults, or so the defaults would occur first.
-    pub(crate) default_request_extensions: Vec<Todo>, // ??
-}
-
-impl Default for ChannelOptions {
-    fn default() -> Self {
-        Self {
-            transport_options: Attributes::default(),
-            channel_authority: None,
-            connection_backoff: None,
-            default_service_config: None,
-            disable_proxy: false,
-            disable_service_config_lookup: false,
-            disable_health_checks: false,
-            max_retry_memory: 8 * 1024 * 1024, // 8MB -- ???
-            idle_timeout: Duration::from_secs(30 * 60),
-            default_request_extensions: vec![],
-        }
-    }
-}
-
-impl ChannelOptions {
-    /// Overrides the channel authority, which is used for credentials
-    /// handshaking and HTTP virtual hosting.
-    pub fn override_authority(self, authority: impl Into<String>) -> Self {
-        Self {
-            channel_authority: Some(authority.into()),
-            ..self
-        }
-    }
-}
 
 /// A virtual, persistent connection to a gRPC service.
 ///
@@ -164,34 +96,49 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Constructs a new gRPC channel.  Channel creation cannot fail, but if the
-    /// target string is invalid, the returned channel will never connect, and
-    /// will fail all RPCs.
-    pub fn new<C>(target: impl Into<String>, credentials: Arc<C>, options: ChannelOptions) -> Self
-    where
-        C: ChannelCredentials,
-        C::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
-    {
-        pick_first::reg();
-        round_robin::reg();
-        dns::reg();
-        #[cfg(unix)]
-        name_resolution::unix::reg();
-        #[cfg(target_os = "linux")]
-        name_resolution::unix_abstract::reg();
-        #[cfg(feature = "_runtime-tokio")]
-        tonic_transport::reg();
-        Self {
-            inner: Arc::new(PersistentChannel::new(
-                target,
-                default_runtime(),
-                options,
-                credentials as Arc<dyn DynChannelCredentials>,
-            )),
+    /// Creates a new channel builder for the given target. Target and
+    /// credentials are required to build a channel.
+    ///
+    /// The [target name](https://github.com/grpc/grpc/blob/master/doc/naming.md)
+    /// is a fully qualified, self contained URI defined by [rfc3986](https://datatracker.ietf.org/doc/html/rfc3986).
+    /// The target's scheme determines the name resolver used. If none is
+    /// detected the default name resolver ("dns") is used, unless overridden
+    /// by the user. Valid examples of target names include:
+    ///
+    /// "foo.googleapis.com:8080"
+    /// "dns:///foo.googleapis.com:8080"
+    /// "dns:///foo.googleapis.com"
+    /// "dns:///10.0.0.213:8080"
+    /// "dns:///%5B2001:db8:85a3:8d3:1319:8a2e:370:7348%5D:443"
+    /// "dns://8.8.8.8/foo.googleapis.com:8080"
+    /// "dns://8.8.8.8/foo.googleapis.com"
+    /// "zookeeper://zk.example.com:9900/example_service"
+    ///
+    /// Credentials must implement the [`ChannelCredentials`] trait.
+    ///
+    ///
+    ///# Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use grpc::client::Channel;
+    /// use grpc::credentials::LocalChannelCredentials;
+    ///
+    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+    ///     .build();
+    /// ```
+    #[cfg(feature = "_runtime-tokio")]
+    pub fn builder(
+        target: impl Into<String>,
+        credentials: Arc<dyn ChannelCredentials>,
+    ) -> ChannelBuilder {
+        ChannelBuilder {
+            target: target.into(),
+            credentials,
+            authority: None,
+            runtime: default_runtime(),
         }
     }
-
-    // TODO: enter_idle(&self) and graceful_stop()?
 
     /// Returns the current state of the channel. If `connect` is true and the
     /// state was [`Idle`](ConnectivityState::Idle), the channel will attempt to
@@ -225,56 +172,88 @@ impl Invoke for Channel {
     }
 }
 
-// A PersistentChannel represents the static configuration of a channel and an
-// optional Arc of an ActiveChannel.  An ActiveChannel exists whenever the
-// PersistentChannel is not IDLE.  Every channel is IDLE at creation, or after
-// some configurable timeout elapses without any any RPC activity.
-struct PersistentChannel {
-    target: Target,
-    resolver_builder: Arc<dyn ResolverBuilder>,
-    options: ChannelOptions,
-    active_channel: Mutex<Option<Arc<ActiveChannel>>>,
+pub struct ChannelBuilder {
+    // Required values.
+    target: String,
+    credentials: Arc<dyn ChannelCredentials>,
     runtime: GrpcRuntime,
-    security_opts: SecurityOpts,
-    authority: String,
+
+    // Optional values.
+    authority: Option<String>,
 }
 
-impl PersistentChannel {
-    // Channels begin idle so `new()` does not automatically connect.
-    // ChannelOption contain only optional parameters.
-    fn new(
-        target: impl Into<String>,
-        runtime: GrpcRuntime,
-        options: ChannelOptions,
-        credentials: Arc<dyn DynChannelCredentials>,
-    ) -> Self {
-        // TODO(arjan-bal): Return errors here instead of panicking.
-        let target = Url::from_str(&target.into()).unwrap();
+impl ChannelBuilder {
+    /// Builds the channel with the provided configuration.
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use grpc::client::Channel;
+    /// use grpc::credentials::LocalChannelCredentials;
+    ///
+    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+    ///     .build();
+    /// ```
+    pub fn build(self) -> Channel {
+        // TODO(nathanielford) This construction is currently a rough-cut placeholder.
+        // The design of PersistentChannel and how and where it is initialized
+        // will be finalized with the 'Internal Channel Design' with
+        // consideration for:
+        // - error handling (inc. always-failing resolvers due to invalid targets))
+        // - testing (inc. credential and transport configuration)
+
+        setup_registeries();
+
+        // TODO(nathanielford): Return errors here instead of panicking.
+        let target = Target::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        let target = name_resolution::Target::from(target);
-        let authority = options
-            .channel_authority
-            .clone()
+        let resolver_builder = proxy_resolver::Builder::new_arc(resolver_builder);
+
+        let authority = self
+            .authority
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
-            credentials,
-            authority: parse_authority(&authority),
+            credentials: self.credentials,
+            authority: Authority::from_host_port_str(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
-
-        Self {
-            target,
-            resolver_builder,
-            active_channel: Mutex::default(),
-            options,
-            runtime,
-            security_opts,
-            authority,
+        Channel {
+            inner: Arc::new(PersistentChannel {
+                active_channel: Mutex::default(),
+                target,
+                security_opts,
+                runtime: self.runtime,
+                resolver_builder,
+            }),
         }
     }
 
-    /// Returns the current state of the channel. If there is no underlying active channel,
-    /// returns Idle. If `connect` is true, will create a new active channel iff none exists.
+    /// Sets the channel's authority value, to be used as the :authority
+    /// pseudo-header and the server name in authentication handshakes. This
+    /// overrides all other ways of setting authority on the channel, but can be
+    /// overridden by per-call authority values.
+    pub fn authority(mut self, authority: impl Into<String>) -> Self {
+        self.authority = Some(authority.into());
+        self
+    }
+}
+
+struct PersistentChannel {
+    active_channel: Mutex<Option<Arc<ActiveChannel>>>,
+
+    // Configuration
+    target: Target,
+    security_opts: SecurityOpts,
+    runtime: GrpcRuntime,
+
+    // Inferred Configuration
+    resolver_builder: Arc<dyn ResolverBuilder>,
+}
+
+impl PersistentChannel {
+    /// Returns the current state of the channel. If there is no underlying active
+    /// channel, returns Idle. If `connect` is true, will create a new active
+    /// channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
         // Done this away to avoid potentially locking twice.
         let active_channel = if connect {
@@ -291,8 +270,9 @@ impl PersistentChannel {
         active_channel.lb_watcher.cur().connectivity_state
     }
 
-    /// Gets the underlying active channel. If there is no current connection, it will create one.
-    /// This cannot fail and will always return a valid active channel.
+    /// Gets the underlying active channel. If there is no current connection,
+    /// it will create one. This cannot fail and will always return a valid
+    /// active channel.
     fn get_active_channel(&self) -> Arc<ActiveChannel> {
         let mut active_channel = self.active_channel.lock().unwrap();
 
@@ -306,8 +286,10 @@ impl PersistentChannel {
 
 // A channel that is not idle (connecting, ready, or erroring).
 struct ActiveChannel {
-    abort_handle: Box<dyn rt::TaskHandle>, // Work scheduler task killed when ActiveChannel is dropped.
-    lb_watcher: Arc<Watcher<LbState>>, // For getting the channel connectivity state and pickers for RPCs.
+    abort_handle: Box<dyn rt::TaskHandle>, /* Work scheduler task killed when ActiveChannel is
+                                            * dropped. */
+    lb_watcher: Arc<Watcher<LbState>>, /* For getting the channel connectivity state and pickers
+                                        * for RPCs. */
 }
 
 impl ActiveChannel {
@@ -329,7 +311,10 @@ impl ActiveChannel {
 
         let work_scheduler = Arc::new(ResolverWorkScheduler { wqtx });
         let resolver_opts = name_resolution::ResolverOptions {
-            authority: persistent_channel.authority.clone(),
+            authority: persistent_channel
+                .security_opts
+                .authority
+                .host_port_string(),
             work_scheduler,
             runtime: runtime.clone(),
         };
@@ -341,7 +326,7 @@ impl ActiveChannel {
             while let Some(w) = wqrx.recv().await {
                 match w {
                     WorkQueueItem::ScheduleResolver => {
-                        resolver.work(&mut resolver_channel_controller)
+                        resolver.work(&mut resolver_channel_controller);
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
                     WorkQueueItem::ScheduleLbPolicy(data) => {
@@ -379,10 +364,10 @@ impl Invoke for Arc<ActiveChannel> {
         let mut i = self.lb_watcher.iter();
         loop {
             let Some(state) = i.next().await else {
-                return FailingRecvStream::new_stream_pair(StatusError::new(
-                    StatusCodeError::Internal,
-                    "channel has been closed",
-                ));
+                return FailingRecvStream::new_stream_pair(
+                    StatusError::new(StatusCodeError::Internal, "channel has been closed"),
+                    None,
+                );
             };
             let result = &state.picker.pick(&headers);
             match result {
@@ -399,7 +384,7 @@ impl Invoke for Arc<ActiveChannel> {
                     // Continue and retry the RPC with the next picker.
                 }
                 PickResult::Fail(status) => {
-                    return FailingRecvStream::new_stream_pair(status.clone());
+                    return FailingRecvStream::new_stream_pair(status.clone(), None);
                 }
                 PickResult::Drop(status) => {
                     todo!("dropped pick: {:?}", status);
@@ -466,28 +451,19 @@ impl ResolverChannelController {
 
 impl name_resolution::ChannelController for ResolverChannelController {
     fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
-        let json_config = if let Ok(Some(service_config)) = update.service_config.as_ref()
-            && service_config
-                .load_balancing_policy
-                .as_ref()
-                .is_some_and(|p| *p == LbPolicyType::RoundRobin)
-        {
-            json!([{round_robin::POLICY_NAME: {}}])
-        } else {
-            json!([{pick_first::POLICY_NAME: {"shuffleAddressList": true, "unknown_field": false}}])
+        let (builder, config) = match update.service_config.as_ref() {
+            Ok(Some(sc)) => sc.lb_config(),
+            _ => ServiceConfig::default_lb_policy(),
         };
 
-        // TODO: config should come from ServiceConfig.
-        let config =
-            GracefulSwitchPolicy::parse_config(&ParsedJsonLbConfig::from_value(json_config))?;
+        let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 
         self.lb_policy
-            .resolver_update(update, Some(&config), &mut self.lb_channel_controller)
-            .map_err(|err| err.to_string())
+            .resolver_update(update, Some(&gsb_config), &mut self.lb_channel_controller)
     }
 
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
-        Err("service configs not supported".to_string())
+    fn parse_service_config(&self, config: &str) -> ParseResult {
+        ServiceConfig::parse(config)
     }
 }
 
@@ -601,8 +577,8 @@ impl<T: Clone> WatcherIter<T> {
     }
 }
 
-/// Parses the host and port from a URL-encoded string. When the input can not
-/// be parsed as (host, port) pair, it returns the entire input as the host.
+/// Parses the host and port from a string. When the input can not be parsed
+/// as (host, port) pair, it returns the entire input as the host.
 fn parse_authority(host_and_port: &str) -> Authority {
     // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
     if let Some(stripped) = host_and_port.strip_prefix('[')
@@ -621,162 +597,16 @@ fn parse_authority(host_and_port: &str) -> Authority {
     Authority::new(host_and_port.to_string(), None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_authority() {
-        struct TestCase {
-            input: &'static str,
-            expected: Authority,
-        }
-
-        let cases = [
-            TestCase {
-                input: "localhost:http",
-                expected: Authority::new("localhost:http", None),
-            },
-            TestCase {
-                input: "localhost:80",
-                expected: Authority::new("localhost", Some(80)),
-            },
-            // host name with zone identifier.
-            TestCase {
-                input: "localhost%lo0:80",
-                expected: Authority::new("localhost%lo0", Some(80)),
-            },
-            TestCase {
-                input: "localhost%lo0:http",
-                expected: Authority::new("localhost%lo0:http", None),
-            },
-            TestCase {
-                input: "[localhost%lo0]:http",
-                expected: Authority::new("[localhost%lo0]:http", None),
-            },
-            TestCase {
-                input: "[localhost%lo0]:80",
-                expected: Authority::new("localhost%lo0", Some(80)),
-            },
-            // IP literal
-            TestCase {
-                input: "127.0.0.1:http",
-                expected: Authority::new("127.0.0.1:http", None),
-            },
-            TestCase {
-                input: "127.0.0.1:80",
-                expected: Authority::new("127.0.0.1", Some(80)),
-            },
-            TestCase {
-                input: "[::1]:http",
-                expected: Authority::new("[::1]:http", None),
-            },
-            TestCase {
-                input: "[::1]:80",
-                expected: Authority::new("::1", Some(80)),
-            },
-            // IP literal with zone identifier.
-            TestCase {
-                input: "[::1%lo0]:http",
-                expected: Authority::new("[::1%lo0]:http", None),
-            },
-            TestCase {
-                input: "[::1%lo0]:80",
-                expected: Authority::new("::1%lo0", Some(80)),
-            },
-            TestCase {
-                input: ":http",
-                expected: Authority::new(":http", None),
-            },
-            TestCase {
-                input: ":80",
-                expected: Authority::new("", Some(80)),
-            },
-            TestCase {
-                input: "grpc.io:",
-                expected: Authority::new("grpc.io:", None),
-            },
-            TestCase {
-                input: "127.0.0.1:",
-                expected: Authority::new("127.0.0.1:", None),
-            },
-            TestCase {
-                input: "[::1]:",
-                expected: Authority::new("[::1]:", None),
-            },
-            TestCase {
-                input: "grpc.io:https%foo",
-                expected: Authority::new("grpc.io:https%foo", None),
-            },
-            TestCase {
-                input: "grpc.io",
-                expected: Authority::new("grpc.io", None),
-            },
-            TestCase {
-                input: "127.0.0.1",
-                expected: Authority::new("127.0.0.1", None),
-            },
-            TestCase {
-                input: "[::1]",
-                expected: Authority::new("[::1]", None),
-            },
-            TestCase {
-                input: "[fe80::1%lo0]",
-                expected: Authority::new("[fe80::1%lo0]", None),
-            },
-            TestCase {
-                input: "[localhost%lo0]",
-                expected: Authority::new("[localhost%lo0]", None),
-            },
-            TestCase {
-                input: "localhost%lo0",
-                expected: Authority::new("localhost%lo0", None),
-            },
-            TestCase {
-                input: "::1",
-                expected: Authority::new("::1", None),
-            },
-            TestCase {
-                input: "fe80::1%lo0",
-                expected: Authority::new("fe80::1%lo0", None),
-            },
-            TestCase {
-                input: "fe80::1%lo0:80",
-                expected: Authority::new("fe80::1%lo0:80", None),
-            },
-            TestCase {
-                input: "[foo:bar]",
-                expected: Authority::new("[foo:bar]", None),
-            },
-            TestCase {
-                input: "[foo:bar]baz",
-                expected: Authority::new("[foo:bar]baz", None),
-            },
-            TestCase {
-                input: "[foo]bar:baz",
-                expected: Authority::new("[foo]bar:baz", None),
-            },
-            TestCase {
-                input: "[foo]:[bar]:baz",
-                expected: Authority::new("[foo]:[bar]:baz", None),
-            },
-            TestCase {
-                input: "[foo]:[bar]baz",
-                expected: Authority::new("[foo]:[bar]baz", None),
-            },
-            TestCase {
-                input: "foo[bar]:baz",
-                expected: Authority::new("foo[bar]:baz", None),
-            },
-            TestCase {
-                input: "foo]bar:baz",
-                expected: Authority::new("foo]bar:baz", None),
-            },
-        ];
-
-        for TestCase { input, expected } in cases {
-            let auth = parse_authority(input);
-            assert_eq!(auth, expected, "authority mismatch for {}", input);
-        }
-    }
+// Sets up the default registries for transports, name resolvers, and load
+// balancers.
+fn setup_registeries() {
+    pick_first::reg();
+    round_robin::reg();
+    dns::reg();
+    #[cfg(unix)]
+    name_resolution::unix::reg();
+    #[cfg(target_os = "linux")]
+    name_resolution::unix_abstract::reg();
+    #[cfg(feature = "_runtime-tokio")]
+    tonic_transport::reg();
 }

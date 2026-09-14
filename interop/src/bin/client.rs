@@ -1,13 +1,36 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grpc::client::ChannelOptions;
 use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
 use grpc::credentials::rustls::StaticProvider;
 use grpc::credentials::rustls::client::ClientTlsConfig as GrpcClientTlsConfig;
-use grpc::credentials::rustls::client::RustlsChannelCredendials;
+use grpc::credentials::rustls::client::RustlsChannelCredentials;
 use interop::client::InteropTest;
 use interop::client::InteropTestUnimplemented;
 use interop::client_prost;
@@ -95,25 +118,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let pem = std::fs::read_to_string("interop/data/ca.pem")?;
                 let root_certs = RootCertificates::from_pem(pem);
-                let creds = RustlsChannelCredendials::new(
+                let creds = RustlsChannelCredentials::new(
                     GrpcClientTlsConfig::new()
                         .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;
-                let channel_options =
-                    ChannelOptions::default().override_authority("test.test.google.fr");
-                grpc::client::Channel::new(
-                    "dns:///localhost:10000",
-                    Arc::new(creds),
-                    channel_options,
-                )
+                grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
+                    .authority("test.test.google.fr")
+                    .build()
             } else {
-                grpc::client::Channel::new(
+                grpc::client::Channel::builder(
                     "dns:///localhost:10000",
                     Arc::new(LocalChannelCredentials::new()),
-                    ChannelOptions::default(),
                 )
+                .build()
             };
-
             (
                 Box::new(client_protobuf::TestClient::new(channel.clone())),
                 Box::new(client_protobuf::UnimplementedClient::new(channel)),

@@ -24,16 +24,19 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
+
+use http::HeaderValue;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::core::Address;
+use crate::core::ConnectionInfo;
+use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::GrpcRuntime;
 
+pub(crate) mod http_connect;
 mod registry;
 
 // Using tower/buffer enables tokio's rt feature even though it's possible to
@@ -41,7 +44,7 @@ mod registry;
 #[cfg(feature = "_runtime-tokio")]
 pub(crate) mod tonic;
 
-use ::tonic::async_trait;
+use crate::async_trait;
 pub(crate) use registry::GLOBAL_TRANSPORT_REGISTRY;
 pub(crate) use registry::TransportRegistry;
 use tokio::sync::oneshot;
@@ -49,7 +52,7 @@ use tokio::sync::oneshot;
 // TODO: The following options are specific to HTTP/2. We should
 // instead pass an `Attribute` like struct to the connect method instead which
 // can hold config relevant to a particular transport.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct TransportOptions {
     pub(crate) init_stream_window_size: Option<u32>,
     pub(crate) init_connection_window_size: Option<u32>,
@@ -57,12 +60,29 @@ pub(crate) struct TransportOptions {
     pub(crate) http2_keep_alive_timeout: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: Option<bool>,
     pub(crate) http2_max_header_list_size: Option<u32>,
-    pub(crate) http2_adaptive_window: Option<bool>,
+    pub(crate) http2_adaptive_window: bool,
     pub(crate) concurrency_limit: Option<usize>,
     pub(crate) rate_limit: Option<(u64, Duration)>,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
-    pub(crate) connect_deadline: Option<Instant>,
+}
+
+impl Default for TransportOptions {
+    fn default() -> Self {
+        TransportOptions {
+            init_stream_window_size: None,
+            init_connection_window_size: None,
+            http2_keep_alive_interval: None,
+            http2_keep_alive_timeout: None,
+            http2_keep_alive_while_idle: None,
+            http2_max_header_list_size: None,
+            http2_adaptive_window: true,
+            concurrency_limit: None,
+            rate_limit: None,
+            tcp_keepalive: None,
+            tcp_nodelay: true,
+        }
+    }
 }
 
 #[trait_variant::make(Send)]
@@ -71,14 +91,14 @@ pub(crate) trait Transport: Sync {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -89,14 +109,14 @@ pub(crate) trait Transport: Sync {
 pub(crate) trait DynTransport: Send + Sync {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            DynClientConnectionSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -107,14 +127,14 @@ pub(crate) trait DynTransport: Send + Sync {
 impl<T: Transport> DynTransport for T {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            DynClientConnectionSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -126,7 +146,57 @@ impl<T: Transport> DynTransport for T {
 
 #[derive(Clone)]
 pub(crate) struct SecurityOpts {
-    pub(crate) credentials: Arc<dyn DynChannelCredentials>,
+    pub(crate) credentials: Arc<dyn ChannelCredentials>,
     pub(crate) authority: Authority,
     pub(crate) handshake_info: ClientHandshakeInfo,
+}
+
+/// Configuration options for establishing an HTTP `CONNECT` proxy tunnel.
+///
+/// This may be added as an [`Address`] attribute by a
+/// [`crate::client::name_resolution::Resolver`]. If present, the subchannel
+/// will automatically handle the HTTP `CONNECT` handshake.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct ProxyOptions {
+    proxy_authorization_header: Option<HeaderValue>,
+    target_authority: String,
+}
+
+impl ProxyOptions {
+    /// Creates a new `ProxyOptions`.
+    ///
+    /// # Arguments
+    /// * `target_authority` - The address of the target server to connect to
+    ///   (host:port). Must be a valid hostname.
+    /// * `proxy_authorization_header` - The value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn new(
+        target_authority: String,
+        proxy_authorization_header: Option<HeaderValue>,
+    ) -> Self {
+        Self {
+            proxy_authorization_header,
+            target_authority,
+        }
+    }
+
+    /// Returns the value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn proxy_authorization_header(&self) -> Option<&HeaderValue> {
+        self.proxy_authorization_header.as_ref()
+    }
+
+    /// Returns the address of the proxy server to connect to (host:port).
+    /// This is Punycode-encoded, i.e., it's a valid URL host:port.
+    pub(crate) fn target_authority(&self) -> &str {
+        &self.target_authority
+    }
+
+    /// Extracts `ProxyOptions` from the given `Address` attributes, if present.
+    pub(crate) fn from_addr(addr: &Address) -> Option<&Self> {
+        addr.attributes.get::<Arc<Self>>().map(AsRef::as_ref)
+    }
+
+    /// Adds these `ProxyOptions` to the given `Address` attributes.
+    pub(crate) fn add_to_addr(addr: &mut Address, options: Arc<Self>) {
+        addr.attributes = addr.attributes.add(options);
+    }
 }

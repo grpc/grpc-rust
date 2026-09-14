@@ -28,8 +28,8 @@ use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::SendStream;
-use crate::core::RequestHeaders;
 
 /// A trait which allows intercepting an RPC [`Invoke`] operation.  The trait is
 /// generic on `I` which should either be implemented as [`InvokeOnce`] (for
@@ -201,17 +201,15 @@ where
 ///
 /// ```
 /// use std::sync::Arc;
-/// use grpc::client::{Channel, ChannelOptions};
+/// use grpc::client::Channel;
 /// use grpc::credentials::LocalChannelCredentials;
 /// use grpc::client::stream_util::ResponseValidator;
 /// use grpc::client::interceptor::InvokeExt;
 ///
 /// // Create a channel:
-/// let channel = Channel::new(
-///     "dns:///localhost:123",
-///     Arc::new(LocalChannelCredentials::new()),
-///     ChannelOptions::default(),
-/// );
+/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+///     .build();
+///
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///
@@ -247,17 +245,14 @@ pub trait InvokeExt: Invoke + Sized {
 ///
 /// ```
 /// use std::sync::Arc;
-/// use grpc::client::{Channel, ChannelOptions};
+/// use grpc::client::Channel;
 /// use grpc::credentials::LocalChannelCredentials;
 /// use grpc::client::stream_util::ResponseValidator;
 /// use grpc::client::interceptor::InvokeOnceExt;
 ///
 /// // Create a channel:
-/// let channel = Channel::new(
-///     "dns:///localhost:123",
-///     Arc::new(LocalChannelCredentials::new()),
-///     ChannelOptions::default(),
-/// );
+/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
+///     .build();
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///
@@ -327,13 +322,13 @@ mod test {
     use crate::client::CallOptions;
     use crate::client::Invoke;
     use crate::client::RecvStream;
+    use crate::client::ResponseHeaders;
     use crate::client::ResponseStreamItem;
     use crate::client::SendOptions;
     use crate::client::SendStream;
+    use crate::client::Trailers;
     use crate::core::RecvMessage;
-    use crate::core::ResponseHeaders;
     use crate::core::SendMessage;
-    use crate::core::Trailers;
 
     #[derive(Clone)]
     struct Reusable;
@@ -568,7 +563,9 @@ mod test {
             .unwrap();
         assert_eq!(controller.recv_req().await.0, one);
         controller
-            .send_resp(ResponseStreamItem::Headers(ResponseHeaders::default()))
+            .send_resp(ResponseStreamItem::Headers(ResponseHeaders::new(
+                crate::core::test_connection_info(),
+            )))
             .await;
 
         let resp = rx.recv(&mut ByteRecvMsg::new()).await;
@@ -920,7 +917,7 @@ mod test {
             Self { data }
         }
     }
-    impl<'a> SendMessage for ByteSendMsg<'a> {
+    impl SendMessage for ByteSendMsg<'_> {
         fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
             Ok(Box::new(self.data.clone()))
         }

@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! xDS routing: route matching logic and [`XdsRouter`] implementation.
 //!
 //! This module contains both the route matching logic (domain → path → headers)
@@ -19,9 +43,11 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use tokio::sync::watch;
 
-use crate::client::route::{RouteDecision, RouteInput, Router};
-use crate::common::async_util::{AbortOnDrop, BoxFuture};
+use crate::client::retry::{GrpcRetryClassifierFactory, RetryClassifierFactory};
+use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
+use crate::common::async_util::AbortOnDrop;
 use crate::xds::cache::XdsCache;
+use crate::xds::resource::hash_policy::HashPolicyConfig;
 use crate::xds::resource::route_config::{
     HeaderMatchSpecifierConfig, HeaderMatcherConfig, PathSpecifierConfig, RouteConfig,
     RouteConfigAction, RouteConfigMatch, RouteConfigResource, VirtualHostConfig, WeightedCluster,
@@ -41,18 +67,30 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// config is available, matching standard gRPC behavior where RPCs wait for the
 /// resolver's first update. Subsequent RPCs read the config lock-free.
 pub(crate) struct XdsRouter {
-    route_config: Arc<ArcSwapOption<RouteConfigResource>>,
+    route_config: Arc<ArcSwapOption<RoutingSnapshot>>,
     ready_rx: watch::Receiver<bool>,
     _watch_task: AbortOnDrop,
 }
 
 impl XdsRouter {
-    /// Creates a new `XdsRouter` that watches route config from the given cache.
+    /// Creates a new `XdsRouter` that watches route config from the given cache,
+    /// compiling per-route retry policies with the default
+    /// [`GrpcRetryClassifierFactory`].
     ///
     /// Spawns a background task that updates the local route config whenever
     /// the cache publishes a new one. The task is aborted when this router
     /// is dropped.
     pub(crate) fn new(cache: &XdsCache) -> Self {
+        Self::with_retry_factory(cache, Arc::new(GrpcRetryClassifierFactory))
+    }
+
+    /// Like [`new`](Self::new) but compiles per-route retry policies with a custom
+    /// [`RetryClassifierFactory`], letting a non-gRPC transport interpret
+    /// `retry_on` for that transport.
+    pub(crate) fn with_retry_factory(
+        cache: &XdsCache,
+        retry_factory: Arc<dyn RetryClassifierFactory>,
+    ) -> Self {
         let route_config = Arc::new(ArcSwapOption::empty());
         let (ready_tx, ready_rx) = watch::channel(false);
         let rc = route_config.clone();
@@ -60,7 +98,10 @@ impl XdsRouter {
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
-                rc.store(Some(config));
+                rc.store(Some(Arc::new(RoutingSnapshot::new(
+                    config,
+                    retry_factory.as_ref(),
+                ))));
                 // Signal readiness on the first config, then drop the sender.
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(true);
@@ -73,52 +114,72 @@ impl XdsRouter {
             _watch_task: AbortOnDrop(handle),
         }
     }
+
+    /// The route config currently in effect, or `None` if none has arrived yet.
+    pub(crate) fn snapshot(&self) -> Option<Arc<RoutingSnapshot>> {
+        self.route_config.load_full()
+    }
 }
 
 impl Router for XdsRouter {
-    fn route(&self, input: &RouteInput<'_>) -> BoxFuture<Result<RouteDecision, RoutingError>> {
-        let authority = input.authority.to_string();
-        let headers = input.headers.clone();
-
-        // Fast path: config already available, no cloning needed.
-        if let Some(rc) = self.route_config.load_full() {
-            return Box::pin(async move { resolve_route(&rc, &authority, &headers) });
+    fn acquire(&self) -> AcquiredConfig {
+        if let Some(config) = self.snapshot() {
+            return AcquiredConfig::Ready(config);
         }
-
-        // Slow path: wait for the initial route config, matching standard
-        // gRPC behavior where RPCs block until the resolver provides the
-        // first update.
+        // Wait for the initial route config, matching standard gRPC behavior
+        // where RPCs block until the resolver provides the first update.
         let route_config_ref = self.route_config.clone();
         let mut ready_rx = self.ready_rx.clone();
-        Box::pin(async move {
+        AcquiredConfig::Pending(Box::pin(async move {
             tokio::time::timeout(DEFAULT_READY_TIMEOUT, ready_rx.wait_for(|ready| *ready))
                 .await
                 .map_err(|_| RoutingError::NotReady)?
                 .map_err(|_| RoutingError::NotReady)?;
-            let rc = route_config_ref.load_full().ok_or(RoutingError::NotReady)?;
-            resolve_route(&rc, &authority, &headers)
-        })
+            route_config_ref.load_full().ok_or(RoutingError::NotReady)
+        }))
+    }
+
+    fn route(
+        &self,
+        input: &RouteInput<'_>,
+        config: &RoutingSnapshot,
+    ) -> Result<RouteDecision, RoutingError> {
+        resolve_route(config, input.authority, input.path, input.headers)
     }
 }
 
-/// Resolve a route decision from the given config, authority, and headers.
+/// Resolve a route decision from the given config, authority, path, and headers.
 fn resolve_route(
-    rc: &RouteConfigResource,
+    rc: &RoutingSnapshot,
     authority: &str,
+    path: &str,
     headers: &http::HeaderMap,
 ) -> Result<RouteDecision, RoutingError> {
-    let path = headers
-        .get(":path")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
-    let action = rc.route(authority, path, headers)?;
-    let cluster = match action {
+    let route = rc.matched_route(authority, path, headers)?;
+    let cluster = match &route.action {
         RouteConfigAction::Cluster(name) => name.clone(),
         RouteConfigAction::WeightedClusters(clusters) => select_weighted_cluster(clusters)
             .ok_or(RoutingError::EmptyWeightedClusters)?
             .to_string(),
     };
-    Ok(RouteDecision { cluster })
+
+    // Retry config for the matched route, from the same snapshot we routed on so
+    // retry and routing act on one RDS version.
+    let retry_config = rc.retry_for(route.retry_config.as_ref());
+
+    // gRFC A42 ring-hash request hash. The policy list is empty for now, so
+    // `request_hash` resolves to `None` and the ring-hash picker falls back to a
+    // random hash.
+    // TODO(madhurishgupta): populate hash policies from the route's RDS
+    // `RouteAction.hash_policy` (later PR).
+    let policies: &[HashPolicyConfig] = &[];
+    let request_hash = HashPolicyConfig::request_hash(headers, policies);
+
+    Ok(RouteDecision {
+        cluster,
+        request_hash,
+        retry_config,
+    })
 }
 
 /// Error returned when routing fails.
@@ -138,19 +199,37 @@ impl RouteConfigResource {
     /// Match a request and return the target cluster action.
     ///
     /// Performs domain matching on the authority, then walks routes in order
-    /// to find the first match.
+    /// to find the first match. Test-only convenience wrapper around
+    /// [`matched_route`](Self::matched_route); production routing uses
+    /// `matched_route` so it can also read the matched route's retry policy.
+    #[cfg(test)]
     pub(crate) fn route(
         &self,
         authority: &str,
         path: &str,
         headers: &http::HeaderMap,
     ) -> Result<&RouteConfigAction, RoutingError> {
+        self.matched_route(authority, path, headers)
+            .map(|route| &route.action)
+    }
+
+    /// Match a request and return the full matched [`RouteConfig`].
+    ///
+    /// Performs domain matching on the authority, then walks routes in order to
+    /// find the first match. Returns the whole matched route so callers can read
+    /// per-route fields (e.g. the retry policy) alongside the action.
+    pub(crate) fn matched_route(
+        &self,
+        authority: &str,
+        path: &str,
+        headers: &http::HeaderMap,
+    ) -> Result<&RouteConfig, RoutingError> {
         let vh = find_best_matching_virtual_host(authority, &self.virtual_hosts)
             .ok_or_else(|| RoutingError::NoMatchingVirtualHost(authority.to_string()))?;
 
         for route in &vh.routes {
             if route_matches(route, path, headers) {
-                return Ok(&route.action);
+                return Ok(route);
             }
         }
 
@@ -337,6 +416,7 @@ mod tests {
     use crate::xds::resource::route_config::{
         RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
     };
+    use crate::xds::resource::safe_regex::SafeRegex;
     use crate::xds::resource::string_matcher::StringMatcher;
 
     fn simple_route(prefix: &str, cluster: &str) -> RouteConfig {
@@ -348,6 +428,7 @@ mod tests {
                 match_fraction: None,
             },
             action: RouteConfigAction::Cluster(cluster.into()),
+            retry_config: None,
         }
     }
 
@@ -355,6 +436,7 @@ mod tests {
         RouteConfigResource {
             name: "test-rc".into(),
             virtual_hosts,
+            metadata: Default::default(),
         }
     }
 
@@ -579,6 +661,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster("c1".into()),
+                retry_config: None,
             }],
         }]);
         let headers = http::HeaderMap::new();
@@ -595,13 +678,14 @@ mod tests {
             routes: vec![RouteConfig {
                 match_criteria: RouteConfigMatch {
                     path_specifier: PathSpecifierConfig::SafeRegex(
-                        regex::Regex::new("^/svc/.*").unwrap(),
+                        SafeRegex::new("/svc/.*").unwrap(),
                     ),
                     headers: vec![],
                     case_sensitive: true,
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster("c1".into()),
+                retry_config: None,
             }],
         }]);
         let headers = http::HeaderMap::new();
@@ -633,6 +717,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("cluster-prod".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "cluster-default"),
             ],
@@ -670,6 +755,7 @@ mod tests {
                         weight: 30,
                     },
                 ]),
+                retry_config: None,
             }],
         }]);
         let action = rc.route("host", "/", &http::HeaderMap::new()).unwrap();
@@ -690,6 +776,7 @@ mod tests {
                         match_fraction: Some(0),
                     },
                     action: RouteConfigAction::Cluster("never".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -713,6 +800,7 @@ mod tests {
                     match_fraction: Some(1_000_000),
                 },
                 action: RouteConfigAction::Cluster("always".into()),
+                retry_config: None,
             }],
         }]);
         for _ in 0..100 {
@@ -742,6 +830,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("versioned".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "default"),
             ],
@@ -837,6 +926,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("grpc".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -872,6 +962,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster("matched".into()),
+                retry_config: None,
             }],
         }]);
 
@@ -909,6 +1000,7 @@ mod tests {
                             match_fraction: None,
                         },
                         action: RouteConfigAction::Cluster("matched".into()),
+                        retry_config: None,
                     },
                     simple_route("/", "fallback"),
                 ],
@@ -959,7 +1051,7 @@ mod tests {
                         headers: vec![HeaderMatcherConfig {
                             name: "x-tag".into(),
                             match_specifier: HeaderMatchSpecifierConfig::String(
-                                StringMatcher::SafeRegex(regex::Regex::new("^v[0-9]+$").unwrap()),
+                                StringMatcher::SafeRegex(SafeRegex::new("v[0-9]+").unwrap()),
                             ),
                             invert_match: false,
                         }],
@@ -967,6 +1059,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("matched".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -1008,6 +1101,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("matched".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -1044,9 +1138,11 @@ mod tests {
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "my-service",
+            path: "/",
             headers: &headers,
         };
-        let decision = router.route(&input).await.unwrap();
+        let config = router.snapshot().expect("config");
+        let decision = router.route(&input, &config).unwrap();
         assert_eq!(decision.cluster, "my-cluster");
     }
 
@@ -1061,39 +1157,43 @@ mod tests {
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "svc",
+            path: "/",
             headers: &headers,
         };
 
-        let decision = router.route(&input).await.unwrap();
+        let config = router.snapshot().expect("config");
+        let decision = router.route(&input, &config).unwrap();
         assert_eq!(decision.cluster, "cluster-a");
 
         cache.update_route_config(make_route_config("cluster-b"));
         tokio::task::yield_now().await;
 
-        let decision = router.route(&input).await.unwrap();
+        let config = router.snapshot().expect("config");
+        let decision = router.route(&input, &config).unwrap();
         assert_eq!(decision.cluster, "cluster-b");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn xds_router_returns_not_ready_without_config() {
         let cache = XdsCache::new();
         let router = XdsRouter::new(&cache);
 
-        let headers = http::HeaderMap::new();
-        let input = RouteInput {
-            authority: "svc",
-            headers: &headers,
-        };
-        // The router now blocks waiting for config; verify it returns
-        // NotReady after the timeout elapses.
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), router.route(&input)).await;
-        // Either the inner timeout fires (NotReady) or the outer timeout
-        // fires (config never arrived) — both are correct.
-        match result {
-            Ok(Err(RoutingError::NotReady)) => {}
-            Err(_elapsed) => {}
-            other => panic!("expected NotReady or timeout, got {other:?}"),
-        }
+        // With no config yet, `acquire` yields the waiting variant, which
+        // blocks and then reports NotReady.
+        assert!(router.snapshot().is_none());
+        assert!(matches!(router.acquire(), AcquiredConfig::Pending(_)));
+
+        let start = tokio::time::Instant::now();
+        let result = router.acquire().get().await;
+
+        assert!(
+            matches!(result, Err(RoutingError::NotReady)),
+            "expected NotReady, got {result:?}",
+        );
+        assert!(
+            start.elapsed() >= DEFAULT_READY_TIMEOUT,
+            "expected the wait to span the full ready timeout, took {:?}",
+            start.elapsed(),
+        );
     }
 }

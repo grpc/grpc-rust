@@ -1,7 +1,7 @@
 [package]
 name = "grpc-protobuf-build"
-version = "0.9.0"
-authors = ["gRPC Authors"]
+version = "0.10.0"
+authors = ["gRPC authors"]
 license = "MIT"
 homepage = "https://grpc.io"
 repository = "https://github.com/grpc/grpc-rust"
@@ -12,16 +12,20 @@ categories = ["web-programming", "network-programming", "asynchronous"]
 rust-version = { workspace = true }
 edition = "2024"
 
+[package.metadata.cargo_check_external_types]
+allowed_external_types = ["protobuf_codegen::Dependency"]
+
 [dependencies]
 prettyplease = "0.2.35"
-protobuf-codegen = { version = "4.34.0-release" }
+protobuf-codegen = { version = "4.35.1-release" }
 syn = "2.0.104"
 which = "8.0"
-protoc-gen-rust-grpc = { version = "0.9.0", path = "../protoc-gen-rust-grpc", optional = true }
+protoc-gen-rust-grpc = { version = "0.10.0", path = "../protoc-gen-rust-grpc", optional = true }
 
 [features]
 default = ["build-plugin"]
-build-plugin = ["dep:protoc-gen-rust-grpc"]
+# Alias for existing users
+build-plugin = ["protoc-gen-rust-grpc"]
 
 [build-dependencies]
 cmake = "0.1"

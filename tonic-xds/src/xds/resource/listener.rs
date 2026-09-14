@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Validated Listener resource (LDS).
 
 use bytes::Bytes;
@@ -102,10 +126,11 @@ impl ListenerResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::listener::v3::ApiListener;
     use envoy_types::pb::envoy::extensions::filters::network::http_connection_manager::v3::Rds;
     use envoy_types::pb::google::protobuf::Any;
+
+    use super::*;
 
     fn make_rds_listener(name: &str, route_config_name: &str) -> Listener {
         let rds = Rds {
@@ -118,7 +143,7 @@ mod tests {
         };
         let hcm_any = Any {
             type_url: "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager".to_string(),
-            value: hcm.encode_to_vec().into(),
+            value: hcm.encode_to_vec(),
         };
         Listener {
             name: name.to_string(),
@@ -181,11 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_resources_required() {
-        assert!(ListenerResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
-    }
-
-    #[test]
     fn test_validate_inline_route_config() {
         use envoy_types::pb::envoy::config::route::v3::route_match::PathSpecifier;
         use envoy_types::pb::envoy::config::route::v3::{
@@ -223,7 +243,7 @@ mod tests {
         };
         let hcm_any = Any {
             type_url: "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager".to_string(),
-            value: hcm.encode_to_vec().into(),
+            value: hcm.encode_to_vec(),
         };
         let listener = Listener {
             name: "inline-listener".to_string(),

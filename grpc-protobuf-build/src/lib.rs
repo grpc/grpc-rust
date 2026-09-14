@@ -110,6 +110,16 @@ impl From<&Dependency> for protobuf_codegen::Dependency {
     }
 }
 
+impl From<protobuf_codegen::Dependency> for Dependency {
+    fn from(val: protobuf_codegen::Dependency) -> Self {
+        Dependency {
+            crate_name: val.crate_name,
+            proto_import_paths: val.proto_import_paths,
+            proto_files: val.proto_files,
+        }
+    }
+}
+
 fn check_runnable(binary: &Path) -> Result<(), String> {
     let out = Command::new(binary)
         .arg("--version")
@@ -257,8 +267,8 @@ impl CodeGen {
             return Ok((protoc.clone(), plugin.clone()));
         }
 
-        // 2. Compiled via protoc-gen-rust-grpc (build-plugin feature)
-        #[cfg(feature = "build-plugin")]
+        // 2. Compiled via protoc-gen-rust-grpc
+        #[cfg(feature = "protoc-gen-rust-grpc")]
         {
             let compiled_protoc = protoc_gen_rust_grpc::protoc();
             let compiled_plugin = protoc_gen_rust_grpc::protoc_gen_rust_grpc();

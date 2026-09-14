@@ -1,6 +1,6 @@
 [package]
 name = "tonic-xds"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.3"
 edition = "2024"
 rust-version.workspace = true
 homepage = "https://github.com/hyperium/tonic"
@@ -8,7 +8,7 @@ repository = "https://github.com/hyperium/tonic"
 authors = [
     "Ankur Mittal <ankurmit2006@gmail.com>",
     "Jeff Jiang <guokeno0@gmail.com>",
-    "Lucio Franco <luciofranco14@gmail.com>",
+    "gRPC authors",
     "Yutao Ma <ytma98@gmail.com>"
 ]
 categories = ["web-programming", "network-programming", "asynchronous"]
@@ -17,7 +17,7 @@ xDS routing and load balancing implementation for Tonic and Tower services
 """
 keywords = ["grpc", "xds"]
 license = "MIT"
-publish = false
+publish = true
 exclude = ["proto/test/*"]
 
 [dependencies]
@@ -33,7 +33,7 @@ url = "2.5.8"
 futures-core = "0.3.31"
 futures-util = "0.3"
 bytes = "1"
-xds-client = { version = "0.1.0-alpha.1", path = "../xds-client" }
+xds-client = { version = "0.1.0-alpha.3", path = "../xds-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 envoy-types = "0.7"
@@ -43,6 +43,8 @@ tokio = { version = "1", features = ["sync", "time"] }
 # Used for weighted cluster selection and fractional route matching — does not need
 # cryptographic security, only statistical uniformity for traffic distribution.
 fastrand = "2"
+# gRFC A42 ring-hash: XXH64 (seed 0) for the request hash and ring construction.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 indexmap = "2"
 tracing = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -53,12 +55,15 @@ tonic-prost = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 x509-parser = { version = "0.17", optional = true }
+opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["metrics"] }
+xds-client-opentelemetry = { version = "0.1.0-alpha.3", path = "../xds-client-opentelemetry", optional = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-xds-client = { version = "0.1.0-alpha.1", path = "../xds-client", features = ["test-util"] }
+xds-client = { version = "0.1.0-alpha.3", path = "../xds-client", features = ["test-util"] }
+xds-test-util = { path = "../xds-test-util" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "test-util"] }
 tonic = { version = "0.14", features = [ "server", "channel", "tls-ring" ] }
 tonic-prost = "0.14"
@@ -66,9 +71,15 @@ tonic-prost-build = "0.14"
 async-stream = "0.3"
 tempfile = "3.27.0"
 rcgen = "0.14"
+google-cloud-auth = { version = "1.9", default-features = false }
 
 [features]
 testutil = ["dep:tonic-prost"]
+
+# Bundled OpenTelemetry metrics recorder for the gRFC A78 xDS client metrics.
+# The recorder lives in the companion `xds-client-opentelemetry` crate so its
+# OpenTelemetry version is decoupled from the core crates.
+otel = ["dep:opentelemetry", "dep:xds-client-opentelemetry"]
 
 # TLS crypto backend — pick exactly one.
 _tls-any = ["dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]
@@ -80,8 +91,38 @@ name = "channel"
 required-features = ["testutil"]
 
 [[example]]
+name = "channel_with_google_default"
+required-features = ["testutil", "tls-ring"]
+
+[[example]]
 name = "greeter_server"
 required-features = ["testutil"]
 
 [[example]]
 name = "xds_server"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "tonic::*",
+    "xds_client::*",
+
+    # major released
+    "bytes::*",
+    "http::*",
+    "http_body::*",
+
+    # not major released
+    "prost::*",
+    "opentelemetry::*",
+    "rustls::verify::ServerCertVerifier",
+    "shared_http_body::shared_body::SharedBody",
+
+    "tower_service::Service",
+    "tower::BoxError",
+    "tower::load::Load",
+    "tower::util::boxed_clone_sync::BoxCloneSyncService",
+    "url::parser::ParseError",
+    "serde_core::de::Deserialize",
+    "serde_core::ser::Serialize",
+    "serde_json::error::Error",
+]

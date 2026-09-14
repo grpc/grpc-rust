@@ -1,6 +1,6 @@
 [package]
 authors = [
-  "Lucio Franco <luciofranco14@gmail.com>",
+  "gRPC authors",
   "Rafael Lemos <flemos.rafael.dev@gmail.com>"
 ]
 categories = ["web-programming", "network-programming", "asynchronous"]

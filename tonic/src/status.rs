@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use crate::metadata::GRPC_CONTENT_TYPE;
 use crate::metadata::MetadataMap;
 use base64::Engine as _;
@@ -400,6 +424,7 @@ impl Status {
             | Some(h2::Reason::INTERNAL_ERROR)
             | Some(h2::Reason::FLOW_CONTROL_ERROR)
             | Some(h2::Reason::SETTINGS_TIMEOUT)
+            | Some(h2::Reason::FRAME_SIZE_ERROR)
             | Some(h2::Reason::COMPRESSION_ERROR)
             | Some(h2::Reason::CONNECT_ERROR) => Code::Internal,
             Some(h2::Reason::REFUSED_STREAM) => Code::Unavailable,
@@ -778,13 +803,13 @@ pub(crate) fn infer_grpc_status(
     trailers: Option<&HeaderMap>,
     status_code: http::StatusCode,
 ) -> Result<(), Option<Status>> {
-    if let Some(trailers) = trailers {
-        if let Some(status) = Status::from_header_map(trailers) {
-            if status.code() == Code::Ok {
-                return Ok(());
-            } else {
-                return Err(status.into());
-            }
+    if let Some(trailers) = trailers
+        && let Some(status) = Status::from_header_map(trailers)
+    {
+        if status.code() == Code::Ok {
+            return Ok(());
+        } else {
+            return Err(status.into());
         }
     }
     trace!("trailers missing grpc-status");
@@ -1005,6 +1030,13 @@ mod tests {
             .and_then(|err| err.downcast_ref::<h2::Error>())
             .unwrap();
         assert_eq!(source.reason(), Some(h2::Reason::CANCEL));
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn code_from_h2_frame_size_error() {
+        let err = h2::Error::from(h2::Reason::FRAME_SIZE_ERROR);
+        assert_eq!(Status::code_from_h2(&err), Code::Internal);
     }
 
     #[test]

@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Configuration for the xDS client.
 
 use std::time::Duration;
@@ -57,6 +81,15 @@ pub struct ClientConfig {
     ///
     /// Default: 30 seconds. Set to `None` to disable the timeout.
     pub(crate) resource_initial_timeout: Option<Duration>,
+
+    /// gRPC channel target this xDS client serves (per gRFC A78).
+    ///
+    /// Used as the `grpc.target` attribute on emitted metrics. This identifies
+    /// the consumer-facing data-plane channel (e.g. `xds:///my-service`).
+    ///
+    /// Set this when constructing the client. When unset, the `grpc.target`
+    /// attribute is emitted as an empty string.
+    pub(crate) target: Option<String>,
     // Future extensions:
     // - `authorities: HashMap<String, AuthorityConfig>` for xDS federation (gRFC A47)
     // - Locality / zone information for locality-aware routing
@@ -84,6 +117,7 @@ impl ClientConfig {
             retry_policy: RetryPolicy::default(),
             servers: vec![ServerConfig::new(server_uri)],
             resource_initial_timeout: Some(DEFAULT_RESOURCE_INITIAL_TIMEOUT),
+            target: None,
         }
     }
 
@@ -108,6 +142,7 @@ impl ClientConfig {
             retry_policy: RetryPolicy::default(),
             servers,
             resource_initial_timeout: Some(DEFAULT_RESOURCE_INITIAL_TIMEOUT),
+            target: None,
         }
     }
 
@@ -157,6 +192,19 @@ impl ClientConfig {
     /// ```
     pub fn with_resource_initial_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.resource_initial_timeout = timeout;
+        self
+    }
+
+    /// Set the gRPC channel target name (per gRFC A78).
+    ///
+    /// Used as the `grpc.target` attribute on emitted metrics. This is the
+    /// data-plane channel target (e.g. `xds:///my-service`).
+    ///
+    /// Consumers that wrap `xds-client` in a channel layer (e.g. tonic-xds)
+    /// should set this to the channel target. When unset, the `grpc.target`
+    /// attribute is emitted as an empty string.
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
         self
     }
 }

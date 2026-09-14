@@ -22,18 +22,13 @@
  *
  */
 
-mod server_status;
 mod status_code;
 
 pub use status_code::StatusCodeError;
 
 /// Represents either a failing gRPC status or a successful result containing
 /// `T`.
-pub type StatusOr<T> = Result<T, StatusError>;
-
-/// The representation of a gRPC status.  OK statuses may not contain a status
-/// message, while error values may.
-pub type Status = StatusOr<()>;
+pub type Result<T> = std::result::Result<T, StatusError>;
 
 /// Represents a gRPC status.
 #[derive(Debug, Clone)]
@@ -61,6 +56,11 @@ impl StatusError {
         &self.message
     }
 
+    /// Consumes the [`StatusError`] and returns its constituent parts (code and message).
+    pub fn into_parts(self) -> (StatusCodeError, String) {
+        (self.code, self.message)
+    }
+
     /// Returns whether the status includes a code restricted for control
     /// plane usage as defined by gRFC A54.
     pub(crate) fn is_restricted_control_plane_code(&self) -> bool {
@@ -76,6 +76,18 @@ impl StatusError {
         )
     }
 }
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "{:?}", self.code)
+        } else {
+            write!(f, "{:?}: {}", self.code, self.message)
+        }
+    }
+}
+
+impl std::error::Error for StatusError {}
 
 #[cfg(test)]
 mod tests {
@@ -95,5 +107,14 @@ mod tests {
         assert!(debug.contains("Status"));
         assert!(debug.contains("Cancelled"));
         assert!(debug.contains("not ok"));
+    }
+
+    #[test]
+    fn test_status_display() {
+        let status = StatusError::new(StatusCodeError::NotFound, "not ok");
+        assert_eq!(format!("{status}"), "NotFound: not ok");
+
+        let status = StatusError::new(StatusCodeError::Cancelled, "");
+        assert_eq!(format!("{status}"), "Cancelled");
     }
 }

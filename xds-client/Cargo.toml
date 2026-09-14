@@ -1,13 +1,13 @@
 [package]
 name = "xds-client"
 description = "An xDS client implementation in Rust"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.3"
 edition = "2024"
 homepage = "https://github.com/hyperium/tonic"
 repository = "https://github.com/hyperium/tonic"
 license = "MIT"
 rust-version = { workspace = true }
-publish = false
+publish = true
 
 [lints]
 workspace = true
@@ -16,6 +16,7 @@ workspace = true
 bytes = "1.11.0"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "macros"] }
+rand = "0.10"
 
 # Optional dependencies for tonic transport
 tonic = { version = "0.14", optional = true }
@@ -31,6 +32,7 @@ default = ["transport-tonic", "codegen-prost"]
 transport-tonic = [
     "rt-tokio",
     "dep:tonic",
+    "tonic/codegen",
     "dep:tokio-stream",
     "dep:http",
 ]
@@ -60,4 +62,7 @@ required-features = ["tonic-tls-ring"]
 allowed_external_types = [
     # major released
     "bytes::*",
+    # Re-exported in the public API behind the transport-tonic / codegen-prost features.
+    "tonic::*",
+    "prost::*",
 ]

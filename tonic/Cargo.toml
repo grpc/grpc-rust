@@ -4,7 +4,7 @@ name = "tonic"
 # - Remove path dependencies
 # - Update CHANGELOG.md.
 # - Create "v0.11.x" git tag.
-authors = ["Lucio Franco <luciofranco14@gmail.com>"]
+authors = ["gRPC authors"]
 categories = ["web-programming", "network-programming", "asynchronous"]
 description = """
 A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility.
@@ -33,7 +33,7 @@ tls-webpki-roots = ["_tls-any","channel", "dep:webpki-roots"]
 tls-connect-info = ["dep:tokio-rustls"]
 router = ["dep:axum", "dep:tower", "tower?/util"]
 server = [
-  "dep:h2",
+  "h2",
   "dep:hyper", "hyper?/server",
   "dep:hyper-util", "hyper-util?/service", "hyper-util?/server-auto",
   "dep:socket2",
@@ -42,6 +42,7 @@ server = [
   "dep:tower", "tower?/util", "tower?/limit", "tower?/load-shed",
 ]
 channel = [
+  "h2",
   "dep:hyper", "hyper?/client",
   "dep:hyper-util", "hyper-util?/client-legacy",
   "dep:tower", "tower?/balance", "tower?/buffer", "tower?/discover", "tower?/limit", "tower?/load-shed", "tower?/util",
@@ -49,6 +50,7 @@ channel = [
   "dep:hyper-timeout",
 ]
 transport = ["server", "channel"]
+h2 = ["dep:h2"]
 
 # [[bench]]
 # name = "bench_main"
@@ -93,6 +95,7 @@ zstd = { version = "0.13.0", optional = true }
 # channel
 hyper-timeout = {version = "0.5", optional = true}
 sync_wrapper = "1.0.2"
+tokio-util = "0.7"
 
 [dev-dependencies]
 bencher = "0.1.5"

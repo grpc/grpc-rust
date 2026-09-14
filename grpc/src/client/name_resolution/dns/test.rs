@@ -124,7 +124,7 @@ pub(crate) fn target_parsing() {
             }),
         },
         TestCase {
-            input: "dns:///[fe80::1%80]:5678/abc",
+            input: "dns:///[fe80::1%2580]:5678/abc",
             want_result: Err("SocketAddr doesn't support IPv6 addresses with zones".to_string()),
         },
         TestCase {
@@ -228,7 +228,7 @@ struct FakeDns {
     lookup_result: Result<Vec<std::net::IpAddr>, String>,
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl rt::DnsResolver for FakeDns {
     async fn lookup_host_name(&self, _: &str) -> Result<Vec<std::net::IpAddr>, String> {
         tokio::time::sleep(self.latency).await;
@@ -268,6 +268,21 @@ impl Runtime for FakeRuntime {
         opts: TcpOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
         self.inner.tcp_stream(target, opts)
+    }
+
+    fn tcp_listener(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn rt::EndpointListener>, String>> + Send>> {
+        self.inner.tcp_listener(addr)
+    }
+
+    fn unix_listener(
+        &self,
+        path: std::path::PathBuf,
+        opts: rt::UnixSocketOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn rt::EndpointListener>, String>> + Send>> {
+        self.inner.unix_listener(path, opts)
     }
 }
 

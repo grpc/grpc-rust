@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Validated ClusterLoadAssignment resource (EDS).
 
 use bytes::Bytes;
@@ -187,10 +211,11 @@ impl EndpointsResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::core::v3::{Address, SocketAddress};
     use envoy_types::pb::envoy::config::endpoint::v3::{Endpoint, LocalityLbEndpoints};
     use envoy_types::pb::google::protobuf::UInt32Value;
+
+    use super::*;
 
     fn make_lb_endpoint(ip: &str, port: u32, health: i32) -> LbEndpoint {
         LbEndpoint {
@@ -253,13 +278,6 @@ mod tests {
         };
         let err = EndpointsResource::validate(cla).unwrap_err();
         assert!(err.to_string().contains("cluster_name"));
-    }
-
-    #[test]
-    fn test_eds_allows_partial_responses_in_sotw() {
-        // EDS resources are per-cluster, so SotW responses may contain only a subset.
-        // Unlike LDS/CDS which require all resources in every SotW response.
-        assert!(!EndpointsResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
     }
 
     #[test]

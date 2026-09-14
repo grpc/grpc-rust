@@ -40,7 +40,6 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::credentials::ChannelCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::credentials::rustls::ALPN_PROTO_STR_H2;
@@ -48,10 +47,10 @@ use crate::credentials::rustls::Identity;
 use crate::credentials::rustls::RootCertificates;
 use crate::credentials::rustls::StaticProvider;
 use crate::credentials::rustls::client::ClientTlsConfig;
-use crate::credentials::rustls::client::RustlsChannelCredendials;
+use crate::credentials::rustls::client::RustlsChannelCredentials;
 use crate::private;
 use crate::rt;
-use crate::rt::AsyncIoAdapter;
+use crate::rt::EndpointIoStream;
 use crate::rt::TcpOptions;
 
 static INIT: Once = Once::new();
@@ -102,7 +101,7 @@ async fn test_tls_cipher_suites_secure() {
         .clone();
 
     // This should succeed as default provider usually has secure suites.
-    let creds = RustlsChannelCredendials::new_impl(config, provider);
+    let creds = RustlsChannelCredentials::new_impl(config, provider);
     assert!(
         creds.is_ok(),
         "Failed to create creds with secure provider: {:?}",
@@ -140,7 +139,7 @@ async fn test_tls_cipher_suites_insecure() {
     // Remove all cipher suites that are considered secure by our policy
     provider.cipher_suites.retain(|suite| !is_secure(suite));
 
-    let creds = RustlsChannelCredendials::new_impl(config, provider);
+    let creds = RustlsChannelCredentials::new_impl(config, provider);
     assert!(creds.err().unwrap().contains("no cipher suites matching"));
 }
 
@@ -161,7 +160,7 @@ async fn test_tls_key_log() {
         .with_root_certificates_provider(root_provider)
         .insecure_with_key_log_path(key_log_file.path());
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -182,7 +181,7 @@ async fn test_tls_key_log() {
         .expect("Handshake failed");
     let stream = result.endpoint;
     let mut buf = Vec::new();
-    let _ = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+    let _ = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
     assert_eq!(buf, b"Hello world");
 
     server_task.await.unwrap();
@@ -211,7 +210,7 @@ async fn test_tls_handshake_wrong_server_name() {
     let root_provider = StaticProvider::new(root_certs);
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -268,7 +267,7 @@ async fn test_tls_validate_authority() {
     let root_provider = StaticProvider::new(root_certs);
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -289,16 +288,16 @@ async fn test_tls_validate_authority() {
         .await
         .expect("Handshake failed");
 
-    let context = result.security.security_context();
+    let av = result.authority_validator;
 
     // Validate correct authorities
-    assert!(context.validate_authority(&Authority::new("localhost".to_string(), None)));
-    assert!(context.validate_authority(&Authority::new("example.com".to_string(), None)));
-    assert!(context.validate_authority(&Authority::new("127.0.0.1".to_string(), None)));
+    assert!(av.validate_authority(&Authority::new("localhost".to_string(), None)));
+    assert!(av.validate_authority(&Authority::new("example.com".to_string(), None)));
+    assert!(av.validate_authority(&Authority::new("127.0.0.1".to_string(), None)));
 
     // Validate incorrect authorities
-    assert!(!context.validate_authority(&Authority::new("wrong.host".to_string(), None)));
-    assert!(!context.validate_authority(&Authority::new("grpc.io".to_string(), None)));
+    assert!(!av.validate_authority(&Authority::new("wrong.host".to_string(), None)));
+    assert!(!av.validate_authority(&Authority::new("grpc.io".to_string(), None)));
 }
 
 #[tokio::test]
@@ -312,7 +311,7 @@ async fn test_mtls_handshake_no_identity() {
     let config = ClientTlsConfig::new()
         .with_root_certificates_provider(StaticProvider::new(load_root_certs("ca.pem")));
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
     let runtime = rt::default_runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
@@ -340,7 +339,7 @@ async fn test_mtls_handshake_no_identity() {
 
     let stream = result.endpoint;
     let mut buf = Vec::new();
-    let res = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+    let res = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
     assert!(
         res.is_err(),
         "read from TLS stream should fail due to missing client identity"
@@ -367,7 +366,7 @@ async fn test_mtls_handshake_with_identitiy() {
         .with_root_certificates_provider(root_provider)
         .with_identity_provider(identity_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
     let runtime = rt::default_runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
@@ -388,7 +387,7 @@ async fn test_mtls_handshake_with_identitiy() {
 
     let stream = result.endpoint;
     let mut buf = Vec::new();
-    let _ = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+    let _ = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
     assert_eq!(buf, b"Hello world");
 
     server_task.await.unwrap();
@@ -422,7 +421,7 @@ async fn check_client_resumption_disabled(
     let root_provider = StaticProvider::new(root_certs);
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     for i in 0..2 {
         let runtime = rt::default_runtime();
@@ -432,18 +431,10 @@ async fn check_client_resumption_disabled(
             .unwrap();
         let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
-        let result = creds
-            .connect(
-                &authority,
-                endpoint,
-                &ClientHandshakeInfo::default(),
-                &runtime,
-                private::Internal,
-            )
+        let (tls_stream, _security, _authority_validator) = creds
+            .connect_tls(&authority, endpoint)
             .await
             .expect("Handshake failed");
-
-        let tls_stream = result.endpoint;
 
         let connection = match tls_stream.inner() {
             tokio_rustls::TlsStream::Client(conn) => conn.get_ref().1,
@@ -458,7 +449,9 @@ async fn check_client_resumption_disabled(
         );
 
         let mut buf = Vec::new();
-        let _ = AsyncIoAdapter::new(tls_stream).read_to_end(&mut buf).await;
+        let _ = EndpointIoStream::new(tls_stream)
+            .read_to_end(&mut buf)
+            .await;
         assert_eq!(buf, b"Hello world");
     }
 
@@ -576,7 +569,7 @@ async fn setup_server_multi_connection(
                         let _ = stream.shutdown().await;
                     }
                     Err(err) => {
-                        println!("TLS handshake failed: {}", err)
+                        println!("TLS handshake failed: {}", err);
                     }
                 }
             });
@@ -597,7 +590,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
 
     let config = ClientTlsConfig::new().with_root_certificates_provider(root_provider);
 
-    let creds = RustlsChannelCredendials::new(config).unwrap();
+    let creds = RustlsChannelCredentials::new(config).unwrap();
 
     let runtime = rt::default_runtime();
     let endpoint = runtime
@@ -623,7 +616,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
         let stream = result.endpoint;
         let mut buf = Vec::new();
         // Ignore read errors if server closed connection abruptly (which happens in failure cases, but here we expect success)
-        let _ = AsyncIoAdapter::new(stream).read_to_end(&mut buf).await;
+        let _ = EndpointIoStream::new(stream).read_to_end(&mut buf).await;
         assert_eq!(buf, b"Hello world");
     } else {
         assert!(result.is_err(), "Handshake succeeded but expected failure");

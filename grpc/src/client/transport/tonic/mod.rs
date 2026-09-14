@@ -28,26 +28,23 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use std::time::Instant;
 
 use bytes::Buf;
 use bytes::BufMut as _;
 use bytes::Bytes;
-use futures::stream::StreamExt;
 use http::Request as HttpRequest;
 use http::Response as HttpResponse;
 use http::Uri;
 use http::uri::PathAndQuery;
 use hyper::client::conn::http2::Builder;
 use hyper::client::conn::http2::SendRequest;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::CancellationHandle;
 use tonic::Code;
 use tonic::Request as TonicRequest;
 use tonic::Status as TonicStatus;
@@ -70,25 +67,28 @@ use tower_service::Service as TowerService;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::attributes::Attributes;
+use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
+use crate::client::ResponseHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
+use crate::client::Trailers;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
-use crate::credentials::client::DynClientConnectionSecurityInfo;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
+use crate::private;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 use crate::rt::TcpOptions;
@@ -96,16 +96,16 @@ use crate::rt::UnixSocketOptions;
 use crate::rt::hyper_wrapper::HyperCompatExec;
 use crate::rt::hyper_wrapper::HyperCompatTimer;
 use crate::rt::hyper_wrapper::HyperStream;
-use crate::status::Status;
 
 #[cfg(test)]
 mod test;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
-pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
 
+type BoxError = Box<dyn Error + Send + Sync>;
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, TonicStatus>> + Send>>;
+type BoxBuf = Box<dyn Buf + Send + Sync>;
 
 pub(crate) fn reg() {
     GLOBAL_TRANSPORT_REGISTRY.add_transport(
@@ -136,6 +136,7 @@ struct TonicTransport {
     grpc: Grpc<TonicService>,
     task_handle: BoxedTaskHandle,
     runtime: GrpcRuntime,
+    connection_info: ConnectionInfo,
 }
 
 impl Drop for TonicTransport {
@@ -154,26 +155,21 @@ impl Invoke for TonicTransport {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::channel(1);
-        let stop_notify = Arc::new(Notify::new());
-
-        // Tonic runs the outbound request stream in a background task. It will
-        // NOT automatically stop sending if the inbound response stream is
-        // dropped. We use `take_until` with this Notify to explicitly force the
-        // stream to yield `None`, which tells Tonic to cancel the stream.
-        let stop_notify_clone = stop_notify.clone();
-        let request_stream =
-            ReceiverStream::new(req_rx).take_until(stop_notify_clone.notified_owned());
+        let request_stream = ReceiverStream::new(req_rx);
         let mut request = TonicRequest::new(Box::pin(request_stream));
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
 
+        let cancel_tx = request.cancellation_handle();
+
         let Ok(path) = PathAndQuery::from_maybe_shared(method) else {
-            return err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));
+            return self
+                .local_err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));
         };
 
         let mut grpc = self.grpc.clone();
         if let Err(e) = grpc.ready().await {
-            return err_streams(StatusError::new(
+            return self.local_err_streams(StatusError::new(
                 StatusCodeError::Unavailable,
                 format!("Service was not ready: {e}"),
             ));
@@ -195,39 +191,29 @@ impl Invoke for TonicTransport {
             TonicSendStream { sender: Ok(req_tx) },
             TonicRecvStream {
                 state: StreamState::AwaitingHeaders(resp_rx),
-                stop_notify: Some(stop_notify),
+                cancel_tx: Some(cancel_tx),
+                connection_info: Some(self.connection_info.clone()),
             },
         )
     }
 }
 
-// Converts from a tonic status to a trailers stream item.
-fn trailers_from_tonic_status(status: TonicStatus, md: Option<TonicMeta>) -> ResponseStreamItem {
-    let status_res = match status.code() {
-        Code::Ok => Ok(()),
-        code => Err(StatusError::new(
-            StatusCodeError::from(code as i32),
-            status.message(),
-        )),
-    };
-    trailers_from_status(status_res, md)
-}
-
-// Builds a trailers with a status
-fn trailers_from_status(status: Status, md: Option<TonicMeta>) -> ResponseStreamItem {
-    let trailers = match md.map(TryInto::try_into) {
-        Some(Err(e)) => Trailers::new(Err(StatusError::new(
-            StatusCodeError::Internal,
-            format!("failed to parse metadata: {e}"),
-        ))),
-        Some(Ok(metadata)) => Trailers::new(status).with_metadata(metadata),
-        None => Trailers::new(status),
-    };
-    ResponseStreamItem::Trailers(trailers)
+impl TonicTransport {
+    /// Creates a send/recv stream pair representing locally-produced errors.
+    fn local_err_streams(&self, status: StatusError) -> (TonicSendStream, TonicRecvStream) {
+        (
+            TonicSendStream { sender: Err(()) },
+            TonicRecvStream {
+                state: StreamState::LocalError(status),
+                cancel_tx: None,
+                connection_info: Some(self.connection_info.clone()),
+            },
+        )
+    }
 }
 
 struct TonicSendStream {
-    sender: Result<mpsc::Sender<Box<dyn Buf + Send + Sync>>, ()>,
+    sender: Result<mpsc::Sender<BoxBuf>, ()>,
 }
 
 impl SendStream for TonicSendStream {
@@ -247,11 +233,59 @@ impl SendStream for TonicSendStream {
 
 struct TonicRecvStream {
     state: StreamState,
-    stop_notify: Option<Arc<Notify>>,
+    cancel_tx: Option<CancellationHandle>,
+    connection_info: Option<ConnectionInfo>,
+}
+
+impl TonicRecvStream {
+    // Converts from a tonic status to a trailers stream item.
+    fn trailers_from_tonic_status(
+        &mut self,
+        status: &TonicStatus,
+        mut md: TonicMeta,
+    ) -> ResponseStreamItem {
+        if !status.details().is_empty() {
+            md.insert_bin(
+                "grpc-status-details-bin",
+                tonic::metadata::MetadataValue::from_bytes(status.details()),
+            );
+        }
+        let status_res = match status.code() {
+            Code::Ok => Ok(()),
+            code => Err(StatusError::new(
+                StatusCodeError::from(code as i32),
+                status.message(),
+            )),
+        };
+        self.trailers_from_grpc_result(status_res, Some(&md))
+    }
+
+    // Builds a trailers stream item with a status.
+    fn trailers_from_grpc_result(
+        &mut self,
+        status: crate::Result<()>,
+        md: Option<&TonicMeta>,
+    ) -> ResponseStreamItem {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            cancel_tx.cancel();
+        }
+        let trailers = if let Some(md) = md {
+            match md.try_into() {
+                Err(e) => Trailers::new(Err(StatusError::new(
+                    StatusCodeError::Internal,
+                    format!("failed to parse metadata: {e}"),
+                ))),
+                Ok(metadata) => Trailers::new(status).with_metadata(metadata),
+            }
+        } else {
+            Trailers::new(status)
+        };
+        ResponseStreamItem::Trailers(trailers.with_connection_info(self.connection_info.take()))
+    }
 }
 
 enum StreamState {
-    Error(StatusError),
+    LocalError(StatusError),
     AwaitingHeaders(oneshot::Receiver<Result<tonic::Response<Streaming<Bytes>>, TonicStatus>>),
     Streaming(Streaming<Bytes>),
     Closed,
@@ -265,8 +299,8 @@ impl RecvStream for TonicRecvStream {
         match state {
             // Closed is terminal.
             StreamState::Closed => ResponseStreamItem::StreamClosed,
-            // Stay closed after sending trailers.
-            StreamState::Error(error) => ResponseStreamItem::Trailers(Trailers::new(Err(error))),
+            // Stay closed after sending trailers (do not set self.state).
+            StreamState::LocalError(error) => self.trailers_from_grpc_result(Err(error), None),
             StreamState::AwaitingHeaders(rx) => match rx.await {
                 Ok(Ok(response)) => {
                     let (metadata, stream, _extensions) = response.into_parts();
@@ -277,63 +311,73 @@ impl RecvStream for TonicRecvStream {
                     // In contrast, standard gRPC implementations eagerly decode
                     // these headers and immediately fail the RPC with an
                     // Internal status.
-                    match metadata.try_into() {
+                    match (&metadata).try_into() {
                         Ok(md) => {
                             // Start streaming and return the headers.
                             self.state = StreamState::Streaming(stream);
-                            ResponseStreamItem::Headers(ResponseHeaders::new().with_metadata(md))
+                            let Some(connection_info) = self.connection_info.take() else {
+                                return self.trailers_from_grpc_result(
+                                    Err(StatusError::new(
+                                        StatusCodeError::Internal,
+                                        "required connection info missing",
+                                    )),
+                                    None,
+                                );
+                            };
+                            let headers = ResponseHeaders::new(connection_info).with_metadata(md);
+                            ResponseStreamItem::Headers(headers)
                         }
-                        Err(e) => {
-                            if let Some(notify) = self.stop_notify.take() {
-                                notify.notify_one();
-                            }
-                            trailers_from_status(
-                                Err(StatusError::new(
-                                    StatusCodeError::Internal,
-                                    format!("error decoding response: {e}"),
-                                )),
-                                None,
-                            )
-                        }
-                    }
-                }
-                // Stay closed after sending trailers.
-                Err(_) => trailers_from_status(
-                    Err(StatusError::new(StatusCodeError::Unknown, "Task cancelled")),
-                    None,
-                ),
-                Ok(Err(status)) => trailers_from_tonic_status(status, None),
-            },
-            StreamState::Streaming(mut stream) => match stream.message().await {
-                Ok(Some(mut buf)) => match msg.decode(&mut buf) {
-                    Ok(()) => {
-                        // More messages may remain in the stream; set receiver again.
-                        self.state = StreamState::Streaming(stream);
-                        ResponseStreamItem::Message
-                    }
-                    Err(e) => {
-                        if let Some(notify) = self.stop_notify.take() {
-                            notify.notify_one();
-                        }
-                        trailers_from_status(
+                        Err(e) => self.trailers_from_grpc_result(
                             Err(StatusError::new(
                                 StatusCodeError::Internal,
                                 format!("error decoding response: {e}"),
                             )),
                             None,
-                        )
+                        ),
                     }
+                }
+                Err(_) => {
+                    // Stay closed after sending trailers (do not set self.state).
+                    self.trailers_from_grpc_result(
+                        Err(StatusError::new(StatusCodeError::Unknown, "Task cancelled")),
+                        None,
+                    )
+                }
+                Ok(Err(mut status)) => {
+                    // In a Trailers-only response, the tonic status contains
+                    // the metadata.
+                    // Stay closed after sending trailers (do not set self.state).
+                    let md = std::mem::take(status.metadata_mut());
+                    self.trailers_from_tonic_status(&status, md)
+                }
+            },
+            StreamState::Streaming(mut stream) => match stream.message().await {
+                Ok(Some(mut buf)) => match msg.decode(&mut buf) {
+                    Ok(()) => {
+                        // More messages may remain in the stream; set receiver
+                        // again.
+                        self.state = StreamState::Streaming(stream);
+                        ResponseStreamItem::Message
+                    }
+                    Err(e) => self.trailers_from_grpc_result(
+                        Err(StatusError::new(
+                            StatusCodeError::Internal,
+                            format!("error decoding response: {e}"),
+                        )),
+                        None,
+                    ),
                 },
-                // Stay closed after sending trailers.
                 Err(status) => {
+                    // Stay closed after sending trailers (do not set self.state).
                     let trailers = stream.trailers().await;
-                    let md = trailers.unwrap_or_default();
-                    trailers_from_tonic_status(status, md)
+                    let md = trailers.unwrap_or_default().unwrap_or_default();
+                    self.trailers_from_tonic_status(&status, md)
                 }
                 Ok(None) => {
+                    // Stay closed after sending trailers (do not set self.state).
                     let trailers = stream.trailers().await;
-                    let md = trailers.unwrap_or_default();
-                    trailers_from_status(Ok(()), md)
+                    let md = trailers.unwrap_or_default().unwrap_or_default();
+                    self.trailers_from_grpc_result(Ok(()), Some(&md))
                 }
             },
         }
@@ -342,20 +386,10 @@ impl RecvStream for TonicRecvStream {
 
 impl Drop for TonicRecvStream {
     fn drop(&mut self) {
-        if let Some(notify) = &self.stop_notify {
-            notify.notify_one();
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            cancel_tx.cancel();
         }
     }
-}
-
-fn err_streams(status: StatusError) -> (TonicSendStream, TonicRecvStream) {
-    (
-        TonicSendStream { sender: Err(()) },
-        TonicRecvStream {
-            state: StreamState::Error(status),
-            stop_notify: None,
-        },
-    )
 }
 
 impl Transport for TransportBuilder {
@@ -363,14 +397,14 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
     ) -> Result<
         (
             Self::Service,
-            DynClientConnectionSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -384,6 +418,7 @@ impl Transport for TransportBuilder {
         })
         .initial_stream_window_size(opts.init_stream_window_size)
         .initial_connection_window_size(opts.init_connection_window_size)
+        .adaptive_window(opts.http2_adaptive_window)
         .keep_alive_interval(opts.http2_keep_alive_interval)
         .clone();
 
@@ -395,10 +430,6 @@ impl Transport for TransportBuilder {
             settings.keep_alive_while_idle(val);
         }
 
-        if let Some(val) = opts.http2_adaptive_window {
-            settings.adaptive_window(val);
-        }
-
         if let Some(val) = opts.http2_max_header_list_size {
             settings.max_header_list_size(val);
         }
@@ -406,7 +437,7 @@ impl Transport for TransportBuilder {
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
                 let addr: SocketAddr =
-                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(&address.address).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -415,30 +446,33 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => {
-                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
-            }
+            NetworkType::Unix => runtime.unix_stream(
+                PathBuf::from(&*address.address),
+                UnixSocketOptions::default(),
+            ),
         };
-        let transport = if let Some(deadline) = opts.connect_deadline {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            tokio::select! {
-                _ = runtime.sleep(timeout) => {
-                    return Err("timed out waiting for transport stream to connect".to_string());
-                }
-                transport = transport_fut => transport?,
-            }
-        } else {
-            transport_fut.await?
-        };
+        let transport = transport_fut.await?;
         let credentials = &security_info.credentials;
         let handshake_ouput = credentials
-            .dyn_connect(
+            .connect(
                 &security_info.authority,
                 transport,
                 &security_info.handshake_info,
                 &runtime,
+                private::Internal,
             )
             .await?;
+
+        let local_address = Address {
+            network_type: handshake_ouput.endpoint.get_network_type(),
+            address: ByteStr::from(handshake_ouput.endpoint.get_local_address().to_string()),
+            attributes: Attributes::new(),
+        };
+        let remote_address = Address {
+            network_type: handshake_ouput.endpoint.get_network_type(),
+            address: ByteStr::from(handshake_ouput.endpoint.get_peer_address().to_string()),
+            attributes: Attributes::new(),
+        };
 
         let transport = HyperStream::new(handshake_ouput.endpoint);
 
@@ -467,16 +501,23 @@ impl Transport for TransportBuilder {
         let (service, worker) = Buffer::pair(service, DEFAULT_BUFFER_SIZE);
         runtime.spawn(Box::pin(worker));
         let authority = &security_info.authority.host_port_string();
-        let uri = Uri::from_maybe_shared(format!("http://{}", &authority))
+        let uri = Uri::from_maybe_shared(format!("http://{}", authority))
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
+
+        let connection_info = ConnectionInfo::new(
+            local_address,
+            remote_address,
+            handshake_ouput.security_info.clone(),
+        );
 
         let service = TonicTransport {
             grpc,
             task_handle,
             runtime,
+            connection_info: connection_info.clone(),
         };
-        Ok((service, handshake_ouput.security, rx))
+        Ok((service, connection_info, rx))
     }
 }
 
@@ -544,7 +585,7 @@ impl Future for ResponseFuture {
 pub(crate) struct BufCodec {}
 
 impl Codec for BufCodec {
-    type Encode = Box<dyn Buf + Send + Sync>;
+    type Encode = BoxBuf;
     type Decode = Bytes;
     type Encoder = BufEncoder;
     type Decoder = BytesDecoder;
@@ -558,22 +599,10 @@ impl Codec for BufCodec {
     }
 }
 
-pub struct BytesEncoder {}
-
-impl Encoder for BytesEncoder {
-    type Item = Bytes;
-    type Error = TonicStatus;
-
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        dst.put_slice(&item);
-        Ok(())
-    }
-}
-
 pub struct BufEncoder {}
 
 impl Encoder for BufEncoder {
-    type Item = Box<dyn Buf + Send + Sync>;
+    type Item = BoxBuf;
     type Error = TonicStatus;
 
     fn encode(&mut self, mut item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {

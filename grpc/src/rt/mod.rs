@@ -40,6 +40,7 @@ use ::tokio::io::ReadBuf;
 
 use crate::private;
 
+pub mod address;
 pub(crate) mod hyper_wrapper;
 #[cfg(feature = "_runtime-tokio")]
 pub(crate) mod tokio;
@@ -47,6 +48,16 @@ pub(crate) mod tokio;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type BoxedTaskHandle = Box<dyn TaskHandle>;
 pub type BoxEndpoint = Box<dyn GrpcEndpoint>;
+
+/// A server-side listening socket that yields incoming connections.
+#[crate::async_trait]
+pub(crate) trait EndpointListener: Send + Sync + 'static {
+    /// Accepts the next incoming connection.
+    async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String>;
+
+    /// Returns the local address this listener is bound to.
+    fn local_addr(&self) -> Box<dyn address::ListenerAddress>;
+}
 
 /// An abstraction over an asynchronous runtime.
 ///
@@ -86,6 +97,23 @@ pub trait Runtime: Send + Sync + Debug {
             Err("Unix sockets are not supported by this runtime on this platform".to_string())
         })
     }
+
+    /// Binds a TCP listener to the given address.
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    fn tcp_listener(
+        &self,
+        addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>>;
+
+    /// Binds a Unix listener to the given path.
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    fn unix_listener(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>>;
 }
 
 /// A future that resolves after a specified duration.
@@ -97,7 +125,7 @@ pub trait TaskHandle: Send + Sync {
 }
 
 /// A trait for asynchronous DNS resolution.
-#[tonic::async_trait]
+#[crate::async_trait]
 pub trait DnsResolver: Send + Sync {
     /// Resolve an address
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<std::net::IpAddr>, String>;
@@ -195,11 +223,11 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
 /// An adapter that exposes `AsyncRead` and `AsyncWrite` functionality for
 /// interfacing with `hyper` and `rustls`. This type is kept private to avoid
 /// exposing its read and write methods to external crates.
-pub(crate) struct AsyncIoAdapter<T> {
+pub(crate) struct EndpointIoStream<T> {
     inner: T,
 }
 
-impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> EndpointIoStream<T> {
     pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
@@ -209,7 +237,7 @@ impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
     }
 }
 
-impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> AsyncRead for EndpointIoStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -219,7 +247,7 @@ impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {
     }
 }
 
-impl<T: GrpcEndpoint> AsyncWrite for AsyncIoAdapter<T> {
+impl<T: GrpcEndpoint> AsyncWrite for EndpointIoStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -246,6 +274,91 @@ impl<T: GrpcEndpoint> AsyncWrite for AsyncIoAdapter<T> {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored_private(private::Internal)
+    }
+}
+
+/// A wrapper that implements [GrpcEndpoint] for an asynchronous I/O stream.
+pub(crate) struct StreamEndpoint<T> {
+    inner: T,
+    peer_addr: Box<str>,
+    local_addr: Box<str>,
+    network_type: &'static str,
+}
+
+impl<T> StreamEndpoint<T> {
+    pub(crate) fn new(
+        inner: T,
+        local_addr: Box<str>,
+        peer_addr: Box<str>,
+        network_type: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            peer_addr,
+            local_addr,
+            network_type,
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for StreamEndpoint<T> {
+    fn get_local_address(&self) -> &str {
+        &self.local_addr
+    }
+
+    fn get_peer_address(&self) -> &str {
+        &self.peer_addr
+    }
+
+    fn get_network_type(&self) -> &'static str {
+        self.network_type
+    }
+
+    fn poll_read_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+        _token: private::Internal,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+
+    fn poll_write_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        _token: private::Internal,
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+        _token: private::Internal,
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored_private(&self, _token: private::Internal) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _token: private::Internal,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown_private(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _token: private::Internal,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -325,6 +438,21 @@ impl Runtime for NoOpRuntime {
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
         unimplemented!()
     }
+
+    fn tcp_listener(
+        &self,
+        _addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        unimplemented!()
+    }
+
+    fn unix_listener(
+        &self,
+        _path: PathBuf,
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        unimplemented!()
+    }
 }
 
 pub(crate) fn default_runtime() -> GrpcRuntime {
@@ -376,5 +504,20 @@ impl GrpcRuntime {
         opts: UnixSocketOptions,
     ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
         self.inner.unix_stream(path, opts)
+    }
+
+    pub(crate) fn tcp_listener(
+        &self,
+        addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        self.inner.tcp_listener(addr)
+    }
+
+    pub(crate) fn unix_listener(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
+        self.inner.unix_listener(path, opts)
     }
 }

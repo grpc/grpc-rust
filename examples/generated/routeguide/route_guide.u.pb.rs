@@ -1,5 +1,5 @@
 const _: () = ::protobuf::__internal::assert_compatible_gencode_version(
-    "4.34.0-release",
+    "4.35.1-release",
 );
 pub(crate) static mut routeguide__Point_msg_init: ::protobuf::__internal::runtime::MiniTableInitPtr = ::protobuf::__internal::runtime::MiniTableInitPtr(
     ::protobuf::__internal::runtime::MiniTablePtr::dangling(),
@@ -8,7 +8,10 @@ pub(crate) static mut routeguide__Point_msg_init: ::protobuf::__internal::runtim
 pub struct Point {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<Point>,
 }
-impl ::protobuf::Message for Point {}
+impl ::protobuf::Message for Point {
+    type MessageView<'msg> = PointView<'msg>;
+    type MessageMut<'msg> = PointMut<'msg>;
+}
 impl ::std::default::Default for Point {
     fn default() -> Self {
         Self::new()
@@ -19,8 +22,8 @@ impl ::std::fmt::Debug for Point {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for Point {}
-unsafe impl Send for Point {}
+unsafe impl ::std::marker::Sync for Point {}
+unsafe impl ::std::marker::Send for Point {}
 impl ::protobuf::Proxied for Point {
     type View<'msg> = PointView<'msg>;
 }
@@ -71,8 +74,8 @@ impl<'msg> PointView<'msg> {
         }
     }
 }
-unsafe impl Sync for PointView<'_> {}
-unsafe impl Send for PointView<'_> {}
+unsafe impl ::std::marker::Sync for PointView<'_> {}
+unsafe impl ::std::marker::Send for PointView<'_> {}
 impl<'msg> ::protobuf::AsView for PointView<'msg> {
     type Proxied = Point;
     fn as_view(&self) -> ::protobuf::View<'msg, Point> {
@@ -104,14 +107,14 @@ impl<'msg> ::protobuf::IntoProxied<Point> for PointMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for Point {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for Point {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for PointView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for PointView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for PointMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for PointMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -142,7 +145,7 @@ impl<'msg> PointMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, Point> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> Point {
         ::protobuf::AsView::as_view(self).to_owned()
@@ -164,16 +167,12 @@ impl<'msg> PointMut<'msg> {
         unsafe { self.inner.ptr_mut().set_base_field_i32_at_index(1, val.into()) }
     }
 }
-unsafe impl Send for PointMut<'_> {}
-unsafe impl Sync for PointMut<'_> {}
+unsafe impl ::std::marker::Send for PointMut<'_> {}
+unsafe impl ::std::marker::Sync for PointMut<'_> {}
 impl<'msg> ::protobuf::AsView for PointMut<'msg> {
     type Proxied = Point;
     fn as_view(&self) -> ::protobuf::View<'_, Point> {
-        PointView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for PointMut<'msg> {
@@ -181,17 +180,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for PointMut<'msg> {
     where
         'msg: 'shorter,
     {
-        PointView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for PointMut<'msg> {
     type MutProxied = Point;
     fn as_mut(&mut self) -> PointMut<'msg> {
-        PointMut { inner: self.inner }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for PointMut<'msg> {
@@ -354,7 +349,10 @@ pub(crate) static mut routeguide__Rectangle_msg_init: ::protobuf::__internal::ru
 pub struct Rectangle {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<Rectangle>,
 }
-impl ::protobuf::Message for Rectangle {}
+impl ::protobuf::Message for Rectangle {
+    type MessageView<'msg> = RectangleView<'msg>;
+    type MessageMut<'msg> = RectangleMut<'msg>;
+}
 impl ::std::default::Default for Rectangle {
     fn default() -> Self {
         Self::new()
@@ -365,8 +363,8 @@ impl ::std::fmt::Debug for Rectangle {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for Rectangle {}
-unsafe impl Send for Rectangle {}
+unsafe impl ::std::marker::Sync for Rectangle {}
+unsafe impl ::std::marker::Send for Rectangle {}
 impl ::protobuf::Proxied for Rectangle {
     type View<'msg> = RectangleView<'msg>;
 }
@@ -409,8 +407,8 @@ impl<'msg> RectangleView<'msg> {
     pub fn has_lo(self) -> bool {
         unsafe { self.inner.ptr().has_field_at_index(0) }
     }
-    pub fn lo_opt(self) -> ::protobuf::Optional<super::PointView<'msg>> {
-        ::protobuf::Optional::new(self.lo(), self.has_lo())
+    pub fn lo_opt(self) -> ::std::option::Option<super::PointView<'msg>> {
+        self.has_lo().then(|| self.lo())
     }
     pub fn lo(self) -> super::PointView<'msg> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(0) };
@@ -423,8 +421,8 @@ impl<'msg> RectangleView<'msg> {
     pub fn has_hi(self) -> bool {
         unsafe { self.inner.ptr().has_field_at_index(1) }
     }
-    pub fn hi_opt(self) -> ::protobuf::Optional<super::PointView<'msg>> {
-        ::protobuf::Optional::new(self.hi(), self.has_hi())
+    pub fn hi_opt(self) -> ::std::option::Option<super::PointView<'msg>> {
+        self.has_hi().then(|| self.hi())
     }
     pub fn hi(self) -> super::PointView<'msg> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(1) };
@@ -435,8 +433,8 @@ impl<'msg> RectangleView<'msg> {
             .unwrap_or(super::PointView::default())
     }
 }
-unsafe impl Sync for RectangleView<'_> {}
-unsafe impl Send for RectangleView<'_> {}
+unsafe impl ::std::marker::Sync for RectangleView<'_> {}
+unsafe impl ::std::marker::Send for RectangleView<'_> {}
 impl<'msg> ::protobuf::AsView for RectangleView<'msg> {
     type Proxied = Rectangle;
     fn as_view(&self) -> ::protobuf::View<'msg, Rectangle> {
@@ -468,14 +466,14 @@ impl<'msg> ::protobuf::IntoProxied<Rectangle> for RectangleMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for Rectangle {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for Rectangle {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for RectangleView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for RectangleView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for RectangleMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for RectangleMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -506,7 +504,7 @@ impl<'msg> RectangleMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, Rectangle> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> Rectangle {
         ::protobuf::AsView::as_view(self).to_owned()
@@ -519,8 +517,8 @@ impl<'msg> RectangleMut<'msg> {
             self.inner.ptr().clear_field_at_index(0);
         }
     }
-    pub fn lo_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.lo(), self.has_lo())
+    pub fn lo_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_lo().then(|| self.lo())
     }
     pub fn lo(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(0) };
@@ -560,8 +558,8 @@ impl<'msg> RectangleMut<'msg> {
             self.inner.ptr().clear_field_at_index(1);
         }
     }
-    pub fn hi_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.hi(), self.has_hi())
+    pub fn hi_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_hi().then(|| self.hi())
     }
     pub fn hi(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(1) };
@@ -594,16 +592,12 @@ impl<'msg> RectangleMut<'msg> {
         }
     }
 }
-unsafe impl Send for RectangleMut<'_> {}
-unsafe impl Sync for RectangleMut<'_> {}
+unsafe impl ::std::marker::Send for RectangleMut<'_> {}
+unsafe impl ::std::marker::Sync for RectangleMut<'_> {}
 impl<'msg> ::protobuf::AsView for RectangleMut<'msg> {
     type Proxied = Rectangle;
     fn as_view(&self) -> ::protobuf::View<'_, Rectangle> {
-        RectangleView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for RectangleMut<'msg> {
@@ -611,17 +605,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for RectangleMut<'msg> {
     where
         'msg: 'shorter,
     {
-        RectangleView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for RectangleMut<'msg> {
     type MutProxied = Rectangle;
     fn as_mut(&mut self) -> RectangleMut<'msg> {
-        RectangleMut { inner: self.inner }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for RectangleMut<'msg> {
@@ -662,8 +652,8 @@ impl Rectangle {
             self.inner.ptr().clear_field_at_index(0);
         }
     }
-    pub fn lo_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.lo(), self.has_lo())
+    pub fn lo_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_lo().then(|| self.lo())
     }
     pub fn lo(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(0) };
@@ -703,8 +693,8 @@ impl Rectangle {
             self.inner.ptr().clear_field_at_index(1);
         }
     }
-    pub fn hi_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.hi(), self.has_hi())
+    pub fn hi_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_hi().then(|| self.hi())
     }
     pub fn hi(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(1) };
@@ -853,7 +843,10 @@ pub(crate) static mut routeguide__Feature_msg_init: ::protobuf::__internal::runt
 pub struct Feature {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<Feature>,
 }
-impl ::protobuf::Message for Feature {}
+impl ::protobuf::Message for Feature {
+    type MessageView<'msg> = FeatureView<'msg>;
+    type MessageMut<'msg> = FeatureMut<'msg>;
+}
 impl ::std::default::Default for Feature {
     fn default() -> Self {
         Self::new()
@@ -864,8 +857,8 @@ impl ::std::fmt::Debug for Feature {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for Feature {}
-unsafe impl Send for Feature {}
+unsafe impl ::std::marker::Sync for Feature {}
+unsafe impl ::std::marker::Send for Feature {}
 impl ::protobuf::Proxied for Feature {
     type View<'msg> = FeatureView<'msg>;
 }
@@ -907,13 +900,13 @@ impl<'msg> FeatureView<'msg> {
     }
     pub fn name(self) -> ::protobuf::View<'msg, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn has_location(self) -> bool {
         unsafe { self.inner.ptr().has_field_at_index(1) }
     }
-    pub fn location_opt(self) -> ::protobuf::Optional<super::PointView<'msg>> {
-        ::protobuf::Optional::new(self.location(), self.has_location())
+    pub fn location_opt(self) -> ::std::option::Option<super::PointView<'msg>> {
+        self.has_location().then(|| self.location())
     }
     pub fn location(self) -> super::PointView<'msg> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(1) };
@@ -924,8 +917,8 @@ impl<'msg> FeatureView<'msg> {
             .unwrap_or(super::PointView::default())
     }
 }
-unsafe impl Sync for FeatureView<'_> {}
-unsafe impl Send for FeatureView<'_> {}
+unsafe impl ::std::marker::Sync for FeatureView<'_> {}
+unsafe impl ::std::marker::Send for FeatureView<'_> {}
 impl<'msg> ::protobuf::AsView for FeatureView<'msg> {
     type Proxied = Feature;
     fn as_view(&self) -> ::protobuf::View<'msg, Feature> {
@@ -957,14 +950,14 @@ impl<'msg> ::protobuf::IntoProxied<Feature> for FeatureMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for Feature {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for Feature {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for FeatureView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for FeatureView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for FeatureMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for FeatureMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -995,14 +988,14 @@ impl<'msg> FeatureMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, Feature> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> Feature {
         ::protobuf::AsView::as_view(self).to_owned()
     }
     pub fn name(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_name(
         &mut self,
@@ -1024,8 +1017,8 @@ impl<'msg> FeatureMut<'msg> {
             self.inner.ptr().clear_field_at_index(1);
         }
     }
-    pub fn location_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.location(), self.has_location())
+    pub fn location_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_location().then(|| self.location())
     }
     pub fn location(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(1) };
@@ -1058,16 +1051,12 @@ impl<'msg> FeatureMut<'msg> {
         }
     }
 }
-unsafe impl Send for FeatureMut<'_> {}
-unsafe impl Sync for FeatureMut<'_> {}
+unsafe impl ::std::marker::Send for FeatureMut<'_> {}
+unsafe impl ::std::marker::Sync for FeatureMut<'_> {}
 impl<'msg> ::protobuf::AsView for FeatureMut<'msg> {
     type Proxied = Feature;
     fn as_view(&self) -> ::protobuf::View<'_, Feature> {
-        FeatureView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for FeatureMut<'msg> {
@@ -1075,17 +1064,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for FeatureMut<'msg> {
     where
         'msg: 'shorter,
     {
-        FeatureView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for FeatureMut<'msg> {
     type MutProxied = Feature;
     fn as_mut(&mut self) -> FeatureMut<'msg> {
-        FeatureMut { inner: self.inner }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for FeatureMut<'msg> {
@@ -1120,7 +1105,7 @@ impl Feature {
     }
     pub fn name(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(0, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_name(
         &mut self,
@@ -1142,8 +1127,8 @@ impl Feature {
             self.inner.ptr().clear_field_at_index(1);
         }
     }
-    pub fn location_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.location(), self.has_location())
+    pub fn location_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_location().then(|| self.location())
     }
     pub fn location(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(1) };
@@ -1291,7 +1276,10 @@ pub(crate) static mut routeguide__RouteNote_msg_init: ::protobuf::__internal::ru
 pub struct RouteNote {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<RouteNote>,
 }
-impl ::protobuf::Message for RouteNote {}
+impl ::protobuf::Message for RouteNote {
+    type MessageView<'msg> = RouteNoteView<'msg>;
+    type MessageMut<'msg> = RouteNoteMut<'msg>;
+}
 impl ::std::default::Default for RouteNote {
     fn default() -> Self {
         Self::new()
@@ -1302,8 +1290,8 @@ impl ::std::fmt::Debug for RouteNote {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for RouteNote {}
-unsafe impl Send for RouteNote {}
+unsafe impl ::std::marker::Sync for RouteNote {}
+unsafe impl ::std::marker::Send for RouteNote {}
 impl ::protobuf::Proxied for RouteNote {
     type View<'msg> = RouteNoteView<'msg>;
 }
@@ -1346,8 +1334,8 @@ impl<'msg> RouteNoteView<'msg> {
     pub fn has_location(self) -> bool {
         unsafe { self.inner.ptr().has_field_at_index(0) }
     }
-    pub fn location_opt(self) -> ::protobuf::Optional<super::PointView<'msg>> {
-        ::protobuf::Optional::new(self.location(), self.has_location())
+    pub fn location_opt(self) -> ::std::option::Option<super::PointView<'msg>> {
+        self.has_location().then(|| self.location())
     }
     pub fn location(self) -> super::PointView<'msg> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(0) };
@@ -1359,11 +1347,11 @@ impl<'msg> RouteNoteView<'msg> {
     }
     pub fn message(self) -> ::protobuf::View<'msg, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(1, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
 }
-unsafe impl Sync for RouteNoteView<'_> {}
-unsafe impl Send for RouteNoteView<'_> {}
+unsafe impl ::std::marker::Sync for RouteNoteView<'_> {}
+unsafe impl ::std::marker::Send for RouteNoteView<'_> {}
 impl<'msg> ::protobuf::AsView for RouteNoteView<'msg> {
     type Proxied = RouteNote;
     fn as_view(&self) -> ::protobuf::View<'msg, RouteNote> {
@@ -1395,14 +1383,14 @@ impl<'msg> ::protobuf::IntoProxied<RouteNote> for RouteNoteMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for RouteNote {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for RouteNote {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for RouteNoteView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for RouteNoteView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for RouteNoteMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for RouteNoteMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -1433,7 +1421,7 @@ impl<'msg> RouteNoteMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, RouteNote> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> RouteNote {
         ::protobuf::AsView::as_view(self).to_owned()
@@ -1446,8 +1434,8 @@ impl<'msg> RouteNoteMut<'msg> {
             self.inner.ptr().clear_field_at_index(0);
         }
     }
-    pub fn location_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.location(), self.has_location())
+    pub fn location_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_location().then(|| self.location())
     }
     pub fn location(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(0) };
@@ -1481,7 +1469,7 @@ impl<'msg> RouteNoteMut<'msg> {
     }
     pub fn message(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(1, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_message(
         &mut self,
@@ -1496,16 +1484,12 @@ impl<'msg> RouteNoteMut<'msg> {
         }
     }
 }
-unsafe impl Send for RouteNoteMut<'_> {}
-unsafe impl Sync for RouteNoteMut<'_> {}
+unsafe impl ::std::marker::Send for RouteNoteMut<'_> {}
+unsafe impl ::std::marker::Sync for RouteNoteMut<'_> {}
 impl<'msg> ::protobuf::AsView for RouteNoteMut<'msg> {
     type Proxied = RouteNote;
     fn as_view(&self) -> ::protobuf::View<'_, RouteNote> {
-        RouteNoteView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for RouteNoteMut<'msg> {
@@ -1513,17 +1497,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for RouteNoteMut<'msg> {
     where
         'msg: 'shorter,
     {
-        RouteNoteView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for RouteNoteMut<'msg> {
     type MutProxied = RouteNote;
     fn as_mut(&mut self) -> RouteNoteMut<'msg> {
-        RouteNoteMut { inner: self.inner }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for RouteNoteMut<'msg> {
@@ -1564,8 +1544,8 @@ impl RouteNote {
             self.inner.ptr().clear_field_at_index(0);
         }
     }
-    pub fn location_opt(&self) -> ::protobuf::Optional<super::PointView<'_>> {
-        ::protobuf::Optional::new(self.location(), self.has_location())
+    pub fn location_opt(&self) -> ::std::option::Option<super::PointView<'_>> {
+        self.has_location().then(|| self.location())
     }
     pub fn location(&self) -> super::PointView<'_> {
         let submsg = unsafe { self.inner.ptr().get_message_at_index(0) };
@@ -1599,7 +1579,7 @@ impl RouteNote {
     }
     pub fn message(&self) -> ::protobuf::View<'_, ::protobuf::ProtoString> {
         let str_view = unsafe { self.inner.ptr().get_string_at_index(1, (b"").into()) };
-        unsafe { ::protobuf::ProtoStr::from_utf8_unchecked(str_view.as_ref()) }
+        ::protobuf::ProtoStr::from_utf8_unchecked(unsafe { str_view.as_ref() })
     }
     pub fn set_message(
         &mut self,
@@ -1729,7 +1709,10 @@ pub(crate) static mut routeguide__RouteSummary_msg_init: ::protobuf::__internal:
 pub struct RouteSummary {
     inner: ::protobuf::__internal::runtime::OwnedMessageInner<RouteSummary>,
 }
-impl ::protobuf::Message for RouteSummary {}
+impl ::protobuf::Message for RouteSummary {
+    type MessageView<'msg> = RouteSummaryView<'msg>;
+    type MessageMut<'msg> = RouteSummaryMut<'msg>;
+}
 impl ::std::default::Default for RouteSummary {
     fn default() -> Self {
         Self::new()
@@ -1740,8 +1723,8 @@ impl ::std::fmt::Debug for RouteSummary {
         write!(f, "{}", ::protobuf::__internal::runtime::debug_string(self))
     }
 }
-unsafe impl Sync for RouteSummary {}
-unsafe impl Send for RouteSummary {}
+unsafe impl ::std::marker::Sync for RouteSummary {}
+unsafe impl ::std::marker::Send for RouteSummary {}
 impl ::protobuf::Proxied for RouteSummary {
     type View<'msg> = RouteSummaryView<'msg>;
 }
@@ -1802,8 +1785,8 @@ impl<'msg> RouteSummaryView<'msg> {
         }
     }
 }
-unsafe impl Sync for RouteSummaryView<'_> {}
-unsafe impl Send for RouteSummaryView<'_> {}
+unsafe impl ::std::marker::Sync for RouteSummaryView<'_> {}
+unsafe impl ::std::marker::Send for RouteSummaryView<'_> {}
 impl<'msg> ::protobuf::AsView for RouteSummaryView<'msg> {
     type Proxied = RouteSummary;
     fn as_view(&self) -> ::protobuf::View<'msg, RouteSummary> {
@@ -1835,14 +1818,14 @@ impl<'msg> ::protobuf::IntoProxied<RouteSummary> for RouteSummaryMut<'msg> {
         )
     }
 }
-impl ::protobuf::__internal::runtime::EntityType for RouteSummary {
-    type Tag = ::protobuf::__internal::runtime::MessageTag;
+impl ::protobuf::__internal::EntityType for RouteSummary {
+    type Tag = ::protobuf::__internal::entity_tag::MessageTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for RouteSummaryView<'msg> {
-    type Tag = ::protobuf::__internal::runtime::ViewProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for RouteSummaryView<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::ViewProxyTag;
 }
-impl<'msg> ::protobuf::__internal::runtime::EntityType for RouteSummaryMut<'msg> {
-    type Tag = ::protobuf::__internal::runtime::MutProxyTag;
+impl<'msg> ::protobuf::__internal::EntityType for RouteSummaryMut<'msg> {
+    type Tag = ::protobuf::__internal::entity_tag::MutProxyTag;
 }
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -1873,7 +1856,7 @@ impl<'msg> RouteSummaryMut<'msg> {
         &mut self,
         _private: ::protobuf::__internal::Private,
     ) -> ::protobuf::__internal::runtime::MessageMutInner<'msg, RouteSummary> {
-        self.inner
+        self.inner.reborrow()
     }
     pub fn to_owned(&self) -> RouteSummary {
         ::protobuf::AsView::as_view(self).to_owned()
@@ -1911,16 +1894,12 @@ impl<'msg> RouteSummaryMut<'msg> {
         unsafe { self.inner.ptr_mut().set_base_field_i32_at_index(3, val.into()) }
     }
 }
-unsafe impl Send for RouteSummaryMut<'_> {}
-unsafe impl Sync for RouteSummaryMut<'_> {}
+unsafe impl ::std::marker::Send for RouteSummaryMut<'_> {}
+unsafe impl ::std::marker::Sync for RouteSummaryMut<'_> {}
 impl<'msg> ::protobuf::AsView for RouteSummaryMut<'msg> {
     type Proxied = RouteSummary;
     fn as_view(&self) -> ::protobuf::View<'_, RouteSummary> {
-        RouteSummaryView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::IntoView<'msg> for RouteSummaryMut<'msg> {
@@ -1928,19 +1907,13 @@ impl<'msg> ::protobuf::IntoView<'msg> for RouteSummaryMut<'msg> {
     where
         'msg: 'shorter,
     {
-        RouteSummaryView {
-            inner: ::protobuf::__internal::runtime::MessageViewInner::view_of_mut(
-                self.inner,
-            ),
-        }
+        self.inner.as_view().into()
     }
 }
 impl<'msg> ::protobuf::AsMut for RouteSummaryMut<'msg> {
     type MutProxied = RouteSummary;
     fn as_mut(&mut self) -> RouteSummaryMut<'msg> {
-        RouteSummaryMut {
-            inner: self.inner,
-        }
+        self.inner.reborrow().into()
     }
 }
 impl<'msg> ::protobuf::IntoMut<'msg> for RouteSummaryMut<'msg> {

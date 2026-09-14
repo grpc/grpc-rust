@@ -42,17 +42,14 @@ Requirements:
 From the `src/cpp_source` directory:
 
 ```bash
-# Create build directory
-mkdir build && cd build
-
 # Configure (downloads protobuf and dependencies automatically)
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build
-cmake --build . --parallel
+cmake --build build --config Release --parallel
 
-# Optional: specify a different protobuf version
-cmake .. -DCMAKE_BUILD_TYPE=Release -DPROTOBUF_VERSION=28.3
+# Install
+cmake --install build --config Release --prefix install
 ```
 
 The binaries will be in `build/bin/`:

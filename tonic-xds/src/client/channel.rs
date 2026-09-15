@@ -213,6 +213,7 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_grpc_service::<XdsChannelGrpc>();
     assert_send_sync::<XdsChannelGrpc>();
+    assert_send_sync::<XdsChannelBuilder>();
 };
 
 /// Builder for creating an [`XdsChannel`] or [`XdsChannelGrpc`].
@@ -222,6 +223,7 @@ pub struct XdsChannelBuilder {
     recorder: Option<Arc<dyn MetricsRecorder>>,
     pre_route: Option<Arc<dyn PreRouteInterceptor>>,
     retry_classifier_factory: Option<Arc<dyn RetryClassifierFactory>>,
+    cp_transport: Option<TonicTransportBuilder>,
     #[cfg(feature = "_tls-any")]
     cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
@@ -256,6 +258,7 @@ impl Debug for XdsChannelBuilder {
             "cert_providers",
             &self.cert_providers.keys().collect::<Vec<_>>(),
         );
+        s.field("cp_transport", &self.cp_transport);
         s.finish()
     }
 }
@@ -269,6 +272,7 @@ impl XdsChannelBuilder {
             recorder: None,
             pre_route: None,
             retry_classifier_factory: None,
+            cp_transport: None,
             #[cfg(feature = "_tls-any")]
             cert_providers: HashMap::new(),
         }
@@ -333,6 +337,25 @@ impl XdsChannelBuilder {
         self
     }
 
+    /// Uses a custom connector for the xDS management server.
+    ///
+    /// Backend connections are unaffected. The connector owns security, so
+    /// bootstrap TLS and
+    /// [`requires_secure_transport`](xds_client::TonicCallCredentials::requires_secure_transport)
+    /// are not applied. Use an `http://` URI with `insecure` bootstrap
+    /// credentials even when the connector uses TLS.
+    #[must_use]
+    pub fn with_control_plane_connector<C>(mut self, connector: C) -> Self
+    where
+        C: tower::Service<http::Uri> + Clone + Send + Sync + 'static,
+        C::Response: xds_client::AdsIo + 'static,
+        C::Future: Send + 'static,
+        BoxError: From<C::Error>,
+    {
+        self.cp_transport = Some(TonicTransportBuilder::new().with_connector(connector));
+        self
+    }
+
     /// Emits the gRFC A78 xDS client metrics through an OpenTelemetry `Meter`.
     ///
     /// Convenience wrapper over
@@ -364,25 +387,16 @@ impl XdsChannelBuilder {
         let listener_name = self.config.target_uri.target.clone();
 
         let server_uri = bootstrap.server_uri().to_owned();
+        let bootstrap_use_tls = bootstrap.use_tls();
 
-        #[allow(unused_mut)]
-        let mut transport_builder = TonicTransportBuilder::new();
-        #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
-        if bootstrap.use_tls() {
-            transport_builder = transport_builder
-                .with_tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots());
-        }
         #[cfg(not(any(feature = "tls-ring", feature = "tls-aws-lc")))]
-        if bootstrap.use_tls() {
+        if self.cp_transport.is_none() && bootstrap_use_tls {
             return Err(BuildError::Bootstrap(BootstrapError::Validation(
                 "TLS requested by bootstrap but no TLS feature enabled \
-                 (enable tls-ring or tls-aws-lc)"
+                 (enable tls-ring or tls-aws-lc, or supply the connection \
+                 yourself with XdsChannelBuilder::with_control_plane_connector)"
                     .into(),
             )));
-        }
-
-        if let Some(creds) = self.config.call_creds.clone() {
-            transport_builder = transport_builder.with_call_credentials(creds);
         }
 
         #[cfg(feature = "_tls-any")]
@@ -394,8 +408,12 @@ impl XdsChannelBuilder {
         let node = Node::try_from(bootstrap.node)?;
         let client_config =
             ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
-        let mut client_builder =
-            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
+        let mut client_builder = XdsClient::builder(
+            client_config,
+            self.control_plane_transport(bootstrap_use_tls),
+            ProstCodec,
+            TokioRuntime,
+        );
         if let Some(recorder) = self.recorder.clone() {
             client_builder = client_builder.with_metrics_recorder(recorder);
         }
@@ -412,6 +430,24 @@ impl XdsChannelBuilder {
             #[cfg(feature = "_tls-any")]
             cert_provider_registry,
         })
+    }
+
+    fn control_plane_transport(&self, bootstrap_use_tls: bool) -> TonicTransportBuilder {
+        #[allow(unused_mut)]
+        let mut transport_builder = self.cp_transport.clone().unwrap_or_default();
+
+        #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+        if bootstrap_use_tls && self.cp_transport.is_none() {
+            transport_builder = transport_builder
+                .with_tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots());
+        }
+        #[cfg(not(any(feature = "tls-ring", feature = "tls-aws-lc")))]
+        let _ = bootstrap_use_tls;
+
+        if let Some(creds) = self.config.call_creds.clone() {
+            transport_builder = transport_builder.with_call_credentials(creds);
+        }
+        transport_builder
     }
 
     /// Wires the shared routing / retry / load-balancing stack from a pre-built

@@ -177,6 +177,7 @@ impl LbPolicy for RoundRobinPolicy {
             return Err(err.into());
         }
 
+        self.child_manager.exit_idle(channel_controller);
         self.update_picker(channel_controller);
         Ok(())
     }

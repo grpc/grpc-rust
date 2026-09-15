@@ -408,13 +408,20 @@ impl FirstPassState {
 
     fn trigger_connection(&mut self, ctx: &mut PickFirstContext<'_>, sc: &Arc<dyn Subchannel>) {
         let addr = sc.address();
-        if let Some(entry) = self.subchannels.iter_mut().find(|e| e.address == addr) {
+        let was_idle = if let Some(entry) = self.subchannels.iter_mut().find(|e| e.address == addr)
+        {
+            let was_idle = entry.state.connectivity_state == ConnectivityState::Idle;
             entry.state = SubchannelState {
                 connectivity_state: ConnectivityState::Connecting,
                 last_connection_error: None,
             };
+            was_idle
+        } else {
+            false
+        };
+        if was_idle {
+            sc.connect();
         }
-        sc.connect();
         self.timer = Timer::start(ctx.runtime.clone(), ctx.work_scheduler.clone());
     }
 

@@ -41,6 +41,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::xds::bootstrap::CertProviderPluginConfig;
+use crate::xds::cert_provider_config::FileWatcherConfig;
 
 /// PEM-encoded identity (a cert chain paired with its private key).
 #[derive(Clone)]
@@ -249,13 +250,12 @@ impl CertProviderRegistry {
     ) -> Result<Arc<dyn CertificateProvider>, CertProviderError> {
         match entry.plugin_name.as_str() {
             file_watcher::PLUGIN_NAME => {
-                let config =
-                    file_watcher::FileWatcherConfig::deserialize(&entry.config).map_err(|e| {
-                        CertProviderError::InvalidPluginConfig {
-                            plugin: entry.plugin_name.clone(),
-                            source: e,
-                        }
-                    })?;
+                let config = FileWatcherConfig::deserialize(&entry.config).map_err(|e| {
+                    CertProviderError::InvalidPluginConfig {
+                        plugin: entry.plugin_name.clone(),
+                        source: e,
+                    }
+                })?;
                 Ok(Arc::new(file_watcher::FileWatcherProvider::new(config)?))
             }
             other => Err(CertProviderError::UnknownPlugin(other.to_string())),

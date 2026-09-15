@@ -83,8 +83,8 @@ otel = ["dep:opentelemetry", "dep:xds-client-opentelemetry"]
 
 # TLS crypto backend — pick exactly one.
 _tls-any = ["dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]
-tls-ring = ["_tls-any", "tonic/tls-ring", "xds-client/tonic-tls-ring"]
-tls-aws-lc = ["_tls-any", "tonic/tls-aws-lc", "xds-client/tonic-tls-aws-lc"]
+tls-ring = ["_tls-any", "tonic/tls-ring", "tonic/tls-native-roots", "xds-client/tonic-tls-ring"]
+tls-aws-lc = ["_tls-any", "tonic/tls-aws-lc", "tonic/tls-native-roots", "xds-client/tonic-tls-aws-lc"]
 
 [[example]]
 name = "channel"

@@ -248,11 +248,18 @@ pub(crate) mod common {
 
 /// Contains information about a [`ChannelCredentials`] or
 /// [`ServerCredentials`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProtocolInfo {
     security_protocol: &'static str,
 }
 
 impl ProtocolInfo {
+    #[cfg(feature = "__unstable")]
+    pub const fn new(security_protocol: &'static str) -> Self {
+        Self { security_protocol }
+    }
+
+    #[cfg(not(feature = "__unstable"))]
     pub(crate) const fn new(security_protocol: &'static str) -> Self {
         Self { security_protocol }
     }

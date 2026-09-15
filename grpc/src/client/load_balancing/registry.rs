@@ -100,11 +100,13 @@ impl LbPolicyRegistry {
     ///
     /// # Example
     ///
-    /// ```ignore (cannot be compiled as doctest because `load_balancing` is pub(crate))
-    /// use grpc::client::load_balancing::GLOBAL_LB_REGISTRY;
+    /// ```rust
+    /// # #[cfg(feature = "__unstable")]
+    /// # {
+    /// use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
     ///
     /// let children_json = r#"[
-    ///     {"xds": {}},
+    ///     {"weighted_round_robin_experimental": {}},
     ///     {"round_robin": {}}
     /// ]"#;
     ///
@@ -118,6 +120,7 @@ impl LbPolicyRegistry {
     ///
     /// assert!(selected.is_some());
     /// assert_eq!(selected.unwrap().builder.name(), "round_robin");
+    /// # }
     /// ```
     pub fn select_child_with_filter<F>(
         &self,

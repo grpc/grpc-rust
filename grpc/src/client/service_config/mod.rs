@@ -23,7 +23,7 @@
  */
 
 pub(crate) mod duration;
-pub(crate) mod serde_bindings;
+mod serde_bindings;
 
 use std::sync::Arc;
 

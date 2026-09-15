@@ -326,7 +326,7 @@ impl ActiveChannel {
             while let Some(w) = wqrx.recv().await {
                 match w {
                     WorkQueueItem::ScheduleResolver => {
-                        resolver.work(&mut resolver_channel_controller)
+                        resolver.work(&mut resolver_channel_controller);
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
                     WorkQueueItem::ScheduleLbPolicy(data) => {

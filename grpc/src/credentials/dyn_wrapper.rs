@@ -22,7 +22,7 @@
  *
  */
 
-use tonic::async_trait;
+use crate::async_trait;
 
 use crate::credentials::ProtocolInfo;
 use crate::credentials::ServerCredentials;

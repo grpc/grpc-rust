@@ -216,7 +216,7 @@ struct InterceptingController<'a> {
     proxy_options: &'a Arc<ProxyOptions>,
 }
 
-impl<'a> ChannelController for InterceptingController<'a> {
+impl ChannelController for InterceptingController<'_> {
     fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
         if let Ok(endpoints) = &mut update.endpoints {
             for endpoint in endpoints {
@@ -282,7 +282,7 @@ mod tests {
         lookup_result: Result<Vec<IpAddr>, String>,
     }
 
-    #[tonic::async_trait]
+    #[crate::async_trait]
     impl rt::DnsResolver for FakeDns {
         async fn lookup_host_name(&self, _: &str) -> Result<Vec<IpAddr>, String> {
             self.lookup_result.clone()

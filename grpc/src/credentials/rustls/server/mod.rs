@@ -340,7 +340,7 @@ impl ProducesTickets for NoTicketer {
     }
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl ServerCredentials for RustlsServerCredentials {
     async fn accept(
         &self,

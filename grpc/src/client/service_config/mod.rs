@@ -359,7 +359,12 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
         assert_eq!(builder.name(), "pick_first");
-        assert!(config.is_none());
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(!pf_config.shuffle_address_list);
 
         // Legacy loadBalancingPolicy fallback when loadBalancingConfig is absent
         let json_data = json!({
@@ -375,6 +380,11 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
         assert_eq!(builder.name(), "pick_first");
-        assert!(config.is_none());
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(!pf_config.shuffle_address_list);
     }
 }

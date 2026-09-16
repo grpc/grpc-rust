@@ -59,9 +59,9 @@ pub static POLICY_NAME: &str = "pick_first";
 
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Deserialize, Clone, Default)]
 pub struct PickFirstConfig {
-    #[serde(rename = "shuffleAddressList")]
+    #[serde(default, rename = "shuffleAddressList")]
     pub shuffle_address_list: bool,
 }
 

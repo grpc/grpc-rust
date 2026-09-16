@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use std::{
     fs::File,
     io::{BufWriter, Write as _},
@@ -82,32 +106,7 @@ fn main() {
         true,
     );
 
-    // grpc-routeguide example
-    codegen_grpc_routeguide(
-        &PathBuf::from(std::env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("examples"),
-    );
-
     println!("Codgen completed: {}ms", start.elapsed().as_millis());
-}
-
-fn codegen_grpc_routeguide(root_dir: &Path) {
-    unsafe {
-        // TODO: Once the codegen is updated to allow the `OUT_DIR` env var to
-        // be unset, change this to use `.output_dir` instead.
-        std::env::set_var("OUT_DIR", root_dir.join("src/grpc-routeguide/generated"));
-    }
-
-    std::env::set_current_dir(root_dir).unwrap();
-
-    grpc_protobuf_build::CodeGen::new()
-        .include("proto/routeguide")
-        .inputs(["route_guide.proto"])
-        .client_only()
-        .compile()
-        .unwrap();
 }
 
 fn codegen(

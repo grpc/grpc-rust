@@ -28,13 +28,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
-use crate::private;
 use crate::rt::BoxEndpoint;
 use crate::rt::BoxFuture;
 use crate::rt::BoxedTaskHandle;
@@ -42,6 +39,7 @@ use crate::rt::DnsResolver;
 use crate::rt::ResolverOptions;
 use crate::rt::Runtime;
 use crate::rt::Sleep;
+use crate::rt::StreamEndpoint;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
 
@@ -54,7 +52,7 @@ struct TokioDefaultDnsResolver {
     _priv: (),
 }
 
-#[tonic::async_trait]
+#[crate::async_trait]
 impl DnsResolver for TokioDefaultDnsResolver {
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
         let name_with_port = match name.parse::<IpAddr>() {
@@ -81,7 +79,7 @@ pub(crate) struct TokioRuntime {
 
 impl TaskHandle for JoinHandle<()> {
     fn abort(&self) {
-        self.abort()
+        self.abort();
     }
 }
 
@@ -116,6 +114,9 @@ impl Runtime for TokioRuntime {
             let stream = TcpStream::connect(target)
                 .await
                 .map_err(|err| err.to_string())?;
+            stream
+                .set_nodelay(opts.enable_nodelay)
+                .map_err(|err| err.to_string())?;
             if let Some(duration) = opts.keepalive {
                 let sock_ref = socket2::SockRef::from(&stream);
                 let mut ka = socket2::TcpKeepalive::new();
@@ -125,7 +126,7 @@ impl Runtime for TokioRuntime {
                     .map_err(|err| err.to_string())?;
             }
             let stream: Box<dyn super::GrpcEndpoint> =
-                Box::new(TokioIoStream::new_from_tcp(stream)?);
+                Box::new(StreamEndpoint::new_from_tcp(stream)?);
             Ok(stream)
         })
     }
@@ -147,7 +148,7 @@ impl Runtime for TokioRuntime {
             let peer_addr = stream.peer_addr().map_err(|err| err.to_string())?;
             let local_addr = stream.local_addr().map_err(|err| err.to_string())?;
 
-            let stream: Box<dyn super::GrpcEndpoint> = Box::new(TokioIoStream {
+            let stream: Box<dyn super::GrpcEndpoint> = Box::new(StreamEndpoint {
                 peer_addr: format!("{peer_addr:?}").into_boxed_str(),
                 local_addr: format!("{local_addr:?}").into_boxed_str(),
                 network_type: UNIX_NETWORK_TYPE,
@@ -155,6 +156,41 @@ impl Runtime for TokioRuntime {
             });
             Ok(stream)
         })
+    }
+
+    fn tcp_listener(
+        &self,
+        addr: SocketAddr,
+    ) -> BoxFuture<Result<Box<dyn super::EndpointListener>, String>> {
+        Box::pin(async move {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Box::new(TokioTcpListener { listener }) as Box<dyn super::EndpointListener>)
+        })
+    }
+
+    #[cfg(unix)]
+    fn unix_listener(
+        &self,
+        path: std::path::PathBuf,
+        _opts: super::UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn super::EndpointListener>, String>> {
+        Box::pin(async move {
+            let listener = tokio::net::UnixListener::bind(&path).map_err(|e| e.to_string())?;
+            Ok(Box::new(TokioUnixListener { listener }) as Box<dyn super::EndpointListener>)
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn unix_listener(
+        &self,
+        _path: std::path::PathBuf,
+        _opts: super::UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn super::EndpointListener>, String>> {
+        Box::pin(
+            async move { Err("Unix listeners are not supported on this platform".to_string()) },
+        )
     }
 }
 
@@ -166,17 +202,9 @@ impl TokioDefaultDnsResolver {
         Ok(TokioDefaultDnsResolver { _priv: () })
     }
 }
-
-pub(crate) struct TokioIoStream<T> {
-    inner: T,
-    peer_addr: Box<str>,
-    local_addr: Box<str>,
-    network_type: &'static str,
-}
-
-impl TokioIoStream<TcpStream> {
+impl StreamEndpoint<TcpStream> {
     pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
-        Ok(TokioIoStream {
+        Ok(StreamEndpoint {
             local_addr: stream
                 .local_addr()
                 .map_err(|err| err.to_string())?
@@ -193,64 +221,64 @@ impl TokioIoStream<TcpStream> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> super::GrpcEndpoint for TokioIoStream<T> {
-    fn get_local_address(&self) -> &str {
-        &self.local_addr
+// ---------------------------------------------------------------------------
+// TokioTcpListener — EndpointListener for TCP
+// ---------------------------------------------------------------------------
+
+/// Wraps `tokio::net::TcpListener` as an [`EndpointListener`](super::EndpointListener).
+struct TokioTcpListener {
+    listener: tokio::net::TcpListener,
+}
+
+#[crate::async_trait]
+impl super::EndpointListener for TokioTcpListener {
+    async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
+        let (stream, _addr) = self.listener.accept().await.map_err(|e| e.to_string())?;
+        let io = StreamEndpoint::new_from_tcp(stream)?;
+        Ok(Box::new(io))
     }
 
-    fn get_peer_address(&self) -> &str {
-        &self.peer_addr
+    fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress> {
+        let addr = self.listener.local_addr().expect("TCP listener has addr");
+        Box::new(crate::rt::address::TcpAddress(addr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TokioUnixListener — EndpointListener for Unix sockets
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+struct TokioUnixListener {
+    listener: tokio::net::UnixListener,
+}
+
+#[cfg(unix)]
+#[crate::async_trait]
+impl super::EndpointListener for TokioUnixListener {
+    async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
+        use crate::client::name_resolution::UNIX_NETWORK_TYPE;
+
+        let (stream, _addr) = self.listener.accept().await.map_err(|e| e.to_string())?;
+        let peer_addr = stream.peer_addr().map_err(|e| e.to_string())?;
+        let local_addr = stream.local_addr().map_err(|e| e.to_string())?;
+
+        let io: Box<dyn super::GrpcEndpoint> = Box::new(StreamEndpoint {
+            peer_addr: format!("{peer_addr:?}").into_boxed_str(),
+            local_addr: format!("{local_addr:?}").into_boxed_str(),
+            network_type: UNIX_NETWORK_TYPE,
+            inner: stream,
+        });
+        Ok(io)
     }
 
-    fn get_network_type(&self) -> &'static str {
-        self.network_type
-    }
-
-    fn poll_read_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-        _token: private::Internal,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-
-    fn poll_write_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored_private(&self, _token: private::Internal) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown_private(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _token: private::Internal,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress> {
+        let path = self
+            .listener
+            .local_addr()
+            .map(|a| format!("{a:?}"))
+            .unwrap_or_default();
+        Box::new(crate::rt::address::UnixListenerAddress::new(path))
     }
 }
 
@@ -273,7 +301,7 @@ mod tests {
         assert!(
             !ips.is_empty(),
             "Expect localhost to resolve to more than 1 IPs."
-        )
+        );
     }
 
     #[tokio::test]
@@ -281,7 +309,7 @@ mod tests {
         let default_resolver = TokioDefaultDnsResolver::new(ResolverOptions::default()).unwrap();
 
         let txt = default_resolver.lookup_txt("google.com").await;
-        assert!(txt.is_err())
+        assert!(txt.is_err());
     }
 
     #[tokio::test]
@@ -290,6 +318,6 @@ mod tests {
             server_addr: Some("8.8.8.8:53".parse().unwrap()),
         };
         let default_resolver = TokioDefaultDnsResolver::new(opts);
-        assert!(default_resolver.is_err())
+        assert!(default_resolver.is_err());
     }
 }

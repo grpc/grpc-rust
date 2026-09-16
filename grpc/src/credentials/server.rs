@@ -22,48 +22,10 @@
  *
  */
 
-use crate::attributes::Attributes;
-use crate::credentials::SecurityLevel;
+use crate::credentials::SecurityInfo;
+use crate::rt::BoxEndpoint;
 
-pub struct HandshakeOutput<T> {
-    pub endpoint: T,
-    pub security: ServerConnectionSecurityInfo,
-}
-
-/// Represents the security state of an established server-side connection.
-pub struct ServerConnectionSecurityInfo {
-    security_protocol: &'static str,
-    security_level: SecurityLevel,
-    /// Stores extra data derived from the underlying protocol.
-    attributes: Attributes,
-}
-
-impl ServerConnectionSecurityInfo {
-    /// Creates a new instance of `ServerConnectionSecurityInfo`.
-    pub fn new(
-        security_protocol: &'static str,
-        security_level: SecurityLevel,
-        attributes: Attributes,
-    ) -> Self {
-        Self {
-            security_protocol,
-            security_level,
-            attributes,
-        }
-    }
-
-    /// Returns the security protocol used.
-    pub fn security_protocol(&self) -> &'static str {
-        self.security_protocol
-    }
-
-    /// Returns the security level of the connection.
-    pub fn security_level(&self) -> SecurityLevel {
-        self.security_level
-    }
-
-    /// Returns the attributes associated with the connection.
-    pub fn attributes(&self) -> &Attributes {
-        &self.attributes
-    }
+pub struct HandshakeOutput {
+    pub endpoint: BoxEndpoint,
+    pub security: SecurityInfo,
 }

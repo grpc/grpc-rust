@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Server implementation and builder.
 
 mod conn;
@@ -721,6 +745,10 @@ impl<L> Server<L> {
     }
 
     /// Serve the service with the signal on the provided incoming stream.
+    ///
+    /// When `signal` completes, this function drops `incoming`.
+    /// If `incoming` is a [`TcpIncoming`], drop closes the listen socket.
+    /// The function then waits for accepted connections to close.
     pub async fn serve_with_incoming_shutdown<S, I, F, IO, IE, ResBody>(
         self,
         svc: S,
@@ -829,37 +857,44 @@ impl<L> Server<L> {
 
         let graceful = signal.is_some();
         let mut sig = pin!(Fuse { inner: signal });
-        let mut incoming = pin!(incoming);
 
-        loop {
-            tokio::select! {
-                _ = &mut sig => {
-                    trace!("signal received, shutting down");
-                    break;
-                },
-                io = incoming.next() => {
-                    let io = match io {
-                        Some(Ok(io)) => io,
-                        Some(Err(e)) => {
-                            trace!("error accepting connection: {}", DisplayErrorStack(&*e));
-                            continue;
-                        },
-                        None => {
-                            break
-                        },
-                    };
+        // Scope the accept loop so `incoming` is dropped as soon as we stop
+        // accepting. For `TcpIncoming` that closes the listen socket immediately
+        // (kernel stops SYN-ACKing). Holding it until after drain leaves the
+        // port bound: new clients complete TCP, then hang until their deadline.
+        {
+            let mut incoming = pin!(incoming);
 
-                    trace!("connection accepted");
+            loop {
+                tokio::select! {
+                    _ = &mut sig => {
+                        trace!("signal received, shutting down");
+                        break;
+                    },
+                    io = incoming.next() => {
+                        let io = match io {
+                            Some(Ok(io)) => io,
+                            Some(Err(e)) => {
+                                trace!("error accepting connection: {}", DisplayErrorStack(&*e));
+                                continue;
+                            },
+                            None => {
+                                break
+                            },
+                        };
 
-                    let req_svc = svc
-                        .call(&io)
-                        .await
-                        .map_err(super::Error::from_source)?;
+                        trace!("connection accepted");
 
-                    let hyper_io = TokioIo::new(io);
-                    let hyper_svc = TowerToHyperService::new(req_svc.map_request(|req: Request<Incoming>| req.map(Body::new)));
+                        let req_svc = svc
+                            .call(&io)
+                            .await
+                            .map_err(super::Error::from_source)?;
 
-                    serve_connection(hyper_io, hyper_svc, server.clone(), graceful.then(|| signal_rx.clone()), max_connection_age, max_connection_age_grace);
+                        let hyper_io = TokioIo::new(io);
+                        let hyper_svc = TowerToHyperService::new(req_svc.map_request(|req: Request<Incoming>| req.map(Body::new)));
+
+                        serve_connection(hyper_io, hyper_svc, server.clone(), graceful.then(|| signal_rx.clone()), max_connection_age, max_connection_age_grace);
+                    }
                 }
             }
         }
@@ -930,10 +965,12 @@ fn serve_connection<B, IO, S, E>(
 
             let mut conn = pin!(builder.serve_connection(hyper_io, hyper_svc));
 
-            let mut connection_timeout = pin!(connection_timeout_future(
-                max_connection_age,
-                max_connection_age_grace,
-            ));
+            let mut connection_timeout = pin!(Fuse {
+                inner: Some(connection_timeout_future(
+                    max_connection_age,
+                    max_connection_age_grace,
+                )),
+            });
 
             loop {
                 tokio::select! {
@@ -1087,6 +1124,9 @@ impl<L> Router<L> {
     /// on the provided incoming stream of `AsyncRead + AsyncWrite`. Similar to
     /// `serve_with_shutdown` this method will also take a signal future to
     /// gracefully shutdown the server.
+    ///
+    /// When `signal` completes, `incoming` is dropped immediately (closing a
+    /// TCP listener) and already-accepted connections are then drained.
     ///
     /// This method discards any provided [`Server`] TCP configuration.
     ///
@@ -1326,6 +1366,36 @@ mod tests {
 
         let action = future.await;
         assert!(matches!(action, TimeoutAction::ForcefulShutdown));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_timeout_polled_after_graceful_shutdown() {
+        // Reproduce #2522: connection_timeout polled after GracefulShutdown
+        let mut future = pin!(Fuse {
+            inner: Some(connection_timeout_future(
+                Some(Duration::from_secs(10)),
+                None,
+            ))
+        });
+
+        // First poll: should return GracefulShutdown after 10s
+        let action = tokio::select! {
+            action = &mut future => action,
+            _ = tokio::time::sleep(Duration::from_secs(11)) => {
+                panic!("timeout future should complete after max_connection_age");
+            }
+        };
+        assert!(matches!(action, TimeoutAction::GracefulShutdown));
+
+        // Second poll: Fuse should return Pending, not panic
+        tokio::select! {
+            _ = &mut future => {
+                panic!("fused future should not complete again");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                // OK: future is fused, returns Pending
+            }
+        }
     }
 
     #[test]

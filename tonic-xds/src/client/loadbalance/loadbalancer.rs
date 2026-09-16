@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Load balancer tower service.
 //!
 //! Receives endpoint updates via [`tower::discover::Discover`],
@@ -13,7 +37,7 @@
 //! `watch` channel each time the set changes; the LB consumes the
 //! latest snapshot, consumes the matching [`ReadyChannel`] via
 //! [`ReadyChannel::eject`], and tracks the resulting
-//! [`EjectedChannel`] in [`Self::ejected`]. When the timer fires, the
+//! [`EjectedChannel`] in `ejected`. When the timer fires, the
 //! resolved [`UnejectedChannel`] is routed back into `ready` or
 //! `connecting`.
 //!
@@ -93,7 +117,7 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// ring stays stable across connection flaps and ejections.
     members: IndexSet<EndpointAddress>,
     /// Currently-ejected channels. Each entry is an
-    /// [`EjectedChannel`] whose `Sleep` fires when the ejection
+    /// `EjectedChannel` whose `Sleep` fires when the ejection
     /// window expires.
     ejected: KeyedFutures<EndpointAddress, UnejectedChannel<C::Service>>,
     /// Per-LB outlier-detection plumbing. Always present; the

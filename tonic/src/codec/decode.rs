@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use super::compression::{CompressionEncoding, CompressionSettings, decompress};
 use super::{BufferSettings, DEFAULT_MAX_RECV_MESSAGE_SIZE, DecodeBuf, Decoder, HEADER_SIZE};
 use crate::{Code, Status, body::Body, metadata::MetadataMap};
@@ -294,13 +318,13 @@ impl StreamingInner {
     }
 
     fn response(&mut self) -> Result<(), Status> {
-        if let Direction::Response(status) = self.direction {
-            if let Err(Some(e)) = crate::status::infer_grpc_status(self.trailers.as_ref(), status) {
-                // If the trailers contain a grpc-status, then we should return that as the error
-                // and otherwise stop the stream (by taking the error state)
-                self.trailers.take();
-                return Err(e);
-            }
+        if let Direction::Response(status) = self.direction
+            && let Err(Some(e)) = crate::status::infer_grpc_status(self.trailers.as_ref(), status)
+        {
+            // If the trailers contain a grpc-status, then we should return that as the error
+            // and otherwise stop the stream (by taking the error state)
+            self.trailers.take();
+            return Err(e);
         }
         Ok(())
     }

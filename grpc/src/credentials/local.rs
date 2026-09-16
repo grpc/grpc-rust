@@ -26,23 +26,23 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::attributes::Attributes;
+use crate::async_trait;
+
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::ServerCredentials;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
+use crate::credentials::client::ValidateAuthority;
 use crate::credentials::common::Authority;
 use crate::credentials::server;
-use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
-use crate::rt::GrpcEndpoint;
+use crate::rt::BoxEndpoint;
 use crate::rt::GrpcRuntime;
 
 pub const PROTOCOL_NAME: &str = "local";
@@ -69,12 +69,12 @@ impl LocalChannelCredentials {
     }
 }
 
-/// An implementation of [`ClientConnectionSecurityContext`] for local
-/// connections.
+/// An implementation of [`ValidateAuthority`] for local connections, allowing
+/// any authority to be used.
 #[derive(Debug, Clone)]
-pub struct LocalConnectionSecurityContext;
+pub struct LocalConnectionAuthorityValidator;
 
-impl ClientConnectionSecurityContext for LocalConnectionSecurityContext {
+impl ValidateAuthority for LocalConnectionAuthorityValidator {
     fn validate_authority(&self, _authority: &Authority) -> bool {
         true
     }
@@ -112,28 +112,22 @@ fn security_level_for_endpoint(
     ))
 }
 
+#[async_trait]
 impl ChannelCredentials for LocalChannelCredentials {
-    type ContextType = LocalConnectionSecurityContext;
-    type Output<I> = I;
-
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect(
         &self,
         _authority: &Authority,
-        source: Input,
+        source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         _runtime: &GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+    ) -> Result<HandshakeOutput, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(HandshakeOutput {
             endpoint: source,
-            security: ClientConnectionSecurityInfo::new(
-                PROTOCOL_NAME,
-                security_level,
-                LocalConnectionSecurityContext,
-                Attributes::new(),
-            ),
+            security_info: SecurityInfo::new(PROTOCOL_NAME).with_security_level(security_level),
+            authority_validator: Box::new(LocalConnectionAuthorityValidator),
         })
     }
 
@@ -161,24 +155,19 @@ impl LocalServerCredentials {
     }
 }
 
+#[async_trait]
 impl ServerCredentials for LocalServerCredentials {
-    type Output<I> = I;
-
-    async fn accept<Input: GrpcEndpoint>(
+    async fn accept(
         &self,
-        source: Input,
+        source: BoxEndpoint,
         _runtime: GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<server::HandshakeOutput<Self::Output<Input>>, String> {
+    ) -> Result<server::HandshakeOutput, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
         Ok(server::HandshakeOutput {
             endpoint: source,
-            security: ServerConnectionSecurityInfo::new(
-                PROTOCOL_NAME,
-                security_level,
-                Attributes::new(),
-            ),
+            security: SecurityInfo::new(PROTOCOL_NAME).with_security_level(security_level),
         })
     }
 
@@ -199,14 +188,13 @@ mod test {
     use crate::credentials::ChannelCredentials;
     use crate::credentials::SecurityLevel;
     use crate::credentials::ServerCredentials;
-    use crate::credentials::client::ClientConnectionSecurityContext;
     use crate::credentials::client::ClientHandshakeInfo;
     use crate::credentials::common::Authority;
     use crate::rt;
-    use crate::rt::AsyncIoAdapter;
+    use crate::rt::EndpointIoStream;
     use crate::rt::GrpcEndpoint;
+    use crate::rt::StreamEndpoint;
     use crate::rt::TcpOptions;
-    use crate::rt::tokio::TokioIoStream;
 
     #[test]
     fn test_security_level_for_endpoint_success() {
@@ -265,7 +253,8 @@ mod test {
             .unwrap();
 
         let endpoint = output.endpoint;
-        let security_info = output.security;
+        let security_info = output.security_info;
+        let authority_validator = output.authority_validator;
 
         // Verify security info.
         assert_eq!(security_info.security_protocol(), "local");
@@ -281,18 +270,14 @@ mod test {
         server_stream.write_all(test_data).await.unwrap();
 
         let mut buf = vec![0u8; test_data.len()];
-        AsyncIoAdapter::new(endpoint)
+        EndpointIoStream::new(endpoint)
             .read_exact(&mut buf)
             .await
             .unwrap();
         assert_eq!(buf, test_data);
 
         // Validate arbitrary authority.
-        assert!(
-            security_info
-                .security_context()
-                .validate_authority(&authority)
-        );
+        assert!(authority_validator.validate_authority(&authority));
     }
 
     #[tokio::test]
@@ -318,10 +303,10 @@ mod test {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let server_stream = TokioIoStream::new_from_tcp(stream).unwrap();
+        let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
 
         let output = creds
-            .accept(server_stream, runtime, private::Internal)
+            .accept(Box::new(server_stream), runtime, private::Internal)
             .await
             .unwrap();
         let endpoint = output.endpoint;
@@ -331,11 +316,63 @@ mod test {
         assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
 
         let mut buf = vec![0u8; 10];
-        AsyncIoAdapter::new(endpoint)
+        EndpointIoStream::new(endpoint)
             .read_exact(&mut buf)
             .await
             .unwrap();
         assert_eq!(&buf[..], b"hello grpc");
+
+        client_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dyn_server_credential_dispatch() {
+        let creds = LocalServerCredentials::new();
+        let dyn_creds: Arc<dyn ServerCredentials> = Arc::new(creds);
+
+        let info = dyn_creds.info();
+        assert_eq!(info.security_protocol, "local");
+
+        let addr = "127.0.0.1:0";
+        let runtime = rt::default_runtime();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr).await.unwrap();
+            let data = b"hello dynamic grpc server";
+            stream.write_all(data).await.unwrap();
+
+            // Keep the connection alive for a bit so server can read
+            let mut buf = vec![0u8; 1];
+            let _ = stream.read(&mut buf).await;
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
+
+        let result = dyn_creds
+            .accept(
+                Box::new(server_stream) as BoxEndpoint,
+                runtime,
+                private::Internal,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        let endpoint = output.endpoint;
+        let security_info = output.security;
+
+        assert_eq!(security_info.security_protocol(), "local");
+        assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
+
+        let mut buf = vec![0u8; 25];
+        EndpointIoStream::new(endpoint)
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..], b"hello dynamic grpc server");
 
         client_handle.abort();
     }

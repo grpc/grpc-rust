@@ -32,6 +32,7 @@ use std::sync::atomic::Ordering;
 use rand::seq::SliceRandom;
 
 use crate::client::ConnectivityState;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::LbPolicy;
@@ -47,26 +48,25 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::core::RequestHeaders;
+use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 
-pub(crate) static POLICY_NAME: &str = "pick_first";
+pub static POLICY_NAME: &str = "pick_first";
 
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
 #[derive(Debug, serde::Deserialize, Clone)]
-pub(crate) struct PickFirstConfig {
+pub struct PickFirstConfig {
     #[serde(rename = "shuffleAddressList")]
     pub shuffle_address_list: bool,
 }
 
 #[derive(Debug)]
-struct PickFirstBuilder {}
+pub struct PickFirstBuilder {}
 
 impl LbPolicyBuilder for PickFirstBuilder {
     type LbPolicy = PickFirstPolicy;
@@ -98,10 +98,10 @@ impl LbPolicyBuilder for PickFirstBuilder {
 }
 
 pub(crate) fn reg() {
-    super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {})
+    super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {});
 }
 
-pub(crate) struct PickFirstPolicy {
+pub struct PickFirstPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
     connectivity_state: ConnectivityState,
@@ -738,9 +738,9 @@ mod test {
     use std::time::Duration;
 
     use super::*;
-    use crate::client::load_balancing::test_utils::{
-        TestChannelController, TestEvent, TestWorkScheduler,
-    };
+    use crate::client::load_balancing::test_utils::TestChannelController;
+    use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestWorkScheduler;
 
     const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 
@@ -928,7 +928,7 @@ mod test {
         let res = state.picker.pick(&RequestHeaders::default());
         match res {
             PickResult::Pick(pick) => {
-                assert_eq!(pick.subchannel.address().address.to_string(), "addr1")
+                assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
             }
             other => panic!("unexpected pick result {:?}", other),
         }

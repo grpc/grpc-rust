@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! # tonic-xds
 //!
 //! xDS-based service discovery, routing, and load balancing for
@@ -14,8 +38,9 @@
 //!
 //! 1. **Provide a bootstrap configuration** that tells the client where
 //!    the xDS management server lives and what node identity to present.
-//!    The format matches [gRFC A27] — a JSON object with `xds_servers`
-//!    and an optional `node`.
+//!    The format matches [gRFC A27] — a JSON object with `xds_servers`,
+//!    each entry carrying a `server_uri` and the `channel_creds` types the
+//!    client may offer, plus an optional `node`.
 //!
 //! 2. **Build the channel** with [`XdsChannelBuilder`], pointing it at
 //!    an `xds:///` target URI.
@@ -30,7 +55,8 @@
 //!
 //! | Method | How |
 //! |--------|-----|
-//! | Programmatic | [`BootstrapConfig::from_json`] then [`XdsChannelConfig::with_bootstrap`] |
+//! | Programmatic (builder) | [`BootstrapConfig::builder`] then [`XdsChannelConfig::with_bootstrap`] |
+//! | Programmatic (JSON) | [`BootstrapConfig::from_json`] then [`XdsChannelConfig::with_bootstrap`] |
 //! | Environment (explicit) | [`XdsChannelConfig::with_bootstrap_from_env`] |
 //! | Environment (implicit) | Omit bootstrap; the builder loads from env vars automatically |
 //!
@@ -42,7 +68,10 @@
 //!
 //! ```json
 //! {
-//!   "xds_servers": [{"server_uri": "xds.example.com:443"}],
+//!   "xds_servers": [{
+//!     "server_uri": "xds.example.com:443",
+//!     "channel_creds": [{"type": "tls"}]
+//!   }],
 //!   "node": {"id": "my-node"}
 //! }
 //! ```
@@ -69,9 +98,32 @@
 //! use tonic_xds::{BootstrapConfig, XdsChannelBuilder, XdsChannelConfig, XdsUri};
 //!
 //! let bootstrap = BootstrapConfig::from_json(r#"{
-//!     "xds_servers": [{"server_uri": "xds.example.com:443"}],
+//!     "xds_servers": [{
+//!         "server_uri": "xds.example.com:443",
+//!         "channel_creds": [{"type": "tls"}]
+//!     }],
 //!     "node": {"id": "my-node", "cluster": "my-cluster"}
 //! }"#).unwrap();
+//!
+//! let target = XdsUri::parse("xds:///myservice:50051").unwrap();
+//! let channel = XdsChannelBuilder::new(
+//!     XdsChannelConfig::new(target).with_bootstrap(bootstrap),
+//! ).build_grpc_channel().unwrap();
+//!
+//! // let client = MyServiceClient::new(channel);
+//! ```
+//!
+//! ### Using the builder
+//!
+//! ```rust,no_run
+//! use tonic_xds::{BootstrapConfig, ChannelCredentialType, XdsChannelBuilder, XdsChannelConfig, XdsUri};
+//!
+//! let bootstrap = BootstrapConfig::builder("xds.example.com:443")
+//!     .channel_creds([ChannelCredentialType::Tls])
+//!     .node_id("my-node")
+//!     .node_cluster("my-cluster")
+//!     .build()
+//!     .unwrap();
 //!
 //! let target = XdsUri::parse("xds:///myservice:50051").unwrap();
 //! let channel = XdsChannelBuilder::new(
@@ -97,7 +149,10 @@
 //!
 //! ```json
 //! {
-//!   "xds_servers": [{"server_uri": "xds.example.com:443"}],
+//!   "xds_servers": [{
+//!     "server_uri": "xds.example.com:443",
+//!     "channel_creds": [{"type": "tls"}]
+//!   }],
 //!   "certificate_providers": {
 //!     "root_ca":  { "plugin_name": "file_watcher", "config": {
 //!       "ca_certificate_file": "/etc/certs/ca.pem"
@@ -146,9 +201,35 @@ pub(crate) mod xds;
 
 pub use client::channel::{
     BuildError, XdsChannel, XdsChannelBuilder, XdsChannelConfig, XdsChannelGrpc,
+    XdsTransportChannel,
 };
-pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
+pub use client::endpoint::{
+    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+};
+pub use client::retry::{
+    GrpcRetryClassifierFactory, RetryClassifier, RetryClassifierFactory, RetryOutcome,
+    is_retryable_connection_error,
+};
+pub use client::route::PreRouteInterceptor;
+pub use common::async_util::BoxFuture;
+pub use shared_http_body::SharedBody;
+pub use xds::bootstrap::{
+    BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,
+};
+pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};
+pub use xds_client::TonicCallCredentials;
+
+#[cfg(feature = "_tls-any")]
+pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};
+/// Re-export of the rustls trait returned by [`ClusterTlsConfig::build_verifier`],
+/// so custom transports can name it without a direct `rustls` dependency.
+#[cfg(feature = "_tls-any")]
+pub use rustls::client::danger::ServerCertVerifier;
+#[cfg(feature = "_tls-any")]
+pub use xds::cert_provider::{CertProviderError, CertificateData, CertificateProvider, Identity};
+
+pub use xds_client::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;

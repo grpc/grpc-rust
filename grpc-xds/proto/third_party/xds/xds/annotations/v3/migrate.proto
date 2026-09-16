@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package xds.annotations.v3;
+
+import "google/protobuf/descriptor.proto";
+
+option go_package = "github.com/cncf/xds/go/xds/annotations/v3";
+
+// Magic number in this file derived from top 28bit of SHA256 digest of
+// "xds.annotation.v3.migrate".
+extend google.protobuf.MessageOptions {
+  MigrateAnnotation message_migrate = 112948430;
+}
+extend google.protobuf.FieldOptions {
+  FieldMigrateAnnotation field_migrate = 112948430;
+}
+extend google.protobuf.EnumOptions {
+  MigrateAnnotation enum_migrate = 112948430;
+}
+extend google.protobuf.EnumValueOptions {
+  MigrateAnnotation enum_value_migrate = 112948430;
+}
+extend google.protobuf.FileOptions {
+  FileMigrateAnnotation file_migrate = 112948430;
+}
+
+message MigrateAnnotation {
+  // Rename the message/enum/enum value in next version.
+  string rename = 1;
+}
+
+message FieldMigrateAnnotation {
+  // Rename the field in next version.
+  string rename = 1;
+
+  // Add the field to a named oneof in next version. If this already exists, the
+  // field will join its siblings under the oneof, otherwise a new oneof will be
+  // created with the given name.
+  string oneof_promotion = 2;
+}
+
+message FileMigrateAnnotation {
+  // Move all types in the file to another package, this implies changing proto
+  // file path.
+  string move_to_package = 2;
+}

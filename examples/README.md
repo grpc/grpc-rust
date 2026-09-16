@@ -100,7 +100,7 @@ Once your credentials are set up, you will need your GCP Project ID, which can
 be found on the main dashboard of the Google Cloud Console. With both of these
 ready, you can run the example like so:
 ```bash
-$ cargo run --bin grpc-gcp-client -- <project-id>
+$ cargo run --bin grpc-gcp-client --features grpc-gcp -- <project-id>
 ```
 
 [Application Default Credentials]: https://docs.cloud.google.com/docs/authentication/application-default-credentials

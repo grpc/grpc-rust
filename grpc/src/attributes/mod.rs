@@ -42,7 +42,6 @@
 
 use std::any::Any;
 use std::any::TypeId;
-use std::cmp::Ordering;
 use std::fmt::Debug;
 
 use crate::attributes::linked_list::LinkedList;
@@ -55,10 +54,9 @@ mod linked_list;
 trait AttributeTrait: Any + Send + Sync + Debug {
     fn any_ref(&self) -> &dyn Any;
     fn dyn_eq(&self, other: &dyn AttributeTrait) -> bool;
-    fn dyn_cmp(&self, other: &dyn AttributeTrait) -> Ordering;
 }
 
-impl<T: Any + Send + Sync + Eq + Ord + Debug> AttributeTrait for T {
+impl<T: Any + Send + Sync + Eq + Debug> AttributeTrait for T {
     fn any_ref(&self) -> &dyn Any {
         self
     }
@@ -68,16 +66,6 @@ impl<T: Any + Send + Sync + Eq + Ord + Debug> AttributeTrait for T {
             self == other
         } else {
             false
-        }
-    }
-
-    fn dyn_cmp(&self, other: &dyn AttributeTrait) -> Ordering {
-        if let Some(other) = other.any_ref().downcast_ref::<T>() {
-            self.cmp(other)
-        } else {
-            // Fallback for safety, though map structure guarantees same-type
-            // comparison.
-            TypeId::of::<T>().cmp(&other.any_ref().type_id())
         }
     }
 }
@@ -95,18 +83,6 @@ impl PartialEq for AttributeValue {
 
 impl Eq for AttributeValue {}
 
-impl PartialOrd for AttributeValue {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for AttributeValue {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.inner.dyn_cmp(other.inner.as_ref())
-    }
-}
-
 /// A collection of attributes indexed by their type.
 ///
 /// `Attributes` provides a map-like interface where values are keyed by their
@@ -115,7 +91,7 @@ impl Ord for AttributeValue {
 /// Equality and ordering of `Attributes` are structural.
 /// This means two `Attributes` maps are equal if they contain the same set of
 /// values, compared by value (via `Eq` trait).
-/// Stored types must implement `Any + Send + Sync + Eq + Ord + Debug`.
+/// Stored types must implement `Any + Send + Sync + Eq + Debug`.
 ///
 /// # Warning
 ///
@@ -135,7 +111,7 @@ impl Attributes {
     /// Adds a value to the attributes.
     /// Returns a new Attributes object with the value added.
     /// If a value of the same type already exists, it is replaced.
-    pub fn add<T: Send + Sync + Eq + Ord + Debug + 'static>(&self, value: T) -> Self {
+    pub fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
         let id = TypeId::of::<T>();
         Attributes {
             elements: self.elements.add(
@@ -163,29 +139,13 @@ impl PartialEq for Attributes {
         if v1.len() != v2.len() {
             return false;
         }
-        v1.sort();
-        v2.sort();
+        v1.sort_by_key(|x| x.0);
+        v2.sort_by_key(|x| x.0);
         v1 == v2
     }
 }
 
 impl Eq for Attributes {}
-
-impl PartialOrd for Attributes {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Attributes {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let mut v1: Vec<_> = self.elements.iter().collect();
-        let mut v2: Vec<_> = other.elements.iter().collect();
-        v1.sort();
-        v2.sort();
-        v1.cmp(&v2)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -236,13 +196,13 @@ mod tests {
         assert_eq!(a2.get::<i32>(), Some(&20));
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct Priority {
         weight: u64,
         name: String,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct Config {
         retries: u32,
         timeout_ms: u64,

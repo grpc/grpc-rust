@@ -1,5 +1,5 @@
 [package]
-authors = ["Lucio Franco <luciofranco14@gmail.com>"]
+authors = ["gRPC authors"]
 edition = "2024"
 license = "MIT"
 name = "examples"
@@ -291,11 +291,13 @@ grpc-gcp = [ "dep:protobuf", "dep:grpc-protobuf", "dep:grpc", "dep:grpc-google",
 "dep:rustls", "dep:protobuf-well-known-types" ]
 grpc-routeguide = ["dep:grpc", "dep:grpc-protobuf", "dep:protobuf", "dep:rand"]
 grpc-helloworld = ["dep:grpc", "dep:grpc-protobuf", "dep:protobuf"]
-full = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web",
+default = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web",
 "tracing", "uds", "streaming", "mock", "json-codec", "compression", "tls",
 "tls-rustls", "tls-client-auth", "types", "cancellation", "h2c",
-"grpc-routeguide", "grpc-helloworld", "grpc-gcp"]
-default = ["full"]
+"grpc-routeguide", "grpc-helloworld"]
+# Workaround for cargo-udeps bug.
+# TODO: Remove once the fix is released: https://github.com/est31/cargo-udeps/pull/338
+h2 = []
 
 [dependencies]
 # Common dependencies
@@ -329,13 +331,13 @@ hyper-rustls = { version = "0.27.0", features = ["http2", "ring", "tls12"], opti
 tower-http = { version = "0.6", optional = true }
 grpc-google = { path = "../grpc-google", optional = true}
 grpc-protobuf = { path = "../grpc-protobuf", optional = true }
-protobuf = { version = "4.34.0-release", optional = true }
+protobuf = { version = "4.35.1-release", optional = true }
 grpc = { path = "../grpc", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true}
-protobuf-well-known-types = { version = "4.34.0-release", optional = true }
+protobuf-well-known-types = { version = "4.35.1-release", optional = true }
 
 [build-dependencies]
 tonic-prost-build = { path = "../tonic-prost-build" }
 grpc-protobuf-build = { path = "../grpc-protobuf-build", default-features = false }
 protoc-gen-rust-grpc = { path = "../protoc-gen-rust-grpc", optional = true }
-protobuf-well-known-types = { version = "4.34.0-release" }
+protobuf-well-known-types = { version = "4.35.1-release" }

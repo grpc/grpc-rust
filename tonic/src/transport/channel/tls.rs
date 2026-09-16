@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 use super::service::TlsConnector;
 use crate::transport::{
     Error,
@@ -152,9 +176,16 @@ impl ClientTlsConfig {
         uri: &Uri,
         server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
     ) -> Result<TlsConnector, crate::BoxError> {
-        let domain = match &self.domain {
-            Some(domain) => domain,
-            None => uri.host().ok_or_else(Error::new_invalid_uri)?,
+        let domain = if let Some(domain) = &self.domain {
+            domain
+        } else {
+            let host = uri.host().ok_or_else(Error::new_invalid_uri)?;
+            // host() returns the host including brackets if it's an IPv6 address
+            if host.starts_with('[') && host.ends_with(']') {
+                &host[1..host.len() - 1]
+            } else {
+                host
+            }
         };
         TlsConnector::new(
             self.certs,
@@ -170,5 +201,96 @@ impl ClientTlsConfig {
             #[cfg(feature = "tls-webpki-roots")]
             self.with_webpki_roots,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_into_tls_connector_with_ipv4() {
+        let config = ClientTlsConfig::new();
+        let uri = "https://192.168.1.1:443".parse::<Uri>().unwrap();
+        config.into_tls_connector(&uri).unwrap();
+    }
+
+    #[test]
+    fn test_into_tls_connector_with_ipv6_() {
+        let config = ClientTlsConfig::new();
+        let uri = "https://[::1]:443".parse::<Uri>().unwrap();
+
+        config.into_tls_connector(&uri).unwrap();
+    }
+
+    #[test]
+    fn test_into_tls_connector_with_domain_name() {
+        let config = ClientTlsConfig::new();
+        let uri = "https://example.com:443".parse::<Uri>().unwrap();
+
+        config.into_tls_connector(&uri).unwrap();
+    }
+
+    #[test]
+    fn test_into_tls_connector_with_explicit_domain() {
+        let config = ClientTlsConfig::new().domain_name("example.com");
+        let uri = "https://[2001:db8::1]:443".parse::<Uri>().unwrap();
+
+        config.into_tls_connector(&uri).unwrap();
+    }
+
+    #[test]
+    fn test_into_tls_connector_with_verifier_with_ipv6() {
+        use tokio_rustls::rustls::DigitallySignedStruct;
+        use tokio_rustls::rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        #[derive(Debug)]
+        struct DummyVerifier;
+
+        impl ServerCertVerifier for DummyVerifier {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+                tokio_rustls::rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let config = ClientTlsConfig::new();
+        let uri = "https://[::1]:443".parse::<Uri>().unwrap();
+        config
+            .into_tls_connector_with_verifier(&uri, Arc::new(DummyVerifier))
+            .unwrap();
     }
 }

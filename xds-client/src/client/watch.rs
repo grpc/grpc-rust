@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Resource watcher types.
 
 use std::marker::PhantomData;
@@ -12,9 +36,13 @@ use crate::resource::{DecodedResource, Resource};
 
 /// A signal to indicate that processing of a resource event is complete.
 ///
-/// The xDS client waits for this signal before sending ACK/NACK to the server.
-/// This allows watchers to add cascading subscriptions (e.g. LDS -> RDS -> CDS -> EDS)
-/// that will be included in the same ACK.
+/// The xDS client does not read the next response from the ADS stream until
+/// every watcher has signaled for the current one (ADS flow control, per
+/// gRFC A88). This lets watchers apply an update — including adding cascading
+/// subscriptions (e.g. LDS -> RDS -> CDS -> EDS) — before the next update can
+/// arrive. It does *not* delay the ACK/NACK, and the worker keeps processing
+/// watch/unwatch commands while waiting, so holding the token cannot deadlock
+/// the client.
 ///
 /// # Automatic Signaling
 ///
@@ -42,33 +70,33 @@ use crate::resource::{DecodedResource, Resource};
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ProcessingDone(Option<oneshot::Sender<()>>);
+pub struct ProcessingDone(Option<Arc<oneshot::Sender<()>>>);
 
 impl ProcessingDone {
-    /// Create a channel pair for signaling.
+    /// Create the shared signal for one response.
     ///
-    /// Returns the `ProcessingDone` sender and a receiver future that resolves
-    /// when the sender is dropped.
+    /// Returns a `ProcessingDone` token and a receiver future that resolves
+    /// once the token and every [`share`](Self::share) of it are dropped
+    /// (dropping the last `Arc` drops the sender, which wakes the receiver).
     pub(crate) fn channel() -> (Self, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
-        (Self(Some(tx)), rx)
+        (Self(Some(Arc::new(tx))), rx)
     }
 
-    /// Creates a no-op token that signals nothing when dropped.
+    /// Another token tied to the same response's signal.
     ///
-    /// Requires the `test-util` feature.
-    #[cfg(feature = "test-util")]
-    pub fn noop() -> Self {
-        Self(None)
+    /// All tokens for one response share a single allocation; the receiver
+    /// resolves only after every one of them is dropped.
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.clone())
     }
-}
 
-impl Drop for ProcessingDone {
-    fn drop(&mut self) {
-        // Auto-signal on drop to prevent deadlocks.
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
-        }
+    /// A token that signals nothing when dropped.
+    ///
+    /// Used internally for events that do not participate in ADS flow
+    /// control, and useful for constructing [`ResourceEvent`]s in tests.
+    pub fn detached() -> Self {
+        Self(None)
     }
 }
 

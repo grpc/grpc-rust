@@ -291,6 +291,8 @@ jobs:
 
   semver:
     runs-on: ubuntu-latest
+    env:
+      SKIP_GRPC_RUST_PROTO_CODEGEN: 1
     steps:
     - uses: actions/checkout@v6
     - uses: obi1kenobi/cargo-semver-checks-action@v2

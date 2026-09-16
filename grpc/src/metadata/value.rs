@@ -562,13 +562,13 @@ impl Error for ToStrError {}
 
 impl Hash for MetadataValue<Ascii> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.data.hash(state)
+        self.inner.data.hash(state);
     }
 }
 
 impl Hash for MetadataValue<Binary> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.data.hash(state)
+        self.inner.data.hash(state);
     }
 }
 

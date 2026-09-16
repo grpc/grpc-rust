@@ -61,7 +61,7 @@ use self::service::TlsAcceptor;
 #[cfg(unix)]
 pub use unix::UdsConnectInfo;
 
-pub use incoming::TcpIncoming;
+pub use incoming::{DynamicAllowlist, TcpIncoming};
 
 #[cfg(feature = "_tls-any")]
 use crate::transport::Error;
@@ -136,6 +136,7 @@ pub struct Server<L = Identity> {
     service_builder: ServiceBuilder<L>,
     max_connection_age: Option<Duration>,
     max_connection_age_grace: Option<Duration>,
+    accept_filter: Option<incoming::AcceptFilter>,
 }
 
 impl Default for Server<Identity> {
@@ -165,6 +166,7 @@ impl Default for Server<Identity> {
             service_builder: Default::default(),
             max_connection_age: None,
             max_connection_age_grace: None,
+            accept_filter: None,
         }
     }
 }
@@ -475,6 +477,31 @@ impl<L> Server<L> {
         }
     }
 
+    /// Only accept new connections from peers for which `filter` returns
+    /// `true`. Rejected connections are closed immediately, before any TLS
+    /// handshake or service dispatch. Connections already accepted are
+    /// unaffected.
+    ///
+    /// `filter` is invoked for every accepted connection, so it can be
+    /// backed by shared, runtime-mutable state (e.g.
+    /// [`DynamicAllowlist`]) to change
+    /// which peers are allowed while the server is running — for example to
+    /// keep accepting connections from a known health-checker while draining
+    /// everything else during a Kubernetes pod shutdown.
+    ///
+    /// Important: This setting is ignored when using `serve_with_incoming`;
+    /// custom incoming streams must filter themselves.
+    #[must_use]
+    pub fn accept_filter(
+        self,
+        filter: impl Fn(SocketAddr) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Server {
+            accept_filter: Some(Arc::new(filter)),
+            ..self
+        }
+    }
+
     /// Sets the max size of received header frames.
     ///
     /// This will default to whatever the default in hyper is. As of v1.4.1, it is 16 KiB.
@@ -671,6 +698,7 @@ impl<L> Server<L> {
             accept_http1: self.accept_http1,
             max_connection_age: self.max_connection_age,
             max_connection_age_grace: self.max_connection_age_grace,
+            accept_filter: self.accept_filter,
         }
     }
 
@@ -680,7 +708,8 @@ impl<L> Server<L> {
             .with_nodelay(Some(self.tcp_nodelay))
             .with_keepalive(self.tcp_keepalive)
             .with_keepalive_interval(self.tcp_keepalive_interval)
-            .with_keepalive_retries(self.tcp_keepalive_retries))
+            .with_keepalive_retries(self.tcp_keepalive_retries)
+            .with_accept_filter(self.accept_filter.clone()))
     }
 
     /// Serve the service.

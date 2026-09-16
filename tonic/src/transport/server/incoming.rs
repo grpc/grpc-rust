@@ -23,8 +23,11 @@
  */
 
 use std::{
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    collections::HashSet,
+    fmt,
+    net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
     pin::Pin,
+    sync::{Arc, RwLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -32,13 +35,79 @@ use std::{
 use socket2::TcpKeepalive;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
-use tracing::warn;
+use tracing::{trace, warn};
+
+/// A filter consulted for every newly accepted TCP connection, before any
+/// TLS handshake or service dispatch. Returning `false` closes the
+/// connection immediately.
+pub(crate) type AcceptFilter = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
+/// A runtime-mutable allowlist of peer IP addresses, usable as an
+/// [`Server::accept_filter`](super::Server::accept_filter).
+///
+/// Unlike a plain closure, the set of allowed IPs can be changed while the
+/// server is running (e.g. from a signal handler starting a graceful drain,
+/// or from an admin endpoint), with updates taking effect on the very next
+/// accepted connection.
+///
+/// # Example
+///
+/// ```
+/// # use tonic::transport::server::DynamicAllowlist;
+/// let allowlist = DynamicAllowlist::new(["10.0.0.5".parse().unwrap()]);
+///
+/// // Elsewhere at runtime, e.g. on SIGTERM:
+/// allowlist.insert("10.0.0.6".parse().unwrap());
+/// allowlist.remove("10.0.0.5".parse().unwrap());
+/// ```
+#[derive(Clone, Default)]
+pub struct DynamicAllowlist(Arc<RwLock<HashSet<IpAddr>>>);
+
+impl fmt::Debug for DynamicAllowlist {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DynamicAllowlist")
+            .field(&self.0.read().unwrap())
+            .finish()
+    }
+}
+
+impl DynamicAllowlist {
+    /// Creates an allowlist containing the given initial set of IPs.
+    pub fn new(initial: impl IntoIterator<Item = IpAddr>) -> Self {
+        Self(Arc::new(RwLock::new(initial.into_iter().collect())))
+    }
+
+    /// Replaces the allowlist with the given set of IPs.
+    pub fn set(&self, ips: impl IntoIterator<Item = IpAddr>) {
+        *self.0.write().unwrap() = ips.into_iter().collect();
+    }
+
+    /// Adds a single IP to the allowlist.
+    pub fn insert(&self, ip: IpAddr) {
+        self.0.write().unwrap().insert(ip);
+    }
+
+    /// Removes a single IP from the allowlist.
+    pub fn remove(&self, ip: IpAddr) {
+        self.0.write().unwrap().remove(&ip);
+    }
+
+    /// Returns `true` if `addr`'s IP is currently in the allowlist.
+    pub fn allows(&self, addr: SocketAddr) -> bool {
+        self.0.read().unwrap().contains(&addr.ip())
+    }
+
+    /// Turns this allowlist into a filter closure usable with
+    /// [`Server::accept_filter`](super::Server::accept_filter).
+    pub fn into_filter(self) -> impl Fn(SocketAddr) -> bool + Send + Sync + 'static {
+        move |addr| self.allows(addr)
+    }
+}
 
 /// Binds a socket address for a [Router](super::Router)
 ///
 /// An incoming stream, usable with [Router::serve_with_incoming](super::Router::serve_with_incoming),
 /// of `AsyncRead + AsyncWrite` that communicate with clients that connect to a socket address.
-#[derive(Debug)]
 pub struct TcpIncoming {
     inner: TcpListenerStream,
     nodelay: Option<bool>,
@@ -46,6 +115,21 @@ pub struct TcpIncoming {
     keepalive_time: Option<Duration>,
     keepalive_interval: Option<Duration>,
     keepalive_retries: Option<u32>,
+    accept_filter: Option<AcceptFilter>,
+}
+
+impl fmt::Debug for TcpIncoming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpIncoming")
+            .field("inner", &self.inner)
+            .field("nodelay", &self.nodelay)
+            .field("keepalive", &self.keepalive)
+            .field("keepalive_time", &self.keepalive_time)
+            .field("keepalive_interval", &self.keepalive_interval)
+            .field("keepalive_retries", &self.keepalive_retries)
+            .field("accept_filter", &self.accept_filter.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 impl TcpIncoming {
@@ -135,6 +219,16 @@ impl TcpIncoming {
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.inner.as_ref().local_addr()
     }
+
+    /// Only accept connections from peers for which `filter` returns `true`.
+    /// Rejected connections are closed immediately, before any TLS handshake
+    /// or service dispatch.
+    pub(crate) fn with_accept_filter(self, filter: Option<AcceptFilter>) -> Self {
+        Self {
+            accept_filter: filter,
+            ..self
+        }
+    }
 }
 
 impl From<TcpListener> for TcpIncoming {
@@ -146,6 +240,7 @@ impl From<TcpListener> for TcpIncoming {
             keepalive_time: None,
             keepalive_interval: None,
             keepalive_retries: None,
+            accept_filter: None,
         }
     }
 }
@@ -154,13 +249,24 @@ impl Stream for TcpIncoming {
     type Item = std::io::Result<TcpStream>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let polled = Pin::new(&mut self.inner).poll_next(cx);
+        loop {
+            let polled = Pin::new(&mut self.inner).poll_next(cx);
 
-        if let Poll::Ready(Some(Ok(stream))) = &polled {
+            let Poll::Ready(Some(Ok(stream))) = &polled else {
+                return polled;
+            };
+
+            if let Some(filter) = &self.accept_filter
+                && let Ok(peer_addr) = stream.peer_addr()
+                && !filter(peer_addr)
+            {
+                trace!("rejecting connection from {peer_addr} via accept_filter");
+                continue;
+            }
+
             set_accepted_socket_options(stream, self.nodelay, &self.keepalive);
+            return polled;
         }
-
-        polled
     }
 }
 
@@ -250,7 +356,11 @@ fn make_keepalive(
 
 #[cfg(test)]
 mod tests {
+    use super::DynamicAllowlist;
     use crate::transport::server::TcpIncoming;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_stream::StreamExt as _;
+
     #[tokio::test]
     async fn one_tcpincoming_at_a_time() {
         let addr = "127.0.0.1:1322".parse().unwrap();
@@ -259,5 +369,68 @@ mod tests {
             let _t2 = TcpIncoming::bind(addr).unwrap_err();
         }
         let _t3 = TcpIncoming::bind(addr).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_filter_rejects_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming =
+            TcpIncoming::from(listener).with_accept_filter(Some(std::sync::Arc::new(|_| false)));
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+
+        // The connection is dropped by the filter, so the listener keeps
+        // waiting for a connection that never arrives (within the timeout).
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), incoming.next()).await;
+        assert!(
+            result.is_err(),
+            "filtered-out connection should not be yielded"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_filter_allows_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming =
+            TcpIncoming::from(listener).with_accept_filter(Some(std::sync::Arc::new(|_| true)));
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), incoming.next()).await;
+        assert!(result.unwrap().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dynamic_allowlist_updates_take_effect_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let allowlist = DynamicAllowlist::new(["127.0.0.1".parse().unwrap()]);
+        let mut incoming =
+            TcpIncoming::from(listener).with_accept_filter(Some(std::sync::Arc::new({
+                let allowlist = allowlist.clone();
+                move |peer| allowlist.allows(peer)
+            })));
+
+        let _client1 = TcpStream::connect(addr).await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), incoming.next()).await;
+        assert!(
+            result.unwrap().unwrap().is_ok(),
+            "127.0.0.1 should be allowed initially"
+        );
+
+        allowlist.remove("127.0.0.1".parse().unwrap());
+
+        let _client2 = TcpStream::connect(addr).await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), incoming.next()).await;
+        assert!(
+            result.is_err(),
+            "127.0.0.1 should be rejected after removal from the allowlist"
+        );
     }
 }

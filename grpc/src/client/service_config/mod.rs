@@ -40,7 +40,7 @@ static DEFAULT_PICK_FIRST: LazyLock<(Arc<DynLbPolicyBuilder>, Option<DynLbConfig
             .get_policy(pick_first::POLICY_NAME)
             .expect("pick_first policy must be registered");
         let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-        let parsed_config = builder.parse_config(&default_json).ok().flatten();
+        let parsed_config = builder.parse_config(&default_json).unwrap(); // If the builder cannot parse an empty config we are in an unrecoverable state.
         (builder, parsed_config)
     });
 

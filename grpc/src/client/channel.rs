@@ -373,7 +373,7 @@ impl Invoke for Arc<ActiveChannel> {
             match result {
                 PickResult::Pick(pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
-                        return sc.dyn_invoke(headers, options.clone()).await;
+                        return sc.dyn_invoke(headers, options).await;
                     } else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"

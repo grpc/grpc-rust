@@ -23,14 +23,14 @@
  */
 
 pub(crate) mod duration;
-pub(crate) mod serde_bindings;
+mod serde_bindings;
 
 use std::sync::Arc;
 
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
-use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::pick_first;
 
 pub type ParseResult = Result<ServiceConfig, String>;
@@ -65,8 +65,7 @@ impl ServiceConfig {
         if let Some(ref policy) = self.inner.load_balancing_policy
             && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(policy)
         {
-            let empty_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-            let parsed_config = builder.parse_config(&empty_json).ok().flatten();
+            let parsed_config = builder.parse_config(&LbConfigJson::empty()).ok().flatten();
             return (builder, parsed_config);
         }
 
@@ -79,8 +78,7 @@ impl ServiceConfig {
         let builder = GLOBAL_LB_REGISTRY
             .get_policy(pick_first::POLICY_NAME)
             .expect("pick_first policy must be registered");
-        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-        let parsed_config = builder.parse_config(&default_json).ok().flatten();
+        let parsed_config = builder.parse_config(&LbConfigJson::empty()).ok().flatten();
         (builder, parsed_config)
     }
 }
@@ -310,7 +308,7 @@ mod test {
     fn test_lb_config_resolution() {
         use crate::client::load_balancing::pick_first::PickFirstConfig;
 
-        // Explicit loadBalancingConfig selects first supported candidate
+        // Explicit loadBalancingConfig selects the first supported load balancing policy.
         let json_data = json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_policy": { "foo": "bar" } },
@@ -328,7 +326,7 @@ mod test {
             .clone();
         assert!(pf_config.shuffle_address_list);
 
-        // Non-empty loadBalancingConfig with no supported policy errors on parse
+        // Non-empty loadBalancingConfig with no supported policy errors on parse.
         let json_data = json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_policy": { "foo": "bar" } }
@@ -336,7 +334,7 @@ mod test {
         });
         assert!(ServiceConfig::parse(&json_data.to_string()).is_err());
 
-        // Empty loadBalancingConfig array falls back to loadBalancingPolicy if present
+        // Empty loadBalancingConfig array falls back to loadBalancingPolicy if present.
         let json_data = json!({
             "loadBalancingConfig": [],
             "loadBalancingPolicy": "round_robin"
@@ -346,7 +344,7 @@ mod test {
         assert_eq!(builder.name(), "round_robin");
         assert!(config.is_none());
 
-        // Empty loadBalancingConfig array with no loadBalancingPolicy falls back to default pick_first
+        // Empty loadBalancingConfig array with no loadBalancingPolicy falls back to default pick_first.
         let json_data = json!({
             "loadBalancingConfig": []
         });
@@ -355,7 +353,7 @@ mod test {
         assert_eq!(builder.name(), "pick_first");
         assert!(config.is_none());
 
-        // Legacy loadBalancingPolicy fallback when loadBalancingConfig is absent
+        // Legacy loadBalancingPolicy fallback when loadBalancingConfig is absent.
         let json_data = json!({
             "loadBalancingPolicy": "round_robin"
         });
@@ -364,7 +362,7 @@ mod test {
         assert_eq!(builder.name(), "round_robin");
         assert!(config.is_none());
 
-        // Neither loadBalancingConfig nor loadBalancingPolicy present -> default pick_first
+        // Neither loadBalancingConfig nor loadBalancingPolicy present -> default pick_first.
         let json_data = json!({});
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();

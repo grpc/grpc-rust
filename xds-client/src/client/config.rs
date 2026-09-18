@@ -24,31 +24,152 @@
 
 //! Configuration for the xDS client.
 
+use std::any::Any;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::retry::RetryPolicy;
 use crate::message::Node;
 
 /// Configuration for an xDS management server.
-#[derive(Debug, Clone)]
+///
+/// Equality and hashing currently cover the URI and transport configuration.
+/// This is not yet the complete gRFC A47 server definition: known server
+/// features must also participate once they are modeled.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct ServerConfig {
     uri: String,
-    // Future extensions per gRFC:
+    transport: Option<TransportConfig>,
+    // Future extension:
     // - `ignore_resource_deletion: bool` (gRFC A53)
-    // - Server features / capabilities
-    // - Per-server channel credentials config
+    //   - Field is deprecated in gRFC a88.
+    // - known server features / capabilities.
+    //   - gRFC A47 requires them to participate in equality and hashing.
+}
+
+/// Opaque, value-based transport configuration for an xDS server.
+///
+/// [`TransportBuilder`](crate::TransportBuilder) implementations can use this
+/// to carry per-server credential selection or other connection settings. It
+/// is transport-only configuration, not a general extension mechanism, and is
+/// not passed to resource decoders.
+///
+/// The concrete type and value participate in [`ServerConfig`] equality and
+/// hashing. Values must implement `Eq + Hash`, so non-hashable values are
+/// rejected at compile time.
+#[derive(Clone)]
+pub struct TransportConfig {
+    inner: Arc<dyn ErasedTransportConfig>,
+}
+
+impl TransportConfig {
+    /// Wraps a transport-specific configuration value.
+    pub fn new<T>(config: T) -> Self
+    where
+        T: Eq + Hash + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(config),
+        }
+    }
+
+    /// Returns the concrete configuration when it has type `T`.
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.inner.as_any().downcast_ref()
+    }
+}
+
+impl fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TransportConfig")
+            .field(&self.inner.type_name())
+            .finish()
+    }
+}
+
+impl PartialEq for TransportConfig {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) || self.inner.erased_eq(&*other.inner)
+    }
+}
+
+impl Eq for TransportConfig {}
+
+impl Hash for TransportConfig {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Match `erased_eq`, which considers values of different concrete
+        // types unequal even when their value hashes happen to be identical.
+        self.inner.as_any().type_id().hash(state);
+        self.inner.erased_hash(state);
+    }
+}
+
+// `Eq` and `Hash` cannot be used directly through a trait object: equality
+// refers to `Self`, and `Hash::hash` is generic over the hasher. This
+// object-safe adapter preserves the concrete value's equality and hashing
+// after it is stored behind `Arc<dyn ErasedTransportConfig>`.
+trait ErasedTransportConfig: Send + Sync + 'static {
+    fn as_any(&self) -> &dyn Any;
+    fn type_name(&self) -> &'static str;
+    fn erased_eq(&self, other: &dyn ErasedTransportConfig) -> bool;
+    fn erased_hash(&self, state: &mut dyn Hasher);
+}
+
+impl<T> ErasedTransportConfig for T
+where
+    T: Eq + Hash + Send + Sync + 'static,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    fn erased_eq(&self, other: &dyn ErasedTransportConfig) -> bool {
+        other.as_any().downcast_ref::<T>() == Some(self)
+    }
+
+    fn erased_hash(&self, mut state: &mut dyn Hasher) {
+        // Select `&mut dyn Hasher` as the sized generic hasher type expected by
+        // `Hash::hash`; that requires passing a mutable reference to `state`.
+        self.hash(&mut state);
+    }
 }
 
 impl ServerConfig {
     /// Create a new server configuration with the given URI.
     pub fn new(uri: impl Into<String>) -> Self {
-        Self { uri: uri.into() }
+        Self {
+            uri: uri.into(),
+            transport: None,
+        }
     }
 
     /// Returns the URI of the management server.
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Returns the transport-specific configuration, if present.
+    pub fn transport_config(&self) -> Option<&TransportConfig> {
+        self.transport.as_ref()
+    }
+
+    /// Sets value-based transport configuration for this server.
+    ///
+    /// The value's concrete type and contents participate in the current
+    /// server key. Known server features are not modeled yet.
+    pub fn with_transport_config<T>(mut self, config: T) -> Self
+    where
+        T: Eq + Hash + Send + Sync + 'static,
+    {
+        self.transport = Some(TransportConfig::new(config));
+        self
     }
 }
 
@@ -206,5 +327,116 @@ impl ClientConfig {
     pub fn with_target(mut self, target: impl Into<String>) -> Self {
         self.target = Some(target.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, hash_map::DefaultHasher};
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct TestTransportConfig(&'static str);
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct OtherTransportConfig(&'static str);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ComplexTransportConfig {
+        credential_type: &'static str,
+        options: HashMap<&'static str, &'static str>,
+    }
+
+    // `HashMap` does not implement `Hash`, because its iteration order is not
+    // stable. Hash entries in key order so hashing agrees with the map's
+    // order-independent equality.
+    impl Hash for ComplexTransportConfig {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.credential_type.hash(state);
+            let mut options: Vec<_> = self.options.iter().collect();
+            options.sort_unstable_by_key(|(key, _)| *key);
+            options.hash(state);
+        }
+    }
+
+    fn hash(config: &ServerConfig) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        config.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn server_key_is_value_based() {
+        let first = ServerConfig::new("https://xds.example.com:443")
+            .with_transport_config(TestTransportConfig("tls"));
+        let second = ServerConfig::new("https://xds.example.com:443")
+            .with_transport_config(TestTransportConfig("tls"));
+
+        assert_eq!(first, second);
+        assert_eq!(hash(&first), hash(&second));
+    }
+
+    #[test]
+    fn server_key_includes_uri_and_transport() {
+        let base = || {
+            ServerConfig::new("https://xds.example.com:443")
+                .with_transport_config(TestTransportConfig("tls"))
+        };
+
+        assert_ne!(
+            base(),
+            ServerConfig::new("https://other.example.com:443")
+                .with_transport_config(TestTransportConfig("tls"))
+        );
+        assert_ne!(
+            base(),
+            ServerConfig::new("https://xds.example.com:443")
+                .with_transport_config(TestTransportConfig("insecure"))
+        );
+        assert_ne!(
+            base(),
+            ServerConfig::new("https://xds.example.com:443")
+                .with_transport_config(OtherTransportConfig("tls"))
+        );
+    }
+
+    #[test]
+    fn transport_config_can_be_downcast_without_debugging_its_value() {
+        let config = ServerConfig::new("https://xds.example.com:443")
+            .with_transport_config(TestTransportConfig("secret"));
+        let transport = config.transport_config().unwrap();
+
+        assert_eq!(
+            transport.downcast_ref::<TestTransportConfig>(),
+            Some(&TestTransportConfig("secret"))
+        );
+        assert!(!format!("{transport:?}").contains("secret"));
+    }
+
+    #[test]
+    fn complex_transport_config_with_hash_map_is_value_based() {
+        let first = ComplexTransportConfig {
+            credential_type: "tls",
+            options: HashMap::from([
+                ("root_cert", "test-ca.pem"),
+                ("server_name", "xds.example.com"),
+            ]),
+        };
+        // Insert the same entries in the opposite order to ensure map
+        // iteration order cannot affect the server key.
+        let second = ComplexTransportConfig {
+            credential_type: "tls",
+            options: HashMap::from([
+                ("server_name", "xds.example.com"),
+                ("root_cert", "test-ca.pem"),
+            ]),
+        };
+
+        let first = ServerConfig::new("https://xds.example.com:443").with_transport_config(first);
+        let second = ServerConfig::new("https://xds.example.com:443").with_transport_config(second);
+
+        assert_eq!(first, second);
+        assert_eq!(hash(&first), hash(&second));
     }
 }

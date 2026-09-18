@@ -228,6 +228,7 @@ pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};
 pub use rustls::client::danger::ServerCertVerifier;
 #[cfg(feature = "_tls-any")]
 pub use xds::cert_provider::{CertProviderError, CertificateData, CertificateProvider, Identity};
+pub use xds::resource::security::ClusterSecurityConfig;
 
 pub use xds_client::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
 

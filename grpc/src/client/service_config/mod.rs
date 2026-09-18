@@ -26,12 +26,23 @@ pub(crate) mod duration;
 pub(crate) mod serde_bindings;
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::pick_first;
+
+static DEFAULT_PICK_FIRST: LazyLock<(Arc<DynLbPolicyBuilder>, Option<DynLbConfig>)> =
+    LazyLock::new(|| {
+        let builder = GLOBAL_LB_REGISTRY
+            .get_policy(pick_first::POLICY_NAME)
+            .expect("pick_first policy must be registered");
+        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
+        let parsed_config = builder.parse_config(&default_json).unwrap(); // If the builder cannot parse an empty config we are in an unrecoverable state.
+        (builder, parsed_config)
+    });
 
 pub type ParseResult = Result<ServiceConfig, String>;
 
@@ -76,12 +87,7 @@ impl ServiceConfig {
 
     // Returns the default load balancing policy (`pick_first`).
     pub(crate) fn default_lb_policy() -> (Arc<DynLbPolicyBuilder>, Option<DynLbConfig>) {
-        let builder = GLOBAL_LB_REGISTRY
-            .get_policy(pick_first::POLICY_NAME)
-            .expect("pick_first policy must be registered");
-        let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
-        let parsed_config = builder.parse_config(&default_json).ok().flatten();
-        (builder, parsed_config)
+        DEFAULT_PICK_FIRST.clone()
     }
 }
 
@@ -353,7 +359,12 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
         assert_eq!(builder.name(), "pick_first");
-        assert!(config.is_none());
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(!pf_config.shuffle_address_list);
 
         // Legacy loadBalancingPolicy fallback when loadBalancingConfig is absent
         let json_data = json!({
@@ -369,6 +380,11 @@ mod test {
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
         assert_eq!(builder.name(), "pick_first");
-        assert!(config.is_none());
+        let pf_config = config
+            .unwrap()
+            .downcast_ref::<PickFirstConfig>()
+            .unwrap()
+            .clone();
+        assert!(!pf_config.shuffle_address_list);
     }
 }

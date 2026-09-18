@@ -41,14 +41,14 @@
 //! }
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use serde::Deserialize;
 
 use crate::common::async_util::AbortOnDrop;
+use crate::xds::cert_provider_config::FileWatcherConfig;
 
 use super::{CertProviderError, CertificateData, CertificateProvider, Identity};
 
@@ -59,54 +59,12 @@ pub(crate) const PLUGIN_NAME: &str = "file_watcher";
 /// Matches grpc-go's `defaultCertRefreshDuration`-equivalent for proxyless gRPC.
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
-/// Configuration for the `file_watcher` certificate provider.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct FileWatcherConfig {
-    /// Path to PEM X.509 identity certificate or certificate chain.
-    #[serde(default)]
-    pub certificate_file: Option<PathBuf>,
-    /// Path to PEM PKCS private key.
-    #[serde(default)]
-    pub private_key_file: Option<PathBuf>,
-    /// Path to PEM X.509 CA trust bundle (root certificates).
-    #[serde(default)]
-    pub ca_certificate_file: Option<PathBuf>,
-    /// How often to re-read the files. Default: 600s.
-    /// Parsed from protobuf JSON duration format (e.g., `"60s"`, `"0.5s"`).
-    #[serde(default, deserialize_with = "deserialize_proto_duration")]
-    pub refresh_interval: Option<Duration>,
-}
-
-/// Deserialize a protobuf JSON duration string (e.g., `"60s"`, `"0.5s"`) into a `Duration`.
-fn deserialize_proto_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let Some(s) = Option::<String>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    let num = s.strip_suffix('s').ok_or_else(|| {
-        serde::de::Error::custom(format!("invalid duration '{s}': must end with 's'"))
-    })?;
-    let secs: f64 = num
-        .parse()
-        .map_err(|_| serde::de::Error::custom(format!("invalid duration number: '{num}'")))?;
-    let duration = Duration::try_from_secs_f64(secs)
-        .map_err(|e| serde::de::Error::custom(format!("invalid duration '{s}': {e}")))?;
-    if duration.is_zero() {
-        return Err(serde::de::Error::custom(format!(
-            "invalid duration '{s}': must be greater than 0"
-        )));
-    }
-    Ok(Some(duration))
-}
-
 /// A certificate provider that reads PEM files from disk.
 ///
 /// On construction, reads all configured files synchronously and spawns a
 /// background task that re-reads them on `config.refresh_interval`.
-/// Read or parse failures during refresh are logged;
-/// the previously cached data is kept.
+/// Read failures during refresh are logged, and the previously cached snapshot
+/// is kept.
 pub(crate) struct FileWatcherProvider {
     cached: Arc<ArcSwap<CertificateData>>,
     _refresh_task: AbortOnDrop,
@@ -146,7 +104,7 @@ fn refresh_once(config: &FileWatcherConfig, cached: &ArcSwap<CertificateData>) {
         Ok(data) => cached.store(Arc::new(data)),
         Err(e) => tracing::warn!(
             error = ?e,
-            "file_watcher cert refresh failed; keeping last good data",
+            "file_watcher cert refresh failed; keeping last successfully read data",
         ),
     }
 }
@@ -160,11 +118,10 @@ impl CertificateProvider for FileWatcherProvider {
 /// Read certificate data from the files specified in the config.
 ///
 /// CA roots and identity material are read as raw PEM bytes; parsing is left to
-/// the consumer. This function is the single validation boundary between the
-/// permissive JSON-parsed [`FileWatcherConfig`] and the invariant-enforcing
-/// [`CertificateData`]. It checks both A65 rules:
-/// - cert/key pairing (first match)
-/// - at least one of identity/roots is set (second match)
+/// the consumer. This function enforces cert/key pairing, which is shared by
+/// A29 and A65, and the A29 file-watcher requirement that at least one
+/// certificate file is configured. A65 empty configs bypass the file watcher
+/// and use system roots directly.
 fn read_certificate_data(config: &FileWatcherConfig) -> Result<CertificateData, CertProviderError> {
     let roots = config
         .ca_certificate_file
@@ -352,76 +309,8 @@ mod tests {
         let after = cached.load_full();
         assert!(
             Arc::ptr_eq(&initial, &after),
-            "expected cache to keep last good data on failure",
+            "expected cache to keep last successfully read data on failure",
         );
-    }
-
-    #[test]
-    fn parse_refresh_interval_seconds() {
-        let config: FileWatcherConfig =
-            serde_json::from_value(serde_json::json!({"refresh_interval": "60s"})).unwrap();
-        assert_eq!(config.refresh_interval, Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn parse_refresh_interval_fractional() {
-        let config: FileWatcherConfig =
-            serde_json::from_value(serde_json::json!({"refresh_interval": "0.5s"})).unwrap();
-        assert_eq!(config.refresh_interval, Some(Duration::from_millis(500)));
-    }
-
-    #[test]
-    fn parse_refresh_interval_absent() {
-        let config: FileWatcherConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(config.refresh_interval, None);
-    }
-
-    #[test]
-    fn parse_refresh_interval_missing_suffix() {
-        let err = serde_json::from_value::<FileWatcherConfig>(
-            serde_json::json!({"refresh_interval": "60"}),
-        );
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("must end with 's'"));
-    }
-
-    #[test]
-    fn parse_refresh_interval_not_a_number() {
-        let err = serde_json::from_value::<FileWatcherConfig>(
-            serde_json::json!({"refresh_interval": "60ms"}),
-        );
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err()
-                .to_string()
-                .contains("invalid duration number")
-        );
-    }
-
-    #[test]
-    fn parse_refresh_interval_must_be_greater_than_zero() {
-        let err = serde_json::from_value::<FileWatcherConfig>(
-            serde_json::json!({"refresh_interval":"0s"}),
-        );
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err()
-                .to_string()
-                .contains("must be greater than 0")
-        );
-    }
-
-    #[test]
-    fn parse_refresh_interval_rejects_invalid_floats() {
-        // Negative, NaN, and infinite all fail `Duration::try_from_secs_f64`
-        // rather than the "must be greater than 0" zero check.
-        for v in [
-            serde_json::json!({"refresh_interval": "-1s"}),
-            serde_json::json!({"refresh_interval": "NaNs"}),
-            serde_json::json!({"refresh_interval": "infs"}),
-        ] {
-            assert!(serde_json::from_value::<FileWatcherConfig>(v).is_err());
-        }
     }
 
     #[tokio::test]

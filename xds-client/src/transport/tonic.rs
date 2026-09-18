@@ -202,7 +202,8 @@ impl TonicTransport {
 ///
 /// # TLS
 ///
-/// Enable the `tls-ring` or `tls-aws-lc` feature and call `with_tls_config`:
+/// Enable the `tonic-tls-ring` or `tonic-tls-aws-lc` feature and call
+/// `with_tls_config`:
 ///
 /// ```ignore
 /// use tonic::transport::ClientTlsConfig;
@@ -211,13 +212,13 @@ impl TonicTransport {
 /// let builder = TonicTransportBuilder::new()
 ///     .with_tls_config(ClientTlsConfig::new().with_enabled_roots());
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TonicTransportBuilder {
     // Future extensions:
     // - Connection pooling settings
     // - Per-server credential overrides (via ServerConfig.extensions)
-    #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
-    tls_config: Option<tonic::transport::ClientTlsConfig>,
+    #[cfg(feature = "_tonic-tls-any")]
+    tls_config_factory: Option<TlsConfigFactory>,
 
     /// Per-stream call credentials for the ADS stream.
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
@@ -232,11 +233,29 @@ pub struct TonicTransportBuilder {
     keep_alive_timeout: Duration,
 }
 
+#[cfg(feature = "_tonic-tls-any")]
+type TlsConfigFactory =
+    Arc<dyn Fn(&ServerConfig) -> Result<tonic::transport::ClientTlsConfig> + Send + Sync + 'static>;
+
+impl std::fmt::Debug for TonicTransportBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("TonicTransportBuilder");
+        #[cfg(feature = "_tonic-tls-any")]
+        builder.field("tls_configured", &self.tls_config_factory.is_some());
+        builder
+            .field("call_creds", &self.call_creds)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("keep_alive_interval", &self.keep_alive_interval)
+            .field("keep_alive_timeout", &self.keep_alive_timeout)
+            .finish()
+    }
+}
+
 impl Default for TonicTransportBuilder {
     fn default() -> Self {
         Self {
-            #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
-            tls_config: None,
+            #[cfg(feature = "_tonic-tls-any")]
+            tls_config_factory: None,
             call_creds: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
@@ -273,9 +292,22 @@ impl TonicTransportBuilder {
     ///
     /// When set, all connections created by this builder will use TLS
     /// with the provided configuration.
-    #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
+    #[cfg(feature = "_tonic-tls-any")]
     pub fn with_tls_config(mut self, tls_config: tonic::transport::ClientTlsConfig) -> Self {
-        self.tls_config = Some(tls_config);
+        self.tls_config_factory = Some(Arc::new(move |_| Ok(tls_config.clone())));
+        self
+    }
+
+    /// Construct the TLS configuration each time a connection is created.
+    ///
+    /// The factory is called from [`build`](TransportBuilder::build), including
+    /// every reconnect, so callers can supply refreshed certificate material.
+    #[cfg(feature = "_tonic-tls-any")]
+    pub fn with_tls_config_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(&ServerConfig) -> Result<tonic::transport::ClientTlsConfig> + Send + Sync + 'static,
+    {
+        self.tls_config_factory = Some(Arc::new(factory));
         self
     }
 
@@ -309,9 +341,9 @@ impl TransportBuilder for TonicTransportBuilder {
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
         // With no TLS backend compiled in, `tls_configured` stays false.
-        #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
-        let tls_configured = self.tls_config.is_some();
-        #[cfg(not(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc")))]
+        #[cfg(feature = "_tonic-tls-any")]
+        let tls_configured = self.tls_config_factory.is_some();
+        #[cfg(not(feature = "_tonic-tls-any"))]
         let tls_configured = false;
 
         let uri = Self::ensure_secure_server_uri(server.uri(), tls_configured);
@@ -359,11 +391,11 @@ impl TransportBuilder for TonicTransportBuilder {
                 .keep_alive_while_idle(true);
         }
 
-        #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
-        let endpoint = match &self.tls_config {
-            Some(tls) => endpoint
-                .tls_config(tls.clone())
-                .map_err(|e| Error::Connection(e.to_string()))?,
+        #[cfg(feature = "_tonic-tls-any")]
+        let endpoint = match &self.tls_config_factory {
+            Some(factory) => endpoint
+                .tls_config(factory(server)?)
+                .map_err(|error| Error::TlsConfig(Box::new(error)))?,
             None => endpoint,
         };
 
@@ -459,6 +491,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::Arc;
+    #[cfg(feature = "_tonic-tls-any")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -621,7 +655,7 @@ mod tests {
         assert!(matches!(err, Error::CallCredentials(_)));
     }
 
-    #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
+    #[cfg(feature = "_tonic-tls-any")]
     #[tokio::test]
     async fn tls_config_and_plaintext_uri_are_rejected() {
         // A URI that keeps a non-`https` scheme stays plaintext despite the TLS
@@ -642,6 +676,46 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("connects in plaintext"), "{uri}");
         }
+    }
+
+    #[cfg(feature = "_tonic-tls-any")]
+    #[tokio::test]
+    async fn tls_config_factory_is_called_for_each_transport_build() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let builder = TonicTransportBuilder::new().with_tls_config_factory(move |_| {
+            let call = factory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Err(Error::TlsConfig(Box::new(std::io::Error::other(format!(
+                "snapshot {call}"
+            )))))
+        });
+        let server = ServerConfig::new("xds.example.com:443");
+
+        for expected_call in 1..=2 {
+            let error = builder.build(&server).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("snapshot {expected_call}"))
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "_tonic-tls-any")]
+    #[tokio::test]
+    async fn invalid_tls_material_is_a_tls_config_error() {
+        let tls_config = tonic::transport::ClientTlsConfig::new().identity(
+            tonic::transport::Identity::from_pem(b"not a certificate", b"not a private key"),
+        );
+        let error = TonicTransportBuilder::new()
+            .with_tls_config(tls_config)
+            .build(&ServerConfig::new("xds.example.com:443"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, Error::TlsConfig(_)));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[tokio::test]

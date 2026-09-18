@@ -32,7 +32,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use proc_macro2::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream};
-use quote::TokenStreamExt;
+use quote::{TokenStreamExt, quote};
 
 // Prost functionality has been moved to tonic-prost-build
 
@@ -283,6 +283,52 @@ pub(crate) fn match_name(pattern: &str, path: &str) -> bool {
         } else {
             pattern_segments[..] == path_segments[path_segments.len() - pattern_segments.len()..]
         }
+    }
+}
+
+// Token helpers switching between the default (`Send`) and `local` (`!Send`)
+// generation modes.
+pub(crate) fn wrapper_token(local: bool) -> proc_macro2::TokenStream {
+    if local { quote!(Rc) } else { quote!(Arc) }
+}
+
+pub(crate) fn body_type_token(local: bool) -> proc_macro2::TokenStream {
+    if local {
+        quote!(tonic::local::body::Body)
+    } else {
+        quote!(tonic::body::Body)
+    }
+}
+
+pub(crate) fn box_future_token(local: bool) -> proc_macro2::TokenStream {
+    if local {
+        quote!(LocalBoxFuture)
+    } else {
+        quote!(BoxFuture)
+    }
+}
+
+pub(crate) fn box_stream_token(local: bool) -> proc_macro2::TokenStream {
+    if local {
+        quote!(LocalBoxStream)
+    } else {
+        quote!(BoxStream)
+    }
+}
+
+pub(crate) fn streaming_type_token(local: bool) -> proc_macro2::TokenStream {
+    if local {
+        quote!(tonic::local::codec::Streaming)
+    } else {
+        quote!(tonic::Streaming)
+    }
+}
+
+pub(crate) fn server_grpc_token(local: bool) -> proc_macro2::TokenStream {
+    if local {
+        quote!(tonic::local::server::Grpc)
+    } else {
+        quote!(tonic::server::Grpc)
     }
 }
 

@@ -39,6 +39,7 @@ mod test {
     use xds_test_util::config;
 
     use crate::BootstrapConfig;
+    use crate::ChannelCredentialType;
     use crate::XdsChannelBuilder;
     use crate::XdsChannelConfig;
     use crate::XdsChannelGrpc;
@@ -62,14 +63,19 @@ mod test {
     /// Builds a real xDS channel whose bootstrap points at `cp_addr` and whose
     /// target resolves the listener `listener_name`.
     fn build_channel(cp_addr: SocketAddr, listener_name: &str) -> XdsChannelGrpc {
-        let bootstrap_json = format!(
-            r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
-        );
-        let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
-        let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
-        XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap))
+        let bootstrap = BootstrapConfig::builder(format!("http://{cp_addr}"))
+            .channel_creds([ChannelCredentialType::Insecure])
+            .node_id("test")
+            .build()
+            .expect("build bootstrap");
+        channel_builder(bootstrap, listener_name)
             .build_grpc_channel()
             .expect("build xds channel")
+    }
+
+    fn channel_builder(bootstrap: BootstrapConfig, listener_name: &str) -> XdsChannelBuilder {
+        let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
+        XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap))
     }
 
     /// Sends `say_hello` in a loop until a reply starting with `want_prefix` is
@@ -316,6 +322,81 @@ mod test {
         }
 
         for backend in backends {
+            let _ = backend.shutdown.send(());
+        }
+    }
+
+    mod user_transport {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn configure_route(
+            control_plane: &RunningControlPlane,
+            name: &str,
+            backend_addr: SocketAddr,
+        ) {
+            let cluster = format!("{name}-cluster");
+            control_plane.get_service().set_xds_config(
+                &config::AdsTypeUrl::Lds,
+                HashMap::from([(
+                    name.to_string(),
+                    config::build_inline_listener(name, &cluster),
+                )]),
+            );
+            control_plane.get_service().set_xds_config(
+                &config::AdsTypeUrl::Cds,
+                HashMap::from([(cluster.clone(), config::build_cluster(&cluster))]),
+            );
+            control_plane.get_service().set_xds_config(
+                &config::AdsTypeUrl::Eds,
+                HashMap::from([(
+                    cluster.clone(),
+                    config::build_cla(
+                        &cluster,
+                        &[(backend_addr.ip().to_string(), backend_addr.port())],
+                    ),
+                )]),
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn custom_control_plane_connector_owns_transport() {
+            const LISTENER: &str = "my-service";
+
+            let backend = spawn_greeter_server("backend", None, None)
+                .await
+                .expect("spawn greeter backend");
+            let (control_plane, cp_addr) = start_control_plane().await;
+            configure_route(&control_plane, LISTENER, backend.addr);
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let connector_calls = calls.clone();
+            let connector = tower::service_fn(move |_uri: http::Uri| {
+                connector_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let stream = tokio::net::TcpStream::connect(cp_addr).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
+            });
+
+            let bootstrap = BootstrapConfig::builder(format!("http://{cp_addr}"))
+                .channel_creds([ChannelCredentialType::Insecure])
+                .node_id("test")
+                .build()
+                .expect("build bootstrap");
+            let channel = channel_builder(bootstrap, LISTENER)
+                .with_control_plane_connector(connector)
+                .build_grpc_channel()
+                .expect("build xds channel");
+
+            let mut client = GreeterClient::new(channel);
+            assert_eq!(
+                say_hello_until_prefix(&mut client, "backend:").await,
+                "backend: world"
+            );
+            assert!(calls.load(Ordering::SeqCst) > 0, "connector was not used");
+
             let _ = backend.shutdown.send(());
         }
     }

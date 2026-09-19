@@ -69,6 +69,7 @@ tonic = { version = "0.14", features = [ "server", "channel", "tls-ring" ] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 async-stream = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3.27.0"
 rcgen = "0.14"
 google-cloud-auth = { version = "1.9", default-features = false }

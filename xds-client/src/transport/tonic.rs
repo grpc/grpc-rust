@@ -143,6 +143,8 @@ impl Decoder for BytesDecoder {
 pub struct TonicTransport {
     channel: Channel,
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
 }
 
 impl TonicTransport {
@@ -172,6 +174,8 @@ impl TonicTransport {
         Self {
             channel,
             call_creds: None,
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
         }
     }
 
@@ -230,6 +234,12 @@ pub struct TonicTransportBuilder {
 
     /// Time to wait for a keepalive PING ack before closing the connection.
     keep_alive_timeout: Duration,
+
+    /// Maximum size of a decoded ADS response; `None` leaves tonic's default.
+    max_decoding_message_size: Option<usize>,
+
+    /// Maximum size of an encoded ADS request; `None` leaves tonic's default.
+    max_encoding_message_size: Option<usize>,
 }
 
 impl Default for TonicTransportBuilder {
@@ -241,6 +251,8 @@ impl Default for TonicTransportBuilder {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
             keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
         }
     }
 }
@@ -285,6 +297,24 @@ impl TonicTransportBuilder {
     /// channel, [`build`](TransportBuilder::build) fails. Not refreshed mid-stream.
     pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
         self.call_creds = Some(creds);
+        self
+    }
+
+    /// Limit the size of a decoded ADS response, in bytes.
+    ///
+    /// Defaults to tonic's 4 MiB. A control plane whose response exceeds the
+    /// limit breaks the stream, so raise it to match the largest resource set
+    /// the server sends.
+    pub fn with_max_decoding_message_size(mut self, limit: usize) -> Self {
+        self.max_decoding_message_size = Some(limit);
+        self
+    }
+
+    /// Limit the size of an encoded ADS request, in bytes.
+    ///
+    /// Defaults to tonic's `usize::MAX`.
+    pub fn with_max_encoding_message_size(mut self, limit: usize) -> Self {
+        self.max_encoding_message_size = Some(limit);
         self
     }
 
@@ -375,6 +405,8 @@ impl TransportBuilder for TonicTransportBuilder {
         Ok(TonicTransport {
             channel,
             call_creds: self.call_creds.clone(),
+            max_decoding_message_size: self.max_decoding_message_size,
+            max_encoding_message_size: self.max_encoding_message_size,
         })
     }
 }
@@ -384,6 +416,13 @@ impl Transport for TonicTransport {
 
     async fn new_stream(&self, initial_requests: Vec<Bytes>) -> Result<Self::Stream> {
         let mut grpc = Grpc::new(self.channel.clone());
+
+        if let Some(limit) = self.max_decoding_message_size {
+            grpc = grpc.max_decoding_message_size(limit);
+        }
+        if let Some(limit) = self.max_encoding_message_size {
+            grpc = grpc.max_encoding_message_size(limit);
+        }
 
         grpc.ready()
             .await
@@ -468,6 +507,8 @@ mod tests {
     #[derive(Default)]
     struct MockAdsServer {
         expected_auth: Option<String>,
+        /// Bytes of filler to attach to each response, to exercise size limits.
+        response_padding: usize,
     }
 
     #[tonic::async_trait]
@@ -491,15 +532,24 @@ mod tests {
                 }
             }
             let mut inbound = request.into_inner();
+            let padding = self.response_padding;
 
             let outbound = async_stream::try_stream! {
                 while let Some(req) = inbound.next().await {
                     let req = req?;
+                    let resources = if padding > 0 {
+                        vec![envoy_types::pb::google::protobuf::Any {
+                            type_url: req.type_url.clone(),
+                            value: vec![0u8; padding],
+                        }]
+                    } else {
+                        vec![]
+                    };
                     let response = DiscoveryResponse {
                         version_info: "1".to_string(),
                         type_url: req.type_url.clone(),
                         nonce: "nonce-1".to_string(),
-                        resources: vec![],
+                        resources,
                         ..Default::default()
                     };
                     yield response;
@@ -521,10 +571,20 @@ mod tests {
     }
 
     async fn start_mock_server(expected_auth: Option<&str>) -> SocketAddr {
+        spawn_mock_server(expected_auth, 0).await
+    }
+
+    /// Start a server that pads every response to just over `response_padding` bytes.
+    async fn start_padded_mock_server(response_padding: usize) -> SocketAddr {
+        spawn_mock_server(None, response_padding).await
+    }
+
+    async fn spawn_mock_server(expected_auth: Option<&str>, response_padding: usize) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = MockAdsServer {
             expected_auth: expected_auth.map(str::to_owned),
+            response_padding,
         };
 
         tokio::spawn(async move {
@@ -538,6 +598,15 @@ mod tests {
         // Give the server a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         addr
+    }
+
+    fn discovery_request() -> Bytes {
+        DiscoveryRequest {
+            type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into()
     }
 
     #[derive(Debug)]
@@ -605,6 +674,44 @@ mod tests {
         let response = stream.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
         assert_eq!(response.version_info, "1");
+    }
+
+    /// Larger than tonic's 4 MiB default decoding limit.
+    const OVERSIZED_RESPONSE: usize = 5 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn oversized_response_fails_at_default_limit() {
+        let addr = start_padded_mock_server(OVERSIZED_RESPONSE).await;
+        let transport = TonicTransportBuilder::new()
+            .build(&ServerConfig::new(format!("http://{addr}")))
+            .await
+            .unwrap();
+        let mut stream = transport
+            .new_stream(vec![discovery_request()])
+            .await
+            .unwrap();
+        let err = stream.recv().await.unwrap_err();
+        let Error::Stream(status) = err else {
+            panic!("expected a stream error, got {err:?}");
+        };
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn raised_limit_accepts_oversized_response() {
+        let addr = start_padded_mock_server(OVERSIZED_RESPONSE).await;
+        let transport = TonicTransportBuilder::new()
+            .with_max_decoding_message_size(OVERSIZED_RESPONSE * 2)
+            .build(&ServerConfig::new(format!("http://{addr}")))
+            .await
+            .unwrap();
+        let mut stream = transport
+            .new_stream(vec![discovery_request()])
+            .await
+            .unwrap();
+        let response = stream.recv().await.unwrap().unwrap();
+        let response = DiscoveryResponse::decode(response).unwrap();
+        assert_eq!(response.resources[0].value.len(), OVERSIZED_RESPONSE);
     }
 
     #[tokio::test]

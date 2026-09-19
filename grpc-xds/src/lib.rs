@@ -42,11 +42,18 @@ pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated/mod.rs"));
 }
 
+/// Shared Envoy string and regular-expression matching primitives.
+/// Used in both routing and TLS SAN matching.
+pub(crate) mod matcher;
+
 /// Validated xDS resource types (LDS/RDS/CDS/EDS), each implementing
 /// `xds_client::Resource` so they can be deserialized, named, and validated
 /// per their respective gRFCs (A27 core resource types, A28 route matching,
 /// A37 aggregate clusters).
 pub(crate) mod resource;
+
+/// Pure routing utilities.
+pub(crate) mod routing;
 
 /// [`xds_config::XdsConfig`]: the atomic xDS configuration snapshot assembled
 /// from a channel's Listener/RouteConfiguration/Cluster/Endpoints resources.

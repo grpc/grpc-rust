@@ -26,17 +26,18 @@
 //!
 //! Models the validated data shapes only (gRFC A28).
 
-// TODO: implement request routing components (virtual-host domain matching, then
+// TODO: implement request routing components (
 // path/header/fraction matching, stripping `-bin` headers from request metadata before
 // evaluating header matchers) in the future resolver/interceptor layer that consumes `XdsConfig`.
 
 use std::collections::HashSet;
 
 use protobuf::Parse;
-use regex::Regex;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
+use super::safe_regex::{SafeRegex, compile_regex};
+use super::string_matcher::{StringMatcher, non_empty_match_value};
 use crate::generated::envoy::config::route::v3::header_matcher::HeaderMatchSpecifierOneof;
 use crate::generated::envoy::config::route::v3::route::ActionOneof;
 use crate::generated::envoy::config::route::v3::route_action::ClusterSpecifierOneof;
@@ -45,8 +46,6 @@ use crate::generated::envoy::config::route::v3::{
     HeaderMatcherView, RouteActionView, RouteConfiguration, RouteMatchView, RouteView,
     VirtualHostView,
 };
-use crate::generated::envoy::r#type::matcher::v3::StringMatcherView;
-use crate::generated::envoy::r#type::matcher::v3::string_matcher::MatchPatternOneof;
 use crate::generated::envoy::r#type::v3::fractional_percent::DenominatorType;
 
 /// Validated RouteConfiguration.
@@ -62,6 +61,36 @@ pub(crate) struct VirtualHost {
     pub(crate) name: String,
     pub(crate) domains: Vec<String>,
     pub(crate) routes: Vec<Route>,
+}
+
+/// Classification of a valid virtual-host domain pattern, in match-precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DomainMatchType {
+    Exact,
+    Suffix,
+    Prefix,
+    Universal,
+}
+
+/// An empty domain pattern or one with unsupported wildcard placement.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InvalidDomainPattern;
+
+impl TryFrom<&str> for DomainMatchType {
+    type Error = InvalidDomainPattern;
+
+    fn try_from(pattern: &str) -> Result<Self, Self::Error> {
+        if pattern.is_empty() {
+            return Err(InvalidDomainPattern);
+        }
+        match pattern.find('*') {
+            None => Ok(Self::Exact),
+            Some(0) if pattern.len() == 1 => Ok(Self::Universal),
+            Some(0) if !pattern[1..].contains('*') => Ok(Self::Suffix),
+            Some(index) if index == pattern.len() - 1 => Ok(Self::Prefix),
+            _ => Err(InvalidDomainPattern),
+        }
+    }
 }
 
 /// A validated route with match criteria and action.
@@ -87,7 +116,7 @@ pub(crate) struct RouteMatch {
 pub(crate) enum PathSpecifier {
     Prefix(String),
     Path(String),
-    SafeRegex(Regex),
+    SafeRegex(SafeRegex),
 }
 
 /// Header matching criteria.
@@ -132,76 +161,6 @@ pub(crate) struct WeightedCluster {
     pub(crate) weight: u32,
 }
 
-/// Validated `envoy.type.matcher.v3.StringMatcher`.
-#[derive(Debug, Clone)]
-pub(crate) enum StringMatcher {
-    Exact { value: String, ignore_case: bool },
-    Prefix { value: String, ignore_case: bool },
-    Suffix { value: String, ignore_case: bool },
-    Contains { value: String, ignore_case: bool },
-    SafeRegex(Regex),
-}
-
-impl StringMatcher {
-    /// Parses and validates an `envoy.type.matcher.v3.StringMatcher`.
-    ///
-    /// Returns an error if the `match_pattern` oneof is unset or carries an
-    /// unsupported variant, a prefix/suffix/contains value is empty, or a
-    /// `safe_regex` fails to compile.
-    fn from_proto(proto: StringMatcherView<'_>) -> xds_client::Result<Self> {
-        let ignore_case = proto.ignore_case();
-        match proto.match_pattern() {
-            MatchPatternOneof::Exact(value) => Ok(Self::Exact {
-                value: value.to_str().unwrap_or_default().to_string(),
-                ignore_case,
-            }),
-            MatchPatternOneof::Prefix(value) => Ok(Self::Prefix {
-                value: non_empty_match_value(value.to_str().unwrap_or_default(), "prefix")?,
-                ignore_case,
-            }),
-            MatchPatternOneof::Suffix(value) => Ok(Self::Suffix {
-                value: non_empty_match_value(value.to_str().unwrap_or_default(), "suffix")?,
-                ignore_case,
-            }),
-            MatchPatternOneof::Contains(value) => Ok(Self::Contains {
-                value: non_empty_match_value(value.to_str().unwrap_or_default(), "contains")?,
-                ignore_case,
-            }),
-            MatchPatternOneof::SafeRegex(r) => {
-                let pattern = r.regex();
-                let pattern = pattern.to_str().unwrap_or_default();
-                Ok(Self::SafeRegex(compile_regex(pattern, "string matcher")?))
-            }
-            MatchPatternOneof::not_set(_) => Err(Error::Validation(
-                "StringMatcher has no match_pattern set".into(),
-            )),
-            _ => Err(Error::Validation(
-                "unsupported StringMatcher pattern".into(),
-            )),
-        }
-    }
-}
-
-fn non_empty_match_value(value: &str, kind: &str) -> xds_client::Result<String> {
-    if value.is_empty() {
-        return Err(Error::Validation(format!(
-            "empty {kind} match is not allowed"
-        )));
-    }
-    Ok(value.to_string())
-}
-
-/// Compiles a `RegexMatcher` pattern, rejecting the empty pattern.
-fn compile_regex(pattern: &str, kind: &str) -> xds_client::Result<Regex> {
-    if pattern.is_empty() {
-        return Err(Error::Validation(format!(
-            "empty {kind} regex is not allowed"
-        )));
-    }
-    Regex::new(pattern)
-        .map_err(|e| Error::Validation(format!("invalid {kind} regex '{pattern}': {e}")))
-}
-
 impl Resource for RouteConfigResource {
     type Message = RouteConfiguration;
 
@@ -244,10 +203,18 @@ fn validate_virtual_host(vh: VirtualHostView<'_>) -> xds_client::Result<VirtualH
             "virtual host '{name}' has no domains"
         )));
     }
-    let domains: Vec<String> = domains_view
+    let domains = domains_view
         .iter()
-        .map(|d| d.to_str().unwrap_or_default().to_string())
-        .collect();
+        .map(|d| {
+            let domain = d.to_str().unwrap_or_default();
+            DomainMatchType::try_from(domain).map_err(|_| {
+                Error::Validation(format!(
+                    "invalid domain pattern '{domain}' in virtual host '{name}'"
+                ))
+            })?;
+            Ok(domain.to_string())
+        })
+        .collect::<xds_client::Result<Vec<_>>>()?;
 
     let mut routes = Vec::new();
     for route in vh.routes().iter() {
@@ -643,6 +610,114 @@ mod tests {
     }
 
     #[test]
+    fn validate_virtual_host_rejects_invalid_domain_patterns() {
+        for domain in ["", "a*b.example.com", "**", "*foo*", "foo**", "*foo*bar"] {
+            let mut invalid = EnvoyVirtualHost::new();
+            invalid.set_name("invalid-host");
+            invalid.domains_mut().push(domain);
+            let mut rc = make_route_config("rc-1");
+            rc.virtual_hosts_mut().push(invalid);
+
+            let err = RouteConfigResource::validate(rc).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid domain pattern"),
+                "{domain:?}: {err}"
+            );
+            assert!(
+                err.to_string().contains("invalid-host"),
+                "{domain:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_domain_patterns_fail_conversion() {
+        for pattern in ["", "a*b.example.com", "**", "*foo*", "foo**", "*foo*bar"] {
+            assert_eq!(
+                DomainMatchType::try_from(pattern),
+                Err(InvalidDomainPattern),
+                "{pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn domain_patterns_convert_to_their_match_type() {
+        for (pattern, expected) in [
+            ("example.com", DomainMatchType::Exact),
+            ("*", DomainMatchType::Universal),
+            ("*.example.com", DomainMatchType::Suffix),
+            ("*-foo", DomainMatchType::Suffix),
+            ("foo.*", DomainMatchType::Prefix),
+            ("foo-*", DomainMatchType::Prefix),
+        ] {
+            assert_eq!(pattern.try_into(), Ok(expected), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn validate_virtual_host_accepts_supported_domain_patterns() {
+        let domains = [
+            "api.example.com",
+            "*.example.com",
+            "*-bar.example.com",
+            "api.*",
+            "api-*",
+            "api.example.com:443",
+            "[2001:db8::1]:443",
+        ];
+        let mut host = EnvoyVirtualHost::new();
+        host.set_name("host");
+        for domain in domains {
+            host.domains_mut().push(domain);
+        }
+        let mut rc = make_route_config("rc-1");
+        rc.virtual_hosts_mut().push(host);
+
+        let validated = RouteConfigResource::validate(rc).unwrap();
+        assert_eq!(validated.virtual_hosts[1].domains, domains);
+    }
+
+    #[test]
+    fn no_matching_virtual_host_does_not_invalidate_the_resource() {
+        let mut host = EnvoyVirtualHost::new();
+        host.set_name("host");
+        host.domains_mut().push("other.example.com");
+        let mut rc = RouteConfiguration::new();
+        rc.set_name("rc-1");
+        rc.virtual_hosts_mut().push(host);
+
+        let validated = RouteConfigResource::validate(rc).unwrap();
+        assert_eq!(
+            crate::routing::find_virtual_host_index("api.example.com", &validated.virtual_hosts),
+            None,
+        );
+    }
+
+    #[test]
+    fn selected_virtual_host_limits_cluster_dependencies() {
+        let mut rc = make_route_config("rc-1");
+        let mut selected = EnvoyVirtualHost::new();
+        selected.set_name("selected");
+        selected.domains_mut().push("api.example.com");
+        selected.routes_mut().push(make_weighted_route(&[
+            ("cluster-a", Some(80)),
+            ("cluster-b", Some(20)),
+            ("cluster-unused", Some(0)),
+        ]));
+        rc.virtual_hosts_mut().push(selected);
+
+        let validated = RouteConfigResource::validate(rc).unwrap();
+        let index =
+            crate::routing::find_virtual_host_index("API.EXAMPLE.COM", &validated.virtual_hosts)
+                .unwrap();
+        assert_eq!(
+            validated.virtual_hosts[index].cluster_names(),
+            HashSet::from(["cluster-a".to_string(), "cluster-b".to_string()]),
+        );
+    }
+
+    #[test]
     fn validate_route_missing_match() {
         let mut route = EnvoyRoute::new();
         route.set_route(EnvoyRouteAction::new());
@@ -972,6 +1047,44 @@ mod tests {
 
         let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
         assert!(err.to_string().contains("empty path regex"));
+    }
+
+    #[test]
+    fn validated_path_regex_requires_a_full_match() {
+        let mut regex = RegexMatcher::new();
+        regex.set_regex("/foo|/bar");
+        let mut route_match = EnvoyRouteMatch::new();
+        route_match.set_safe_regex(regex);
+
+        let validated =
+            RouteConfigResource::validate(route_config_with_match(route_match)).unwrap();
+        let PathSpecifier::SafeRegex(regex) = &validated.virtual_hosts[0].routes[0]
+            .route_match
+            .path_specifier
+        else {
+            panic!("expected regex path matcher");
+        };
+        assert!(regex.is_match("/foo"));
+        assert!(regex.is_match("/bar"));
+        assert!(!regex.is_match("/foobar"));
+        assert!(!regex.is_match("prefix/bar"));
+    }
+
+    #[test]
+    fn validated_legacy_header_regex_requires_a_full_match() {
+        let mut regex = RegexMatcher::new();
+        regex.set_regex("foo|bar");
+        let mut header = EnvoyHeaderMatcher::new();
+        header.set_name("x-test");
+        header.set_safe_regex_match(regex);
+
+        let HeaderMatchSpecifier::String(matcher) = validate_header(header) else {
+            panic!("expected string header matcher");
+        };
+        assert!(matcher.is_match("foo"));
+        assert!(matcher.is_match("bar"));
+        assert!(!matcher.is_match("foobar"));
+        assert!(!matcher.is_match("xbar"));
     }
 
     #[test]

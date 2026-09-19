@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -22,31 +22,11 @@
  *
  */
 
-//! The xDS data model layer: validated, owned representations of the raw
-//! discovery-protocol resources (LDS/RDS/CDS/EDS), each implementing
-//! [`xds_client::Resource`] so it can be deserialized, named, and validated
-//! (gRFC A27) independently of any live xDS traffic.
-//! The dependency manager assembles these into an [`crate::xds_config::XdsConfig`].
+//! Pure xDS routing utilities.
 
-// TODO: remove once the xDS dependency manager subscribes to these resource
-// types and assembles them into an XdsConfig.
+// TODO: remove once the dependency manager consumes virtual-host selection.
 #![allow(dead_code, unused_imports)]
 
-mod cluster;
-mod endpoint;
-mod listener;
-mod route;
-mod safe_regex;
-mod string_matcher;
+mod virtual_host;
 
-pub(crate) use cluster::{ClusterDiscovery, ClusterResource};
-pub(crate) use endpoint::{
-    EndpointAddress, EndpointsResource, HealthStatus, LbEndpoint, Locality, LocalityLbEndpoints,
-};
-pub(crate) use listener::{ListenerResource, RouteSource};
-pub(crate) use route::{
-    DomainMatchType, HeaderMatchSpecifier, HeaderMatcher, PathSpecifier, Route, RouteAction,
-    RouteConfigResource, RouteMatch, VirtualHost, WeightedCluster,
-};
-pub(crate) use safe_regex::SafeRegex;
-pub(crate) use string_matcher::StringMatcher;
+pub(crate) use virtual_host::find_virtual_host_index;

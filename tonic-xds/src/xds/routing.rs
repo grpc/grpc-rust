@@ -52,6 +52,9 @@ use crate::xds::resource::route_config::{
     HeaderMatchSpecifierConfig, HeaderMatcherConfig, PathSpecifierConfig, RouteConfig,
     RouteConfigAction, RouteConfigMatch, RouteConfigResource, VirtualHostConfig, WeightedCluster,
 };
+use crate::xds::resource::string_matcher::{
+    ends_with_ignore_ascii_case, starts_with_ignore_ascii_case,
+};
 
 /// Default timeout for waiting for the initial route config (matches gRFC A57
 /// resource initial timeout).
@@ -290,16 +293,8 @@ fn match_domain(authority: &str, pattern: &str) -> Option<DomainMatchScore> {
     // The wildcard must absorb at least one authority byte, so the
     // authority has to be strictly longer than the pattern tail.
     if let Some(suffix) = pattern.strip_prefix(WILDCARD)
-        && authority
-            .len()
-            .checked_sub(suffix.len())
-            .is_some_and(|start| {
-                start > 0
-                    && authority
-                        .as_bytes()
-                        .get(start..)
-                        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix.as_bytes()))
-            })
+        && authority.len() > suffix.len()
+        && ends_with_ignore_ascii_case(authority, suffix)
     {
         return Some(DomainMatchScore(
             DomainMatchType::Suffix,
@@ -309,10 +304,7 @@ fn match_domain(authority: &str, pattern: &str) -> Option<DomainMatchScore> {
 
     if let Some(prefix) = pattern.strip_suffix(WILDCARD)
         && authority.len() > prefix.len()
-        && authority
-            .as_bytes()
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+        && starts_with_ignore_ascii_case(authority, prefix)
     {
         return Some(DomainMatchScore(
             DomainMatchType::Prefix,
@@ -492,6 +484,32 @@ mod tests {
         let h = http::HeaderMap::new();
         assert!(rc.route("foo.bar", "/", &h).is_ok());
         assert!(rc.route("bar.foo", "/", &h).is_err());
+    }
+
+    #[test]
+    fn domain_suffix_wildcard_case_insensitive() {
+        let rc = simple_rc(vec![VirtualHostConfig {
+            name: "vh1".into(),
+            domains: vec!["*.FOO.com".into()],
+            routes: vec![simple_route("/", "c1")],
+        }]);
+        let h = http::HeaderMap::new();
+        assert!(rc.route("bar.foo.com", "/", &h).is_ok());
+        assert!(rc.route("BAR.foo.COM", "/", &h).is_ok());
+        assert!(rc.route("foo.com", "/", &h).is_err());
+    }
+
+    #[test]
+    fn domain_prefix_wildcard_case_insensitive() {
+        let rc = simple_rc(vec![VirtualHostConfig {
+            name: "vh1".into(),
+            domains: vec!["FOO.*".into()],
+            routes: vec![simple_route("/", "c1")],
+        }]);
+        let h = http::HeaderMap::new();
+        assert!(rc.route("foo.bar", "/", &h).is_ok());
+        assert!(rc.route("FOO.bar", "/", &h).is_ok());
+        assert!(rc.route("FOO.", "/", &h).is_err());
     }
 
     #[test]

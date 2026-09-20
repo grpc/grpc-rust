@@ -36,8 +36,6 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::Subchannel;
-use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::ResolverUpdate;
@@ -54,6 +52,7 @@ pub struct Lazy<T: LbPolicyBuilder> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Inner<T: LbPolicyBuilder> {
     Void,
     Pending(Pending<T>),
@@ -108,17 +107,6 @@ where
                 Ok(())
             }
             Inner::Built(delegate) => delegate.resolver_update(update, config, channel_controller),
-        }
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        if let Inner::Built(delegate) = &mut self.inner {
-            delegate.subchannel_update(subchannel, state, channel_controller);
         }
     }
 
@@ -205,7 +193,6 @@ mod tests {
     enum MockEvent {
         Build,
         ResolverUpdate,
-        SubchannelUpdate,
         Work,
         ExitIdle,
     }
@@ -449,14 +436,6 @@ mod tests {
         ) -> Result<(), String> {
             self.tx.send(MockEvent::ResolverUpdate).unwrap();
             Ok(())
-        }
-        fn subchannel_update(
-            &mut self,
-            _subchannel: Arc<dyn Subchannel>,
-            _state: &SubchannelState,
-            _channel_controller: &mut dyn ChannelController,
-        ) {
-            self.tx.send(MockEvent::SubchannelUpdate).unwrap();
         }
         fn work(
             &mut self,

@@ -37,8 +37,6 @@ use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::WorkData;
-use crate::client::load_balancing::subchannel::Subchannel;
-use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
 
 /// A registry to store and retrieve LB policies.  LB policies are indexed by
@@ -126,16 +124,6 @@ impl<T: LbPolicy> LbPolicy for DynAdapter<T> {
             })
         });
         self.0.resolver_update(update, config, channel_controller)
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        self.0
-            .subchannel_update(subchannel, state, channel_controller);
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {

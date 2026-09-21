@@ -39,8 +39,6 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::Subchannel;
-use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
@@ -181,17 +179,6 @@ impl LbPolicy for RoundRobinPolicy {
         Ok(())
     }
 
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        self.child_manager
-            .subchannel_update(subchannel, state, channel_controller);
-        self.update_picker(channel_controller);
-    }
-
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
         self.child_manager.work(data, channel_controller);
         self.update_picker(channel_controller);
@@ -241,6 +228,8 @@ mod test {
 
     use super::*;
     use crate::StatusCodeError;
+    use crate::client::load_balancing::subchannel::Subchannel;
+    use crate::client::load_balancing::subchannel::SubchannelState;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
@@ -319,22 +308,32 @@ mod test {
         let _ = lb_policy.resolver_update(update, None, tcc);
     }
 
+    // Simulates a state change of `subchannel` and delivers the resulting work
+    // to the policy, which routes it to the child that created it.
     fn move_subchannel_to_state(
         lb_policy: &mut impl LbPolicy,
+        rx_events: &mpsc::Receiver<TestEvent>,
         subchannel: Arc<dyn Subchannel>,
         state: &SubchannelState,
         tcc: &mut dyn ChannelController,
     ) {
-        lb_policy.subchannel_update(subchannel, state, tcc);
+        test_utils::schedule_subchannel_update(&subchannel, state.clone());
+        let TestEvent::ScheduleWork(data) = rx_events.recv().unwrap() else {
+            panic!("expected ScheduleWork event");
+        };
+        lb_policy.work(data, tcc);
     }
 
     fn move_subchannel_to_transient_failure(
         lb_policy: &mut impl LbPolicy,
+        rx_events: &mpsc::Receiver<TestEvent>,
         subchannel: Arc<dyn Subchannel>,
         err: &str,
         tcc: &mut dyn ChannelController,
     ) {
-        lb_policy.subchannel_update(
+        move_subchannel_to_state(
+            lb_policy,
+            rx_events,
             subchannel,
             &SubchannelState {
                 connectivity_state: ConnectivityState::TransientFailure,
@@ -550,6 +549,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -609,6 +609,7 @@ mod test {
         let connection_error = String::from("test connection error");
         move_subchannel_to_transient_failure(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &connection_error,
             tcc,
@@ -632,6 +633,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -639,6 +641,7 @@ mod test {
         verify_ready_picker(&mut rx_events, subchannels[0].clone());
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[1].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -700,6 +703,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -707,6 +711,7 @@ mod test {
         let _picker = verify_ready_picker(&mut rx_events, subchannels[0].clone());
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[1].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -734,7 +739,13 @@ mod test {
         assert!(picked.contains(&subchannels[1]));
         let subchannel_being_removed = subchannels[1].clone();
         let error = "endpoint down";
-        move_subchannel_to_transient_failure(&mut lb_policy, subchannels[1].clone(), error, tcc);
+        move_subchannel_to_transient_failure(
+            &mut lb_policy,
+            &rx_events,
+            subchannels[1].clone(),
+            error,
+            tcc,
+        );
 
         let new_picker = verify_roundrobin_ready_picker(&mut rx_events);
 
@@ -803,6 +814,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannel_one.clone(),
             &SubchannelState::ready(),
             tcc,
@@ -810,6 +822,7 @@ mod test {
         verify_ready_picker(&mut rx_events, subchannel_one.clone());
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannel_two.clone(),
             &SubchannelState::ready(),
             tcc,
@@ -851,6 +864,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             new_sc.clone(),
             &SubchannelState::ready(),
             tcc,
@@ -883,6 +897,7 @@ mod test {
         let first_error = String::from("test connection error 1");
         move_subchannel_to_transient_failure(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &first_error,
             tcc,
@@ -891,6 +906,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_transient_failure(
             &mut lb_policy,
+            &rx_events,
             subchannels[1].clone(),
             &first_error,
             tcc,
@@ -899,6 +915,7 @@ mod test {
         verify_transient_failure_picker(&mut rx_events, first_error);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -934,6 +951,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -967,6 +985,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -1012,6 +1031,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,

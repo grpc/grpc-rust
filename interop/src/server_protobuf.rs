@@ -42,16 +42,18 @@ use grpc_protobuf::server::GrpcStreamingRequest;
 use grpc_protobuf::server::GrpcStreamingResponse;
 use protobuf::proto;
 
+use crate::grpc_pb::test_service_server::TestService;
 pub use crate::grpc_pb::test_service_server::TestServiceServer;
+use crate::grpc_pb::unimplemented_service_server::UnimplementedService;
 pub use crate::grpc_pb::unimplemented_service_server::UnimplementedServiceServer;
 use crate::grpc_pb::*;
 use crate::grpc_utils;
 
 #[derive(Default, Clone)]
-pub struct TestService {}
+pub struct InteropTestService {}
 
 #[grpc::async_trait]
-impl crate::grpc_pb::test_service_server::TestService for TestService {
+impl TestService for InteropTestService {
     async fn empty_call(&self, _request: EmptyView<'_>, _response: EmptyMut<'_>) -> ServerStatus {
         Ok(())
     }
@@ -61,11 +63,11 @@ impl crate::grpc_pb::test_service_server::TestService for TestService {
         request: SimpleRequestView<'_>,
         mut response: SimpleResponseMut<'_>,
     ) -> ServerStatus {
-        if request.response_status().code() != 0 {
-            let echo_status = request.response_status();
+        let code = request.response_status().code();
+        if code != 0 {
             let status = ServerStatusError::new(
-                StatusCodeError::from(echo_status.code()),
-                echo_status.message().to_string(),
+                StatusCodeError::from(code),
+                request.response_status().message().to_string(),
             );
             return Err(status);
         }
@@ -86,14 +88,6 @@ impl crate::grpc_pb::test_service_server::TestService for TestService {
         Ok(())
     }
 
-    async fn cacheable_unary_call(
-        &self,
-        _request: SimpleRequestView<'_>,
-        _response: SimpleResponseMut<'_>,
-    ) -> ServerStatus {
-        unimplemented!()
-    }
-
     async fn streaming_output_call(
         &self,
         request: StreamingOutputCallRequestView<'_>,
@@ -103,7 +97,7 @@ impl crate::grpc_pb::test_service_server::TestService for TestService {
             tokio::time::sleep(Duration::from_micros(param.interval_us() as u64)).await;
 
             let payload = grpc_utils::server_payload(param.size() as usize);
-            let response = proto!(StreamingOutputCallResponse { payload: payload });
+            let response = proto!(StreamingOutputCallResponse { payload });
             if responses.send(&response).await.is_err() {
                 break;
             }
@@ -155,11 +149,11 @@ impl crate::grpc_pb::test_service_server::TestService for TestService {
                 None => break,
             };
 
-            if msg.response_status().code() != 0 {
-                let echo_status = msg.response_status();
+            let code = msg.response_status().code();
+            if code != 0 {
                 let status = ServerStatusError::new(
-                    StatusCodeError::from(echo_status.code()),
-                    echo_status.message().to_string(),
+                    StatusCodeError::from(code),
+                    msg.response_status().message().to_string(),
                 );
                 return Err(status);
             }
@@ -180,40 +174,13 @@ impl crate::grpc_pb::test_service_server::TestService for TestService {
 
         Ok(())
     }
-
-    async fn half_duplex_call(
-        &self,
-        _request: GrpcStreamingRequest<StreamingOutputCallRequest>,
-        _responses: GrpcStreamingResponse<'_, StreamingOutputCallResponse>,
-    ) -> ServerStatus {
-        Err(ServerStatusError::new(
-            StatusCodeError::Unimplemented,
-            "TODO",
-        ))
-    }
-
-    async fn unimplemented_call(
-        &self,
-        _request: EmptyView<'_>,
-        _response: EmptyMut<'_>,
-    ) -> ServerStatus {
-        Err(ServerStatusError::new(StatusCodeError::Unimplemented, ""))
-    }
 }
 
 #[derive(Default)]
-pub struct UnimplementedService {}
+pub struct UnimplementedInteropService {}
 
 #[grpc::async_trait]
-impl crate::grpc_pb::unimplemented_service_server::UnimplementedService for UnimplementedService {
-    async fn unimplemented_call(
-        &self,
-        _request: EmptyView<'_>,
-        _response: EmptyMut<'_>,
-    ) -> ServerStatus {
-        Err(ServerStatusError::new(StatusCodeError::Unimplemented, ""))
-    }
-}
+impl UnimplementedService for UnimplementedInteropService {}
 
 #[derive(Debug, Clone)]
 pub struct EchoHeaders {

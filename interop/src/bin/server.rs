@@ -100,10 +100,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .await?;
         }
         Codec::Protobuf => {
-            let test_service =
-                server_protobuf::TestServiceServer::new(server_protobuf::TestService::default());
+            let test_service = server_protobuf::TestServiceServer::new(
+                server_protobuf::InteropTestService::default(),
+            );
             let unimplemented_service = server_protobuf::UnimplementedServiceServer::new(
-                server_protobuf::UnimplementedService::default(),
+                server_protobuf::UnimplementedInteropService::default(),
             );
 
             let _server = grpc::server::Server::builder()

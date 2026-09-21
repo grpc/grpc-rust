@@ -180,7 +180,7 @@ public:
   explicit Method(const MethodDescriptor *method) : method_(method) {}
 
   // The name of the method in Rust snake-case style.
-  std::string Name() const {
+  std::string NameSnakeCase() const {
     return rust::RsSafeName(rust::CamelToSnakeCase(method_->name()));
   };
 
@@ -355,7 +355,7 @@ static void GenerateMethods(Printer &printer, const Service &service,
     const std::string request_type = method.RequestName(opts, 1);
     const std::string response_type = method.ResponseName(opts, 1);
     {
-      auto vars = printer.WithVars({{"ident", method.Name()},
+      auto vars = printer.WithVars({{"ident", method.NameSnakeCase()},
                                     {"request", request_type},
                                     {"response", response_type},
                                     {"service_name", service.FullName()},
@@ -477,7 +477,7 @@ static void GenerateTraitMethods(Printer &printer, const Service &service,
     const std::string request_type = method.RequestName(opts, 1);
     const std::string response_type = method.ResponseName(opts, 1);
     auto vars = printer.WithVars({
-        {"name", method.Name()},
+        {"name", method.NameSnakeCase()},
         {"request", request_type},
         {"response", response_type},
         {"method_doc", ProtoCommentToRustDoc(method.Comment())},
@@ -578,7 +578,7 @@ static void GenerateMethodWrappers(Printer &printer, const Service &service,
   const std::vector<Method> methods = service.Methods();
   for (const Method &method : methods) {
     auto vars = printer.WithVars({
-        {"method_ident", method.Name()},
+        {"method_ident", method.NameSnakeCase()},
         {"struct_ident", method.NameCamelCase()},
         {"request", method.RequestName(opts, 2)},
         {"response", method.ResponseName(opts, 2)},

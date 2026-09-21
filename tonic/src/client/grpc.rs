@@ -22,6 +22,8 @@
  *
  */
 
+// NB: keep in sync with src/local/client.rs
+
 use crate::codec::EncodeBody;
 use crate::codec::{CompressionEncoding, EnabledCompressionEncodings};
 use crate::metadata::GRPC_CONTENT_TYPE;
@@ -58,16 +60,17 @@ pub struct Grpc<T> {
     config: GrpcConfig,
 }
 
-struct GrpcConfig {
-    origin: Uri,
+#[derive(Clone)]
+pub(crate) struct GrpcConfig {
+    pub(crate) origin: Uri,
     /// Which compression encodings does the client accept?
-    accept_compression_encodings: EnabledCompressionEncodings,
+    pub(crate) accept_compression_encodings: EnabledCompressionEncodings,
     /// The compression encoding that will be applied to requests.
-    send_compression_encodings: Option<CompressionEncoding>,
+    pub(crate) send_compression_encodings: Option<CompressionEncoding>,
     /// Limits the maximum size of a decoded message.
-    max_decoding_message_size: Option<usize>,
+    pub(crate) max_decoding_message_size: Option<usize>,
     /// Limits the maximum size of an encoded message.
-    max_encoding_message_size: Option<usize>,
+    pub(crate) max_encoding_message_size: Option<usize>,
 }
 
 impl<T> Grpc<T> {
@@ -83,13 +86,7 @@ impl<T> Grpc<T> {
     pub fn with_origin(inner: T, origin: Uri) -> Self {
         Self {
             inner,
-            config: GrpcConfig {
-                origin,
-                send_compression_encodings: None,
-                accept_compression_encodings: EnabledCompressionEncodings::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            },
+            config: GrpcConfig::new(origin),
         }
     }
 
@@ -357,25 +354,10 @@ impl<T> Grpc<T> {
         T::ResponseBody: HttpBody + Send + 'static,
         <T::ResponseBody as HttpBody>::Error: Into<crate::BoxError>,
     {
-        let encoding = CompressionEncoding::from_encoding_header(
-            response.headers(),
-            self.config.accept_compression_encodings,
-        )?;
+        let (encoding, expect_additional_trailers) =
+            classify_response(response.headers(), self.config.accept_compression_encodings)?;
 
         let status_code = response.status();
-        let trailers_only_status = Status::from_header_map(response.headers());
-
-        // We do not need to check for trailers if the `grpc-status` header is present
-        // with a valid code.
-        let expect_additional_trailers = if let Some(status) = trailers_only_status {
-            if status.code() != Code::Ok {
-                return Err(status);
-            }
-
-            false
-        } else {
-            true
-        };
 
         let response = response.map(|body| {
             if expect_additional_trailers {
@@ -395,8 +377,64 @@ impl<T> Grpc<T> {
     }
 }
 
+// Shared by both `create_response` variants (this one and `local::client::Grpc`'s): pulls the
+// response compression encoding out of the headers and decides, from a trailers-only
+// `grpc-status`, whether more trailers are still expected on the body. The HTTP status code is
+// deliberately not a parameter here - this block never reads it; callers pass it straight to
+// `Streaming::new_response` themselves.
+pub(crate) fn classify_response(
+    headers: &http::HeaderMap,
+    accept_encodings: EnabledCompressionEncodings,
+) -> Result<(Option<CompressionEncoding>, bool), Status> {
+    let encoding = CompressionEncoding::from_encoding_header(headers, accept_encodings)?;
+
+    let trailers_only_status = Status::from_header_map(headers);
+
+    // We do not need to check for trailers if the `grpc-status` header is present
+    // with a valid code.
+    let expect_additional_trailers = if let Some(status) = trailers_only_status {
+        if status.code() != Code::Ok {
+            return Err(status);
+        }
+
+        false
+    } else {
+        true
+    };
+
+    Ok((encoding, expect_additional_trailers))
+}
+
 impl GrpcConfig {
-    fn prepare_request(&self, request: Request<Body>, path: PathAndQuery) -> http::Request<Body> {
+    pub(crate) fn new(origin: Uri) -> Self {
+        Self {
+            origin,
+            send_compression_encodings: None,
+            accept_compression_encodings: EnabledCompressionEncodings::default(),
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
+        }
+    }
+
+    pub(crate) fn debug_fields<'a, 'b, 'c>(
+        &self,
+        d: &'c mut fmt::DebugStruct<'a, 'b>,
+    ) -> &'c mut fmt::DebugStruct<'a, 'b> {
+        d.field("origin", &self.origin)
+            .field("compression_encoding", &self.send_compression_encodings)
+            .field(
+                "accept_compression_encodings",
+                &self.accept_compression_encodings,
+            )
+            .field("max_decoding_message_size", &self.max_decoding_message_size)
+            .field("max_encoding_message_size", &self.max_encoding_message_size)
+    }
+
+    pub(crate) fn prepare_request<B>(
+        &self,
+        request: Request<B>,
+        path: PathAndQuery,
+    ) -> http::Request<B> {
         let mut parts = self.origin.clone().into_parts();
 
         match &parts.path_and_query {
@@ -457,38 +495,15 @@ impl<T: Clone> Clone for Grpc<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            config: GrpcConfig {
-                origin: self.config.origin.clone(),
-                send_compression_encodings: self.config.send_compression_encodings,
-                accept_compression_encodings: self.config.accept_compression_encodings,
-                max_encoding_message_size: self.config.max_encoding_message_size,
-                max_decoding_message_size: self.config.max_decoding_message_size,
-            },
+            config: self.config.clone(),
         }
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Grpc")
-            .field("inner", &self.inner)
-            .field("origin", &self.config.origin)
-            .field(
-                "compression_encoding",
-                &self.config.send_compression_encodings,
-            )
-            .field(
-                "accept_compression_encodings",
-                &self.config.accept_compression_encodings,
-            )
-            .field(
-                "max_decoding_message_size",
-                &self.config.max_decoding_message_size,
-            )
-            .field(
-                "max_encoding_message_size",
-                &self.config.max_encoding_message_size,
-            )
-            .finish()
+        let mut d = f.debug_struct("Grpc");
+        d.field("inner", &self.inner);
+        self.config.debug_fields(&mut d).finish()
     }
 }

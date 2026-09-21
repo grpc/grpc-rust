@@ -51,6 +51,8 @@ channel = [
 ]
 transport = ["server", "channel"]
 h2 = ["dep:h2"]
+local = []
+local-transport = ["local", "dep:hyper", "hyper?/client", "hyper?/server", "dep:hyper-util", "hyper-util?/service", "dep:tokio", "tokio?/rt", "tokio?/net", "tokio-stream/net"]
 
 # [[bench]]
 # name = "bench_main"
@@ -141,3 +143,8 @@ allowed_external_types = [
 [[bench]]
 harness = false
 name = "decode"
+
+[[bench]]
+harness = false
+name = "local_decode"
+required-features = ["local"]

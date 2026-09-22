@@ -112,10 +112,22 @@ where
     /// Otherwise, if any child is IDLE, then report IDLE.
     /// Report TRANSIENT FAILURE if no conditions above apply.
     pub fn aggregate_states(&self) -> ConnectivityState {
+        self.aggregate_states_filtered(|_| true)
+    }
+
+    /// Ignores any children for which the filter returns false. Otherwise,
+    /// behaves like aggregate_states.
+    pub fn aggregate_states_filtered(
+        &self,
+        filter: impl Fn(&Child<T, B>) -> bool,
+    ) -> ConnectivityState {
         let mut is_connecting = false;
         let mut is_idle = false;
 
         for child in &self.children {
+            if !filter(child) {
+                continue;
+            }
             match child.state.connectivity_state {
                 ConnectivityState::Ready => {
                     return ConnectivityState::Ready;
@@ -331,7 +343,20 @@ where
 
     /// Calls exit_idle on all children.
     pub fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+        self.exit_idle_filtered(channel_controller, |_| true);
+    }
+
+    /// Skips any children for which the filter returns false. Otherwise,
+    /// behaves like exit_idle.
+    pub fn exit_idle_filtered(
+        &mut self,
+        channel_controller: &mut dyn ChannelController,
+        filter: impl Fn(&Child<T, B>) -> bool,
+    ) {
         for child in &mut self.children {
+            if !filter(child) {
+                continue;
+            }
             let mut channel_controller =
                 WrappedController::new(channel_controller, &mut child.state, &mut self.updated);
             child.policy.exit_idle(&mut channel_controller);
@@ -660,6 +685,97 @@ mod test {
             &SubchannelState::ready(),
         );
         assert_eq!(child_manager.aggregate_states(), ConnectivityState::Ready);
+    }
+
+    #[test]
+    fn childmanager_aggregate_states_filtered() {
+        let test_name = "stub-childmanager_aggregate_states_filtered";
+        let (mut rx_events, mut child_manager, mut tcc) =
+            setup(create_verifying_funcs_for_aggregate_tests(), test_name);
+        let builder: Arc<DynLbPolicyBuilder> = GLOBAL_LB_REGISTRY.get_policy(test_name).unwrap();
+
+        let endpoints = create_n_endpoints_with_k_addresses(4, 1);
+        send_resolver_update_to_policy(
+            &mut child_manager,
+            endpoints.clone(),
+            builder,
+            tcc.as_mut(),
+        )
+        .unwrap();
+        let mut subchannels = vec![];
+        for endpoint in endpoints {
+            subchannels.push(
+                verify_subchannel_creation_from_policy(&mut rx_events, endpoint.addresses.len())
+                    .remove(0),
+            );
+        }
+
+        let mut subchannels = subchannels.into_iter();
+        move_subchannel_to_state(
+            &mut child_manager,
+            &rx_events,
+            subchannels.next().unwrap(),
+            tcc.as_mut(),
+            &SubchannelState::transient_failure("n/a"),
+        );
+        move_subchannel_to_state(
+            &mut child_manager,
+            &rx_events,
+            subchannels.next().unwrap(),
+            tcc.as_mut(),
+            &SubchannelState::idle(),
+        );
+        move_subchannel_to_state(
+            &mut child_manager,
+            &rx_events,
+            subchannels.next().unwrap(),
+            tcc.as_mut(),
+            &SubchannelState::connecting(),
+        );
+        move_subchannel_to_state(
+            &mut child_manager,
+            &rx_events,
+            subchannels.next().unwrap(),
+            tcc.as_mut(),
+            &SubchannelState::ready(),
+        );
+
+        // All children unfiltered -> Ready
+        assert_eq!(
+            child_manager.aggregate_states_filtered(|_| true),
+            ConnectivityState::Ready
+        );
+
+        // Excluding Ready -> Connecting
+        assert_eq!(
+            child_manager.aggregate_states_filtered(
+                |c| c.state.connectivity_state != ConnectivityState::Ready
+            ),
+            ConnectivityState::Connecting
+        );
+
+        // Excluding Ready and Connecting -> Idle
+        assert_eq!(
+            child_manager.aggregate_states_filtered(|c| {
+                c.state.connectivity_state != ConnectivityState::Ready
+                    && c.state.connectivity_state != ConnectivityState::Connecting
+            }),
+            ConnectivityState::Idle
+        );
+
+        // Excluding Ready, Connecting, and Idle -> TransientFailure
+        assert_eq!(
+            child_manager.aggregate_states_filtered(|c| {
+                c.state.connectivity_state == ConnectivityState::TransientFailure
+            }),
+            ConnectivityState::TransientFailure
+        );
+
+        // Filter matching nothing -> TransientFailure
+        assert_eq!(
+            child_manager.aggregate_states_filtered(|_| false),
+            ConnectivityState::TransientFailure
+        );
     }
 
     // Tests the scenario where no children are READY and the children are in

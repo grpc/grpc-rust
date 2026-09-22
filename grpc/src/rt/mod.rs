@@ -455,7 +455,7 @@ impl Runtime for NoOpRuntime {
     }
 }
 
-pub(crate) fn default_runtime() -> GrpcRuntime {
+pub fn default_runtime() -> GrpcRuntime {
     #[cfg(feature = "_runtime-tokio")]
     {
         return GrpcRuntime::new(tokio::TokioRuntime::default());

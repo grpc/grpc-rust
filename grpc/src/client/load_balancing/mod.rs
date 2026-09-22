@@ -546,13 +546,13 @@ impl Picker for FailingPicker {
 
 /// A dynamic LB policy config implementation that can be downcast to a specific
 /// config as needed.
-pub(crate) type DynLbConfig = Arc<dyn Any + Send + Sync>;
+pub type DynLbConfig = Arc<dyn Any + Send + Sync>;
 
 /// A builder of dynamic LB policies.
-pub(crate) type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
+pub type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
 
 /// An LB policy that accepts dynamic configs.
-pub(crate) type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
+pub type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
 
 impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     type LbConfig = T::LbConfig;

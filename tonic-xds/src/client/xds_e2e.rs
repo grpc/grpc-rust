@@ -319,6 +319,71 @@ mod test {
             let _ = backend.shutdown.send(());
         }
     }
+
+    /// A CDS response past tonic's 4 MiB decode default only arrives when the
+    /// channel raises the limit, so successful routing proves the configured
+    /// ceiling reached the ADS transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_decoding_limit_admits_oversized_ads_response() {
+        const PADDING: usize = 5 * 1024 * 1024;
+
+        let backend = spawn_greeter_server("backend", None, None)
+            .await
+            .expect("spawn greeter backend");
+        let backend_addr = backend.addr;
+
+        let (control_plane, cp_addr) = start_control_plane().await;
+
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Lds,
+            HashMap::from([(
+                "my-service".to_string(),
+                config::build_inline_listener("my-service", "my-cluster"),
+            )]),
+        );
+        // `alt_stat_name` is ignored by CDS validation, so it pads the response
+        // without changing how the cluster behaves.
+        let mut cluster = config::build_cluster("my-cluster");
+        cluster.alt_stat_name = "x".repeat(PADDING);
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Cds,
+            HashMap::from([("my-cluster".to_string(), cluster)]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cla(
+                    "my-cluster",
+                    &[(backend_addr.ip().to_string(), backend_addr.port())],
+                ),
+            )]),
+        );
+
+        let bootstrap_json = format!(
+            r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
+        );
+        let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
+        let target = XdsUri::parse("xds:///my-service").expect("parse target");
+        let channel = XdsChannelBuilder::new(
+            XdsChannelConfig::new(target)
+                .with_bootstrap(bootstrap)
+                .with_max_decoding_message_size(2 * PADDING),
+        )
+        .build_grpc_channel()
+        .expect("build xds channel");
+
+        let mut client = GreeterClient::new(channel);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(30),
+            say_hello_until_prefix(&mut client, "backend:"),
+        )
+        .await
+        .expect("oversized CDS response never routed; decoding limit not applied");
+        assert_eq!(reply, "backend: world");
+
+        let _ = backend.shutdown.send(());
+    }
 }
 
 /// gRFC A65 end-to-end test

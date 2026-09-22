@@ -62,6 +62,8 @@ pub struct XdsChannelConfig {
     target_uri: XdsUri,
     bootstrap: Option<BootstrapConfig>,
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
 }
 
 impl XdsChannelConfig {
@@ -72,6 +74,8 @@ impl XdsChannelConfig {
             target_uri,
             bootstrap: None,
             call_creds: None,
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
         }
     }
 
@@ -104,6 +108,24 @@ impl XdsChannelConfig {
     /// channel, stream creation fails. Not refreshed mid-stream.
     pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
         self.call_creds = Some(creds);
+        self
+    }
+
+    /// Limit the size of a decoded ADS response, in bytes.
+    ///
+    /// Defaults to tonic's 4 MiB. A control plane whose response exceeds the
+    /// limit breaks the stream, so raise it to match the largest resource set
+    /// the server sends.
+    pub fn with_max_decoding_message_size(mut self, limit: usize) -> Self {
+        self.max_decoding_message_size = Some(limit);
+        self
+    }
+
+    /// Limit the size of an encoded ADS request, in bytes.
+    ///
+    /// Defaults to tonic's `usize::MAX`.
+    pub fn with_max_encoding_message_size(mut self, limit: usize) -> Self {
+        self.max_encoding_message_size = Some(limit);
         self
     }
 }
@@ -437,6 +459,13 @@ impl XdsChannelBuilder {
 
         if let Some(creds) = self.config.call_creds.clone() {
             transport_builder = transport_builder.with_call_credentials(creds);
+        }
+
+        if let Some(limit) = self.config.max_decoding_message_size {
+            transport_builder = transport_builder.with_max_decoding_message_size(limit);
+        }
+        if let Some(limit) = self.config.max_encoding_message_size {
+            transport_builder = transport_builder.with_max_encoding_message_size(limit);
         }
 
         #[cfg(feature = "_tls-any")]

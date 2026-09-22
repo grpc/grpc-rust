@@ -154,7 +154,7 @@ impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&T::LbConfig>,
+        config: &T::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         let mut channel_controller = SharingChannelController {
@@ -383,6 +383,7 @@ mod tests {
 
     use super::*;
     use crate::client::ConnectivityState;
+    use crate::client::load_balancing::DynLbConfig;
     use crate::client::load_balancing::LbPolicy;
     use crate::client::load_balancing::LbPolicyOptions;
     use crate::client::load_balancing::Pick;
@@ -929,7 +930,6 @@ mod tests {
                     let called_clone = called.clone();
                     move |_data, _cc| called_clone.lock().unwrap().push("exit_idle")
                 })),
-                ..Default::default()
             },
             test_lb_policy_options(tx_events.clone()),
         );
@@ -937,7 +937,9 @@ mod tests {
         let mut sharing = new_sharing(mock, tx_events.clone());
 
         let update = ResolverUpdate::default();
-        sharing.resolver_update(update, None, &mut cc).unwrap();
+        sharing
+            .resolver_update(update, &(Arc::new(()) as DynLbConfig), &mut cc)
+            .unwrap();
         sharing.work(None, &mut cc);
         sharing.exit_idle(&mut cc);
 

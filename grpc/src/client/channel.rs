@@ -451,7 +451,7 @@ impl name_resolution::ChannelController for ResolverChannelController {
         let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 
         self.lb_policy
-            .resolver_update(update, Some(&gsb_config), &mut self.lb_channel_controller)
+            .resolver_update(update, &gsb_config, &mut self.lb_channel_controller)
     }
 
     fn parse_service_config(&self, config: &str) -> ParseResult {

@@ -63,7 +63,7 @@ enum Inner<T: LbPolicyBuilder> {
 struct Pending<T: LbPolicyBuilder> {
     delegate_builder: T,
     options: LbPolicyOptions,
-    latest_state: Option<(ResolverUpdate, Option<<T::LbPolicy as LbPolicy>::LbConfig>)>,
+    latest_state: Option<(ResolverUpdate, <T::LbPolicy as LbPolicy>::LbConfig)>,
 }
 
 impl<T: LbPolicyBuilder> Lazy<T> {
@@ -97,13 +97,13 @@ where
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         match &mut self.inner {
             Inner::Void => unreachable!(),
             Inner::Pending(pending) => {
-                pending.latest_state = Some((update, config.cloned()));
+                pending.latest_state = Some((update, config.clone()));
                 Ok(())
             }
             Inner::Built(delegate) => delegate.resolver_update(update, config, channel_controller),
@@ -139,7 +139,7 @@ where
         // If there is a pending update, send it now.  Otherwise just exit_idle.
         if let Some((update, config)) = latest_state {
             if delegate
-                .resolver_update(update, config.as_ref(), channel_controller)
+                .resolver_update(update, &config, channel_controller)
                 .is_err()
             {
                 // Notify the channel that it should try to retrieve a new update.
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(lb_state.connectivity_state, ConnectivityState::Idle);
 
         // Give lazy an update.
-        lazy.resolver_update(ResolverUpdate::default(), None, &mut cc)
+        lazy.resolver_update(ResolverUpdate::default(), &Arc::new(()), &mut cc)
             .unwrap();
 
         // Ensure delegate is not built yet.
@@ -263,7 +263,7 @@ mod tests {
         };
 
         // Give lazy an update.
-        lazy.resolver_update(ResolverUpdate::default(), None, &mut cc)
+        lazy.resolver_update(ResolverUpdate::default(), &Arc::new(()), &mut cc)
             .unwrap();
 
         // Call pick on the picker.
@@ -423,6 +423,12 @@ mod tests {
         fn name(&self) -> &'static str {
             "mock"
         }
+        fn parse_config(
+            &self,
+            _config: &crate::client::load_balancing::ParsedJsonLbConfig,
+        ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
+            Ok(())
+        }
     }
 
     impl LbPolicy for MockPolicy {
@@ -431,7 +437,7 @@ mod tests {
         fn resolver_update(
             &mut self,
             _update: ResolverUpdate,
-            _config: Option<&()>,
+            _config: &(),
             _channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
             self.tx.send(MockEvent::ResolverUpdate).unwrap();

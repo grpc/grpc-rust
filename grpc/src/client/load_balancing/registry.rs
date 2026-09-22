@@ -102,10 +102,10 @@ impl<T: LbPolicyBuilder> LbPolicyBuilder for DynAdapter<T> {
         self.0.name()
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<DynLbConfig>, String> {
+    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<DynLbConfig, String> {
         // Call the real parse config and then wrap its result in a DynLbConfig if it is Ok(Some)
         let cfg = self.0.parse_config(config)?;
-        Ok(cfg.map(|c| Arc::new(c) as DynLbConfig))
+        Ok(Arc::new(cfg) as DynLbConfig)
     }
 }
 
@@ -115,14 +115,12 @@ impl<T: LbPolicy> LbPolicy for DynAdapter<T> {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&DynLbConfig>,
+        config: &DynLbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let config = config.map(|c| {
-            c.downcast_ref::<T::LbConfig>().unwrap_or_else(|| {
-                panic!("LB config type should be {}", type_name::<T::LbConfig>())
-            })
-        });
+        let config = config
+            .downcast_ref::<T::LbConfig>()
+            .unwrap_or_else(|| panic!("LB config type should be {}", type_name::<T::LbConfig>()));
         self.0.resolver_update(update, config, channel_controller)
     }
 

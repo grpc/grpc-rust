@@ -80,10 +80,7 @@ pub struct ChildUpdate<'a, T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
     /// None, then resolver_update will not be called on the child.  Should
     /// generally be Some for any new children, otherwise they will not be
     /// called.
-    pub child_update: Option<(
-        ResolverUpdate,
-        Option<&'a <B::LbPolicy as LbPolicy>::LbConfig>,
-    )>,
+    pub child_update: Option<(ResolverUpdate, &'a <B::LbPolicy as LbPolicy>::LbConfig)>,
 }
 
 impl<T, B> ChildManager<T, B>
@@ -279,7 +276,7 @@ where
     pub fn resolver_update(
         &mut self,
         resolver_update: ResolverUpdate,
-        config: Option<&<B::LbPolicy as LbPolicy>::LbConfig>,
+        config: &<B::LbPolicy as LbPolicy>::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut errs = Vec::with_capacity(self.children.len());
@@ -512,6 +509,7 @@ mod test {
         builder: Arc<DynLbPolicyBuilder>,
         tcc: &mut dyn ChannelController,
     ) -> Result<(), String> {
+        let cfg = Arc::new(()) as DynLbConfig;
         let updates = endpoints.iter().map(|e| ChildUpdate {
             child_identifier: e.clone(),
             child_policy_builder: builder.clone(),
@@ -522,7 +520,7 @@ mod test {
                     service_config: Ok(None),
                     resolution_note: None,
                 },
-                None,
+                &cfg,
             )),
         });
 
@@ -829,7 +827,6 @@ mod test {
                     .unwrap();
                 assert!(!stubdata.requested_work);
                 if lbcfg
-                    .unwrap()
                     .downcast_ref::<Mutex<HashMap<&'static str, ()>>>()
                     .unwrap()
                     .lock()
@@ -896,7 +893,7 @@ mod test {
             ChildUpdate {
                 child_identifier: (),
                 child_policy_builder,
-                child_update: Some((ResolverUpdate::default(), Some(&cfg))),
+                child_update: Some((ResolverUpdate::default(), &cfg)),
             }
         });
         child_manager.update(updates.clone(), &mut tcc).unwrap();

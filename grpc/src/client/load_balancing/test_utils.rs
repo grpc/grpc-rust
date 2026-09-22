@@ -211,7 +211,7 @@ type ResolverUpdateFn = Arc<
     dyn Fn(
             &mut StubPolicyData,
             ResolverUpdate,
-            Option<&DynLbConfig>,
+            &DynLbConfig,
             &mut dyn ChannelController,
         ) -> Result<(), String>
         + Send
@@ -268,7 +268,7 @@ impl LbPolicy for StubPolicy {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&DynLbConfig>,
+        config: &DynLbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         if let Some(f) = &mut self.funcs.resolver_update {
@@ -327,14 +327,14 @@ impl LbPolicyBuilder for StubPolicyBuilder {
         self.name
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<DynLbConfig>, String> {
+    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<DynLbConfig, String> {
         let cfg: MockConfig = match config.convert_to() {
             Ok(c) => c,
             Err(e) => {
                 return Err(format!("failed to parse JSON config: {}", e));
             }
         };
-        Ok(Some(Arc::new(cfg)))
+        Ok(Arc::new(cfg))
     }
 }
 

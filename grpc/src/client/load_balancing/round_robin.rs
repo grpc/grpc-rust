@@ -43,14 +43,18 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first::PickFirstBuilder;
+use crate::client::load_balancing::pick_first::PickFirstConfig;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 
 pub static POLICY_NAME: &str = "round_robin";
 static START: Once = Once::new();
 
+#[derive(Debug, Default)]
+pub(crate) struct RoundRobinConfig(PickFirstConfig);
+
 #[derive(Debug)]
-pub struct RoundRobinBuilder {}
+pub(crate) struct RoundRobinBuilder {}
 
 impl LbPolicyBuilder for RoundRobinBuilder {
     type LbPolicy = RoundRobinPolicy;
@@ -63,10 +67,17 @@ impl LbPolicyBuilder for RoundRobinBuilder {
     fn name(&self) -> &'static str {
         POLICY_NAME
     }
+
+    fn parse_config(
+        &self,
+        _config: &super::ParsedJsonLbConfig,
+    ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
+        Ok(RoundRobinConfig::default())
+    }
 }
 
 #[derive(Debug)]
-pub struct RoundRobinPolicy {
+pub(crate) struct RoundRobinPolicy {
     child_manager: ChildManager<Endpoint, PickFirstBuilder>,
 }
 
@@ -117,6 +128,7 @@ impl RoundRobinPolicy {
     fn handle_resolver_error(
         &mut self,
         resolver_update: ResolverUpdate,
+        config: &RoundRobinConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         let err = format!(
@@ -131,22 +143,22 @@ impl RoundRobinPolicy {
         // Forward the error to each child, ignoring their responses.
         let _ = self
             .child_manager
-            .resolver_update(resolver_update, None, channel_controller);
+            .resolver_update(resolver_update, &config.0, channel_controller);
         self.update_picker(channel_controller);
         Err(err)
     }
 }
 
 impl LbPolicy for RoundRobinPolicy {
-    type LbConfig = ();
+    type LbConfig = RoundRobinConfig;
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         if update.endpoints.is_err() {
-            return self.handle_resolver_error(update, channel_controller);
+            return self.handle_resolver_error(update, config, channel_controller);
         }
 
         // Shard the update by endpoint.
@@ -160,7 +172,7 @@ impl LbPolicy for RoundRobinPolicy {
             ChildUpdate {
                 child_identifier: e.clone(),
                 child_policy_builder: PickFirstBuilder {},
-                child_update: Some((update, None)),
+                child_update: Some((update, &config.0)),
             }
         });
         self.child_manager
@@ -285,7 +297,7 @@ mod test {
 
     // Sends a resolver update to the LB policy with the specified endpoint.
     fn send_resolver_update_to_policy(
-        lb_policy: &mut impl LbPolicy,
+        lb_policy: &mut RoundRobinPolicy,
         endpoints: Vec<Endpoint>,
         tcc: &mut dyn ChannelController,
     ) {
@@ -293,7 +305,7 @@ mod test {
             endpoints: Ok(endpoints),
             ..Default::default()
         };
-        let _ = lb_policy.resolver_update(update, None, tcc);
+        let _ = lb_policy.resolver_update(update, &RoundRobinConfig::default(), tcc);
     }
 
     fn send_resolver_error_to_policy(
@@ -305,7 +317,7 @@ mod test {
             endpoints: Err(err),
             ..Default::default()
         };
-        let _ = lb_policy.resolver_update(update, None, tcc);
+        let _ = lb_policy.resolver_update(update, &RoundRobinConfig::default(), tcc);
     }
 
     // Simulates a state change of `subchannel` and delivers the resulting work
@@ -684,7 +696,7 @@ mod test {
             endpoints: Ok(vec![]),
             ..Default::default()
         };
-        let _ = lb_policy.resolver_update(update, None, tcc);
+        let _ = lb_policy.resolver_update(update, &RoundRobinConfig::default(), tcc);
         let want_error = "Received empty address list from the name resolver";
         verify_transient_failure_picker(&mut rx_events, want_error.to_string());
         verify_resolution_request(&mut rx_events);
@@ -961,7 +973,11 @@ mod test {
             endpoints: Ok(vec![]),
             ..Default::default()
         };
-        assert!(lb_policy.resolver_update(update, None, tcc).is_err());
+        assert!(
+            lb_policy
+                .resolver_update(update, &RoundRobinConfig::default(), tcc)
+                .is_err()
+        );
         verify_transient_failure_picker(
             &mut rx_events,
             "Received empty address list from the name resolver".to_string(),

@@ -39,6 +39,9 @@ use crate::xds::cert_provider_config::{FileWatcherConfig, TlsChannelCredentials}
 const ENV_BOOTSTRAP_FILE: &str = "GRPC_XDS_BOOTSTRAP";
 /// Environment variable containing inline bootstrap JSON.
 const ENV_BOOTSTRAP_CONFIG: &str = "GRPC_XDS_BOOTSTRAP_CONFIG";
+/// `Node.user_agent_name`, which gRFC A27 has the client populate rather than
+/// the bootstrap. The "gRPC <language>" prefix matches other gRPC xDS clients.
+const USER_AGENT_NAME: &str = "gRPC Rust tonic-xds";
 
 /// Parsed xDS bootstrap configuration per [gRFC A27].
 ///
@@ -841,7 +844,7 @@ impl TryFrom<NodeConfig> for Node {
     type Error = BootstrapError;
 
     fn try_from(config: NodeConfig) -> Result<Self, Self::Error> {
-        let mut node = Node::new("tonic-xds", env!("CARGO_PKG_VERSION"));
+        let mut node = Node::new(USER_AGENT_NAME, env!("CARGO_PKG_VERSION"));
 
         if !config.id.is_empty() {
             node = node.with_id(config.id);
@@ -941,7 +944,7 @@ mod tests {
         let node = Node::try_from(config.node).unwrap();
         assert_eq!(node.id.as_deref(), Some("projects/123/nodes/456"));
         assert_eq!(node.cluster.as_deref(), Some("test-cluster"));
-        assert_eq!(node.user_agent_name, "tonic-xds");
+        assert_eq!(node.user_agent_name, "gRPC Rust tonic-xds");
 
         let locality = node.locality.unwrap();
         assert_eq!(locality.region, "us-east1");

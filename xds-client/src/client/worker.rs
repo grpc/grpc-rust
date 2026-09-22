@@ -2144,10 +2144,13 @@ mod flow_control_tests {
             .responses
             .send(Ok(Some(response("2", "n2", &["extra"]))))
             .unwrap();
-        assert_no_event(&mut extra, "second response delivered before all tokens dropped").await;
+        assert_no_event(
+            &mut extra,
+            "second response delivered before all tokens dropped",
+        )
+        .await;
 
         drop(dones);
         assert!(next_changed(&mut extra).await.0.is_ok());
     }
 }
-

@@ -34,11 +34,11 @@ use rand::seq::SliceRandom;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickOptions;
 use crate::client::load_balancing::PickResult;
@@ -92,7 +92,7 @@ impl LbPolicyBuilder for PickFirstBuilder {
         POLICY_NAME
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<PickFirstConfig, String> {
+    fn parse_config(&self, config: &LbConfigJson) -> Result<PickFirstConfig, String> {
         let config: PickFirstConfig = config.convert_to().map_err(|e| e.to_string())?;
         Ok(config)
     }

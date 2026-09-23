@@ -31,14 +31,14 @@ use std::sync::LazyLock;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
-use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::pick_first;
 
 static DEFAULT_PICK_FIRST: LazyLock<(Arc<DynLbPolicyBuilder>, DynLbConfig)> = LazyLock::new(|| {
     let builder = GLOBAL_LB_REGISTRY
         .get_policy(pick_first::POLICY_NAME)
         .expect("pick_first policy must be registered");
-    let default_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
+    let default_json = LbConfigJson::empty();
     let parsed_config = builder
         .parse_config(&default_json)
         .expect("pick first must parse an empty config");
@@ -77,7 +77,7 @@ impl ServiceConfig {
         if let Some(ref policy) = self.inner.load_balancing_policy
             && let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(policy)
         {
-            let empty_json = ParsedJsonLbConfig::from_value(serde_json::json!({}));
+            let empty_json = LbConfigJson::empty();
             if let Ok(parsed_config) = builder.parse_config(&empty_json) {
                 return (builder, parsed_config);
             }
@@ -128,7 +128,7 @@ mod test {
 
         fn parse_config(
             &self,
-            config: &ParsedJsonLbConfig,
+            config: &LbConfigJson,
         ) -> Result<<Self::LbPolicy as crate::client::load_balancing::LbPolicy>::LbConfig, String>
         {
             let config: TestPolicyConfig = config.convert_to().map_err(|e| e.to_string())?;

@@ -29,7 +29,7 @@
 //!
 //! 1. The cluster resource watch — produces a fresh [`Connector`] on each
 //!    CDS update (e.g. when `transport_socket` changes). The connector is
-//!    held inside a [`ConnectorSwap`] so the diff loop reads the latest
+//!    held by the [`EndpointManager`] so the diff loop reads the latest
 //!    snapshot per endpoint connection.
 //! 2. The endpoint watch — produces `Change::Insert` / `Change::Remove`
 //!    events forwarded to the LB layer.
@@ -40,7 +40,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,7 +56,7 @@ use crate::common::async_util::BoxFuture;
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
-use crate::xds::endpoint_manager::{ConnectorSwap, EndpointManager};
+use crate::xds::endpoint_manager::{EndpointManager, SharedConnector, healthy_addresses};
 
 /// Buffer capacity for the discovery channel between the spawned task and
 /// Tower's LB layer.
@@ -141,7 +140,7 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
         tokio::spawn(async move {
             let mut cluster_watch = cache.watch_cluster(&cluster_name);
 
-            let connector_swap: ConnectorSwap<MC::Service> = loop {
+            let initial: SharedConnector<MC::Service> = loop {
                 let Some(cluster) = cluster_watch.next().await else {
                     return;
                 };
@@ -151,7 +150,7 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                     &registry,
                 );
                 match make_connector.make_connector(cluster_config) {
-                    Ok(c) => break Arc::new(ArcSwap::from_pointee(c)),
+                    Ok(c) => break c,
                     Err(e) => tracing::warn!(
                         cluster = %cluster_name,
                         error = %e,
@@ -160,8 +159,9 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                 }
             };
 
-            let manager = EndpointManager::new(Arc::clone(&connector_swap));
-            let mut endpoints = manager.discover_endpoints(cache.watch_endpoints(&cluster_name));
+            let manager = EndpointManager::new(initial);
+            let mut endpoints =
+                manager.discover_endpoints(healthy_addresses(cache.watch_endpoints(&cluster_name)));
 
             loop {
                 tokio::select! {
@@ -177,7 +177,7 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                             &registry,
                         );
                         match make_connector.make_connector(cluster_config) {
-                            Ok(new) => connector_swap.store(Arc::new(new)),
+                            Ok(new) => manager.set_connector(new),
                             Err(e) => tracing::warn!(
                                 cluster = %cluster_name,
                                 error = %e,

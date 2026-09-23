@@ -22,19 +22,25 @@
  *
  */
 
-//! Converts snapshot-based endpoint cache updates into incremental
-//! [`Change`] streams for Tower's load balancing infrastructure.
+//! Converts snapshot-based endpoint updates into incremental [`Change`]
+//! streams for Tower's load balancing infrastructure.
 //!
-//! The resource manager writes [`EndpointsResource`] snapshots into the
-//! `XdsCache`; this module diffs consecutive snapshots and produces
-//! `Change::Insert` / `Change::Remove` events that Tower's P2C balancer
-//! (or any other `Discover`-based balancer) can consume.
+//! Each update carries the complete address set for a cluster; this module
+//! diffs consecutive updates and produces `Change::Insert` / `Change::Remove`
+//! events that Tower's P2C balancer (or any other `Discover`-based balancer)
+//! can consume.
+//!
+//! Which addresses belong in an update is the caller's decision. The xDS
+//! client passes the endpoints that gRFC A27 considers usable; a caller with
+//! different rules passes a different set.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use futures_core::Stream;
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tower::BoxError;
 use tower::discover::Change;
@@ -50,67 +56,79 @@ const ENDPOINT_CHANNEL_CAPACITY: usize = 64;
 
 /// An atomically-swappable [`Connector`] held by an [`EndpointManager`].
 ///
-/// `XdsClusterDiscovery` stores a snapshot of the cluster's per-CDS-update
-/// connector here. The diff loop calls `load_full()` on every new endpoint
-/// so each connection picks up the latest snapshot. Existing endpoint
-/// channels keep their `EndpointChannel` instance (and any in-flight TLS
-/// session) — only freshly-discovered endpoints see the swapped value.
+/// The diff loop calls `load_full()` on every new endpoint so each connection
+/// picks up the latest connector. Existing endpoint channels keep their
+/// `EndpointChannel` instance (and any in-flight TLS session) — only
+/// freshly-discovered endpoints see a swapped value.
 pub(crate) type ConnectorSwap<S> = Arc<ArcSwap<Arc<dyn Connector<Service = S> + Send + Sync>>>;
 
-/// Converts endpoint cache watches into incremental [`Change`] streams.
+/// A [`Connector`] an [`EndpointManager`] may be given.
+pub type SharedConnector<S> = Arc<dyn Connector<Service = S> + Send + Sync>;
+
+/// Converts endpoint updates into incremental [`Change`] streams.
 ///
-/// `EndpointManager` is a pure diff-and-connect component: the caller
-/// (typically `XdsClusterDiscovery`) obtains a [`CacheWatch`] from the
-/// [`XdsCache`](crate::xds::cache::XdsCache) and passes it here, plus a
-/// [`ConnectorSwap`] that the caller may swap on CDS updates.
-pub(crate) struct EndpointManager<S: Send + 'static> {
+/// `EndpointManager` is a pure diff-and-connect component: the caller supplies
+/// a stream of address sets and gets back the changes between consecutive
+/// sets, with each new address already connected.
+pub struct EndpointManager<S: Send + 'static> {
     connector: ConnectorSwap<S>,
 }
 
+impl<S: Send + 'static> std::fmt::Debug for EndpointManager<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointManager").finish_non_exhaustive()
+    }
+}
+
 impl<S: Send + 'static> EndpointManager<S> {
-    pub(crate) fn new(connector: ConnectorSwap<S>) -> Self {
-        Self { connector }
+    /// Builds a manager that connects through `connector`.
+    pub fn new(connector: SharedConnector<S>) -> Self {
+        Self {
+            connector: Arc::new(ArcSwap::from_pointee(connector)),
+        }
     }
 
-    /// Returns a stream of endpoint changes for the given cache watch.
+    /// Replaces the connector used for endpoints discovered from now on.
     ///
-    /// Diffs each snapshot against the previous set of healthy endpoints,
-    /// emitting `Change::Insert` for new endpoints and `Change::Remove`
-    /// for removed ones.
-    pub(crate) fn discover_endpoints(
-        &self,
-        watch: CacheWatch<EndpointsResource>,
-    ) -> BoxDiscover<EndpointAddress, S> {
+    /// A caller rebuilds the connector when the cluster's CDS resource changes.
+    /// Endpoints already discovered keep the channels they were opened with.
+    pub fn set_connector(&self, connector: SharedConnector<S>) {
+        self.connector.store(Arc::new(connector));
+    }
+
+    /// Returns a stream of endpoint changes for the given address sets.
+    ///
+    /// Diffs each set against the previous one, emitting `Change::Insert` for
+    /// addresses that appeared and `Change::Remove` for those that went. An
+    /// address present in both is left alone, so its connection survives.
+    ///
+    /// The returned stream ends when `updates` ends or the consumer drops it.
+    pub fn discover_endpoints<U>(&self, updates: U) -> BoxDiscover<EndpointAddress, S>
+    where
+        U: Stream<Item = HashSet<EndpointAddress>> + Send + 'static,
+    {
         let connector = self.connector.clone();
         let (tx, rx) = mpsc::channel(ENDPOINT_CHANNEL_CAPACITY);
 
-        // The spawned task exits naturally when either:
-        // - The CacheWatch closes (cache.remove_endpoints() drops the watch sender)
-        // - The receiver is dropped (consumer no longer reading Change events)
-        tokio::spawn(diff_loop(watch, connector, tx));
+        tokio::spawn(diff_loop(updates, connector, tx));
 
         Box::pin(ReceiverStream::new(rx))
     }
 }
 
-/// Background task: watches endpoint snapshots and emits incremental changes.
-///
-/// Each time a new [`EndpointsResource`] arrives from the cache, we diff
-/// `healthy_endpoints()` against the previous set and emit `Insert` for
-/// new endpoints followed by `Remove` for gone ones.
-async fn diff_loop<S: Send + 'static>(
-    mut watch: CacheWatch<EndpointsResource>,
+/// Background task: diffs consecutive address sets into incremental changes.
+async fn diff_loop<S, U>(
+    updates: U,
     connector: ConnectorSwap<S>,
     tx: mpsc::Sender<Result<Change<EndpointAddress, S>, BoxError>>,
-) {
+) where
+    S: Send + 'static,
+    U: Stream<Item = HashSet<EndpointAddress>> + Send + 'static,
+{
     let mut active: HashSet<EndpointAddress> = HashSet::new();
+    let mut updates = std::pin::pin!(updates);
 
-    while let Some(endpoints) = watch.next().await {
-        let new_set: HashSet<EndpointAddress> = endpoints
-            .healthy_endpoints()
-            .map(|ep| ep.address.clone())
-            .collect();
-
+    while let Some(new_set) = updates.next().await {
         for added in new_set.difference(&active) {
             let svc = connector.load_full().connect(added).await;
             if tx
@@ -130,6 +148,25 @@ async fn diff_loop<S: Send + 'static>(
 
         active = new_set;
     }
+}
+
+/// The addresses of a cluster's endpoints that gRFC A27 considers usable.
+///
+/// An endpoint whose health is neither `HEALTHY` nor `UNKNOWN` is left out, so
+/// the balancer never holds it. This is an adapter rather than something
+/// [`EndpointManager`] applies, so a caller with different rules can feed its
+/// own set.
+pub(crate) fn healthy_addresses(
+    watch: CacheWatch<EndpointsResource>,
+) -> impl Stream<Item = HashSet<EndpointAddress>> + Send + 'static {
+    futures_util::stream::unfold(watch, |mut watch| async move {
+        let endpoints = watch.next().await?;
+        let addresses = endpoints
+            .healthy_endpoints()
+            .map(|endpoint| endpoint.address.clone())
+            .collect();
+        Some((addresses, watch))
+    })
 }
 
 #[cfg(test)]
@@ -152,9 +189,8 @@ mod tests {
         }
     }
 
-    fn test_swap() -> ConnectorSwap<String> {
-        let conn: Arc<dyn Connector<Service = String> + Send + Sync> = Arc::new(StringConnector);
-        Arc::new(ArcSwap::from_pointee(conn))
+    fn test_connector() -> SharedConnector<String> {
+        Arc::new(StringConnector)
     }
 
     fn make_endpoints(cluster: &str, addrs: &[(&str, u16)]) -> Arc<EndpointsResource> {
@@ -179,14 +215,14 @@ mod tests {
     #[tokio::test]
     async fn initial_endpoints_emitted_as_inserts() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints(
             "c1",
             make_endpoints("c1", &[("10.0.0.1", 8080), ("10.0.0.2", 8080)]),
         );
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
 
         let mut addrs: Vec<String> = Vec::new();
         for _ in 0..2 {
@@ -202,11 +238,11 @@ mod tests {
     #[tokio::test]
     async fn added_endpoint_emits_insert() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
         let _ = stream.next().await; // consume initial
 
         cache.update_endpoints(
@@ -223,14 +259,14 @@ mod tests {
     #[tokio::test]
     async fn removed_endpoint_emits_remove() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints(
             "c1",
             make_endpoints("c1", &[("10.0.0.1", 8080), ("10.0.0.2", 8080)]),
         );
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
         // Consume 2 initial inserts.
         let _ = stream.next().await;
         let _ = stream.next().await;
@@ -247,11 +283,11 @@ mod tests {
     #[tokio::test]
     async fn unhealthy_endpoint_removed() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
         let _ = stream.next().await; // consume initial insert
 
         let unhealthy = Arc::new(EndpointsResource {
@@ -278,11 +314,11 @@ mod tests {
     #[tokio::test]
     async fn cache_removal_closes_stream() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
         let _ = stream.next().await; // consume initial
 
         cache.remove_endpoints("c1");
@@ -293,13 +329,13 @@ mod tests {
     #[tokio::test]
     async fn multiple_clusters_independent() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
         cache.update_endpoints("c2", make_endpoints("c2", &[("10.0.0.2", 9090)]));
 
-        let mut s1 = manager.discover_endpoints(cache.watch_endpoints("c1"));
-        let mut s2 = manager.discover_endpoints(cache.watch_endpoints("c2"));
+        let mut s1 = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
+        let mut s2 = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c2")));
 
         match s1.next().await.unwrap().unwrap() {
             Change::Insert(addr, _) => assert_eq!(addr.to_string(), "10.0.0.1:8080"),
@@ -314,11 +350,11 @@ mod tests {
     #[tokio::test]
     async fn endpoint_swap_emits_insert_then_remove() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints(healthy_addresses(cache.watch_endpoints("c1")));
         let _ = stream.next().await; // consume initial
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.2", 8080)]));

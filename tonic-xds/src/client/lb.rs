@@ -34,7 +34,7 @@ use tower::{BoxError, Service, discover::Change, load::Load};
 
 /// A pinned, boxed stream of endpoint changes for Tower's `Discover`-based
 /// load balancers.
-pub(crate) type BoxDiscover<Endpoint, S> =
+pub type BoxDiscover<Endpoint, S> =
     Pin<Box<dyn futures_core::Stream<Item = Result<Change<Endpoint, S>, BoxError>> + Send>>;
 
 /// Trait for discovering cluster endpoints.

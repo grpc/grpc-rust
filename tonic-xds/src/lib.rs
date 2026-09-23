@@ -240,6 +240,7 @@ pub use client::channel::{
 pub use client::endpoint::{
     ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
 };
+pub use client::lb::BoxDiscover;
 pub use client::retry::{
     GrpcRetryClassifierFactory, RetryClassifier, RetryClassifierFactory, RetryOutcome,
     is_retryable_connection_error,
@@ -251,6 +252,7 @@ pub use xds::bootstrap::{
     BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,
 };
 pub use xds::cert_provider_config::TlsChannelCredentials;
+pub use xds::endpoint_manager::{EndpointManager, SharedConnector};
 pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};
 /// Re-export of the error type returned by

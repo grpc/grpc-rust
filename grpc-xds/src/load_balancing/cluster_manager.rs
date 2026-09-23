@@ -111,26 +111,13 @@ struct ClusterChildConfigJson {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ClusterManagerLbBuilder {
-    deactivation_timeout: Option<Duration>,
-}
-
-impl ClusterManagerLbBuilder {
-    #[cfg(test)]
-    fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.deactivation_timeout = Some(timeout);
-        self
-    }
-}
+pub(crate) struct ClusterManagerLbBuilder;
 
 impl LbPolicyBuilder for ClusterManagerLbBuilder {
     type LbPolicy = ClusterManagerPolicy;
 
     fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
-        let timeout = self
-            .deactivation_timeout
-            .unwrap_or(DEFAULT_DEACTIVATION_TIMEOUT);
-        ClusterManagerPolicy::new(options, timeout)
+        ClusterManagerPolicy::new(options)
     }
 
     fn name(&self) -> &'static str {
@@ -298,18 +285,16 @@ pub(crate) struct ClusterManagerPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
     child_manager: ChildManager<String, AnnotatedChildBuilder>,
-    deactivation_timeout: Duration,
 }
 
 impl ClusterManagerPolicy {
-    fn new(options: LbPolicyOptions, deactivation_timeout: Duration) -> Self {
+    fn new(options: LbPolicyOptions) -> Self {
         let child_manager =
             ChildManager::new(options.runtime.clone(), options.work_scheduler.clone());
         Self {
             child_manager,
             work_scheduler: options.work_scheduler,
             runtime: options.runtime,
-            deactivation_timeout,
         }
     }
 
@@ -352,10 +337,9 @@ impl ClusterManagerPolicy {
                 let cluster = child.identifier.clone();
                 let scheduler = self.work_scheduler.clone();
                 let runtime = self.runtime.clone();
-                let timeout = self.deactivation_timeout;
 
                 let task_handle = self.runtime.spawn(Box::pin(async move {
-                    runtime.sleep(timeout).await;
+                    runtime.sleep(DEFAULT_DEACTIVATION_TIMEOUT).await;
                     scheduler.schedule_work(Some(Box::new(ClusterDeactivationTimeout {
                         cluster_name: cluster,
                     })));
@@ -551,8 +535,7 @@ mod tests {
     // - picker refresh driven by a child connectivity change.
     // - aggregate state when every child is deactivated.
     //
-    // Also look at whether the tokio start_paused should be used instead.
-    // And check whether the registry can be better injected for tests.
+    // Also check whether the registry can be better injected for tests.
 
     #[test]
     fn policy_builder_name() {
@@ -831,6 +814,23 @@ mod tests {
         }
     }
 
+    /// Advances virtual time by `duration` on the paused Tokio runtime.
+    ///
+    /// Yields before advancing so that any newly spawned deactivation timer
+    /// task runs up to its first `.await`, polling its `sleep` future and
+    /// registering on Tokio's timer wheel; a timer that has not registered is
+    /// not affected by `advance`. Yields again afterwards so woken timer tasks
+    /// can run their continuation (scheduling the timeout work item).
+    ///
+    /// Note that under `start_paused` the runtime auto-advances the clock
+    /// whenever it goes idle, so awaiting anything that is not instantly ready
+    /// can jump time forward by the full deactivation timeout.
+    async fn advance_time(duration: Duration) {
+        tokio::task::yield_now().await;
+        tokio::time::advance(duration).await;
+        tokio::task::yield_now().await;
+    }
+
     // TODO: cover exit_idle. `TestDummyLbPolicy::exit_idle` is an empty body,
     // so nothing can currently observe which children are woken. Making it
     // record the call would allow asserting:
@@ -951,12 +951,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_raii_timer_abort_on_reactivation() {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
 
         let scheduler = Arc::new(RecordingScheduler::default());
-        let builder = ClusterManagerLbBuilder::default().with_timeout(Duration::from_millis(80));
+        let builder = ClusterManagerLbBuilder::default();
         let mut policy = builder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
             runtime: default_runtime(),
@@ -1008,8 +1008,8 @@ mod tests {
             1
         );
 
-        // Reactivate cluster_b before timeout expires (20ms < 80ms)
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Reactivate cluster_b partway through the grace period.
+        advance_time(Duration::from_secs(60)).await;
         policy
             .resolver_update(ResolverUpdate::default(), &parsed_cfg_2, &mut controller)
             .unwrap();
@@ -1032,8 +1032,8 @@ mod tests {
             0
         );
 
-        // Wait past original 80ms timer expiration (sleep 120ms total)
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Advance past the original timer's deadline.
+        advance_time(DEFAULT_DEACTIVATION_TIMEOUT).await;
 
         // Verify NO deactivation timeout event was scheduled to work_scheduler
         assert!(scheduler.is_empty());
@@ -1050,12 +1050,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_timeout_expiration_prunes_child() {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
 
         let scheduler = Arc::new(RecordingScheduler::default());
-        let builder = ClusterManagerLbBuilder::default().with_timeout(Duration::from_millis(50));
+        let builder = ClusterManagerLbBuilder::default();
         let mut policy = builder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
             runtime: default_runtime(),
@@ -1098,8 +1098,8 @@ mod tests {
             .resolver_update(ResolverUpdate::default(), &parsed_cfg_1, &mut controller)
             .unwrap();
 
-        // Wait for 50ms deactivation timeout to expire
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Advance past the deactivation deadline so the timer fires.
+        advance_time(DEFAULT_DEACTIVATION_TIMEOUT + Duration::from_secs(1)).await;
 
         // Pop scheduled timeout work
         let event = scheduler

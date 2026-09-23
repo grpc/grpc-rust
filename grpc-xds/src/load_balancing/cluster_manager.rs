@@ -65,8 +65,15 @@ pub(crate) static POLICY_NAME: &str = "xds_cluster_manager_experimental";
 
 // Target cluster attribute for an RPC, keyed by its `TypeId` in the
 // per-call attribute map.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
 pub(crate) struct XdsCluster(pub(crate) String);
+
+impl std::fmt::Display for XdsCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 // TODO: deduplicate this with LbInnerConfig.
 #[derive(Clone, Debug)]
@@ -80,13 +87,13 @@ struct ChildConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterManagerConfig {
     // Todo: Hashmap or BTreeMap?
-    children: HashMap<String, ChildConfig>,
+    children: HashMap<XdsCluster, ChildConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct ClusterManagerConfigJson {
     #[serde(default)]
-    children: HashMap<String, ClusterChildConfigJson>,
+    children: HashMap<XdsCluster, ClusterChildConfigJson>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -123,17 +130,17 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
         }
 
         let mut parsed_children = HashMap::with_capacity(json_val.children.len());
-        for (cluster_name, child_cfg) in json_val.children {
+        for (cluster, child_cfg) in json_val.children {
             if child_cfg.child_policy.is_empty() {
                 return Err(format!(
-                    "cluster '{cluster_name}': childPolicy list must be non-empty"
+                    "cluster '{cluster}': childPolicy list must be non-empty"
                 ));
             }
             let mut resolved = None;
             for candidate_map in child_cfg.child_policy {
                 if candidate_map.len() != 1 {
                     return Err(format!(
-                        "cluster '{cluster_name}': childPolicy entry must contain exactly 1 policy/config pair"
+                        "cluster '{cluster}': childPolicy entry must contain exactly 1 policy/config pair"
                     ));
                 }
                 let (policy_name, policy_json) = candidate_map.into_iter().next().unwrap();
@@ -142,7 +149,7 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
                         .parse_config(&ParsedJsonLbConfig::from_value(policy_json))
                         .map_err(|e| {
                             format!(
-                                "cluster '{cluster_name}': failed to parse child policy '{policy_name}': {e}"
+                                "cluster '{cluster}': failed to parse child policy '{policy_name}': {e}"
                             )
                         })?;
                     resolved = Some(ChildConfig {
@@ -153,11 +160,9 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
                 }
             }
             let child_config = resolved.ok_or_else(|| {
-                format!(
-                    "cluster '{cluster_name}': no supported child policy found in childPolicy list"
-                )
+                format!("cluster '{cluster}': no supported child policy found in childPolicy list")
             })?;
-            parsed_children.insert(cluster_name, child_config);
+            parsed_children.insert(cluster, child_config);
         }
 
         Ok(ClusterManagerConfig {
@@ -169,7 +174,7 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
 // An instance of the Cluster Manager Load Balancing policy.
 #[derive(Debug)]
 pub(crate) struct ClusterManagerPolicy {
-    child_manager: ChildManager<String>,
+    child_manager: ChildManager<XdsCluster>,
 }
 
 impl ClusterManagerPolicy {
@@ -217,8 +222,8 @@ impl LbPolicy for ClusterManagerPolicy {
         let child_updates = config
             .children
             .iter()
-            .map(|(cluster_name, child_cfg)| ChildUpdate {
-                child_identifier: cluster_name.clone(),
+            .map(|(cluster, child_cfg)| ChildUpdate {
+                child_identifier: cluster.clone(),
                 child_policy_builder: child_cfg.builder.clone(),
                 child_update: Some((update.clone(), &child_cfg.config)),
             });
@@ -250,29 +255,29 @@ impl LbPolicy for ClusterManagerPolicy {
 // Picker that delegates to the active child picker corresponding to the cluster attribute.
 #[derive(Debug)]
 struct ClusterPicker {
-    children: HashMap<String, Arc<dyn Picker>>,
+    children: HashMap<XdsCluster, Arc<dyn Picker>>,
 }
 
 impl ClusterPicker {
-    fn new(children: HashMap<String, Arc<dyn Picker>>) -> Self {
+    fn new(children: HashMap<XdsCluster, Arc<dyn Picker>>) -> Self {
         Self { children }
     }
 
-    // Resolves the target cluster name from the per-call attributes.
-    fn resolve_cluster<'a>(&self, attributes: &'a CallAttributes) -> Result<&'a str, StatusError> {
-        attributes
-            .get::<XdsCluster>()
-            .map(|cluster| cluster.0.as_str())
-            .ok_or_else(|| {
-                // Todo: should this be INTERNAL?
-                StatusError::new(
-                    StatusCodeError::Unavailable,
-                    "cluster manager: cluster attribute not present",
-                )
-            })
+    // Resolves the target cluster from the per-call attributes.
+    fn resolve_cluster<'a>(
+        &self,
+        attributes: &'a CallAttributes,
+    ) -> Result<&'a XdsCluster, StatusError> {
+        attributes.get::<XdsCluster>().ok_or_else(|| {
+            // Todo: should this be INTERNAL?
+            StatusError::new(
+                StatusCodeError::Unavailable,
+                "cluster manager: cluster attribute not present",
+            )
+        })
     }
 
-    // Routes the request to the child picker for `cluster_name`.
+    // Looks up the child picker for `cluster`.
     //
     // A cluster missing from the map means either that it was removed from the
     // config, or that the Config Selector named a cluster this picker has never
@@ -286,24 +291,26 @@ impl ClusterPicker {
     // not be possible" given the Config Selector's two-step removal. This
     // picker cannot tell them apart, and grpc-java and grpc-core disagree on
     // the code (UNAVAILABLE vs INTERNAL). Determine what is correct here.
-    fn route_to_cluster(&self, cluster_name: &str, options: PickOptions<'_>) -> PickResult {
-        match self.children.get(cluster_name) {
-            Some(picker) => picker.pick(options),
-            None => PickResult::Drop(StatusError::new(
+    fn child_picker(&self, cluster: &XdsCluster) -> Result<&Arc<dyn Picker>, StatusError> {
+        self.children.get(cluster).ok_or_else(|| {
+            StatusError::new(
                 StatusCodeError::Unavailable,
-                format!("cluster manager: unknown cluster '{cluster_name}'"),
-            )),
-        }
+                format!("cluster manager: unknown cluster '{cluster}'"),
+            )
+        })
     }
 }
 
 impl Picker for ClusterPicker {
     fn pick(&self, options: PickOptions<'_>) -> PickResult {
-        let cluster_name = match self.resolve_cluster(options.call_attributes) {
-            Ok(name) => name.to_owned(),
+        let picker = match self
+            .resolve_cluster(options.call_attributes)
+            .and_then(|cluster| self.child_picker(cluster))
+        {
+            Ok(picker) => picker,
             Err(err) => return PickResult::Drop(err),
         };
-        self.route_to_cluster(&cluster_name, options)
+        picker.pick(options)
     }
 }
 
@@ -360,8 +367,16 @@ mod tests {
         let config = builder.parse_config(&parsed_json).expect("parse config");
 
         assert_eq!(config.children.len(), 2);
-        assert!(config.children.contains_key("cluster_a"));
-        assert!(config.children.contains_key("cluster_b"));
+        assert!(
+            config
+                .children
+                .contains_key(&XdsCluster("cluster_a".into()))
+        );
+        assert!(
+            config
+                .children
+                .contains_key(&XdsCluster("cluster_b".into()))
+        );
     }
 
     #[test]
@@ -392,10 +407,23 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PickedChild(String);
+
+    #[derive(Debug)]
+    struct TaggedPicker(String);
+
+    impl Picker for TaggedPicker {
+        fn pick(&self, options: PickOptions<'_>) -> PickResult {
+            options.call_attributes.add(PickedChild(self.0.clone()));
+            PickResult::Queue
+        }
+    }
+
     #[test]
     fn cluster_picker_pick_fails_without_attributes() {
-        let mut children: HashMap<String, Arc<dyn Picker>> = HashMap::new();
-        children.insert("cluster_one".to_string(), Arc::new(DummyPicker));
+        let mut children: HashMap<XdsCluster, Arc<dyn Picker>> = HashMap::new();
+        children.insert(XdsCluster("cluster_one".to_string()), Arc::new(DummyPicker));
         let cluster_picker = ClusterPicker { children };
 
         let req = RequestHeaders::new();
@@ -411,8 +439,8 @@ mod tests {
 
     #[test]
     fn cluster_picker_with_attributes_routing() {
-        let mut children: HashMap<String, Arc<dyn Picker>> = HashMap::new();
-        children.insert("cluster_one".to_string(), Arc::new(DummyPicker));
+        let mut children: HashMap<XdsCluster, Arc<dyn Picker>> = HashMap::new();
+        children.insert(XdsCluster("cluster_one".to_string()), Arc::new(DummyPicker));
         let cluster_picker = ClusterPicker { children };
 
         let req = RequestHeaders::new();
@@ -497,21 +525,27 @@ mod tests {
         fn request_resolution(&mut self) {}
     }
 
+    #[derive(Debug, Default, Deserialize)]
+    struct TestDummyConfig {
+        #[serde(default)]
+        tag: String,
+    }
+
     #[derive(Debug)]
     struct TestDummyLbPolicy;
 
     impl LbPolicy for TestDummyLbPolicy {
-        type LbConfig = ();
+        type LbConfig = TestDummyConfig;
 
         fn resolver_update(
             &mut self,
             _update: ResolverUpdate,
-            _config: &Self::LbConfig,
+            config: &Self::LbConfig,
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
             channel_controller.update_picker(LbState {
                 connectivity_state: ConnectivityState::Ready,
-                picker: Arc::new(DummyPicker),
+                picker: Arc::new(TaggedPicker(config.tag.clone())),
             });
             Ok(())
         }
@@ -540,8 +574,8 @@ mod tests {
             "test_dummy_lb"
         }
 
-        fn parse_config(&self, _config: &ParsedJsonLbConfig) -> Result<(), String> {
-            Ok(())
+        fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<TestDummyConfig, String> {
+            config.convert_to().map_err(|e| e.to_string())
         }
     }
 
@@ -571,10 +605,10 @@ mod tests {
         let json_2_clusters = serde_json::json!({
             "children": {
                 "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": {} }]
+                    "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }]
                 },
                 "cluster_b": {
-                    "childPolicy": [{ "test_dummy_lb": {} }]
+                    "childPolicy": [{ "test_dummy_lb": { "tag": "child_b" } }]
                 }
             }
         });
@@ -590,11 +624,35 @@ mod tests {
         assert_eq!(policy.child_manager.children().count(), 2);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
 
+        // Both clusters route to their own child picker and forward PickOptions.
+        let req = RequestHeaders::new();
+        let mut attrs_a = CallAttributes::new();
+        attrs_a.add(XdsCluster("cluster_a".into()));
+        assert!(matches!(
+            state.picker.pick(PickOptions::new(&req, &mut attrs_a)),
+            PickResult::Queue
+        ));
+        assert_eq!(
+            attrs_a.get::<PickedChild>(),
+            Some(&PickedChild("child_a".into()))
+        );
+
+        let mut attrs_b = CallAttributes::new();
+        attrs_b.add(XdsCluster("cluster_b".into()));
+        assert!(matches!(
+            state.picker.pick(PickOptions::new(&req, &mut attrs_b)),
+            PickResult::Queue
+        ));
+        assert_eq!(
+            attrs_b.get::<PickedChild>(),
+            Some(&PickedChild("child_b".into()))
+        );
+
         // Drop cluster_b from the config.
         let json_1_cluster = serde_json::json!({
             "children": {
                 "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": {} }]
+                    "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }]
                 }
             }
         });
@@ -607,22 +665,25 @@ mod tests {
             .unwrap();
 
         // cluster_b is gone from child_manager immediately
-        let identifiers: Vec<&str> = policy
+        let identifiers: Vec<&XdsCluster> = policy
             .child_manager
             .children()
-            .map(|c| c.identifier.as_str())
+            .map(|c| &c.identifier)
             .collect();
-        assert_eq!(identifiers, vec!["cluster_a"]);
+        assert_eq!(identifiers, vec![&XdsCluster("cluster_a".into())]);
 
         // ...and so is absent from the picker.
         let state = controller.latest_state.take().expect("state update");
-        let req = RequestHeaders::new();
         let mut attrs_a = CallAttributes::new();
         attrs_a.add(XdsCluster("cluster_a".into()));
         assert!(matches!(
             state.picker.pick(PickOptions::new(&req, &mut attrs_a)),
             PickResult::Queue
         ));
+        assert_eq!(
+            attrs_a.get::<PickedChild>(),
+            Some(&PickedChild("child_a".into()))
+        );
 
         let mut attrs_b = CallAttributes::new();
         attrs_b.add(XdsCluster("cluster_b".into()));

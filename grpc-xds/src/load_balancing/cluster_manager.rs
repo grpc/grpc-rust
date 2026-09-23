@@ -48,6 +48,7 @@ use grpc::__unstable::client::load_balancing::LbPolicyBuilder;
 use grpc::__unstable::client::load_balancing::LbPolicyOptions;
 use grpc::__unstable::client::load_balancing::LbState;
 use grpc::__unstable::client::load_balancing::ParsedJsonLbConfig;
+use grpc::__unstable::client::load_balancing::PickOptions;
 use grpc::__unstable::client::load_balancing::PickResult;
 use grpc::__unstable::client::load_balancing::Picker;
 use grpc::__unstable::client::load_balancing::WorkData;
@@ -56,8 +57,7 @@ use grpc::__unstable::client::load_balancing::child_manager::ChildUpdate;
 use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::StatusCodeError;
 use grpc::StatusError;
-use grpc::client::RequestHeaders;
-use http::Extensions;
+use grpc::call_attributes::CallAttributes;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -65,12 +65,6 @@ pub(crate) static POLICY_NAME: &str = "xds_cluster_manager_experimental";
 
 // Target cluster attribute for an RPC, keyed by its `TypeId` in the
 // per-call attribute map.
-//
-// TODO: swap [`Extensions`] for `grpc::call_attributes::CallAttributes` once
-// it lands (grpc/grpc-rust#2878). Both are TypeId-keyed and `get` is identical;
-// `CallAttributes` drops the `Sync` bound, so the swap only loosens
-// requirements. Note `&CallAttributes` will not be `Send`, unlike
-// `&Extensions`, so the reference must not outlive a synchronous pick.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct XdsCluster(pub(crate) String);
 
@@ -265,12 +259,9 @@ impl ClusterPicker {
     }
 
     // Resolves the target cluster name from the per-call attributes.
-    fn resolve_cluster<'a>(
-        &self,
-        attributes: Option<&'a Extensions>,
-    ) -> Result<&'a str, StatusError> {
+    fn resolve_cluster<'a>(&self, attributes: &'a CallAttributes) -> Result<&'a str, StatusError> {
         attributes
-            .and_then(|attrs| attrs.get::<XdsCluster>())
+            .get::<XdsCluster>()
             .map(|cluster| cluster.0.as_str())
             .ok_or_else(|| {
                 // Todo: should this be INTERNAL?
@@ -295,33 +286,24 @@ impl ClusterPicker {
     // not be possible" given the Config Selector's two-step removal. This
     // picker cannot tell them apart, and grpc-java and grpc-core disagree on
     // the code (UNAVAILABLE vs INTERNAL). Determine what is correct here.
-    fn route_to_cluster(&self, cluster_name: &str, request: &RequestHeaders) -> PickResult {
+    fn route_to_cluster(&self, cluster_name: &str, options: PickOptions<'_>) -> PickResult {
         match self.children.get(cluster_name) {
-            Some(picker) => picker.pick(request),
+            Some(picker) => picker.pick(options),
             None => PickResult::Drop(StatusError::new(
                 StatusCodeError::Unavailable,
                 format!("cluster manager: unknown cluster '{cluster_name}'"),
             )),
         }
     }
-
-    // Picks a child policy using the per-call attributes.
-    fn pick_with_attributes(
-        &self,
-        request: &RequestHeaders,
-        attributes: Option<&Extensions>,
-    ) -> PickResult {
-        match self.resolve_cluster(attributes) {
-            Ok(cluster_name) => self.route_to_cluster(cluster_name, request),
-            Err(err) => PickResult::Drop(err),
-        }
-    }
 }
 
 impl Picker for ClusterPicker {
-    fn pick(&self, request: &RequestHeaders) -> PickResult {
-        // TODO: pass the call's attributes here. Need to know API.
-        self.pick_with_attributes(request, None)
+    fn pick(&self, options: PickOptions<'_>) -> PickResult {
+        let cluster_name = match self.resolve_cluster(options.call_attributes) {
+            Ok(name) => name.to_owned(),
+            Err(err) => return PickResult::Drop(err),
+        };
+        self.route_to_cluster(&cluster_name, options)
     }
 }
 
@@ -333,6 +315,7 @@ mod tests {
     use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
     use grpc::__unstable::rt::default_runtime;
     use grpc::client::ConnectivityState;
+    use grpc::client::RequestHeaders;
     use grpc::core::Address;
 
     use super::*;
@@ -349,7 +332,7 @@ mod tests {
 
     #[test]
     fn policy_builder_name() {
-        let builder = ClusterManagerLbBuilder::default();
+        let builder = ClusterManagerLbBuilder;
         assert_eq!(builder.name(), "xds_cluster_manager_experimental");
     }
 
@@ -373,7 +356,7 @@ mod tests {
         .to_string();
 
         let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder::default();
+        let builder = ClusterManagerLbBuilder;
         let config = builder.parse_config(&parsed_json).expect("parse config");
 
         assert_eq!(config.children.len(), 2);
@@ -395,7 +378,7 @@ mod tests {
         .to_string();
 
         let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder::default();
+        let builder = ClusterManagerLbBuilder;
         let err = builder.parse_config(&parsed_json).unwrap_err();
         assert!(err.contains("no supported child policy"));
     }
@@ -404,29 +387,20 @@ mod tests {
     struct DummyPicker;
 
     impl Picker for DummyPicker {
-        fn pick(&self, _request: &RequestHeaders) -> PickResult {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
             PickResult::Queue
         }
     }
 
-    // TODO: restore end-to-end picker coverage once per-call attributes reach
-    // `Picker::pick`. That needs `CallAttributes` (grpc/grpc-rust#2878) and a
-    // way to pass them to `pick()`.
-    //
-    // Cases to to cover once we have above:
-    //
-    // - pick with a known cluster attribute delegates to that child's picker
-    // - pick with an unknown cluster attribute fails UNAVAILABLE
-    // - pick for a cluster removed from the config fails UNAVAILABLE
     #[test]
     fn cluster_picker_pick_fails_without_attributes() {
         let mut children: HashMap<String, Arc<dyn Picker>> = HashMap::new();
         children.insert("cluster_one".to_string(), Arc::new(DummyPicker));
         let cluster_picker = ClusterPicker { children };
 
-        // `pick` cannot supply attributes, so every request fails regardless of
-        // what the channel has configured.
-        match cluster_picker.pick(&RequestHeaders::new()) {
+        let req = RequestHeaders::new();
+        let mut attrs = CallAttributes::new();
+        match cluster_picker.pick(PickOptions::new(&req, &mut attrs)) {
             PickResult::Drop(err) => {
                 assert_eq!(err.code(), StatusCodeError::Unavailable);
                 assert!(err.message().contains("not present"));
@@ -441,45 +415,26 @@ mod tests {
         children.insert("cluster_one".to_string(), Arc::new(DummyPicker));
         let cluster_picker = ClusterPicker { children };
 
-        // Known cluster in attributes -> routes to child picker
         let req = RequestHeaders::new();
         let attrs_for = |cluster: &str| {
-            let mut attrs = Extensions::new();
-            attrs.insert(XdsCluster(cluster.into()));
+            let mut attrs = CallAttributes::new();
+            attrs.add(XdsCluster(cluster.into()));
             attrs
         };
-        let attrs_known = attrs_for("cluster_one");
-        match cluster_picker.pick_with_attributes(&req, Some(&attrs_known)) {
+
+        // Known cluster in attributes -> routes to child picker
+        let mut attrs_known = attrs_for("cluster_one");
+        match cluster_picker.pick(PickOptions::new(&req, &mut attrs_known)) {
             PickResult::Queue => {}
             other => panic!("expected Queue from DummyPicker, got {other:?}"),
         }
 
         // Unknown cluster in attributes -> UNAVAILABLE
-        let attrs_unknown = attrs_for("cluster_unknown");
-        match cluster_picker.pick_with_attributes(&req, Some(&attrs_unknown)) {
+        let mut attrs_unknown = attrs_for("cluster_unknown");
+        match cluster_picker.pick(PickOptions::new(&req, &mut attrs_unknown)) {
             PickResult::Drop(err) => {
                 assert_eq!(err.code(), StatusCodeError::Unavailable);
                 assert!(err.message().contains("unknown cluster"));
-            }
-            other => panic!("expected Drop, got {other:?}"),
-        }
-
-        // Empty attributes -> UNAVAILABLE
-        let attrs_empty = Extensions::new();
-        match cluster_picker.pick_with_attributes(&req, Some(&attrs_empty)) {
-            PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
-                assert!(err.message().contains("not present"));
-            }
-            other => panic!("expected Drop, got {other:?}"),
-        }
-
-        // No attributes at all -> UNAVAILABLE. Nothing else about the request
-        // can select a cluster.
-        match cluster_picker.pick_with_attributes(&req, None) {
-            PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
-                assert!(err.message().contains("not present"));
             }
             other => panic!("expected Drop, got {other:?}"),
         }
@@ -493,7 +448,7 @@ mod tests {
         .to_string();
 
         let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder::default();
+        let builder = ClusterManagerLbBuilder;
         let err = builder.parse_config(&parsed_json).unwrap_err();
         assert!(err.contains("children"));
     }
@@ -510,7 +465,7 @@ mod tests {
         .to_string();
 
         let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder::default();
+        let builder = ClusterManagerLbBuilder;
         let err = builder.parse_config(&parsed_json).unwrap_err();
         assert!(err.contains("childPolicy"));
     }
@@ -594,13 +549,11 @@ mod tests {
     // so nothing can currently observe which children are woken. Making it
     // record the call would allow asserting that exit_idle reaches every
     // configured child.
-    //
-    // Unlike the picker cases above, this is not blocked on call attributes.
     #[tokio::test]
     async fn removed_cluster_is_shut_down() {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
 
-        let builder = ClusterManagerLbBuilder::default();
+        let builder = ClusterManagerLbBuilder;
         let mut policy = builder.build(LbPolicyOptions {
             work_scheduler: Arc::new(MockScheduler),
             // TODO: replace with a no-op test runtime once `rt::Runtime` can be
@@ -653,8 +606,7 @@ mod tests {
             .resolver_update(ResolverUpdate::default(), &parsed_cfg_1, &mut controller)
             .unwrap();
 
-        // cluster_b is gone from child_manager immediately; there is no
-        // retention period.
+        // cluster_b is gone from child_manager immediately
         let identifiers: Vec<&str> = policy
             .child_manager
             .children()
@@ -663,18 +615,23 @@ mod tests {
         assert_eq!(identifiers, vec!["cluster_a"]);
 
         // ...and so is absent from the picker.
-        //
-        // TODO: assert this via `state.picker.pick(...)` instead, once a pick
-        // can name a cluster. See the picker TODO above.
         let state = controller.latest_state.take().expect("state update");
-        let picker = format!("{:?}", state.picker);
-        assert!(
-            picker.contains("cluster_a"),
-            "configured cluster missing from picker: {picker}"
-        );
-        assert!(
-            !picker.contains("cluster_b"),
-            "removed cluster present in picker: {picker}"
-        );
+        let req = RequestHeaders::new();
+        let mut attrs_a = CallAttributes::new();
+        attrs_a.add(XdsCluster("cluster_a".into()));
+        assert!(matches!(
+            state.picker.pick(PickOptions::new(&req, &mut attrs_a)),
+            PickResult::Queue
+        ));
+
+        let mut attrs_b = CallAttributes::new();
+        attrs_b.add(XdsCluster("cluster_b".into()));
+        match state.picker.pick(PickOptions::new(&req, &mut attrs_b)) {
+            PickResult::Drop(err) => {
+                assert_eq!(err.code(), StatusCodeError::Unavailable);
+                assert!(err.message().contains("unknown cluster"));
+            }
+            other => panic!("expected Drop for removed cluster, got {other:?}"),
+        }
     }
 }

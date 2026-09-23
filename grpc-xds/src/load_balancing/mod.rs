@@ -36,5 +36,5 @@ pub(crate) mod cluster_manager;
 /// Repeated calls overwrite the existing entry with an equivalent builder.
 pub fn register() {
     // Todo: assess whether this is a valid time to update the registry.
-    GLOBAL_LB_REGISTRY.add_builder(cluster_manager::ClusterManagerLbBuilder::default());
+    GLOBAL_LB_REGISTRY.add_builder(cluster_manager::ClusterManagerLbBuilder);
 }

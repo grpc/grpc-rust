@@ -577,9 +577,8 @@ pub(crate) struct AdsWorker<TB, C, R> {
 }
 
 /// A watcher notification staged during response handling: the channel to
-/// deliver on and the event, carrying its `ProcessingDone` token. Events
-/// that participate in ADS flow control share the response's single
-/// `ProcessingDone` signal; the others carry a detached token.
+/// deliver on and the event, carrying a share of the response's
+/// `ProcessingDone` token.
 type Delivery = (
     mpsc::Sender<ResourceEvent<DecodedResource>>,
     ResourceEvent<DecodedResource>,
@@ -1104,7 +1103,7 @@ where
         // Only notify watchers for per-resource errors (where we know the name).
         // Top-level errors have no associated name, so no watcher to notify.
         for (resource_name, error) in &per_resource_errors {
-            self.notify_resource_error(&mut deliveries, &type_url, resource_name, error);
+            self.notify_resource_error(&mut deliveries, &type_url, resource_name, error, &done);
         }
 
         // Detect deleted resources (per A53):
@@ -1201,14 +1200,14 @@ where
     /// Stage validation-error notifications for a specific resource.
     ///
     /// Per gRFC A46/A88, errors are routed only to watchers interested in
-    /// that specific resource (plus wildcard watchers). Error events do not
-    /// gate flow control (they carry a detached `ProcessingDone` token).
+    /// that specific resource (plus wildcard watchers).
     fn notify_resource_error(
         &mut self,
         deliveries: &mut Vec<Delivery>,
         type_url: &str,
         resource_name: &str,
         error: &str,
+        done: &ProcessingDone,
     ) {
         let type_state = match self.type_states.get_mut(type_url) {
             Some(s) => s,
@@ -1230,7 +1229,7 @@ where
         for event_tx in type_state.matching_watchers(resource_name) {
             let event = ResourceEvent::ResourceChanged {
                 result: Err(Error::Validation(error.to_string())),
-                done: ProcessingDone::detached(),
+                done: done.share(),
             };
             deliveries.push((event_tx, event));
         }
@@ -1954,11 +1953,11 @@ mod flow_control_tests {
         assert!(next_changed(&mut w2).await.0.is_ok());
     }
 
-    /// Validation-error events do not gate flow control (gRFC A46/A88):
-    /// the response is NACKed, valid resources are still delivered, and a
-    /// held error token must not delay the next response.
+    /// Validation-error events gate flow control like regular updates:
+    /// the response is NACKed, valid resources are still delivered, and
+    /// holding the error token delays the next response.
     #[tokio::test]
-    async fn error_events_do_not_gate_next_response() {
+    async fn error_events_gate_next_response() {
         let (client, mut w_ok, mut server) = connected_client().await;
         let mut w_bad = watch_synced(&client, &mut server, "bad-0").await;
 
@@ -1968,7 +1967,7 @@ mod flow_control_tests {
             .unwrap();
         let (result, done_ok) = next_changed(&mut w_ok).await;
         assert!(result.is_ok());
-        let (result, _err_done) = next_changed(&mut w_bad).await;
+        let (result, err_done) = next_changed(&mut w_bad).await;
         assert!(matches!(result, Err(Error::Validation(_))));
 
         // NACK keeps the old (empty) version.
@@ -1983,7 +1982,13 @@ mod flow_control_tests {
             .responses
             .send(Ok(Some(response("2", "n2", &["res-0"]))))
             .unwrap();
-        // `_err_done` is still held; it must not gate this delivery.
+        assert_no_event(
+            &mut w_ok,
+            "response delivered while the error token was held",
+        )
+        .await;
+
+        drop(err_done);
         assert!(next_changed(&mut w_ok).await.0.is_ok());
     }
 

@@ -455,6 +455,8 @@ impl Runtime for NoOpRuntime {
     }
 }
 
+// TODO: probably make this `pub(crate)` again once other crates can supply
+// their own `Runtime`. Public so that grpc-xds crate can use it for tests.
 pub fn default_runtime() -> GrpcRuntime {
     #[cfg(feature = "_runtime-tokio")]
     {

@@ -425,7 +425,7 @@ mod tests {
         }
         fn parse_config(
             &self,
-            _config: &crate::client::load_balancing::ParsedJsonLbConfig,
+            _config: &crate::client::load_balancing::LbConfigJson,
         ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
             Ok(())
         }

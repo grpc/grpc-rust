@@ -32,7 +32,6 @@ use std::sync::atomic::Ordering;
 use rand::seq::SliceRandom;
 
 use crate::client::ConnectivityState;
-use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::LbPolicy;
@@ -41,6 +40,7 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Pick;
+use crate::client::load_balancing::PickOptions;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
@@ -653,7 +653,7 @@ struct OneSubchannelPicker {
 }
 
 impl Picker for OneSubchannelPicker {
-    fn pick(&self, _: &RequestHeaders) -> PickResult {
+    fn pick(&self, _: PickOptions<'_>) -> PickResult {
         PickResult::Pick(Pick {
             subchannel: self.sc.clone(),
             metadata: MetadataMap::new(),
@@ -678,7 +678,7 @@ impl IdlePicker {
 }
 
 impl Picker for IdlePicker {
-    fn pick(&self, _: &RequestHeaders) -> PickResult {
+    fn pick(&self, _: PickOptions<'_>) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
             self.work_scheduler.schedule_work(None);
         }
@@ -748,6 +748,8 @@ mod test {
     use std::time::Duration;
 
     use super::*;
+    use crate::call_attributes::CallAttributes;
+    use crate::client::RequestHeaders;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
@@ -959,7 +961,10 @@ mod test {
         // Should update picker to READY with sc1.
         let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        let res = state.picker.pick(&RequestHeaders::default());
+        let res = state.picker.pick(PickOptions::new(
+            &RequestHeaders::default(),
+            &mut CallAttributes::new(),
+        ));
         match res {
             PickResult::Pick(pick) => {
                 assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
@@ -1387,7 +1392,10 @@ mod test {
         // The policy should switch to it immediately (enter READY state).
         let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        let res = state.picker.pick(&RequestHeaders::default());
+        let res = state.picker.pick(PickOptions::new(
+            &RequestHeaders::default(),
+            &mut CallAttributes::new(),
+        ));
         match res {
             PickResult::Pick(pick) => {
                 assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
@@ -1636,7 +1644,10 @@ mod test {
         // 1. Consume the initial Ready picker update.
         let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        let res = state.picker.pick(&RequestHeaders::default());
+        let res = state.picker.pick(PickOptions::new(
+            &RequestHeaders::default(),
+            &mut CallAttributes::new(),
+        ));
         let sc1 = match res {
             PickResult::Pick(pick) => {
                 assert_eq!(pick.subchannel.address().address.to_string(), "addr1");
@@ -1666,7 +1677,10 @@ mod test {
         assert!(rx.try_recv().is_err(), "unexpected event");
 
         // 4. Simulate an RPC (pick) happening.
-        let pick_result = idle_picker.pick(&RequestHeaders::default());
+        let pick_result = idle_picker.pick(PickOptions::new(
+            &RequestHeaders::default(),
+            &mut CallAttributes::new(),
+        ));
         assert!(matches!(pick_result, PickResult::Queue));
 
         // 5. The picker should schedule work.

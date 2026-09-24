@@ -34,7 +34,8 @@ pub(crate) mod cluster_manager;
 /// but it cannot reference policies defined in this crate. Callers must invoke
 /// this before a channel resolves a service config naming an xDS policy.
 /// Repeated calls overwrite the existing entry with an equivalent builder.
-pub fn register() {
+#[allow(dead_code)]
+pub(crate) fn register() {
     // Todo: assess whether this is a valid time to update the registry.
     GLOBAL_LB_REGISTRY.add_builder(cluster_manager::ClusterManagerLbBuilder);
 }

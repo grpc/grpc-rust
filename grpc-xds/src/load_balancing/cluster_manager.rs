@@ -31,10 +31,11 @@
 //!
 //! Clusters removed from the configuration are shut down immediately.
 //!
-//! TODO: gRFC A31 does not specify retention behaviour for removed clusters,
-//! and existing implementations in other langauges disagree. Revisit
-//! once there is cross-language agreement on the intended behaviour or we
-//! implement subchannel caching, which serves the same purpose.
+//! TODO(https://github.com/grpc/grpc-rust/issues/2890): gRFC A31 does not
+//! specify retention behaviour for removed clusters, and existing
+//! implementations in other languages disagree. Revisit once there is
+//! cross-language agreement on the intended behaviour or we implement
+//! subchannel caching, which serves the same purpose.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,13 +58,12 @@ use grpc::StatusCodeError;
 use grpc::StatusError;
 use grpc::call_attributes::CallAttributes;
 use serde::Deserialize;
-use serde::Serialize;
 
 pub(crate) static POLICY_NAME: &str = "xds_cluster_manager_experimental";
 
 // Target cluster attribute for an RPC, keyed by its `TypeId` in the
 // per-call attribute map.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct XdsCluster(pub(crate) String);
 
@@ -75,19 +75,14 @@ impl std::fmt::Display for XdsCluster {
 
 // Validated configuration for `xds_cluster_manager_experimental`.
 // Maps a cluster name to a load balancing configuration for that cluster.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ClusterManagerConfig {
-    children: HashMap<XdsCluster, ParsedLbConfig>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct ClusterManagerConfigJson {
     #[serde(default)]
-    children: HashMap<XdsCluster, ClusterChildConfigJson>,
+    children: HashMap<XdsCluster, ClusterChildConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct ClusterChildConfigJson {
+#[derive(Clone, Debug, Deserialize)]
+struct ClusterChildConfig {
     #[serde(rename = "childPolicy")]
     child_policy: ParsedLbConfig,
 }
@@ -107,24 +102,18 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
     }
 
     fn parse_config(&self, config: &LbConfigJson) -> Result<ClusterManagerConfig, String> {
-        let json_val: ClusterManagerConfigJson = config
+        let parsed: ClusterManagerConfig = config
             .convert_to()
             .map_err(|e| format!("failed to deserialize xds_cluster_manager config: {e}"))?;
 
-        if json_val.children.is_empty() {
+        if parsed.children.is_empty() {
             return Err(
                 "failed to parse xds_cluster_manager config: 'children' must be non-empty"
                     .to_string(),
             );
         }
 
-        let children = json_val
-            .children
-            .into_iter()
-            .map(|(cluster, child_cfg)| (cluster, child_cfg.child_policy))
-            .collect();
-
-        Ok(ClusterManagerConfig { children })
+        Ok(parsed)
     }
 }
 
@@ -181,8 +170,8 @@ impl LbPolicy for ClusterManagerPolicy {
             .iter()
             .map(|(cluster, child_cfg)| ChildUpdate {
                 child_identifier: cluster.clone(),
-                child_policy_builder: child_cfg.builder.clone(),
-                child_update: Some((update.clone(), &child_cfg.config)),
+                child_policy_builder: child_cfg.child_policy.builder.clone(),
+                child_update: Some((update.clone(), &child_cfg.child_policy.config)),
             });
 
         self.child_manager

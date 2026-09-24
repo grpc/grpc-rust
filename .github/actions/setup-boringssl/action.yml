@@ -1,0 +1,45 @@
+name: "Setup BoringSSL"
+description: "Clone, build, and cache BoringSSL with Rust bindings"
+runs:
+  using: "composite"
+  steps:
+    - name: Cache BoringSSL build
+      uses: actions/cache@v4
+      id: bssl-cache
+      with:
+        path: ${{ runner.temp }}/boringssl/build
+        key: boringssl-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+    - name: Install bindgen-cli
+      if: steps.bssl-cache.outputs.cache-hit != 'true'
+      uses: taiki-e/cache-cargo-install-action@v2
+      with:
+        tool: bindgen-cli
+
+    - name: Build BoringSSL
+      if: steps.bssl-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        BUILD_DIR="${{ runner.temp }}/boringssl/build"
+        SRC_DIR="${{ runner.temp }}/boringssl/src"
+        mkdir -p "${{ runner.temp }}/boringssl"
+        if [ ! -d "$SRC_DIR/.git" ]; then
+          git clone https://boringssl.googlesource.com/boringssl "$SRC_DIR"
+        fi
+        REV=$(grep -A 2 'name = "bssl-sys"' Cargo.lock | grep -o 'boringssl#[a-f0-9]*' | cut -d'#' -f2 | head -n1 | tr -d '\r' || true)
+        TARGET=$(rustc -vV | sed -n 's|host: ||p' | tr -d '\r')
+        cd "$SRC_DIR"
+        if [ -n "$REV" ]; then
+          git checkout "$REV"
+        fi
+        cmake -GNinja -B "$BUILD_DIR" -S "$SRC_DIR" -DBUILD_TESTING=OFF -DRUST_BINDINGS="$TARGET"
+        ninja -C "$BUILD_DIR" crypto ssl bssl_sys
+
+    - name: Export BORINGSSL_BUILD_DIR and C++ runtime library
+      shell: bash
+      run: |
+        echo "BORINGSSL_BUILD_DIR=${{ runner.temp }}/boringssl/build" >> "$GITHUB_ENV"
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          echo "BORINGSSL_RUST_CPPLIB=stdc++" >> "$GITHUB_ENV"
+        fi

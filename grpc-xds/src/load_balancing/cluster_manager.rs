@@ -285,16 +285,6 @@ mod tests {
 
     use super::*;
 
-    // TODO: outstanding test coverage gaps (probably - needs review)
-    //
-    // Policy plumbing:
-    // - `work()` delegating data to the child manager.
-    // - `work(None)`.
-    // - `child_manager.update()` returning Err.
-    // - picker refresh driven by a child connectivity change.
-    //
-    // Also check whether the registry can be better injected for tests.
-
     #[test]
     fn policy_builder_name() {
         let builder = ClusterManagerLbBuilder;
@@ -456,11 +446,15 @@ mod tests {
         assert!(err.contains("must not be empty"));
     }
 
-    #[derive(Debug)]
-    struct MockScheduler;
+    #[derive(Debug, Default)]
+    struct MockScheduler {
+        queued_work: std::sync::Mutex<Vec<Option<WorkData>>>,
+    }
 
     impl WorkScheduler for MockScheduler {
-        fn schedule_work(&self, _data: Option<WorkData>) {}
+        fn schedule_work(&self, data: Option<WorkData>) {
+            self.queued_work.lock().unwrap().push(data);
+        }
     }
 
     struct MockChannelController {
@@ -487,10 +481,19 @@ mod tests {
     struct TestDummyConfig {
         #[serde(default)]
         tag: String,
+        #[serde(default)]
+        fail_update: bool,
+        #[serde(default)]
+        start_connecting: bool,
+        #[serde(default)]
+        start_idle: bool,
     }
 
     #[derive(Debug)]
-    struct TestDummyLbPolicy;
+    struct TestDummyLbPolicy {
+        work_scheduler: Arc<dyn WorkScheduler>,
+        tag: String,
+    }
 
     impl LbPolicy for TestDummyLbPolicy {
         type LbConfig = TestDummyConfig;
@@ -501,21 +504,47 @@ mod tests {
             config: &Self::LbConfig,
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
-            channel_controller.update_picker(LbState {
-                connectivity_state: ConnectivityState::Ready,
-                picker: Arc::new(TaggedPicker(config.tag.clone())),
-            });
+            if config.fail_update {
+                return Err("simulated child resolver_update failure".to_string());
+            }
+            self.tag = config.tag.clone();
+            if config.start_connecting {
+                channel_controller.update_picker(LbState {
+                    connectivity_state: ConnectivityState::Connecting,
+                    picker: Arc::new(DummyPicker),
+                });
+                self.work_scheduler.schedule_work(None);
+            } else if config.start_idle {
+                channel_controller.update_picker(LbState {
+                    connectivity_state: ConnectivityState::Idle,
+                    picker: Arc::new(DummyPicker),
+                });
+            } else {
+                channel_controller.update_picker(LbState {
+                    connectivity_state: ConnectivityState::Ready,
+                    picker: Arc::new(TaggedPicker(config.tag.clone())),
+                });
+            }
             Ok(())
         }
 
         fn work(
             &mut self,
             _data: Option<WorkData>,
-            _channel_controller: &mut dyn ChannelController,
+            channel_controller: &mut dyn ChannelController,
         ) {
+            channel_controller.update_picker(LbState {
+                connectivity_state: ConnectivityState::Ready,
+                picker: Arc::new(TaggedPicker(self.tag.clone())),
+            });
         }
 
-        fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {}
+        fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+            channel_controller.update_picker(LbState {
+                connectivity_state: ConnectivityState::Ready,
+                picker: Arc::new(TaggedPicker(self.tag.clone())),
+            });
+        }
     }
 
     #[derive(Debug)]
@@ -524,8 +553,11 @@ mod tests {
     impl LbPolicyBuilder for TestDummyLbBuilder {
         type LbPolicy = TestDummyLbPolicy;
 
-        fn build(&self, _options: LbPolicyOptions) -> Self::LbPolicy {
-            TestDummyLbPolicy
+        fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
+            TestDummyLbPolicy {
+                work_scheduler: options.work_scheduler,
+                tag: String::new(),
+            }
         }
 
         fn name(&self) -> &'static str {
@@ -537,17 +569,13 @@ mod tests {
         }
     }
 
-    // TODO: cover exit_idle. `TestDummyLbPolicy::exit_idle` is an empty body,
-    // so nothing can currently observe which children are woken. Making it
-    // record the call would allow asserting that exit_idle reaches every
-    // configured child.
     #[test]
     fn removed_cluster_is_shut_down() {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
 
         let builder = ClusterManagerLbBuilder;
         let mut policy = builder.build(LbPolicyOptions {
-            work_scheduler: Arc::new(MockScheduler),
+            work_scheduler: Arc::new(MockScheduler::default()),
             // TODO: replace with a no-op test runtime once `rt::Runtime` can be
             // implemented outside the `grpc` crate. That is blocked on
             // `EndpointListener` being `pub(crate)`; see the TODO on
@@ -652,5 +680,146 @@ mod tests {
             }
             other => panic!("expected Drop for removed cluster, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn work_delegates_to_child_and_refreshes_picker() {
+        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
+
+        let scheduler = Arc::new(MockScheduler::default());
+        let builder = ClusterManagerLbBuilder;
+        let mut policy = builder.build(LbPolicyOptions {
+            work_scheduler: scheduler.clone(),
+            runtime: default_runtime(),
+        });
+
+        let mut controller = MockChannelController { latest_state: None };
+        let json_cfg = serde_json::json!({
+            "children": {
+                "cluster_a": {
+                    "childPolicy": [{ "test_dummy_lb": { "tag": "work_ready", "start_connecting": true } }]
+                }
+            }
+        });
+        let parsed_cfg = builder
+            .parse_config(&LbConfigJson::new(&json_cfg.to_string()).unwrap())
+            .unwrap();
+
+        policy
+            .resolver_update(ResolverUpdate::default(), &parsed_cfg, &mut controller)
+            .unwrap();
+
+        // Initially Connecting; child scheduled work via WorkScheduler.
+        let initial_state = controller.latest_state.take().expect("initial state");
+        assert_eq!(
+            initial_state.connectivity_state,
+            ConnectivityState::Connecting
+        );
+
+        let work_item = scheduler
+            .queued_work
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("scheduled work");
+        policy.work(work_item, &mut controller);
+
+        // Work completion transitions child to Ready and refreshes ClusterPicker.
+        let updated_state = controller.latest_state.take().expect("updated state");
+        assert_eq!(updated_state.connectivity_state, ConnectivityState::Ready);
+
+        let req = RequestHeaders::new();
+        let mut attrs = CallAttributes::new();
+        attrs.add(XdsCluster("cluster_a".into()));
+        assert!(matches!(
+            updated_state
+                .picker
+                .pick(PickOptions::new(&req, &mut attrs)),
+            PickResult::Queue
+        ));
+        assert_eq!(
+            attrs.get::<PickedChild>(),
+            Some(&PickedChild("work_ready".into()))
+        );
+    }
+
+    #[test]
+    fn exit_idle_wakes_children_and_refreshes_picker() {
+        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
+
+        let builder = ClusterManagerLbBuilder;
+        let mut policy = builder.build(LbPolicyOptions {
+            work_scheduler: Arc::new(MockScheduler::default()),
+            runtime: default_runtime(),
+        });
+
+        let mut controller = MockChannelController { latest_state: None };
+        let json_cfg = serde_json::json!({
+            "children": {
+                "cluster_a": {
+                    "childPolicy": [{ "test_dummy_lb": { "tag": "woken_a", "start_idle": true } }]
+                },
+                "cluster_b": {
+                    "childPolicy": [{ "test_dummy_lb": { "tag": "woken_b", "start_idle": true } }]
+                }
+            }
+        });
+        let parsed_cfg = builder
+            .parse_config(&LbConfigJson::new(&json_cfg.to_string()).unwrap())
+            .unwrap();
+
+        policy
+            .resolver_update(ResolverUpdate::default(), &parsed_cfg, &mut controller)
+            .unwrap();
+
+        let initial_state = controller.latest_state.take().expect("initial state");
+        assert_eq!(initial_state.connectivity_state, ConnectivityState::Idle);
+
+        policy.exit_idle(&mut controller);
+
+        let woken_state = controller.latest_state.take().expect("woken state");
+        assert_eq!(woken_state.connectivity_state, ConnectivityState::Ready);
+
+        let req = RequestHeaders::new();
+        for (cluster, expected_tag) in [("cluster_a", "woken_a"), ("cluster_b", "woken_b")] {
+            let mut attrs = CallAttributes::new();
+            attrs.add(XdsCluster(cluster.into()));
+            assert!(matches!(
+                woken_state.picker.pick(PickOptions::new(&req, &mut attrs)),
+                PickResult::Queue
+            ));
+            assert_eq!(
+                attrs.get::<PickedChild>(),
+                Some(&PickedChild(expected_tag.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_update_propagates_child_error() {
+        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
+
+        let builder = ClusterManagerLbBuilder;
+        let mut policy = builder.build(LbPolicyOptions {
+            work_scheduler: Arc::new(MockScheduler::default()),
+            runtime: default_runtime(),
+        });
+
+        let mut controller = MockChannelController { latest_state: None };
+        let json_cfg = serde_json::json!({
+            "children": {
+                "cluster_a": {
+                    "childPolicy": [{ "test_dummy_lb": { "fail_update": true } }]
+                }
+            }
+        });
+        let parsed_cfg = builder
+            .parse_config(&LbConfigJson::new(&json_cfg.to_string()).unwrap())
+            .unwrap();
+
+        let err = policy
+            .resolver_update(ResolverUpdate::default(), &parsed_cfg, &mut controller)
+            .unwrap_err();
+        assert!(err.contains("simulated child resolver_update failure"));
     }
 }

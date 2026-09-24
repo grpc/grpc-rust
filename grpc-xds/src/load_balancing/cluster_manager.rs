@@ -40,14 +40,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use grpc::__unstable::client::load_balancing::ChannelController;
-use grpc::__unstable::client::load_balancing::DynLbConfig;
-use grpc::__unstable::client::load_balancing::DynLbPolicyBuilder;
-use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
+use grpc::__unstable::client::load_balancing::LbConfigJson;
 use grpc::__unstable::client::load_balancing::LbPolicy;
 use grpc::__unstable::client::load_balancing::LbPolicyBuilder;
 use grpc::__unstable::client::load_balancing::LbPolicyOptions;
 use grpc::__unstable::client::load_balancing::LbState;
-use grpc::__unstable::client::load_balancing::ParsedJsonLbConfig;
+use grpc::__unstable::client::load_balancing::ParsedLbConfig;
 use grpc::__unstable::client::load_balancing::PickOptions;
 use grpc::__unstable::client::load_balancing::PickResult;
 use grpc::__unstable::client::load_balancing::Picker;
@@ -75,31 +73,23 @@ impl std::fmt::Display for XdsCluster {
     }
 }
 
-// TODO: deduplicate this with LbInnerConfig.
-#[derive(Clone, Debug)]
-struct ChildConfig {
-    builder: Arc<DynLbPolicyBuilder>,
-    config: DynLbConfig,
-}
-
 // Validated configuration for `xds_cluster_manager_experimental`.
 // Maps a cluster name to a load balancing configuration for that cluster.
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterManagerConfig {
-    // Todo: Hashmap or BTreeMap?
-    children: HashMap<XdsCluster, ChildConfig>,
+    children: HashMap<XdsCluster, ParsedLbConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 struct ClusterManagerConfigJson {
     #[serde(default)]
     children: HashMap<XdsCluster, ClusterChildConfigJson>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 struct ClusterChildConfigJson {
     #[serde(rename = "childPolicy")]
-    child_policy: Vec<HashMap<String, serde_json::Value>>,
+    child_policy: ParsedLbConfig,
 }
 
 #[derive(Debug, Default)]
@@ -116,8 +106,7 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
         POLICY_NAME
     }
 
-    // TODO De-duplicate the selection mechanism here with that used in ServiceConfig.
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<ClusterManagerConfig, String> {
+    fn parse_config(&self, config: &LbConfigJson) -> Result<ClusterManagerConfig, String> {
         let json_val: ClusterManagerConfigJson = config
             .convert_to()
             .map_err(|e| format!("failed to deserialize xds_cluster_manager config: {e}"))?;
@@ -129,45 +118,13 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
             );
         }
 
-        let mut parsed_children = HashMap::with_capacity(json_val.children.len());
-        for (cluster, child_cfg) in json_val.children {
-            if child_cfg.child_policy.is_empty() {
-                return Err(format!(
-                    "cluster '{cluster}': childPolicy list must be non-empty"
-                ));
-            }
-            let mut resolved = None;
-            for candidate_map in child_cfg.child_policy {
-                if candidate_map.len() != 1 {
-                    return Err(format!(
-                        "cluster '{cluster}': childPolicy entry must contain exactly 1 policy/config pair"
-                    ));
-                }
-                let (policy_name, policy_json) = candidate_map.into_iter().next().unwrap();
-                if let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&policy_name) {
-                    let parsed_lb_config = builder
-                        .parse_config(&ParsedJsonLbConfig::from_value(policy_json))
-                        .map_err(|e| {
-                            format!(
-                                "cluster '{cluster}': failed to parse child policy '{policy_name}': {e}"
-                            )
-                        })?;
-                    resolved = Some(ChildConfig {
-                        builder,
-                        config: parsed_lb_config,
-                    });
-                    break;
-                }
-            }
-            let child_config = resolved.ok_or_else(|| {
-                format!("cluster '{cluster}': no supported child policy found in childPolicy list")
-            })?;
-            parsed_children.insert(cluster, child_config);
-        }
+        let children = json_val
+            .children
+            .into_iter()
+            .map(|(cluster, child_cfg)| (cluster, child_cfg.child_policy))
+            .collect();
 
-        Ok(ClusterManagerConfig {
-            children: parsed_children,
-        })
+        Ok(ClusterManagerConfig { children })
     }
 }
 
@@ -316,6 +273,7 @@ impl Picker for ClusterPicker {
 
 #[cfg(test)]
 mod tests {
+    use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
     use grpc::__unstable::client::load_balancing::WorkScheduler;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
@@ -362,7 +320,7 @@ mod tests {
         })
         .to_string();
 
-        let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
+        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
         let builder = ClusterManagerLbBuilder;
         let config = builder.parse_config(&parsed_json).expect("parse config");
 
@@ -392,10 +350,10 @@ mod tests {
         })
         .to_string();
 
-        let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
+        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
         let builder = ClusterManagerLbBuilder;
         let err = builder.parse_config(&parsed_json).unwrap_err();
-        assert!(err.contains("no supported child policy"));
+        assert!(err.contains("No supported load balancing policy"));
     }
 
     #[derive(Debug)]
@@ -475,7 +433,7 @@ mod tests {
         })
         .to_string();
 
-        let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
+        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
         let builder = ClusterManagerLbBuilder;
         let err = builder.parse_config(&parsed_json).unwrap_err();
         assert!(err.contains("children"));
@@ -492,10 +450,10 @@ mod tests {
         })
         .to_string();
 
-        let parsed_json = ParsedJsonLbConfig::new(&json_str).expect("parse json");
+        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
         let builder = ClusterManagerLbBuilder;
         let err = builder.parse_config(&parsed_json).unwrap_err();
-        assert!(err.contains("childPolicy"));
+        assert!(err.contains("must not be empty"));
     }
 
     #[derive(Debug)]
@@ -574,7 +532,7 @@ mod tests {
             "test_dummy_lb"
         }
 
-        fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<TestDummyConfig, String> {
+        fn parse_config(&self, config: &LbConfigJson) -> Result<TestDummyConfig, String> {
             config.convert_to().map_err(|e| e.to_string())
         }
     }
@@ -583,8 +541,8 @@ mod tests {
     // so nothing can currently observe which children are woken. Making it
     // record the call would allow asserting that exit_idle reaches every
     // configured child.
-    #[tokio::test]
-    async fn removed_cluster_is_shut_down() {
+    #[test]
+    fn removed_cluster_is_shut_down() {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
 
         let builder = ClusterManagerLbBuilder;
@@ -613,7 +571,7 @@ mod tests {
             }
         });
         let parsed_cfg_2 = builder
-            .parse_config(&ParsedJsonLbConfig::from_value(json_2_clusters))
+            .parse_config(&LbConfigJson::new(&json_2_clusters.to_string()).unwrap())
             .unwrap();
 
         policy
@@ -657,7 +615,7 @@ mod tests {
             }
         });
         let parsed_cfg_1 = builder
-            .parse_config(&ParsedJsonLbConfig::from_value(json_1_cluster))
+            .parse_config(&LbConfigJson::new(&json_1_cluster.to_string()).unwrap())
             .unwrap();
 
         policy

@@ -27,9 +27,6 @@ serde_json = "1.0"
 xds-client = { version = "0.1.0-alpha.4", path = "../xds-client", default-features = false }
 regex = "1"
 
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
-
 [build-dependencies]
 protobuf-codegen = "4.35.1-release"
 protobuf-well-known-types = "4.35.1-release"

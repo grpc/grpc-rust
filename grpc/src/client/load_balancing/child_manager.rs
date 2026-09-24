@@ -90,6 +90,7 @@ where
 {
     /// Creates a new ChildManager LB policy.  shard_update is called whenever a
     /// resolver_update operation occurs.
+    // TODO: Should this take LbPolicyOptions instead?
     pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
         Self {
             handle_to_child_idx: Default::default(),

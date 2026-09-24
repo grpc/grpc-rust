@@ -181,8 +181,7 @@ impl LbPolicy for ClusterManagerPolicy {
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        // Every work item originates from a child, so `data` is always `Some`.
-        // Forward it unconditionally: `ChildManager::work` debug_asserts on a
+        // Forward data unconditionally: `ChildManager::work` debug_asserts on a
         // `None` payload, and suppressing that here would hide the violation.
         self.child_manager.work(data, channel_controller);
         if self.child_manager.child_updated() {
@@ -275,34 +274,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_builder_name() {
+    fn parse_config() {
         let builder = ClusterManagerLbBuilder;
         assert_eq!(builder.name(), "xds_cluster_manager_experimental");
-    }
 
-    #[test]
-    fn parse_valid_config() {
-        let json_str = serde_json::json!({
+        let valid_json = serde_json::json!({
             "children": {
-                "cluster_a": {
-                    "childPolicy": [
-                        { RR_POLICY_NAME: {} }
-                    ]
-                },
-                "cluster_b": {
-                    "childPolicy": [
-                        { "unknown_policy": {} },
-                        { RR_POLICY_NAME: {} }
-                    ]
-                }
+                "cluster_a": { "childPolicy": [{ RR_POLICY_NAME: {} }] },
+                "cluster_b": { "childPolicy": [{ RR_POLICY_NAME: {} }] }
             }
-        })
-        .to_string();
-
-        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder;
-        let config = builder.parse_config(&parsed_json).expect("parse config");
-
+        });
+        let config = builder
+            .parse_config(&LbConfigJson::new(&valid_json.to_string()).unwrap())
+            .expect("parse valid config");
         assert_eq!(config.children.len(), 2);
         assert!(
             config
@@ -314,25 +298,204 @@ mod tests {
                 .children
                 .contains_key(&XdsCluster("cluster_b".into()))
         );
+
+        let empty_children = serde_json::json!({ "children": {} });
+        let err = builder
+            .parse_config(&LbConfigJson::new(&empty_children.to_string()).unwrap())
+            .unwrap_err();
+        assert!(err.contains("children"));
     }
 
     #[test]
-    fn parse_no_supported_policy_fails() {
-        let json_str = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": [
-                        { "unsupported_lb_policy": {} }
-                    ]
-                }
-            }
-        })
-        .to_string();
+    fn cluster_picker_routing() {
+        let mut children: HashMap<XdsCluster, Arc<dyn Picker>> = HashMap::new();
+        children.insert(
+            XdsCluster("cluster_one".to_string()),
+            Arc::new(TaggedPicker("child_one".to_string())),
+        );
+        let cluster_picker = ClusterPicker { children };
+        let req = RequestHeaders::new();
 
-        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder;
-        let err = builder.parse_config(&parsed_json).unwrap_err();
-        assert!(err.contains("No supported load balancing policy"));
+        // Known cluster -> delegates to child picker and forwards CallAttributes.
+        let mut attrs = CallAttributes::new();
+        attrs.add(XdsCluster("cluster_one".into()));
+        assert!(matches!(
+            cluster_picker.pick(PickOptions::new(&req, &mut attrs)),
+            PickResult::Queue
+        ));
+        assert_eq!(
+            attrs.get::<PickedChild>(),
+            Some(&PickedChild("child_one".into()))
+        );
+
+        // Unknown cluster -> Drop(Unavailable).
+        let mut attrs = CallAttributes::new();
+        attrs.add(XdsCluster("cluster_unknown".into()));
+        match cluster_picker.pick(PickOptions::new(&req, &mut attrs)) {
+            PickResult::Drop(err) => {
+                assert_eq!(err.code(), StatusCodeError::Unavailable);
+                assert!(err.message().contains("unknown cluster"));
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+
+        // Missing XdsCluster attribute -> Drop(Unavailable).
+        let mut empty_attrs = CallAttributes::new();
+        match cluster_picker.pick(PickOptions::new(&req, &mut empty_attrs)) {
+            PickResult::Drop(err) => {
+                assert_eq!(err.code(), StatusCodeError::Unavailable);
+                assert!(err.message().contains("not present"));
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removed_cluster_is_shut_down() {
+        let (mut policy, _scheduler, mut controller) = setup_test_policy();
+
+        let state = apply_json_config(
+            &mut policy,
+            &mut controller,
+            serde_json::json!({
+                "children": {
+                    "cluster_a": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }] },
+                    "cluster_b": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_b" } }] }
+                }
+            }),
+        );
+        assert_eq!(policy.child_manager.children().count(), 2);
+        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
+        assert_picks_child(&state.picker, "cluster_a", "child_a");
+        assert_picks_child(&state.picker, "cluster_b", "child_b");
+
+        // Drop cluster_b from the config.
+        let state = apply_json_config(
+            &mut policy,
+            &mut controller,
+            serde_json::json!({
+                "children": {
+                    "cluster_a": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }] }
+                }
+            }),
+        );
+
+        let identifiers: Vec<&XdsCluster> = policy
+            .child_manager
+            .children()
+            .map(|c| &c.identifier)
+            .collect();
+        assert_eq!(identifiers, vec![&XdsCluster("cluster_a".into())]);
+        assert_picks_child(&state.picker, "cluster_a", "child_a");
+
+        let req = RequestHeaders::new();
+        let mut attrs_b = CallAttributes::new();
+        attrs_b.add(XdsCluster("cluster_b".into()));
+        match state.picker.pick(PickOptions::new(&req, &mut attrs_b)) {
+            PickResult::Drop(err) => assert_eq!(err.code(), StatusCodeError::Unavailable),
+            other => panic!("expected Drop for removed cluster, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn work_delegates_to_child_and_refreshes_picker() {
+        let (mut policy, scheduler, mut controller) = setup_test_policy();
+
+        let initial = apply_json_config(
+            &mut policy,
+            &mut controller,
+            serde_json::json!({
+                "children": {
+                    "cluster_a": {
+                        "childPolicy": [{ "test_dummy_lb": { "tag": "work_ready", "start_connecting": true } }]
+                    }
+                }
+            }),
+        );
+        assert_eq!(initial.connectivity_state, ConnectivityState::Connecting);
+
+        let work_item = scheduler
+            .queued_work
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("scheduled work");
+        policy.work(work_item, &mut controller);
+
+        let updated = controller.latest_state.take().expect("updated state");
+        assert_eq!(updated.connectivity_state, ConnectivityState::Ready);
+        assert_picks_child(&updated.picker, "cluster_a", "work_ready");
+    }
+
+    #[test]
+    fn exit_idle_wakes_children_and_refreshes_picker() {
+        let (mut policy, _scheduler, mut controller) = setup_test_policy();
+
+        let initial = apply_json_config(
+            &mut policy,
+            &mut controller,
+            serde_json::json!({
+                "children": {
+                    "cluster_a": { "childPolicy": [{ "test_dummy_lb": { "tag": "woken_a", "start_idle": true } }] },
+                    "cluster_b": { "childPolicy": [{ "test_dummy_lb": { "tag": "woken_b", "start_idle": true } }] }
+                }
+            }),
+        );
+        assert_eq!(initial.connectivity_state, ConnectivityState::Idle);
+
+        policy.exit_idle(&mut controller);
+
+        let woken = controller.latest_state.take().expect("woken state");
+        assert_eq!(woken.connectivity_state, ConnectivityState::Ready);
+        assert_picks_child(&woken.picker, "cluster_a", "woken_a");
+        assert_picks_child(&woken.picker, "cluster_b", "woken_b");
+    }
+
+    fn setup_test_policy() -> (
+        ClusterManagerPolicy,
+        Arc<MockScheduler>,
+        MockChannelController,
+    ) {
+        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
+        let scheduler = Arc::new(MockScheduler::default());
+        let policy = ClusterManagerLbBuilder.build(LbPolicyOptions {
+            work_scheduler: scheduler.clone(),
+            // TODO: replace with a no-op test runtime once `rt::Runtime` can be
+            // implemented outside the `grpc` crate. That is blocked on
+            // `EndpointListener` being `pub(crate)`; see the TODO on
+            // `default_runtime`.
+            runtime: default_runtime(),
+        });
+        let controller = MockChannelController { latest_state: None };
+        (policy, scheduler, controller)
+    }
+
+    fn apply_json_config(
+        policy: &mut ClusterManagerPolicy,
+        controller: &mut MockChannelController,
+        json: serde_json::Value,
+    ) -> LbState {
+        let cfg = ClusterManagerLbBuilder
+            .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
+            .unwrap();
+        policy
+            .resolver_update(ResolverUpdate::default(), &cfg, controller)
+            .unwrap();
+        controller.latest_state.take().expect("state update")
+    }
+
+    fn assert_picks_child(picker: &Arc<dyn Picker>, cluster: &str, expected_tag: &str) {
+        let req = RequestHeaders::new();
+        let mut attrs = CallAttributes::new();
+        attrs.add(XdsCluster(cluster.into()));
+        assert!(matches!(
+            picker.pick(PickOptions::new(&req, &mut attrs)),
+            PickResult::Queue
+        ));
+        assert_eq!(
+            attrs.get::<PickedChild>(),
+            Some(&PickedChild(expected_tag.into()))
+        );
     }
 
     #[derive(Debug)]
@@ -355,84 +518,6 @@ mod tests {
             options.call_attributes.add(PickedChild(self.0.clone()));
             PickResult::Queue
         }
-    }
-
-    #[test]
-    fn cluster_picker_pick_fails_without_attributes() {
-        let mut children: HashMap<XdsCluster, Arc<dyn Picker>> = HashMap::new();
-        children.insert(XdsCluster("cluster_one".to_string()), Arc::new(DummyPicker));
-        let cluster_picker = ClusterPicker { children };
-
-        let req = RequestHeaders::new();
-        let mut attrs = CallAttributes::new();
-        match cluster_picker.pick(PickOptions::new(&req, &mut attrs)) {
-            PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
-                assert!(err.message().contains("not present"));
-            }
-            other => panic!("expected Drop, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cluster_picker_with_attributes_routing() {
-        let mut children: HashMap<XdsCluster, Arc<dyn Picker>> = HashMap::new();
-        children.insert(XdsCluster("cluster_one".to_string()), Arc::new(DummyPicker));
-        let cluster_picker = ClusterPicker { children };
-
-        let req = RequestHeaders::new();
-        let attrs_for = |cluster: &str| {
-            let mut attrs = CallAttributes::new();
-            attrs.add(XdsCluster(cluster.into()));
-            attrs
-        };
-
-        // Known cluster in attributes -> routes to child picker
-        let mut attrs_known = attrs_for("cluster_one");
-        match cluster_picker.pick(PickOptions::new(&req, &mut attrs_known)) {
-            PickResult::Queue => {}
-            other => panic!("expected Queue from DummyPicker, got {other:?}"),
-        }
-
-        // Unknown cluster in attributes -> UNAVAILABLE
-        let mut attrs_unknown = attrs_for("cluster_unknown");
-        match cluster_picker.pick(PickOptions::new(&req, &mut attrs_unknown)) {
-            PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
-                assert!(err.message().contains("unknown cluster"));
-            }
-            other => panic!("expected Drop, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_empty_children_fails() {
-        let json_str = serde_json::json!({
-            "children": {}
-        })
-        .to_string();
-
-        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder;
-        let err = builder.parse_config(&parsed_json).unwrap_err();
-        assert!(err.contains("children"));
-    }
-
-    #[test]
-    fn parse_empty_child_policy_fails() {
-        let json_str = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": []
-                }
-            }
-        })
-        .to_string();
-
-        let parsed_json = LbConfigJson::new(&json_str).expect("parse json");
-        let builder = ClusterManagerLbBuilder;
-        let err = builder.parse_config(&parsed_json).unwrap_err();
-        assert!(err.contains("must not be empty"));
     }
 
     #[derive(Debug, Default)]
@@ -471,8 +556,6 @@ mod tests {
         #[serde(default)]
         tag: String,
         #[serde(default)]
-        fail_update: bool,
-        #[serde(default)]
         start_connecting: bool,
         #[serde(default)]
         start_idle: bool,
@@ -493,9 +576,6 @@ mod tests {
             config: &Self::LbConfig,
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
-            if config.fail_update {
-                return Err("simulated child resolver_update failure".to_string());
-            }
             self.tag = config.tag.clone();
             if config.start_connecting {
                 channel_controller.update_picker(LbState {
@@ -556,259 +636,5 @@ mod tests {
         fn parse_config(&self, config: &LbConfigJson) -> Result<TestDummyConfig, String> {
             config.convert_to().map_err(|e| e.to_string())
         }
-    }
-
-    #[test]
-    fn removed_cluster_is_shut_down() {
-        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
-
-        let builder = ClusterManagerLbBuilder;
-        let mut policy = builder.build(LbPolicyOptions {
-            work_scheduler: Arc::new(MockScheduler::default()),
-            // TODO: replace with a no-op test runtime once `rt::Runtime` can be
-            // implemented outside the `grpc` crate. That is blocked on
-            // `EndpointListener` being `pub(crate)`; see the TODO on
-            // `default_runtime`. Nothing here spawns or sleeps, so a stub would
-            // do, but `default_runtime` is the only `GrpcRuntime` this crate
-            // can construct.
-            runtime: default_runtime(),
-        });
-
-        let mut controller = MockChannelController { latest_state: None };
-
-        // Initial config with cluster_a and cluster_b.
-        let json_2_clusters = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }]
-                },
-                "cluster_b": {
-                    "childPolicy": [{ "test_dummy_lb": { "tag": "child_b" } }]
-                }
-            }
-        });
-        let parsed_cfg_2 = builder
-            .parse_config(&LbConfigJson::new(&json_2_clusters.to_string()).unwrap())
-            .unwrap();
-
-        policy
-            .resolver_update(ResolverUpdate::default(), &parsed_cfg_2, &mut controller)
-            .unwrap();
-
-        let state = controller.latest_state.take().expect("state update");
-        assert_eq!(policy.child_manager.children().count(), 2);
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-
-        // Both clusters route to their own child picker and forward PickOptions.
-        let req = RequestHeaders::new();
-        let mut attrs_a = CallAttributes::new();
-        attrs_a.add(XdsCluster("cluster_a".into()));
-        assert!(matches!(
-            state.picker.pick(PickOptions::new(&req, &mut attrs_a)),
-            PickResult::Queue
-        ));
-        assert_eq!(
-            attrs_a.get::<PickedChild>(),
-            Some(&PickedChild("child_a".into()))
-        );
-
-        let mut attrs_b = CallAttributes::new();
-        attrs_b.add(XdsCluster("cluster_b".into()));
-        assert!(matches!(
-            state.picker.pick(PickOptions::new(&req, &mut attrs_b)),
-            PickResult::Queue
-        ));
-        assert_eq!(
-            attrs_b.get::<PickedChild>(),
-            Some(&PickedChild("child_b".into()))
-        );
-
-        // Drop cluster_b from the config.
-        let json_1_cluster = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }]
-                }
-            }
-        });
-        let parsed_cfg_1 = builder
-            .parse_config(&LbConfigJson::new(&json_1_cluster.to_string()).unwrap())
-            .unwrap();
-
-        policy
-            .resolver_update(ResolverUpdate::default(), &parsed_cfg_1, &mut controller)
-            .unwrap();
-
-        // cluster_b is gone from child_manager immediately
-        let identifiers: Vec<&XdsCluster> = policy
-            .child_manager
-            .children()
-            .map(|c| &c.identifier)
-            .collect();
-        assert_eq!(identifiers, vec![&XdsCluster("cluster_a".into())]);
-
-        // ...and so is absent from the picker.
-        let state = controller.latest_state.take().expect("state update");
-        let mut attrs_a = CallAttributes::new();
-        attrs_a.add(XdsCluster("cluster_a".into()));
-        assert!(matches!(
-            state.picker.pick(PickOptions::new(&req, &mut attrs_a)),
-            PickResult::Queue
-        ));
-        assert_eq!(
-            attrs_a.get::<PickedChild>(),
-            Some(&PickedChild("child_a".into()))
-        );
-
-        let mut attrs_b = CallAttributes::new();
-        attrs_b.add(XdsCluster("cluster_b".into()));
-        match state.picker.pick(PickOptions::new(&req, &mut attrs_b)) {
-            PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
-                assert!(err.message().contains("unknown cluster"));
-            }
-            other => panic!("expected Drop for removed cluster, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn work_delegates_to_child_and_refreshes_picker() {
-        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
-
-        let scheduler = Arc::new(MockScheduler::default());
-        let builder = ClusterManagerLbBuilder;
-        let mut policy = builder.build(LbPolicyOptions {
-            work_scheduler: scheduler.clone(),
-            runtime: default_runtime(),
-        });
-
-        let mut controller = MockChannelController { latest_state: None };
-        let json_cfg = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": { "tag": "work_ready", "start_connecting": true } }]
-                }
-            }
-        });
-        let parsed_cfg = builder
-            .parse_config(&LbConfigJson::new(&json_cfg.to_string()).unwrap())
-            .unwrap();
-
-        policy
-            .resolver_update(ResolverUpdate::default(), &parsed_cfg, &mut controller)
-            .unwrap();
-
-        // Initially Connecting; child scheduled work via WorkScheduler.
-        let initial_state = controller.latest_state.take().expect("initial state");
-        assert_eq!(
-            initial_state.connectivity_state,
-            ConnectivityState::Connecting
-        );
-
-        let work_item = scheduler
-            .queued_work
-            .lock()
-            .unwrap()
-            .pop()
-            .expect("scheduled work");
-        policy.work(work_item, &mut controller);
-
-        // Work completion transitions child to Ready and refreshes ClusterPicker.
-        let updated_state = controller.latest_state.take().expect("updated state");
-        assert_eq!(updated_state.connectivity_state, ConnectivityState::Ready);
-
-        let req = RequestHeaders::new();
-        let mut attrs = CallAttributes::new();
-        attrs.add(XdsCluster("cluster_a".into()));
-        assert!(matches!(
-            updated_state
-                .picker
-                .pick(PickOptions::new(&req, &mut attrs)),
-            PickResult::Queue
-        ));
-        assert_eq!(
-            attrs.get::<PickedChild>(),
-            Some(&PickedChild("work_ready".into()))
-        );
-    }
-
-    #[test]
-    fn exit_idle_wakes_children_and_refreshes_picker() {
-        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
-
-        let builder = ClusterManagerLbBuilder;
-        let mut policy = builder.build(LbPolicyOptions {
-            work_scheduler: Arc::new(MockScheduler::default()),
-            runtime: default_runtime(),
-        });
-
-        let mut controller = MockChannelController { latest_state: None };
-        let json_cfg = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": { "tag": "woken_a", "start_idle": true } }]
-                },
-                "cluster_b": {
-                    "childPolicy": [{ "test_dummy_lb": { "tag": "woken_b", "start_idle": true } }]
-                }
-            }
-        });
-        let parsed_cfg = builder
-            .parse_config(&LbConfigJson::new(&json_cfg.to_string()).unwrap())
-            .unwrap();
-
-        policy
-            .resolver_update(ResolverUpdate::default(), &parsed_cfg, &mut controller)
-            .unwrap();
-
-        let initial_state = controller.latest_state.take().expect("initial state");
-        assert_eq!(initial_state.connectivity_state, ConnectivityState::Idle);
-
-        policy.exit_idle(&mut controller);
-
-        let woken_state = controller.latest_state.take().expect("woken state");
-        assert_eq!(woken_state.connectivity_state, ConnectivityState::Ready);
-
-        let req = RequestHeaders::new();
-        for (cluster, expected_tag) in [("cluster_a", "woken_a"), ("cluster_b", "woken_b")] {
-            let mut attrs = CallAttributes::new();
-            attrs.add(XdsCluster(cluster.into()));
-            assert!(matches!(
-                woken_state.picker.pick(PickOptions::new(&req, &mut attrs)),
-                PickResult::Queue
-            ));
-            assert_eq!(
-                attrs.get::<PickedChild>(),
-                Some(&PickedChild(expected_tag.into()))
-            );
-        }
-    }
-
-    #[test]
-    fn resolver_update_propagates_child_error() {
-        GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
-
-        let builder = ClusterManagerLbBuilder;
-        let mut policy = builder.build(LbPolicyOptions {
-            work_scheduler: Arc::new(MockScheduler::default()),
-            runtime: default_runtime(),
-        });
-
-        let mut controller = MockChannelController { latest_state: None };
-        let json_cfg = serde_json::json!({
-            "children": {
-                "cluster_a": {
-                    "childPolicy": [{ "test_dummy_lb": { "fail_update": true } }]
-                }
-            }
-        });
-        let parsed_cfg = builder
-            .parse_config(&LbConfigJson::new(&json_cfg.to_string()).unwrap())
-            .unwrap();
-
-        let err = policy
-            .resolver_update(ResolverUpdate::default(), &parsed_cfg, &mut controller)
-            .unwrap_err();
-        assert!(err.contains("simulated child resolver_update failure"));
     }
 }

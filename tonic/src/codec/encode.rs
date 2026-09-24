@@ -336,12 +336,10 @@ impl EncodeState {
                 }
 
                 self.is_end_stream = true;
-                let status = if let Some(status) = self.error.take() {
-                    status
-                } else {
-                    Status::ok("")
-                };
-                Some(status.to_header_map())
+                Some(match self.error.take() {
+                    Some(status) => status.to_header_map(),
+                    None => Ok(Status::ok_header_map()),
+                })
             }
         }
     }

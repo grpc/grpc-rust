@@ -28,12 +28,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crate::client::ConnectivityState;
-use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
+use crate::client::load_balancing::PickOptions;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::WorkData;
@@ -171,7 +171,7 @@ impl WakeUpPicker {
 }
 
 impl Picker for WakeUpPicker {
-    fn pick(&self, request: &RequestHeaders) -> PickResult {
+    fn pick(&self, _options: PickOptions<'_>) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
             self.work_scheduler.schedule_work(None);
         }
@@ -184,6 +184,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+    use crate::call_attributes::CallAttributes;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
@@ -267,7 +268,10 @@ mod tests {
             .unwrap();
 
         // Call pick on the picker.
-        let res = lb_state.picker.pick(&new_request_headers());
+        let res = lb_state.picker.pick(PickOptions::new(
+            &new_request_headers(),
+            &mut CallAttributes::new(),
+        ));
 
         // PickResult should be Queue.
         assert!(matches!(res, PickResult::Queue));
@@ -311,7 +315,10 @@ mod tests {
 
         // Call pick multiple times.
         for _ in 0..10 {
-            let res = lb_state.picker.pick(&new_request_headers());
+            let res = lb_state.picker.pick(PickOptions::new(
+                &new_request_headers(),
+                &mut CallAttributes::new(),
+            ));
             assert!(matches!(res, PickResult::Queue));
         }
 
@@ -380,7 +387,10 @@ mod tests {
         };
 
         // Call pick on the picker.
-        let res = lb_state.picker.pick(&new_request_headers());
+        let res = lb_state.picker.pick(PickOptions::new(
+            &new_request_headers(),
+            &mut CallAttributes::new(),
+        ));
 
         // PickResult should be Queue.
         assert!(matches!(res, PickResult::Queue));

@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::call_attributes::CallAttributes;
 use crate::client::ConnectivityState;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -358,7 +359,30 @@ pub trait Picker: Send + Sync + Debug {
     /// time-consuming work to service this request, it should return Queue, and
     /// the Pick call will be repeated by the channel when a new Picker is
     /// produced by the LbPolicy.
-    fn pick(&self, request: &RequestHeaders) -> PickResult;
+    fn pick(&self, options: PickOptions<'_>) -> PickResult;
+}
+
+/// The data provided to a [`Picker`] when picking a connection for a request.
+pub struct PickOptions<'a> {
+    /// The headers of the request being picked for.
+    pub request_headers: &'a RequestHeaders,
+    /// The attributes of the call being picked for.  Pickers may read
+    /// attributes set by earlier stages (e.g. the config selector), and may
+    /// add or modify attributes for use by later stages of the RPC.
+    pub call_attributes: &'a mut CallAttributes,
+}
+
+impl<'a> PickOptions<'a> {
+    /// Creates a new `PickOptions` from the request's headers and attributes.
+    pub fn new(
+        request_headers: &'a RequestHeaders,
+        call_attributes: &'a mut CallAttributes,
+    ) -> Self {
+        Self {
+            request_headers,
+            call_attributes,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -486,7 +510,7 @@ pub(crate) struct OneSubchannelPicker {
 }
 
 impl Picker for OneSubchannelPicker {
-    fn pick(&self, _: &RequestHeaders) -> PickResult {
+    fn pick(&self, _: PickOptions<'_>) -> PickResult {
         PickResult::Pick(Pick {
             subchannel: self.sc.clone(),
             metadata: MetadataMap::new(),
@@ -501,7 +525,7 @@ impl Picker for OneSubchannelPicker {
 pub(crate) struct QueuingPicker;
 
 impl Picker for QueuingPicker {
-    fn pick(&self, _request: &RequestHeaders) -> PickResult {
+    fn pick(&self, _options: PickOptions<'_>) -> PickResult {
         PickResult::Queue
     }
 }
@@ -512,7 +536,7 @@ pub(crate) struct FailingPicker {
 }
 
 impl Picker for FailingPicker {
-    fn pick(&self, _: &RequestHeaders) -> PickResult {
+    fn pick(&self, _: PickOptions<'_>) -> PickResult {
         PickResult::Fail(StatusError::new(
             StatusCodeError::Unavailable,
             self.error.clone(),
@@ -522,13 +546,13 @@ impl Picker for FailingPicker {
 
 /// A dynamic LB policy config implementation that can be downcast to a specific
 /// config as needed.
-pub(crate) type DynLbConfig = Arc<dyn Any + Send + Sync>;
+pub type DynLbConfig = Arc<dyn Any + Send + Sync>;
 
 /// A builder of dynamic LB policies.
-pub(crate) type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
+pub type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
 
 /// An LB policy that accepts dynamic configs.
-pub(crate) type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
+pub type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
 
 impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     type LbConfig = T::LbConfig;

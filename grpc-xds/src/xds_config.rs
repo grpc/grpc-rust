@@ -36,10 +36,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::resource::{
-    ClusterResource, EndpointAddress, EndpointsResource, ListenerResource, RouteConfigResource,
-    RouteSource, VirtualHost,
-};
+use crate::resource::ClusterResource;
+use crate::resource::EndpointAddress;
+use crate::resource::EndpointsResource;
+use crate::resource::ListenerResource;
+use crate::resource::RouteConfigResource;
+use crate::resource::RouteSource;
+use crate::resource::VirtualHost;
 
 /// The atomic xDS configuration snapshot for a channel.
 #[derive(Debug, Clone)]

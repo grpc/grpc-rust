@@ -52,20 +52,13 @@ const DEFAULT_YIELD_THRESHOLD: usize = 32 * 1024;
 
 /// Settings for how tonic allocates and grows buffers.
 ///
-/// Tonic eagerly allocates the buffer_size per RPC, and grows
-/// the buffer by buffer_size increments to handle larger messages.
-/// Buffer size defaults to 8KiB.
+/// Tonic eagerly allocates `buffer_size` bytes per RPC. The default is 8 KiB.
+/// Buffers grow as needed for larger messages.
 ///
-/// Example:
-/// ```ignore
-/// Buffer start:       | 8kb |
-/// Message received:   |   24612 bytes    |
-/// Buffer grows:       | 8kb | 8kb | 8kb | 8kb |
-/// ```
-///
-/// The buffer grows to the next largest buffer_size increment of
-/// 32768 to hold 24612 bytes, which is just slightly too large for
-/// the previous buffer increment of 24576.
+/// After the decoder reads and validates a message length, it makes one
+/// reservation for that many additional bytes. The buffer can allocate more
+/// capacity than requested. The decoder's input buffer does not grow in
+/// fixed `buffer_size` increments.
 ///
 /// If you use a smaller buffer size you will waste less memory, but
 /// you will allocate more frequently. If one way or the other matters

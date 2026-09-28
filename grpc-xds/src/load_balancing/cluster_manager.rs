@@ -171,10 +171,9 @@ impl LbPolicy for ClusterManagerPolicy {
             }
         });
 
-        self.child_manager
-            .update(child_updates, channel_controller)?;
+        let result = self.child_manager.update(child_updates, channel_controller);
         self.update_picker(channel_controller);
-        Ok(())
+        result.map_err(|e| format!("failed to update xds_cluster_manager children: {e}"))
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
@@ -371,6 +370,31 @@ mod tests {
         assert_eq!(
             received_endpoints("child_b"),
             vec![endpoint_with_path(&["locality_b"])]
+        );
+    }
+
+    #[test]
+    fn child_error_still_publishes_picker() {
+        let (mut policy, _scheduler, mut controller) = setup_test_policy();
+        let json = serde_json::json!({
+            "children": {
+                "cluster_a": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }] },
+                "cluster_b": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_b", "fail_update": true } }] }
+            }
+        });
+        let cfg = ClusterManagerBuilder
+            .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
+            .unwrap();
+
+        let err = policy
+            .resolver_update(ResolverUpdate::default(), &cfg, &mut controller)
+            .unwrap_err();
+
+        let state = controller.latest_state.take().expect("state update");
+        assert_picks_child(&state.picker, "cluster_a", "child_a");
+        assert_eq!(
+            err,
+            "failed to update xds_cluster_manager children: child_b failed"
         );
     }
 
@@ -599,6 +623,8 @@ mod tests {
         start_connecting: bool,
         #[serde(default)]
         start_idle: bool,
+        #[serde(default)]
+        fail_update: bool,
     }
 
     #[derive(Debug)]
@@ -620,6 +646,9 @@ mod tests {
             RECEIVED_ENDPOINTS.with_borrow_mut(|r| {
                 r.insert(config.tag.clone(), update.endpoints.unwrap_or_default())
             });
+            if config.fail_update {
+                return Err(format!("{} failed", config.tag));
+            }
             if config.start_connecting {
                 channel_controller.update_picker(LbState {
                     connectivity_state: ConnectivityState::Connecting,

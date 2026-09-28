@@ -1,0 +1,32 @@
+[package]
+name = "grpc-bssl"
+version = "0.10.0"
+authors = ["gRPC authors"]
+license = "MIT"
+edition = "2024"
+rust-version = { workspace = true }
+publish = false
+description = "BoringSSL TLS credentials provider for gRPC in Rust"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+readme = "README.md"
+keywords = ["rpc", "grpc", "async", "tls", "boringssl"]
+categories = ["web-programming", "network-programming", "asynchronous"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "bssl_tls::*",
+    "bssl_tls_tokio::*",
+    "grpc::*",
+]
+
+[dependencies]
+bssl-tls = { git = "https://boringssl.googlesource.com/boringssl", rev = "281fb6d844f8ef70c95ce9d3d599652cc2448292", package = "bssl-tls" }
+bssl-tls-tokio = { git = "https://boringssl.googlesource.com/boringssl", rev = "281fb6d844f8ef70c95ce9d3d599652cc2448292", package = "bssl-tls-tokio" }
+grpc = { path = "../grpc", default-features = false, features = ["__unstable"] }
+tokio = { version = "1", features = ["io-util", "net"] }
+tonic = { version = "0.14.6", path = "../tonic", default-features = false }
+
+[dev-dependencies]
+bssl-x509 = { git = "https://boringssl.googlesource.com/boringssl", rev = "281fb6d844f8ef70c95ce9d3d599652cc2448292", package = "bssl-x509" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net"] }

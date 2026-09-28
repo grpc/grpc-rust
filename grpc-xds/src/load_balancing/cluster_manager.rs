@@ -218,21 +218,12 @@ impl Picker for ClusterPicker {
                 )
             })
             .and_then(|cluster| {
-                // A cluster missing from the map means either that it was removed from the
-                // config, or that the Config Selector named a cluster this picker has never
-                // seen. Per gRFC A31 both must terminate the RPC rather than queue it: a
-                // wait-for-ready RPC left queued would hold a reference to the cluster
-                // indefinitely and block its removal. `PickResult::Fail` does not terminate
-                // wait-for-ready RPCs, so `PickResult::Drop` is required here.
-                //
-                // TODO: A31 distinguishes the two cases -- UNAVAILABLE for a deleted
-                // cluster, INTERNAL for a name the picker does not recognise, which "should
-                // not be possible" given the Config Selector's two-step removal. This
-                // picker cannot tell them apart, and grpc-java and grpc-core disagree on
-                // the code (UNAVAILABLE vs INTERNAL). Determine what is correct here.
+                // A31 distinguishes the two cases -- UNAVAILABLE for a deleted
+                // cluster, INTERNAL for an unknown cluster. These cases are
+                // indistinguishable here, so INTERNAL is used for both here.
                 self.children.get(&*cluster.0).ok_or_else(|| {
                     StatusError::new(
-                        StatusCodeError::Unavailable,
+                        StatusCodeError::Internal,
                         format!("cluster manager: unknown cluster '{cluster:?}'"),
                     )
                 })

@@ -37,5 +37,5 @@ pub(crate) mod cluster_manager;
 #[allow(dead_code)]
 pub(crate) fn register() {
     // Todo: assess whether this is a valid time to update the registry.
-    GLOBAL_LB_REGISTRY.add_builder(cluster_manager::ClusterManagerLbBuilder);
+    GLOBAL_LB_REGISTRY.add_builder(cluster_manager::ClusterManagerBuilder);
 }

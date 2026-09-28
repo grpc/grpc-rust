@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Once;
 
 use grpc::__unstable::client::load_balancing::ChannelController;
 use grpc::__unstable::client::load_balancing::LbConfigJson;
@@ -53,32 +54,26 @@ use grpc::__unstable::client::load_balancing::Picker;
 use grpc::__unstable::client::load_balancing::WorkData;
 use grpc::__unstable::client::load_balancing::child_manager::ChildManager;
 use grpc::__unstable::client::load_balancing::child_manager::ChildUpdate;
+use grpc::__unstable::client::load_balancing::endpoint_filtering;
+use grpc::__unstable::client::load_balancing::registry::GLOBAL_LB_REGISTRY;
 use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::StatusCodeError;
 use grpc::StatusError;
-use grpc::call_attributes::CallAttributes;
 use serde::Deserialize;
 
-pub(crate) static POLICY_NAME: &str = "xds_cluster_manager_experimental";
+static POLICY_NAME: &str = "xds_cluster_manager_experimental";
+static START: Once = Once::new();
 
 // Target cluster attribute for an RPC, keyed by its `TypeId` in the
 // per-call attribute map.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct XdsCluster(pub(crate) String);
-
-impl std::fmt::Display for XdsCluster {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+#[derive(Debug, Clone)]
+struct XdsCluster(Arc<str>);
 
 // Validated configuration for `xds_cluster_manager_experimental`.
 // Maps a cluster name to a load balancing configuration for that cluster.
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct ClusterManagerConfig {
-    #[serde(default)]
-    children: HashMap<XdsCluster, ClusterChildConfig>,
+pub(super) struct ClusterManagerConfig {
+    children: HashMap<String, ClusterChildConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,9 +83,9 @@ struct ClusterChildConfig {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ClusterManagerLbBuilder;
+pub(super) struct ClusterManagerBuilder;
 
-impl LbPolicyBuilder for ClusterManagerLbBuilder {
+impl LbPolicyBuilder for ClusterManagerBuilder {
     type LbPolicy = ClusterManagerPolicy;
 
     fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
@@ -119,8 +114,8 @@ impl LbPolicyBuilder for ClusterManagerLbBuilder {
 
 // An instance of the Cluster Manager Load Balancing policy.
 #[derive(Debug)]
-pub(crate) struct ClusterManagerPolicy {
-    child_manager: ChildManager<XdsCluster>,
+pub(super) struct ClusterManagerPolicy {
+    child_manager: ChildManager<String>,
 }
 
 impl ClusterManagerPolicy {
@@ -156,23 +151,25 @@ impl LbPolicy for ClusterManagerPolicy {
         config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
+        let mut grouped_endpoints = update.endpoints.map(endpoint_filtering::group_by_path);
+
         // `ChildManager::update` removes any existing child that is absent from
-        // this list, so clusters dropped from the config are shut down here.
-        //
-        // TODO: this is only safe once the Config Selector implements the
-        // two-step removal in gRFC A31 -- the Resolver must first publish a
-        // Config Selector that cannot select the cluster while the Service
-        // Config still lists it, and only drop it from the Service Config once
-        // no in-flight RPC references it. Until then a cluster can disappear
-        // from under RPCs that have already selected it.
-        let child_updates = config
-            .children
-            .iter()
-            .map(|(cluster, child_cfg)| ChildUpdate {
+        // this list, so clusters dropped from the config are removed here.
+        let child_updates = config.children.iter().map(|(cluster, child_cfg)| {
+            let mut child_update = ResolverUpdate::default();
+            child_update.attributes = update.attributes.clone();
+            child_update.endpoints = match &mut grouped_endpoints {
+                Ok(grouped) => Ok(grouped.remove(cluster).unwrap_or_default()),
+                Err(status) => Err(status.clone()),
+            };
+            child_update.service_config = update.service_config.clone();
+            child_update.resolution_note = update.resolution_note.clone();
+            ChildUpdate {
                 child_identifier: cluster.clone(),
                 child_policy_builder: child_cfg.child_policy.builder.clone(),
-                child_update: Some((update.clone(), &child_cfg.child_policy.config)),
-            });
+                child_update: Some((child_update, &child_cfg.child_policy.config)),
+            }
+        });
 
         self.child_manager
             .update(child_updates, channel_controller)?;
@@ -200,63 +197,57 @@ impl LbPolicy for ClusterManagerPolicy {
 // Picker that delegates to the active child picker corresponding to the cluster attribute.
 #[derive(Debug)]
 struct ClusterPicker {
-    children: HashMap<XdsCluster, Arc<dyn Picker>>,
+    children: HashMap<String, Arc<dyn Picker>>,
 }
 
 impl ClusterPicker {
-    fn new(children: HashMap<XdsCluster, Arc<dyn Picker>>) -> Self {
+    fn new(children: HashMap<String, Arc<dyn Picker>>) -> Self {
         Self { children }
-    }
-
-    // Resolves the target cluster from the per-call attributes.
-    fn resolve_cluster<'a>(
-        &self,
-        attributes: &'a CallAttributes,
-    ) -> Result<&'a XdsCluster, StatusError> {
-        attributes.get::<XdsCluster>().ok_or_else(|| {
-            // Todo: should this be INTERNAL?
-            StatusError::new(
-                StatusCodeError::Unavailable,
-                "cluster manager: cluster attribute not present",
-            )
-        })
-    }
-
-    // Looks up the child picker for `cluster`.
-    //
-    // A cluster missing from the map means either that it was removed from the
-    // config, or that the Config Selector named a cluster this picker has never
-    // seen. Per gRFC A31 both must terminate the RPC rather than queue it: a
-    // wait-for-ready RPC left queued would hold a reference to the cluster
-    // indefinitely and block its removal. `PickResult::Fail` does not terminate
-    // wait-for-ready RPCs, so `PickResult::Drop` is required here.
-    //
-    // TODO: A31 distinguishes the two cases -- UNAVAILABLE for a deleted
-    // cluster, INTERNAL for a name the picker does not recognise, which "should
-    // not be possible" given the Config Selector's two-step removal. This
-    // picker cannot tell them apart, and grpc-java and grpc-core disagree on
-    // the code (UNAVAILABLE vs INTERNAL). Determine what is correct here.
-    fn child_picker(&self, cluster: &XdsCluster) -> Result<&Arc<dyn Picker>, StatusError> {
-        self.children.get(cluster).ok_or_else(|| {
-            StatusError::new(
-                StatusCodeError::Unavailable,
-                format!("cluster manager: unknown cluster '{cluster}'"),
-            )
-        })
     }
 }
 
 impl Picker for ClusterPicker {
     fn pick(&self, options: PickOptions<'_>) -> PickResult {
-        let picker = match self
-            .resolve_cluster(options.call_attributes)
-            .and_then(|cluster| self.child_picker(cluster))
-        {
-            Ok(picker) => picker,
-            Err(err) => return PickResult::Drop(err),
-        };
-        picker.pick(options)
+        options
+            .call_attributes
+            .get::<XdsCluster>()
+            .ok_or_else(|| {
+                debug_assert!(false, "cluster manager: cluster attribute not present");
+                StatusError::new(
+                    StatusCodeError::Internal,
+                    "cluster manager: cluster attribute not present",
+                )
+            })
+            .and_then(|cluster| {
+                // A cluster missing from the map means either that it was removed from the
+                // config, or that the Config Selector named a cluster this picker has never
+                // seen. Per gRFC A31 both must terminate the RPC rather than queue it: a
+                // wait-for-ready RPC left queued would hold a reference to the cluster
+                // indefinitely and block its removal. `PickResult::Fail` does not terminate
+                // wait-for-ready RPCs, so `PickResult::Drop` is required here.
+                //
+                // TODO: A31 distinguishes the two cases -- UNAVAILABLE for a deleted
+                // cluster, INTERNAL for a name the picker does not recognise, which "should
+                // not be possible" given the Config Selector's two-step removal. This
+                // picker cannot tell them apart, and grpc-java and grpc-core disagree on
+                // the code (UNAVAILABLE vs INTERNAL). Determine what is correct here.
+                self.children.get(&*cluster.0).ok_or_else(|| {
+                    StatusError::new(
+                        StatusCodeError::Unavailable,
+                        format!("cluster manager: unknown cluster '{cluster:?}'"),
+                    )
+                })
+            })
+            .map_or_else(PickResult::Drop, |picker| picker.pick(options))
     }
+}
+
+/// Register cluster manager as a LbPolicy.
+#[expect(dead_code, reason = "no caller until there is an xDS resolver.")]
+pub(crate) fn reg() {
+    START.call_once(|| {
+        GLOBAL_LB_REGISTRY.add_builder(ClusterManagerBuilder {});
+    });
 }
 
 #[cfg(test)]
@@ -266,7 +257,9 @@ mod tests {
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
     use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
+    use grpc::__unstable::client::name_resolution::Endpoint;
     use grpc::__unstable::rt::default_runtime;
+    use grpc::call_attributes::CallAttributes;
     use grpc::client::ConnectivityState;
     use grpc::client::RequestHeaders;
     use grpc::core::Address;
@@ -275,7 +268,7 @@ mod tests {
 
     #[test]
     fn parse_config() {
-        let builder = ClusterManagerLbBuilder;
+        let builder = ClusterManagerBuilder;
         assert_eq!(builder.name(), "xds_cluster_manager_experimental");
 
         let valid_json = serde_json::json!({
@@ -288,16 +281,8 @@ mod tests {
             .parse_config(&LbConfigJson::new(&valid_json.to_string()).unwrap())
             .expect("parse valid config");
         assert_eq!(config.children.len(), 2);
-        assert!(
-            config
-                .children
-                .contains_key(&XdsCluster("cluster_a".into()))
-        );
-        assert!(
-            config
-                .children
-                .contains_key(&XdsCluster("cluster_b".into()))
-        );
+        assert!(config.children.contains_key("cluster_a"));
+        assert!(config.children.contains_key("cluster_b"));
 
         let empty_children = serde_json::json!({ "children": {} });
         let err = builder
@@ -308,9 +293,9 @@ mod tests {
 
     #[test]
     fn cluster_picker_routing() {
-        let mut children: HashMap<XdsCluster, Arc<dyn Picker>> = HashMap::new();
+        let mut children: HashMap<String, Arc<dyn Picker>> = HashMap::new();
         children.insert(
-            XdsCluster("cluster_one".to_string()),
+            "cluster_one".to_string(),
             Arc::new(TaggedPicker("child_one".to_string())),
         );
         let cluster_picker = ClusterPicker { children };
@@ -338,16 +323,55 @@ mod tests {
             }
             other => panic!("expected Drop, got {other:?}"),
         }
+    }
 
-        // Missing XdsCluster attribute -> Drop(Unavailable).
-        let mut empty_attrs = CallAttributes::new();
-        match cluster_picker.pick(PickOptions::new(&req, &mut empty_attrs)) {
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "cluster attribute not present")
+    )]
+    fn missing_cluster_attribute_is_internal_error() {
+        let cluster_picker = ClusterPicker::new(HashMap::new());
+        let req = RequestHeaders::new();
+        let mut attrs = CallAttributes::new();
+        match cluster_picker.pick(PickOptions::new(&req, &mut attrs)) {
             PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
+                assert_eq!(err.code(), StatusCodeError::Internal);
                 assert!(err.message().contains("not present"));
             }
             other => panic!("expected Drop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolver_update_splits_endpoints_by_hierarchy() {
+        let (mut policy, _scheduler, mut controller) = setup_test_policy();
+        let json = serde_json::json!({
+            "children": {
+                "cluster_a": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_a" } }] },
+                "cluster_b": { "childPolicy": [{ "test_dummy_lb": { "tag": "child_b" } }] }
+            }
+        });
+        let cfg = ClusterManagerBuilder
+            .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
+            .unwrap();
+        let mut update = ResolverUpdate::default();
+        update.endpoints = Ok(vec![
+            endpoint_with_path(&["cluster_a", "locality_a"]),
+            endpoint_with_path(&["cluster_b", "locality_b"]),
+        ]);
+        policy
+            .resolver_update(update, &cfg, &mut controller)
+            .unwrap();
+
+        assert_eq!(
+            received_endpoints("child_a"),
+            vec![endpoint_with_path(&["locality_a"])]
+        );
+        assert_eq!(
+            received_endpoints("child_b"),
+            vec![endpoint_with_path(&["locality_b"])]
+        );
     }
 
     #[test]
@@ -380,12 +404,12 @@ mod tests {
             }),
         );
 
-        let identifiers: Vec<&XdsCluster> = policy
+        let identifiers: Vec<&String> = policy
             .child_manager
             .children()
             .map(|c| &c.identifier)
             .collect();
-        assert_eq!(identifiers, vec![&XdsCluster("cluster_a".into())]);
+        assert_eq!(identifiers, vec!["cluster_a"]);
         assert_picks_child(&state.picker, "cluster_a", "child_a");
 
         let req = RequestHeaders::new();
@@ -458,7 +482,7 @@ mod tests {
     ) {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
         let scheduler = Arc::new(MockScheduler::default());
-        let policy = ClusterManagerLbBuilder.build(LbPolicyOptions {
+        let policy = ClusterManagerBuilder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
             // TODO: replace with a no-op test runtime once `rt::Runtime` can be
             // implemented outside the `grpc` crate. That is blocked on
@@ -475,7 +499,7 @@ mod tests {
         controller: &mut MockChannelController,
         json: serde_json::Value,
     ) -> LbState {
-        let cfg = ClusterManagerLbBuilder
+        let cfg = ClusterManagerBuilder
             .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
             .unwrap();
         policy
@@ -496,6 +520,22 @@ mod tests {
             attrs.get::<PickedChild>(),
             Some(&PickedChild(expected_tag.into()))
         );
+    }
+
+    fn endpoint_with_path(path: &[&str]) -> Endpoint {
+        endpoint_filtering::set_path_in_endpoint(
+            Endpoint::default(),
+            path.iter().map(|p| p.to_string()).collect(),
+        )
+    }
+
+    thread_local! {
+        static RECEIVED_ENDPOINTS: std::cell::RefCell<HashMap<String, Vec<Endpoint>>> =
+            std::cell::RefCell::default();
+    }
+
+    fn received_endpoints(tag: &str) -> Vec<Endpoint> {
+        RECEIVED_ENDPOINTS.with_borrow(|r| r[tag].clone())
     }
 
     #[derive(Debug)]
@@ -572,11 +612,14 @@ mod tests {
 
         fn resolver_update(
             &mut self,
-            _update: ResolverUpdate,
+            update: ResolverUpdate,
             config: &Self::LbConfig,
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
             self.tag = config.tag.clone();
+            RECEIVED_ENDPOINTS.with_borrow_mut(|r| {
+                r.insert(config.tag.clone(), update.endpoints.unwrap_or_default())
+            });
             if config.start_connecting {
                 channel_controller.update_picker(LbState {
                     connectivity_state: ConnectivityState::Connecting,

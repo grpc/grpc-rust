@@ -303,12 +303,12 @@ mod tests {
             Some(&PickedChild("child_one".into()))
         );
 
-        // Unknown cluster -> Drop(Unavailable).
+        // Unknown cluster -> Drop(Internal).
         let mut attrs = CallAttributes::new();
         attrs.add(XdsCluster("cluster_unknown".into()));
         match cluster_picker.pick(PickOptions::new(&req, &mut attrs)) {
             PickResult::Drop(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
+                assert_eq!(err.code(), StatusCodeError::Internal);
                 assert!(err.message().contains("unknown cluster"));
             }
             other => panic!("expected Drop, got {other:?}"),
@@ -431,7 +431,7 @@ mod tests {
         let mut attrs_b = CallAttributes::new();
         attrs_b.add(XdsCluster("cluster_b".into()));
         match state.picker.pick(PickOptions::new(&req, &mut attrs_b)) {
-            PickResult::Drop(err) => assert_eq!(err.code(), StatusCodeError::Unavailable),
+            PickResult::Drop(err) => assert_eq!(err.code(), StatusCodeError::Internal),
             other => panic!("expected Drop for removed cluster, got {other:?}"),
         }
     }

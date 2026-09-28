@@ -123,7 +123,7 @@ mod test {
         }
 
         fn name(&self) -> &'static str {
-            "test_policy"
+            "service_config_test_policy"
         }
 
         fn parse_config(
@@ -170,7 +170,7 @@ mod test {
 
         let json_data = json!({
             "loadBalancingConfig": [
-                { "test_policy": { "testField": true } },
+                { "service_config_test_policy": { "testField": true } },
                 { "round_robin": {} }
             ],
             "methodConfig": [
@@ -206,7 +206,7 @@ mod test {
 
         // Verify Load Balancing Config.
         let (builder, config) = sc.lb_config();
-        assert_eq!(builder.name(), "test_policy");
+        assert_eq!(builder.name(), "service_config_test_policy");
         let pf_config = config.downcast_ref::<TestPolicyConfig>().unwrap().clone();
         assert!(pf_config.test_field);
 
@@ -379,13 +379,13 @@ mod test {
         let json_data = json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_policy": { "foo": "bar" } },
-                { "test_policy": { "testField": true } },
+                { "service_config_test_policy": { "testField": true } },
                 { "round_robin": {} }
             ]
         });
         let sc = ServiceConfig::parse(&json_data.to_string()).unwrap();
         let (builder, config) = sc.lb_config();
-        assert_eq!(builder.name(), "test_policy");
+        assert_eq!(builder.name(), "service_config_test_policy");
         let pf_config = config.downcast_ref::<TestPolicyConfig>().unwrap().clone();
         assert!(pf_config.test_field);
 

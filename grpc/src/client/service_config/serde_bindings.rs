@@ -357,7 +357,7 @@ mod test {
             }
 
             fn name(&self) -> &'static str {
-                "test_policy"
+                "serde_bindings_test_policy"
             }
 
             fn parse_config(
@@ -417,17 +417,17 @@ mod test {
         let selected = val.load_balancing_config.as_ref().unwrap();
         assert_eq!(selected.builder.name(), "round_robin");
 
-        // Multiple policies; picks first supported with parsed config (test_policy)
+        // Multiple policies; picks first supported with parsed config (serde_bindings_test_policy)
         let val: TestConfig = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_1": { "key": "val" } },
-                { "test_policy": { "testField": true } },
+                { "serde_bindings_test_policy": { "testField": true } },
                 { "round_robin": {} }
             ]
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.builder.name(), "test_policy");
+        assert_eq!(selected.builder.name(), "serde_bindings_test_policy");
         let pf_cfg = selected
             .config
             .as_ref()
@@ -437,7 +437,7 @@ mod test {
 
         // Invalid config for supported policy fails deserialization
         let res: Result<TestConfig, _> = serde_json::from_value(json!({
-            "loadBalancingConfig": [{ "testPolicy": { "testField": "not_a_bool" } }]
+            "loadBalancingConfig": [{ "serde_bindings_test_policy": { "testField": "not_a_bool" } }]
         }));
         assert!(res.is_err());
 
@@ -470,14 +470,14 @@ mod test {
         // Multiple policies; trailing entries after first supported are ignored
         let val: TestConfig = serde_json::from_value(json!({
             "loadBalancingConfig": [
-                { "test_policy": { "testField": true } },
+                { "serde_bindings_test_policy": { "testField": true } },
                 { "unsupported": { "invalid": 123 }, "other": {} },
                 {}
             ]
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.builder.name(), "test_policy");
+        assert_eq!(selected.builder.name(), "serde_bindings_test_policy");
 
         // Invalid entry with multiple keys in single object -> Error
         let res: Result<TestConfig, _> = serde_json::from_value(json!({

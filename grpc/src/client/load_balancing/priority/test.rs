@@ -33,7 +33,6 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
@@ -61,7 +60,7 @@ fn parse_config_child_not_found() {
   }
 }"#;
     let builder = Builder {};
-    let got = ParsedJsonLbConfig::new(js).and_then(|cfg| builder.parse_config(&cfg));
+    let got = LbConfigJson::new(js).and_then(|cfg| builder.parse_config(&cfg));
     assert!(got.is_err());
 }
 
@@ -78,7 +77,7 @@ fn parse_config_child_not_used() {
   }
 }"#;
     let builder = Builder {};
-    let got = ParsedJsonLbConfig::new(js).and_then(|cfg| builder.parse_config(&cfg));
+    let got = LbConfigJson::new(js).and_then(|cfg| builder.parse_config(&cfg));
     assert!(got.is_err());
 }
 
@@ -95,7 +94,7 @@ fn parse_config_success() {
   }
 }"#;
     let builder = Builder {};
-    let got = ParsedJsonLbConfig::new(js)
+    let got = LbConfigJson::new(js)
         .and_then(|cfg| builder.parse_config(&cfg))
         .unwrap();
 
@@ -291,7 +290,7 @@ async fn empty_priorities_reports_transient_failure() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -337,7 +336,7 @@ async fn high_priority_ready_and_add_remove_lower() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -386,7 +385,7 @@ async fn high_priority_ready_and_add_remove_lower() {
 }"#;
     let cfg2 = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js2).unwrap())
+        .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
     let update2 = ResolverUpdate {
         attributes: Default::default(),
@@ -426,7 +425,7 @@ async fn switch_priority_failover_and_failback() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -501,7 +500,7 @@ async fn init_timeout_failover() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -572,7 +571,7 @@ async fn connecting_to_connecting_does_not_restart_timer() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -628,7 +627,7 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -691,7 +690,7 @@ async fn deactivation_and_reactivation() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -777,7 +776,7 @@ async fn ignore_reresolution_requests_configuration() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -848,7 +847,7 @@ async fn remove_child_from_config_deletes_immediately() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -875,7 +874,7 @@ async fn remove_child_from_config_deletes_immediately() {
 }"#;
     let cfg2 = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js2).unwrap())
+        .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
     let update2 = ResolverUpdate {
         attributes: Default::default(),
@@ -939,7 +938,7 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -989,7 +988,7 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
 }"#;
     let cfg = env
         .builder
-        .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
+        .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),

@@ -58,11 +58,11 @@ use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::child_manager::ChildManager;
@@ -313,7 +313,7 @@ impl LbPolicyBuilder for Builder {
         POLICY_NAME
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<PriorityConfig, String> {
+    fn parse_config(&self, config: &LbConfigJson) -> Result<PriorityConfig, String> {
         let cfg: PriorityConfig = config.convert_to().map_err(|e| e.to_string())?;
         cfg.validate()?;
         Ok(cfg)

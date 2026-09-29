@@ -46,13 +46,12 @@
 use std::sync::Arc;
 
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::DynLbConfig;
-use crate::client::load_balancing::DynLbPolicyBuilder;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::ParsedLbConfig;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
@@ -60,8 +59,6 @@ use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::client::service_config::serde_bindings::LbConfigSerde;
-use crate::client::service_config::serde_bindings::LbInnerConfig;
 use crate::core::Address;
 
 /// Configuration for an individual child under the `priority_experimental`
@@ -86,7 +83,7 @@ pub(super) struct PriorityChildConfig {
     /// The child load balancing policy configuration, specifying the policy
     /// to instantiate (e.g., `round_robin`, `pick_first`, `weighted_target`)
     /// and its policy-specific configuration.
-    config: ChildPolicyConfig,
+    config: ParsedLbConfig,
 
     /// If `true`, re-resolution requests from this child policy will be ignored
     /// and not forwarded to the channel controller.
@@ -101,34 +98,6 @@ pub(super) struct PriorityChildConfig {
     ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md
     #[serde(default)]
     ignore_reresolution_requests: bool,
-}
-
-/// Parsed load balancing policy configuration for a child balancer.
-///
-/// Deserializes using [`LbConfigSerde`] and ensures that a supported child
-/// load balancing policy is present (i.e. `as_ref()` is `Some`), failing
-/// deserialization otherwise.
-#[derive(Debug, Clone)]
-struct ChildPolicyConfig {
-    builder: Arc<DynLbPolicyBuilder>,
-    lb_config: DynLbConfig,
-}
-
-impl<'de> serde::Deserialize<'de> for ChildPolicyConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let lb_config = LbConfigSerde::deserialize(deserializer)?;
-        let inner = lb_config.as_ref().ok_or_else(|| {
-            serde::de::Error::custom("child load balancing policy config must not be empty")
-        })?;
-        let LbInnerConfig { builder, config } = inner.clone();
-        Ok(Self {
-            builder,
-            lb_config: config,
-        })
-    }
 }
 
 /// Builder for [`ChildPolicy`].
@@ -166,7 +135,7 @@ impl LbPolicyBuilder for ChildBuilder {
     /// priority policy.
     fn parse_config(
         &self,
-        _config: &ParsedJsonLbConfig,
+        _config: &LbConfigJson,
     ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
         unreachable!("config should be parsed through the priority_experimental builder")
     }
@@ -200,7 +169,7 @@ impl LbPolicy for ChildPolicy {
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
         let gs_cfg = GracefulSwitchLbConfig::new(
             priority_child_cfg.config.builder.clone(),
-            priority_child_cfg.config.lb_config.clone(),
+            priority_child_cfg.config.config.clone(),
         );
         self.graceful_switch
             .resolver_update(update, &gs_cfg, &mut wrapped_controller)
@@ -274,20 +243,6 @@ mod test {
     use crate::rt::default_runtime;
 
     #[test]
-    fn test_child_lb_config_empty_fails() {
-        let json = r#"[]"#;
-        let res: Result<ChildPolicyConfig, _> = serde_json::from_str(json);
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_child_lb_config_unsupported_fails() {
-        let json = r#"[{"unsupported_policy": {}}]"#;
-        let res: Result<ChildPolicyConfig, _> = serde_json::from_str(json);
-        assert!(res.is_err());
-    }
-
-    #[test]
     fn test_child_config_empty_policy_fails() {
         let json = r#"{
             "config": [],
@@ -323,7 +278,7 @@ mod test {
         assert_eq!(cfg.config.builder.name(), "pick_first");
         let pf_cfg = cfg
             .config
-            .lb_config
+            .config
             .as_ref()
             .downcast_ref::<PickFirstConfig>()
             .expect("expected a PickFirstConfig");

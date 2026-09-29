@@ -641,7 +641,7 @@ mod tests {
         // Perform a subchannel update and confirm zero calls are made.
         *update_calls.lock().unwrap() = 0;
         env.send_subchannel_update(&internal_sc, &state);
-        env.run_work();
+        env.expect_no_events();
         assert_eq!(*update_calls.lock().unwrap(), 0);
 
         // Create a subchannel with the same address again and confirm that a
@@ -822,7 +822,8 @@ mod tests {
         let (tx_work, rx_work) = mpsc::channel::<WorkFn>();
         // Wrap rx_work in a mutex to allow the stub work Fn() closure to access
         // it mutably.
-        let rx_work = Mutex::new(rx_work);
+        let rx_work = Arc::new(Mutex::new(rx_work));
+        let rx_work_clone = rx_work.clone();
 
         let mut env = new_env(StubPolicyFuncs {
             work: Some(Arc::new(move |data, work_item, cc| {
@@ -832,7 +833,7 @@ mod tests {
                     return;
                 }
                 let work_scheduler = data.lb_policy_options.work_scheduler.clone();
-                (rx_work.lock().unwrap().recv().unwrap())(cc, work_scheduler);
+                (rx_work_clone.lock().unwrap().recv().unwrap())(cc, work_scheduler);
             })),
             ..Default::default()
         });
@@ -870,7 +871,8 @@ mod tests {
                 assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
             }))
             .unwrap();
-        env.run_work();
+        env.policy.work(None, &mut env.tcc); // execute the work above
+        env.run_work(); // When _sc is dropped a work item is produced; run it.
 
         // Update the state to Ready.
         env.send_subchannel_update(&int_sc, &SubchannelState::ready());
@@ -885,7 +887,12 @@ mod tests {
                 assert_eq!(state.connectivity_state, ConnectivityState::Ready);
             }))
             .unwrap();
-        env.run_work();
+        env.policy.work(None, &mut env.tcc);
+
+        assert!(
+            rx_work.lock().unwrap().try_recv().is_err(),
+            "not all work functions were executed"
+        );
     }
 
     // A channel controller that reports a state change for every subchannel it

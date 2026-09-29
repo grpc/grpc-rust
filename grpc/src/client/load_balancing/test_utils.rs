@@ -218,9 +218,12 @@ pub(crate) fn run_pending_work<P: LbPolicy + ?Sized>(
     rx_work: &mpsc::Receiver<Option<WorkData>>,
     channel_controller: &mut dyn ChannelController,
 ) {
+    let mut got_work = false;
     while let Ok(data) = rx_work.try_recv() {
+        got_work = true;
         policy.work(data, channel_controller);
     }
+    assert!(got_work, "no work received when asked to run pending work");
 }
 
 /// A test environment for an LB policy of type `P`.

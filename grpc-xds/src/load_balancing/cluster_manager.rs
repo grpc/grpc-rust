@@ -183,7 +183,8 @@ impl LbPolicy for ClusterManagerPolicy {
     }
 }
 
-// Picker that delegates to the active child picker corresponding to the cluster attribute.
+// Picker that delegates to the child picker corresponding to the cluster
+// call attribute.
 #[derive(Debug)]
 struct ClusterPicker {
     children: HashMap<String, Arc<dyn Picker>>,
@@ -208,14 +209,11 @@ impl Picker for ClusterPicker {
                 )
             })
             .and_then(|cluster| {
-                // A31 distinguishes the two cases -- UNAVAILABLE for a deleted
-                // cluster, INTERNAL for an unknown cluster. These cases are
-                // indistinguishable here, so INTERNAL is used for both here.
                 self.children.get(&*cluster.0).ok_or_else(|| {
-                    debug_assert!(false, "cluster manager: unknown cluster '{cluster:?}'");
+                    debug_assert!(false, "cluster manager: unknown cluster '{}'", cluster.0);
                     StatusError::new(
                         StatusCodeError::Internal,
-                        format!("cluster manager: unknown cluster '{cluster:?}'"),
+                        format!("cluster manager: unknown cluster '{}'", cluster.0),
                     )
                 })
             })
@@ -382,7 +380,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "unknown cluster"))]
-    fn removed_cluster_is_shut_down() {
+    fn cluster_removal_on_update() {
         let (mut policy, _scheduler, mut controller) = setup_test_policy();
 
         let state = apply_json_config(

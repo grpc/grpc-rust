@@ -22,16 +22,10 @@
  *
  */
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use serde::Deserialize;
 
 use super::duration::GrpcDuration;
-use crate::client::load_balancing::DynLbConfig;
-use crate::client::load_balancing::DynLbPolicyBuilder;
-use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
-use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::ParsedLbConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,17 +82,12 @@ fn default_max_connections_per_subchannel() -> SerdeU32 {
     SerdeU32(10)
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct LbInnerConfig {
-    pub(crate) builder: Arc<DynLbPolicyBuilder>,
-    pub(crate) config: DynLbConfig,
-}
-
+// Required to cleanly wrap the deserialization of child lb policy array.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LbConfigSerde(Option<LbInnerConfig>);
+pub(crate) struct LbConfigSerde(Option<ParsedLbConfig>);
 
 impl LbConfigSerde {
-    pub(crate) fn as_ref(&self) -> Option<&LbInnerConfig> {
+    pub(crate) fn as_ref(&self) -> Option<&ParsedLbConfig> {
         self.0.as_ref()
     }
 
@@ -116,37 +105,9 @@ impl<'de> Deserialize<'de> for LbConfigSerde {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw_entries =
-            Option::<Vec<HashMap<String, serde_json::Value>>>::deserialize(deserializer)?
-                .unwrap_or_default();
-
-        if raw_entries.is_empty() {
-            return Ok(LbConfigSerde(None));
-        }
-
-        for map in raw_entries {
-            let mut iter = map.into_iter();
-            let (Some((name, raw_config)), None) = (iter.next(), iter.next()) else {
-                return Err(serde::de::Error::custom(
-                    "Each load balancing config entry must contain exactly one policy name.",
-                ));
-            };
-
-            if let Some(builder) = GLOBAL_LB_REGISTRY.get_policy(&name) {
-                let parsed_json = ParsedJsonLbConfig::from_value(raw_config);
-                let parsed_config = builder
-                    .parse_config(&parsed_json)
-                    .map_err(serde::de::Error::custom)?;
-                return Ok(LbConfigSerde(Some(LbInnerConfig {
-                    builder,
-                    config: parsed_config,
-                })));
-            }
-        }
-
-        Err(serde::de::Error::custom(
-            "No supported load balancing policy found in config.",
-        ))
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let parsed = ParsedLbConfig::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(LbConfigSerde(parsed))
     }
 }
 
@@ -328,6 +289,7 @@ mod test {
 
     use super::*;
     use crate::client::load_balancing::ChannelController;
+    use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
     use crate::client::load_balancing::LbPolicy;
     use crate::client::load_balancing::LbPolicyBuilder;
     use crate::client::load_balancing::LbPolicyOptions;
@@ -395,12 +357,12 @@ mod test {
             }
 
             fn name(&self) -> &'static str {
-                "test_policy"
+                "serde_bindings_test_policy"
             }
 
             fn parse_config(
                 &self,
-                config: &ParsedJsonLbConfig,
+                config: &crate::client::load_balancing::LbConfigJson,
             ) -> Result<<Self::LbPolicy as crate::client::load_balancing::LbPolicy>::LbConfig, String>
             {
                 let config: TestPolicyConfig = config.convert_to().map_err(|e| e.to_string())?;
@@ -455,17 +417,17 @@ mod test {
         let selected = val.load_balancing_config.as_ref().unwrap();
         assert_eq!(selected.builder.name(), "round_robin");
 
-        // Multiple policies; picks first supported with parsed config (test_policy)
+        // Multiple policies; picks first supported with parsed config (serde_bindings_test_policy)
         let val: TestConfig = serde_json::from_value(json!({
             "loadBalancingConfig": [
                 { "unsupported_lb_1": { "key": "val" } },
-                { "test_policy": { "testField": true } },
+                { "serde_bindings_test_policy": { "testField": true } },
                 { "round_robin": {} }
             ]
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.builder.name(), "test_policy");
+        assert_eq!(selected.builder.name(), "serde_bindings_test_policy");
         let pf_cfg = selected
             .config
             .as_ref()
@@ -475,7 +437,7 @@ mod test {
 
         // Invalid config for supported policy fails deserialization
         let res: Result<TestConfig, _> = serde_json::from_value(json!({
-            "loadBalancingConfig": [{ "testPolicy": { "testField": "not_a_bool" } }]
+            "loadBalancingConfig": [{ "serde_bindings_test_policy": { "testField": "not_a_bool" } }]
         }));
         assert!(res.is_err());
 
@@ -508,14 +470,14 @@ mod test {
         // Multiple policies; trailing entries after first supported are ignored
         let val: TestConfig = serde_json::from_value(json!({
             "loadBalancingConfig": [
-                { "test_policy": { "testField": true } },
+                { "serde_bindings_test_policy": { "testField": true } },
                 { "unsupported": { "invalid": 123 }, "other": {} },
                 {}
             ]
         }))
         .unwrap();
         let selected = val.load_balancing_config.as_ref().unwrap();
-        assert_eq!(selected.builder.name(), "test_policy");
+        assert_eq!(selected.builder.name(), "serde_bindings_test_policy");
 
         // Invalid entry with multiple keys in single object -> Error
         let res: Result<TestConfig, _> = serde_json::from_value(json!({

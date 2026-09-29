@@ -70,7 +70,7 @@ impl LbPolicyBuilder for RoundRobinBuilder {
 
     fn parse_config(
         &self,
-        _config: &super::ParsedJsonLbConfig,
+        _config: &super::LbConfigJson,
     ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
         Ok(RoundRobinConfig::default())
     }

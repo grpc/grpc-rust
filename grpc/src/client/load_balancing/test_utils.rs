@@ -34,11 +34,11 @@ use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicy;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
@@ -327,7 +327,7 @@ impl LbPolicyBuilder for StubPolicyBuilder {
         self.name
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<DynLbConfig, String> {
+    fn parse_config(&self, config: &LbConfigJson) -> Result<DynLbConfig, String> {
         let cfg: MockConfig = match config.convert_to() {
             Ok(c) => c,
             Err(e) => {

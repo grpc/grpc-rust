@@ -32,10 +32,10 @@ use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicy;
 use crate::client::load_balancing::DynLbPolicyBuilder;
+use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::WorkData;
 use crate::client::name_resolution::ResolverUpdate;
 
@@ -102,7 +102,7 @@ impl<T: LbPolicyBuilder> LbPolicyBuilder for DynAdapter<T> {
         self.0.name()
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<DynLbConfig, String> {
+    fn parse_config(&self, config: &LbConfigJson) -> Result<DynLbConfig, String> {
         // Call the real parse config and then wrap its result in a DynLbConfig if it is Ok(Some)
         let cfg = self.0.parse_config(config)?;
         Ok(Arc::new(cfg) as DynLbConfig)

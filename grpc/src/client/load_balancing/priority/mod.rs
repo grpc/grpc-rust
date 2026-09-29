@@ -386,6 +386,12 @@ impl LbPolicy for PriorityPolicy {
             self.children.push(child_data);
         }
 
+        debug_assert!(
+            sharded_endpoints.is_err() || sharded_endpoints.as_ref().unwrap().is_empty(),
+            "endpoints contain paths not belonging to any child: {:?}",
+            sharded_endpoints
+        );
+
         // Only children that have already been created are sent to the
         // ChildManager; the remaining ones are created lazily by
         // choose_priority.
@@ -450,6 +456,48 @@ impl PriorityPolicy {
         self.handle_connectivity_timer();
         self.update_child_data();
         self.choose_priority(channel_controller);
+    }
+
+    /// Prunes deactivated children whose 15-minute retention timer has expired.
+    ///
+    /// Expired children revert to [`ChildState::Uninitialized`] and are removed
+    /// from [`ChildManager`] to tear down their subchannels. They are NOT
+    /// removed from `self.children` so they can be lazily re-created if
+    /// higher priorities fail later (see [gRFC A56 (Section Child Lifetime
+    /// Management)]).
+    fn handle_deactivation_timer(&mut self) {
+        let now = Instant::now();
+
+        for child_data in &mut self.children {
+            if let ChildState::Deactivated(timer, _) = &child_data.state
+                && now >= timer.deadline
+            {
+                child_data.state = ChildState::Uninitialized;
+            }
+        }
+
+        let iter = self
+            .children
+            .iter()
+            .filter(|child_data| !matches!(child_data.state, ChildState::Uninitialized))
+            .map(|child_data| (child_data.name.clone(), ChildBuilder {}));
+
+        self.child_mgr.retain_children(iter);
+    }
+
+    /// Checks for children in [`ChildState::Connecting`] whose 10-second
+    /// failover timer has expired, transitioning them to
+    /// [`ChildState::ConnectingExpired`].
+    fn handle_connectivity_timer(&mut self) {
+        let now = Instant::now();
+
+        for child_data in &mut self.children {
+            if let ChildState::Connecting(connecting_state, lb_state) = &child_data.state
+                && now >= connecting_state.deadline
+            {
+                child_data.state = ChildState::ConnectingExpired(lb_state.clone());
+            }
+        }
     }
 
     /// Synchronizes the local [`ChildState`] of each child with the latest
@@ -712,49 +760,6 @@ impl PriorityPolicy {
             });
 
         self.child_mgr.update(child_updates, channel_controller)
-    }
-
-    /// Checks for children in [`ChildState::Connecting`] whose 10-second
-    /// failover timer has expired, transitioning them to
-    /// [`ChildState::ConnectingExpired`].
-    fn handle_connectivity_timer(&mut self) {
-        for child_data in &mut self.children {
-            if let ChildState::Connecting(connecting_state, lb_state) = &child_data.state
-                && Instant::now() >= connecting_state.deadline
-            {
-                child_data.state = ChildState::ConnectingExpired(lb_state.clone());
-            }
-        }
-    }
-
-    /// Prunes deactivated children whose 15-minute retention timer has expired.
-    ///
-    /// Expired children revert to [`ChildState::Uninitialized`] and are removed
-    /// from [`ChildManager`] to tear down their subchannels. They are NOT
-    /// removed from `self.children` so they can be lazily re-created if
-    /// higher priorities fail later (see [gRFC A56 (Section Child Lifetime
-    /// Management)]).
-    fn handle_deactivation_timer(&mut self) {
-        let mut any_expired = false;
-        for child_data in &mut self.children {
-            if let ChildState::Deactivated(timer, _) = &child_data.state
-                && Instant::now() >= timer.deadline
-            {
-                child_data.state = ChildState::Uninitialized;
-                any_expired = true;
-            }
-        }
-
-        if !any_expired {
-            return;
-        }
-        let iter = self
-            .children
-            .iter()
-            .filter(|child_data| !matches!(child_data.state, ChildState::Uninitialized))
-            .map(|child_data| (child_data.name.clone(), ChildBuilder {}));
-
-        self.child_mgr.retain_children(iter);
     }
 }
 

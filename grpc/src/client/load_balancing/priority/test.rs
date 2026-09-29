@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
@@ -34,15 +33,12 @@ use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::QueuingPicker;
-use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::endpoint_filtering;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::load_balancing::test_utils;
 use crate::client::load_balancing::test_utils::StubPolicyFuncs;
-use crate::client::load_balancing::test_utils::TestChannelController;
-use crate::client::load_balancing::test_utils::TestEvent;
-use crate::client::load_balancing::test_utils::TestWorkScheduler;
+use crate::client::load_balancing::test_utils::TestEnv;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::core::Address;
@@ -104,68 +100,21 @@ fn parse_config_success() {
     assert_eq!(child_names, vec!["child-1", "child-2", "child-3"]);
 }
 
-/// Test environment container holding a PriorityPolicy, channel controller,
-/// receiver for test events, and the builder.
-struct TestEnv {
-    rx_events: mpsc::Receiver<TestEvent>,
-    policy: PriorityPolicy,
-    tcc: TestChannelController,
-    builder: Builder,
-}
-
-fn setup_test_env() -> TestEnv {
-    let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
-    let tcc = TestChannelController {
-        tx_events: tx_events.clone(),
-    };
-    let work_scheduler = Arc::new(TestWorkScheduler { tx_events });
-    let rt = default_runtime();
-    let builder = Builder {};
-    let policy = builder.build(LbPolicyOptions {
-        runtime: rt,
-        work_scheduler,
-    });
-    TestEnv {
-        rx_events,
-        policy,
-        tcc,
-        builder,
-    }
-}
-
-/// Helper to receive the next `ScheduleWork` event from the test channel.
-fn recv_schedule_work(rx: &mpsc::Receiver<TestEvent>) -> Option<WorkData> {
-    loop {
-        match rx.recv().unwrap() {
-            TestEvent::ScheduleWork(data) => return data,
-            _ => continue,
-        }
-    }
-}
-
-/// Returns the state of the last `UpdatePicker` event currently queued, if
-/// any. Consumes all pending events.
-fn last_picker_update(rx: &mpsc::Receiver<TestEvent>) -> Option<LbState> {
-    rx.try_iter()
-        .filter_map(|e| match e {
-            TestEvent::UpdatePicker(state) => Some(state),
-            _ => None,
+fn setup_test_env() -> TestEnv<PriorityPolicy> {
+    TestEnv::new(|work_scheduler| {
+        Builder {}.build(LbPolicyOptions {
+            runtime: default_runtime(),
+            work_scheduler,
         })
-        .last()
+    })
 }
 
-/// Simulates a state change of `subchannel` and delivers the resulting work
-/// item to the policy, exactly as the channel would.
-///
-/// Note that any events queued before the update are discarded.
-fn move_subchannel_to_state(
-    env: &mut TestEnv,
-    subchannel: &Arc<dyn Subchannel>,
-    state: SubchannelState,
-) {
-    test_utils::schedule_subchannel_update(subchannel, state);
-    let data = recv_schedule_work(&env.rx_events);
-    env.policy.work(data, &mut env.tcc);
+/// Verifies that the policy produced a new picker with connectivity state
+/// `want`, and returns the state containing it.
+fn expect_picker_state(env: &mut TestEnv<PriorityPolicy>, want: ConnectivityState) -> LbState {
+    let state = env.expect_picker_update();
+    assert_eq!(state.connectivity_state, want);
+    state
 }
 
 /// Advances virtual time by `duration` on the paused Tokio runtime.
@@ -194,89 +143,44 @@ fn new_test_endpoint(child_name: &str, addr: &str) -> Endpoint {
     endpoint_filtering::set_path_in_endpoint(endpoint, vec![child_name.to_string()])
 }
 
-#[derive(Clone, Default)]
-struct ControllableStubHandle {
-    subchannel: Arc<Mutex<Option<Arc<dyn Subchannel>>>>,
-    resolution_requested: Arc<Mutex<bool>>,
-}
-
-impl ControllableStubHandle {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn subchannel(&self) -> Option<Arc<dyn Subchannel>> {
-        self.subchannel.lock().unwrap().clone()
-    }
-
-    fn get_subchannel(&self) -> Option<Arc<dyn Subchannel>> {
-        self.subchannel()
-    }
-
-    fn set_subchannel(&self, subchannel: Option<Arc<dyn Subchannel>>) {
-        *self.subchannel.lock().unwrap() = subchannel;
-    }
-
-    fn resolution_requested(&self) -> bool {
-        *self.resolution_requested.lock().unwrap()
-    }
-
-    fn get_resolution_requested(&self) -> bool {
-        self.resolution_requested()
-    }
-
-    fn set_resolution_requested(&self, requested: bool) {
-        *self.resolution_requested.lock().unwrap() = requested;
-    }
-}
-
-/// Helper registering a stub child LB policy that creates a subchannel and
-/// reports connectivity updates.
-fn new_stub(policy_name: &'static str) -> ControllableStubHandle {
-    let handle = ControllableStubHandle::new();
-    let handle_clone = handle.clone();
-
+/// Registers a stub child LB policy named `policy_name`.
+///
+/// On every resolver update, the stub creates a subchannel for the first
+/// address. On every subchannel update, it reports the subchannel's
+/// connectivity state as its own (with a new picker), and requests
+/// re-resolution if the subchannel is in TRANSIENT_FAILURE.
+fn reg_stub(policy_name: &'static str) {
     let funcs = StubPolicyFuncs {
-        resolver_update: Some(Arc::new({
-            let handle = handle_clone.clone();
-            move |data, update, _cfg, controller| {
-                let addr = update
-                    .endpoints
-                    .as_ref()
-                    .ok()
-                    .and_then(|e| e.first())
-                    .and_then(|e| e.addresses.first())
-                    .cloned()
-                    .unwrap_or_default();
-                let (subchannel, _) =
-                    controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
-                handle.set_subchannel(Some(subchannel));
-                Ok(())
-            }
+        resolver_update: Some(Arc::new(|data, update, _cfg, controller| {
+            let addr = update
+                .endpoints
+                .as_ref()
+                .ok()
+                .and_then(|e| e.first())
+                .and_then(|e| e.addresses.first())
+                .cloned()
+                .unwrap_or_default();
+            controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
+            Ok(())
         })),
         // Subchannel state changes are delivered as SubchannelUpdate work
         // items.
-        work: Some(Arc::new({
-            let handle = handle_clone;
-            move |_data, work_data, controller| {
-                let update = work_data
-                    .expect("expected work data")
-                    .downcast::<SubchannelUpdate>()
-                    .expect("expected SubchannelUpdate");
-                if update.state.connectivity_state == ConnectivityState::TransientFailure {
-                    handle.set_resolution_requested(true);
-                    controller.request_resolution();
-                }
-                controller.update_picker(LbState {
-                    connectivity_state: update.state.connectivity_state,
-                    picker: Arc::new(QueuingPicker {}),
-                });
+        work: Some(Arc::new(|_data, work_data, controller| {
+            let update = work_data
+                .expect("expected work data")
+                .downcast::<SubchannelUpdate>()
+                .expect("expected SubchannelUpdate");
+            if update.state.connectivity_state == ConnectivityState::TransientFailure {
+                controller.request_resolution();
             }
+            controller.update_picker(LbState {
+                connectivity_state: update.state.connectivity_state,
+                picker: Arc::new(QueuingPicker {}),
+            });
         })),
         ..Default::default()
     };
     test_utils::reg_stub_policy(policy_name, funcs);
-    handle
 }
 
 /// Verifies that an empty priority list immediately reports
@@ -288,8 +192,7 @@ async fn empty_priorities_reports_transient_failure() {
   "priorities": [],
   "children": {}
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -302,18 +205,8 @@ async fn empty_priorities_reports_transient_failure() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    let picker_event = env
-        .rx_events
-        .try_iter()
-        .find_map(|e| match e {
-            TestEvent::UpdatePicker(state) => Some(state),
-            _ => None,
-        })
-        .expect("expected UpdatePicker event");
-    assert_eq!(
-        picker_event.connectivity_state,
-        ConnectivityState::TransientFailure
-    );
+    expect_picker_state(&mut env, ConnectivityState::TransientFailure);
+    env.expect_no_events();
 }
 
 /// Verifies that when a high-priority child is READY, traffic routes to it
@@ -321,9 +214,9 @@ async fn empty_priorities_reports_transient_failure() {
 /// churn or initialize unused children.
 #[tokio::test]
 async fn high_priority_ready_and_add_remove_lower() {
-    let stub_handle0 = new_stub("stub_hr_0");
-    let stub_handle1 = new_stub("stub_hr_1");
-    let stub_handle2 = new_stub("stub_hr_2");
+    reg_stub("stub_hr_0");
+    reg_stub("stub_hr_1");
+    reg_stub("stub_hr_2");
 
     let mut env = setup_test_env();
 
@@ -334,8 +227,7 @@ async fn high_priority_ready_and_add_remove_lower() {
     "child-1": {"config": [{"stub_hr_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -351,28 +243,16 @@ async fn high_priority_ready_and_add_remove_lower() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    // child-0 should be lazily instantiated and connecting.
-    let sc0 = stub_handle0
-        .subchannel()
-        .expect("child-0 subchannel should be created");
-    assert!(
-        stub_handle1.subchannel().is_none(),
-        "child-1 should NOT be created while child-0 is connecting"
-    );
+    // child-0 should be lazily instantiated and connecting. child-1 should NOT
+    // be created while child-0 is connecting.
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
     // Make child-0 Ready.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
-
-    let last_picker = env
-        .rx_events
-        .try_iter()
-        .filter_map(|e| match e {
-            TestEvent::UpdatePicker(state) => Some(state),
-            _ => None,
-        })
-        .last()
-        .expect("expected picker update");
-    assert_eq!(last_picker.connectivity_state, ConnectivityState::Ready);
+    env.send_subchannel_update(&sc0, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
     // Add child-2 to priorities.
     let js2 = r#"{
@@ -383,8 +263,7 @@ async fn high_priority_ready_and_add_remove_lower() {
     "child-2": {"config": [{"stub_hr_2": {}}]}
   }
 }"#;
-    let cfg2 = env
-        .builder
+    let cfg2 = Builder {}
         .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
     let update2 = ResolverUpdate {
@@ -401,18 +280,19 @@ async fn high_priority_ready_and_add_remove_lower() {
         .resolver_update(update2, &cfg2, &mut env.tcc)
         .unwrap();
 
-    // child-0 is still Ready; child-1 and child-2 should still not be
-    // created.
-    assert!(stub_handle1.subchannel().is_none());
-    assert!(stub_handle2.subchannel().is_none());
+    // The update is forwarded to child-0, whose stub creates a subchannel for
+    // every resolver update.  child-0 is still Ready, so the picker is
+    // unchanged. child-1 and child-2 should still not be created.
+    env.expect_new_subchannel();
+    env.expect_no_events();
 }
 
 /// Verifies priority failover when the primary child enters
 /// TRANSIENT_FAILURE, and failback with deactivation when it recovers.
 #[tokio::test]
 async fn switch_priority_failover_and_failback() {
-    let stub_handle0 = new_stub("stub_sp_0");
-    let stub_handle1 = new_stub("stub_sp_1");
+    reg_stub("stub_sp_0");
+    reg_stub("stub_sp_1");
 
     let mut env = setup_test_env();
 
@@ -423,8 +303,7 @@ async fn switch_priority_failover_and_failback() {
     "child-1": {"config": [{"stub_sp_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -440,41 +319,36 @@ async fn switch_priority_failover_and_failback() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    let sc0 = stub_handle0
-        .subchannel()
-        .expect("child-0 subchannel created");
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
+    env.send_subchannel_update(&sc0, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
     // Turn down child-0 with TransientFailure.
-    move_subchannel_to_state(
-        &mut env,
+    env.send_subchannel_update(
         &sc0,
-        SubchannelState::transient_failure("connection refused"),
+        &SubchannelState::transient_failure("connection refused"),
     );
 
-    // Failover: child-1 is lazily created and starts connecting.
-    let sc1 = stub_handle1
-        .subchannel()
-        .expect("child-1 should be created on failover");
+    // child-0 requests re-resolution. Failover: child-1 is lazily created and
+    // starts connecting.
+    env.expect_request_resolution();
+    let sc1 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
     // Make child-1 Ready.
-    move_subchannel_to_state(&mut env, &sc1, SubchannelState::ready());
+    env.send_subchannel_update(&sc1, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
-    let last_picker = env
-        .rx_events
-        .try_iter()
-        .filter_map(|e| match e {
-            TestEvent::UpdatePicker(s) => Some(s),
-            _ => None,
-        })
-        .last()
-        .unwrap();
-    assert_eq!(last_picker.connectivity_state, ConnectivityState::Ready);
+    // Failback: child-0 recovers to Ready and is selected again.
+    env.send_subchannel_update(&sc0, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
-    // Failback: child-0 recovers to Ready.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
-
-    // child-0 is selected again.
     // child-1 is deactivated with a 15-minute timer.
     assert!(matches!(
         env.policy.child("child-1").unwrap().state,
@@ -486,8 +360,8 @@ async fn switch_priority_failover_and_failback() {
 /// failover timer expires and triggers failover to the next priority.
 #[tokio::test(start_paused = true)]
 async fn init_timeout_failover() {
-    let stub_handle0 = new_stub("stub_to_0");
-    let stub_handle1 = new_stub("stub_to_1");
+    reg_stub("stub_to_0");
+    reg_stub("stub_to_1");
 
     let mut env = setup_test_env();
 
@@ -498,8 +372,7 @@ async fn init_timeout_failover() {
     "child-1": {"config": [{"stub_to_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -515,15 +388,14 @@ async fn init_timeout_failover() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    // child-0 is connecting.
-    assert!(stub_handle0.subchannel().is_some());
-    assert!(
-        stub_handle1.subchannel().is_none(),
-        "child-1 should not be initialized before timeout"
-    );
+    // child-0 is connecting; child-1 is not initialized before the timeout.
+    env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
     // Advance time by 5 seconds (less than 10s timeout).
     advance_time(Duration::from_secs(5)).await;
+    env.expect_no_events();
 
     assert!(
         matches!(
@@ -532,12 +404,11 @@ async fn init_timeout_failover() {
         ),
         "child-0 should still be in Connecting state after 5 seconds"
     );
-    assert!(stub_handle1.subchannel().is_none());
 
     // Advance time by another 6 seconds (total 11s > 10s timeout).
     advance_time(Duration::from_secs(6)).await;
 
-    let data = recv_schedule_work(&env.rx_events);
+    let data = env.expect_schedule_work();
     env.policy.work(data, &mut env.tcc);
 
     // child-0 should now be ConnectingExpired.
@@ -546,19 +417,18 @@ async fn init_timeout_failover() {
         ChildState::ConnectingExpired(_)
     ));
 
-    // child-1 should have been lazily initialized.
-    assert!(
-        stub_handle1.subchannel().is_some(),
-        "child-1 should be created after timeout"
-    );
+    // child-1 should have been lazily initialized and selected.
+    env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 }
 
 /// Verifies that receiving multiple CONNECTING updates does not reset the
 /// 10-second failover timer.
 #[tokio::test(start_paused = true)]
 async fn connecting_to_connecting_does_not_restart_timer() {
-    let stub_handle0 = new_stub("stub_c2c_0");
-    let _stub_handle1 = new_stub("stub_c2c_1");
+    reg_stub("stub_c2c_0");
+    reg_stub("stub_c2c_1");
 
     let mut env = setup_test_env();
 
@@ -569,8 +439,7 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     "child-1": {"config": [{"stub_c2c_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -585,19 +454,24 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     env.policy
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
-    let sc0 = stub_handle0.subchannel().unwrap();
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
     // Advance time by 5 seconds.
     advance_time(Duration::from_secs(5)).await;
+    env.expect_no_events();
 
-    // Send another Connecting update for child-0.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::connecting());
+    // Send another Connecting update for child-0. Its new picker is published.
+    env.send_subchannel_update(&sc0, &SubchannelState::connecting());
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
     // Advance time by 6 seconds (total 11s from start, but only 6s from
     // 2nd update).
     advance_time(Duration::from_secs(6)).await;
 
-    let data = recv_schedule_work(&env.rx_events);
+    let data = env.expect_schedule_work();
     env.policy.work(data, &mut env.tcc);
 
     // The timer should have expired based on original start time
@@ -606,6 +480,11 @@ async fn connecting_to_connecting_does_not_restart_timer() {
         env.policy.child("child-0").unwrap().state,
         ChildState::ConnectingExpired(_)
     ));
+
+    // Failover: child-1 is lazily created and selected.
+    env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 }
 
 /// Verifies that a child transitioning from TRANSIENT_FAILURE to
@@ -613,8 +492,8 @@ async fn connecting_to_connecting_does_not_restart_timer() {
 /// timer.
 #[tokio::test]
 async fn transient_failure_to_connecting_enters_connecting_expired() {
-    let stub_handle0 = new_stub("stub_tf2c_0");
-    let stub_handle1 = new_stub("stub_tf2c_1");
+    reg_stub("stub_tf2c_0");
+    reg_stub("stub_tf2c_1");
 
     let mut env = setup_test_env();
 
@@ -625,8 +504,7 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
     "child-1": {"config": [{"stub_tf2c_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -642,21 +520,25 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    let sc0 = stub_handle0.subchannel().unwrap();
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
-    // child-0 goes to TransientFailure.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::transient_failure("fail"));
+    // child-0 goes to TransientFailure and requests re-resolution; child-1 is
+    // initialized.
+    env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
+    env.expect_request_resolution();
+    let sc1 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
-    // child-1 is initialized and goes Ready.
-    let sc1 = stub_handle1.subchannel().unwrap();
-    move_subchannel_to_state(&mut env, &sc1, SubchannelState::ready());
-
-    // child-1 is chosen as the active child.
-    let last_picker = last_picker_update(&env.rx_events).expect("expected picker update");
-    assert_eq!(last_picker.connectivity_state, ConnectivityState::Ready);
+    // child-1 goes Ready and is chosen as the active child.
+    env.send_subchannel_update(&sc1, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
     // Now child-0 attempts to connect again (TransientFailure -> Connecting).
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::connecting());
+    env.send_subchannel_update(&sc0, &SubchannelState::connecting());
 
     // Per gRFC A56, child-0 enters ConnectingExpired (no new 10s timer).
     assert!(matches!(
@@ -664,11 +546,9 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
         ChildState::ConnectingExpired(_)
     ));
 
-    // And child-1 (which is Ready) remains the chosen active child, so any
-    // picker published after child-0 started connecting still reports Ready.
-    if let Some(picker) = last_picker_update(&env.rx_events) {
-        assert_eq!(picker.connectivity_state, ConnectivityState::Ready);
-    }
+    // And child-1 (which is Ready) remains the chosen active child, so no new
+    // picker is published.
+    env.expect_no_events();
 }
 
 /// Verifies the 15-minute deactivation retention timer, background update
@@ -676,8 +556,8 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
 /// reactivation without panic.
 #[tokio::test(start_paused = true)]
 async fn deactivation_and_reactivation() {
-    let stub_handle0 = new_stub("stub_dr_0");
-    let stub_handle1 = new_stub("stub_dr_1");
+    reg_stub("stub_dr_0");
+    reg_stub("stub_dr_1");
 
     let mut env = setup_test_env();
 
@@ -688,8 +568,7 @@ async fn deactivation_and_reactivation() {
     "child-1": {"config": [{"stub_dr_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -705,15 +584,24 @@ async fn deactivation_and_reactivation() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    let sc0 = stub_handle0.subchannel().unwrap();
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
     // child-0 fails -> failover to child-1.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::transient_failure("fail"));
-    let sc1 = stub_handle1.subchannel().unwrap();
-    move_subchannel_to_state(&mut env, &sc1, SubchannelState::ready());
+    env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
+    env.expect_request_resolution();
+    let sc1 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
+    env.send_subchannel_update(&sc1, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
     // child-0 recovers -> failback to child-0.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
+    env.send_subchannel_update(&sc0, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
     // child-1 is deactivated with a 15-minute timer.
     assert!(matches!(
@@ -722,8 +610,9 @@ async fn deactivation_and_reactivation() {
     ));
 
     // While deactivated, background updates to child-1 do NOT cancel
-    // deactivation.
-    move_subchannel_to_state(&mut env, &sc1, SubchannelState::connecting());
+    // deactivation, and do not affect the picker.
+    env.send_subchannel_update(&sc1, &SubchannelState::connecting());
+    env.expect_no_events();
     assert!(matches!(
         env.policy.child("child-1").unwrap().state,
         ChildState::Deactivated(_, _)
@@ -731,8 +620,9 @@ async fn deactivation_and_reactivation() {
     // Advance time past 15 minutes (901 seconds).
     advance_time(Duration::from_secs(15 * 60 + 1)).await;
 
-    let data = recv_schedule_work(&env.rx_events);
+    let data = env.expect_schedule_work();
     env.policy.work(data, &mut env.tcc);
+    env.expect_no_events();
 
     // child-1 should now be Uninitialized in the child list, and pruned from
     // child_mgr.
@@ -740,28 +630,22 @@ async fn deactivation_and_reactivation() {
         env.policy.child("child-1").unwrap().state,
         ChildState::Uninitialized
     ));
-    assert_eq!(env.policy.child_mgr.children().count(), 1);
 
-    // Now child-0 fails again. child-1 should be reactivated.
-    stub_handle1.set_subchannel(None);
-    move_subchannel_to_state(
-        &mut env,
-        &sc0,
-        SubchannelState::transient_failure("fail again"),
-    );
-
-    assert!(
-        stub_handle1.subchannel().is_some(),
-        "child-1 should be re-created from Uninitialized"
-    );
+    // Now child-0 fails again. child-1 should be re-created from
+    // Uninitialized.
+    env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail again"));
+    env.expect_request_resolution();
+    env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 }
 
 /// Verifies that ignoreReresolutionRequests config correctly filters
 /// re-resolution requests from child policies.
 #[tokio::test]
 async fn ignore_reresolution_requests_configuration() {
-    let stub_handle0 = new_stub("stub_irr_0");
-    let stub_handle1 = new_stub("stub_irr_1");
+    reg_stub("stub_irr_0");
+    reg_stub("stub_irr_1");
 
     let mut env = setup_test_env();
 
@@ -774,8 +658,7 @@ async fn ignore_reresolution_requests_configuration() {
     "child-1": {"config": [{"stub_irr_1": {}}], "ignoreReresolutionRequests": false}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -791,50 +674,34 @@ async fn ignore_reresolution_requests_configuration() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    let sc0 = stub_handle0.subchannel().unwrap();
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
-    // child-0 enters TransientFailure (our stub calls
-    // request_resolution()).
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::transient_failure("fail"));
-    assert!(stub_handle0.resolution_requested());
+    // child-0 enters TransientFailure (our stub calls request_resolution()).
+    env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
+    // Since child-0 has ignoreReresolutionRequests = true, tcc does NOT
+    // receive RequestResolution. Failover occurs to child-1.
+    let sc1 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
-    // Since child-0 has ignoreReresolutionRequests = true, tcc did NOT
-    // receive RequestResolution.
-    let had_resolution_req = env
-        .rx_events
-        .try_iter()
-        .any(|e| matches!(e, TestEvent::RequestResolution));
-    assert!(
-        !had_resolution_req,
-        "re-resolution request from child-0 should be ignored"
-    );
-
-    // Failover occurred to child-1.
-    let sc1 = stub_handle1.subchannel().unwrap();
-
-    // child-1 enters TransientFailure (our stub calls
-    // request_resolution()).
-    move_subchannel_to_state(&mut env, &sc1, SubchannelState::transient_failure("fail"));
-    assert!(stub_handle1.resolution_requested());
-
+    // child-1 enters TransientFailure (our stub calls request_resolution()).
+    env.send_subchannel_update(&sc1, &SubchannelState::transient_failure("fail"));
     // Since child-1 has ignoreReresolutionRequests = false, tcc DOES
-    // receive RequestResolution!
-    let had_resolution_req2 = env
-        .rx_events
-        .try_iter()
-        .any(|e| matches!(e, TestEvent::RequestResolution));
-    assert!(
-        had_resolution_req2,
-        "re-resolution request from child-1 should be forwarded"
-    );
+    // receive RequestResolution. All children have failed, so the last
+    // child's TransientFailure picker is published.
+    env.expect_request_resolution();
+    expect_picker_state(&mut env, ConnectivityState::TransientFailure);
+    env.expect_no_events();
 }
 
 /// Verifies that removing a child from the configuration immediately deletes
 /// it from the child list and child_mgr.
 #[tokio::test]
 async fn remove_child_from_config_deletes_immediately() {
-    let _stub_handle0 = new_stub("stub_rc_0");
-    let _stub_handle1 = new_stub("stub_rc_1");
+    reg_stub("stub_rc_0");
+    reg_stub("stub_rc_1");
 
     let mut env = setup_test_env();
 
@@ -845,8 +712,7 @@ async fn remove_child_from_config_deletes_immediately() {
     "child-1": {"config": [{"stub_rc_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -862,6 +728,9 @@ async fn remove_child_from_config_deletes_immediately() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
+    env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
     assert!(env.policy.child("child-0").is_some());
     assert!(env.policy.child("child-1").is_some());
 
@@ -872,8 +741,7 @@ async fn remove_child_from_config_deletes_immediately() {
     "child-0": {"config": [{"stub_rc_0": {}}]}
   }
 }"#;
-    let cfg2 = env
-        .builder
+    let cfg2 = Builder {}
         .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
     let update2 = ResolverUpdate {
@@ -885,6 +753,11 @@ async fn remove_child_from_config_deletes_immediately() {
     env.policy
         .resolver_update(update2, &cfg2, &mut env.tcc)
         .unwrap();
+
+    // The update is forwarded to child-0, whose stub creates a subchannel for
+    // every resolver update.  The picker is unchanged.
+    env.expect_new_subchannel();
+    env.expect_no_events();
 
     // child-1 must be removed immediately (gRFC A115).
     assert!(env.policy.child("child-0").is_some());
@@ -936,8 +809,7 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
     "child-0": {"config": [{"stub_filter_work": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -950,6 +822,9 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
+    env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+
     // Deliver a PriorityTimerWork item: it should be consumed by PriorityPolicy
     // and NOT forwarded to child_mgr.
     let timer_work: WorkData = Box::new(PriorityTimerWork);
@@ -961,12 +836,14 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
 
     // Deliver the work item that the child scheduled in its resolver_update:
     // It should be forwarded to ChildManager and invoke the child's work fn.
-    let child_work = recv_schedule_work(&env.rx_events);
+    let child_work = env.expect_schedule_work();
+    env.expect_no_events();
     env.policy.work(child_work, &mut env.tcc);
     assert!(
         *child_work_called.lock().unwrap(),
         "Child policy work item should be forwarded to child policy"
     );
+    env.expect_no_events();
 }
 
 /// Verifies that updates to inactive/background children do not cause redundant
@@ -974,8 +851,8 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
 /// active child's picker remains unchanged.
 #[tokio::test]
 async fn picker_updates_are_debounced_for_inactive_child_events() {
-    let stub_handle0 = new_stub("stub_debounce_0");
-    let _stub_handle1 = new_stub("stub_debounce_1");
+    reg_stub("stub_debounce_0");
+    reg_stub("stub_debounce_1");
 
     let mut env = setup_test_env();
 
@@ -986,8 +863,7 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
     "child-1": {"config": [{"stub_debounce_1": {}}]}
   }
 }"#;
-    let cfg = env
-        .builder
+    let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
     let update = ResolverUpdate {
@@ -1003,35 +879,17 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
         .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
-    let sc0 = stub_handle0.subchannel().unwrap();
+    let sc0 = env.expect_new_subchannel();
+    expect_picker_state(&mut env, ConnectivityState::Connecting);
+    env.expect_no_events();
 
-    // Transition child-0 to Ready.
-    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
-
-    // Drain events; verify child-0 published Ready.
-    let mut saw_ready = false;
-    while let Ok(event) = env.rx_events.try_recv() {
-        if let TestEvent::UpdatePicker(state) = event
-            && state.connectivity_state == ConnectivityState::Ready
-        {
-            saw_ready = true;
-        }
-    }
-    assert!(saw_ready);
+    // Transition child-0 to Ready; child-0 publishes Ready.
+    env.send_subchannel_update(&sc0, &SubchannelState::ready());
+    expect_picker_state(&mut env, ConnectivityState::Ready);
+    env.expect_no_events();
 
     // An event that reconciles without altering the active child's picker
     // (such as exit_idle) does not re-emit an UpdatePicker event.
     env.policy.exit_idle(&mut env.tcc);
-
-    // Verify NO new UpdatePicker was emitted because it was debounced.
-    let mut unexpected_picker_update = false;
-    while let Ok(event) = env.rx_events.try_recv() {
-        if let TestEvent::UpdatePicker(_) = event {
-            unexpected_picker_update = true;
-        }
-    }
-    assert!(
-        !unexpected_picker_update,
-        "identical picker update should be debounced"
-    );
+    env.expect_no_events();
 }

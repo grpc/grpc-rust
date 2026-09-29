@@ -50,9 +50,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-
-use tokio::time::Instant;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
@@ -171,15 +171,21 @@ struct PriorityTimerWork;
 /// An RAII timer that triggers a work notification upon expiration.
 ///
 /// When instantiated via [`Timer::new`], a background task is spawned on the
-/// runtime that sleeps for the specified duration and then invokes
-/// [`WorkScheduler::schedule_work`] with [`PriorityTimerWork`].
+/// runtime that sleeps for the specified duration, marks the timer as expired
+/// and then invokes [`WorkScheduler::schedule_work`] with
+/// [`PriorityTimerWork`].
+///
+/// Expiry is tracked with a flag set by the background task. This avoids
+/// depending on a specific time source and guarantees that the timer is
+/// observed as expired whenever the work it schedules runs.
 ///
 /// If dropped before expiration (e.g., when a child transitions out of
 /// `Connecting` or is reactivated from `Deactivated`), the spawned task is
 /// aborted via its task handle, preventing stale timer wakeups.
 struct Timer {
-    /// Absolute instant when the timer expires.
-    deadline: Instant,
+    /// Set by the background task once the sleep completes, before work is
+    /// scheduled.
+    expired: Arc<AtomicBool>,
     /// Task handle for the background sleep task, aborted upon drop.
     task_handle: BoxedTaskHandle,
 }
@@ -187,7 +193,7 @@ struct Timer {
 impl fmt::Debug for Timer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Timer")
-            .field("deadline", &self.deadline)
+            .field("expired", &self.expired())
             .finish()
     }
 }
@@ -203,14 +209,22 @@ impl Timer {
     /// completion.
     fn new(duration: Duration, work_scheduler: Arc<dyn WorkScheduler>, rt: GrpcRuntime) -> Timer {
         let rt_clone = rt.clone();
+        let expired = Arc::new(AtomicBool::new(false));
+        let expired_clone = expired.clone();
         let task_handle = rt.spawn(Box::pin(async move {
             rt_clone.sleep(duration).await;
+            expired_clone.store(true, Ordering::Release);
             work_scheduler.schedule_work(Some(Box::new(PriorityTimerWork)));
         }));
         Timer {
-            deadline: Instant::now() + duration,
+            expired,
             task_handle,
         }
+    }
+
+    /// Returns true once the timer's duration has elapsed.
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
     }
 }
 
@@ -466,11 +480,9 @@ impl PriorityPolicy {
     /// higher priorities fail later (see [gRFC A56 (Section Child Lifetime
     /// Management)]).
     fn handle_deactivation_timer(&mut self) {
-        let now = Instant::now();
-
         for child_data in &mut self.children {
             if let ChildState::Deactivated(timer, _) = &child_data.state
-                && now >= timer.deadline
+                && timer.expired()
             {
                 child_data.state = ChildState::Uninitialized;
             }
@@ -489,11 +501,9 @@ impl PriorityPolicy {
     /// failover timer has expired, transitioning them to
     /// [`ChildState::ConnectingExpired`].
     fn handle_connectivity_timer(&mut self) {
-        let now = Instant::now();
-
         for child_data in &mut self.children {
-            if let ChildState::Connecting(connecting_state, lb_state) = &child_data.state
-                && now >= connecting_state.deadline
+            if let ChildState::Connecting(timer, lb_state) = &child_data.state
+                && timer.expired()
             {
                 child_data.state = ChildState::ConnectingExpired(lb_state.clone());
             }

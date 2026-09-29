@@ -207,7 +207,6 @@ mod test {
     use std::panic;
     use std::sync::Arc;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     use crate::call_attributes::CallAttributes;
     use crate::client::load_balancing::ChannelController;
@@ -226,10 +225,8 @@ mod test {
     use crate::client::load_balancing::subchannel::SubchannelUpdate;
     use crate::client::load_balancing::test_utils::StubPolicyData;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
-    use crate::client::load_balancing::test_utils::TestChannelController;
-    use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestEnv;
     use crate::client::load_balancing::test_utils::TestSubchannel;
-    use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::load_balancing::test_utils::reg_stub_policy;
     use crate::client::load_balancing::test_utils::{self};
     use crate::client::name_resolution::Endpoint;
@@ -237,8 +234,6 @@ mod test {
     use crate::core::Address;
     use crate::metadata::MetadataMap;
     use crate::rt::default_runtime;
-
-    const DEFAULT_TEST_SHORT_TIMEOUT: Duration = Duration::from_millis(10);
 
     fn stub_lb_config(name: &str) -> GracefulSwitchLbConfig {
         let builder = GLOBAL_LB_REGISTRY.get_policy(name).unwrap();
@@ -358,37 +353,29 @@ mod test {
         }
     }
 
-    // Sets up the test environment.
-    //
-    // Performs the following:
-    // 1. Creates a work scheduler.
-    // 2. Creates a fake channel that acts as a channel controller.
-    // 3. Creates an StubPolicyBuilder with StubFuncs that each test will define and
-    //    name the test.
-    // 5. Creates a GracefulSwitch.
-    //
-    // Returns the following:
-    // 1. A receiver for events initiated by the LB policy (like creating a new
-    //    subchannel, sending a new picker etc).
-    // 2. The GracefulSwitch to send resolver and subchannel updates from the test.
-    // 3. The controller to pass to the LB policy as part of the updates.
-    fn setup() -> (
-        mpsc::Receiver<TestEvent>,
-        GracefulSwitchPolicy,
-        Box<dyn ChannelController>,
-    ) {
-        let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
-        let work_scheduler = Arc::new(TestWorkScheduler {
-            tx_events: tx_events.clone(),
-        });
+    // Constructs the test environment for GracefulSwitchPolicy tests.
+    fn new_env() -> TestEnv<GracefulSwitchPolicy> {
+        TestEnv::new(|work_scheduler| GracefulSwitchPolicy::new(default_runtime(), work_scheduler))
+    }
 
-        let tcc = Box::new(TestChannelController {
-            tx_events: tx_events.clone(),
-        });
+    impl TestEnv<GracefulSwitchPolicy> {
+        // Verifies that the policy produced a new picker that picks a
+        // subchannel whose address is `name`.
+        fn verify_correct_picker(&mut self, name: &str) {
+            println!("verify ready picker");
+            let update = self.expect_picker_update();
+            let req = test_utils::new_request_headers();
+            println!("{:?}", update.connectivity_state);
 
-        let graceful_switch =
-            GracefulSwitchPolicy::new(default_runtime(), Arc::new(TestWorkScheduler { tx_events }));
-        (rx_events, graceful_switch, tcc)
+            let pick = update
+                .picker
+                .pick(PickOptions::new(&req, &mut CallAttributes::new()));
+            let PickResult::Pick(pick) = pick else {
+                panic!("unexpected pick result: {:?}", pick);
+            };
+            let received_address = &pick.subchannel.address().address.to_string();
+            assert_eq!(received_address, name);
+        }
     }
 
     fn create_endpoint_with_one_address(addr: String) -> Endpoint {
@@ -399,61 +386,6 @@ mod test {
             }],
             ..Default::default()
         }
-    }
-
-    // Verifies that the next event on rx_events channel is NewSubchannel.
-    // Returns the subchannel created.
-    fn verify_subchannel_creation_from_policy(
-        rx_events: &mut mpsc::Receiver<TestEvent>,
-    ) -> Arc<dyn Subchannel> {
-        match rx_events.recv().unwrap() {
-            TestEvent::NewSubchannel(sc) => sc,
-            other => panic!("unexpected event {:?}", other),
-        }
-    }
-
-    // Verifies that the channel moves to READY state with a picker that returns the
-    // given subchannel.
-    //
-    // Returns the picker for tests to make more picks, if required.
-    fn verify_correct_picker_from_policy(rx_events: &mut mpsc::Receiver<TestEvent>, name: &str) {
-        println!("verify ready picker");
-        let event = rx_events.recv().unwrap();
-        let TestEvent::UpdatePicker(update) = event else {
-            panic!("unexpected event {:?}", event);
-        };
-        let req = test_utils::new_request_headers();
-        println!("{:?}", update.connectivity_state);
-
-        let pick = update
-            .picker
-            .pick(PickOptions::new(&req, &mut CallAttributes::new()));
-        let PickResult::Pick(pick) = pick else {
-            panic!("unexpected pick result: {:?}", pick);
-        };
-        let received_address = &pick.subchannel.address().address.to_string();
-        // It's good practice to create the expected value once.
-        let expected_address = name.to_string();
-
-        // Check for inequality and panic with a detailed message if they don't match.
-        assert_eq!(received_address, &expected_address);
-    }
-
-    // Simulates a state change of `subchannel` and delivers the resulting work
-    // item to the LB policy.
-    fn move_subchannel_to_state(
-        lb_policy: &mut impl LbPolicy,
-        rx_events: &mpsc::Receiver<TestEvent>,
-        subchannel: Arc<dyn Subchannel>,
-        tcc: &mut dyn ChannelController,
-        state: &SubchannelState,
-    ) {
-        test_utils::schedule_subchannel_update(&subchannel, state.clone());
-        let event = rx_events.recv().unwrap();
-        let TestEvent::ScheduleWork(data) = event else {
-            panic!("unexpected event {event:?}");
-        };
-        lb_policy.work(data, tcc);
     }
 
     // Tests that the gracefulswitch policy correctly sets a child and sends
@@ -473,7 +405,7 @@ mod test {
             ),
         );
 
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         let parsed_config = stub_lb_config("stub-gracefulswitch_successful_first_update-one");
 
         let endpoint = create_endpoint_with_one_address("127.0.0.1:1234".to_string());
@@ -481,29 +413,20 @@ mod test {
             endpoints: Ok(vec![endpoint.clone()]),
             ..Default::default()
         };
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
 
-        let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            subchannel,
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_successful_first_update-one",
-        );
+        let subchannel = env.expect_new_subchannel();
+        env.send_subchannel_update(&subchannel, &SubchannelState::ready());
+        env.verify_correct_picker("stub-gracefulswitch_successful_first_update-one");
     }
 
     // Tests that the gracefulswitch policy correctly sets a pending child and
     // sends subchannel updates to that child when it receives a new config.
     #[test]
     fn gracefulswitch_switching_to_resolver_update() {
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         reg_stub_policy(
             "stub-gracefulswitch_switching_to_resolver_update-one",
             create_funcs_for_gracefulswitch_tests(
@@ -525,59 +448,37 @@ mod test {
             ..Default::default()
         };
 
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
 
         // Subchannel creation and ready
-        let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            subchannel,
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
+        let subchannel = env.expect_new_subchannel();
+        env.send_subchannel_update(&subchannel, &SubchannelState::ready());
 
         // Assert picker is TestPickerOne by checking subchannel address
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_switching_to_resolver_update-one",
-        );
+        env.verify_correct_picker("stub-gracefulswitch_switching_to_resolver_update-one");
 
         // 2. Switch to mock_policy_two as pending
         let new_parsed_config =
             stub_lb_config("stub-gracefulswitch_switching_to_resolver_update-two");
-        graceful_switch
-            .resolver_update(update.clone(), &new_parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &new_parsed_config, &mut env.tcc)
             .unwrap();
 
         // Simulate subchannel creation and ready for pending
-        let subchannel_two = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            subchannel_two,
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
+        let subchannel_two = env.expect_new_subchannel();
+        env.send_subchannel_update(&subchannel_two, &SubchannelState::ready());
         // Assert picker is TestPickerTwo by checking subchannel address
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_switching_to_resolver_update-two",
-        );
-        assert_channel_empty(&mut rx_events);
-    }
-
-    fn assert_channel_empty(rx_events: &mut mpsc::Receiver<TestEvent>) {
-        assert!(rx_events.try_recv().is_err());
+        env.verify_correct_picker("stub-gracefulswitch_switching_to_resolver_update-two");
+        env.expect_no_events();
     }
 
     // Tests that the gracefulswitch policy should do nothing when it receives a
     // new config of the same policy that it received before.
     #[test]
     fn gracefulswitch_two_policies_same_type() {
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         reg_stub_policy(
             "stub-gracefulswitch_two_policies_same_type-one",
             create_funcs_for_gracefulswitch_tests("stub-gracefulswitch_two_policies_same_type-one"),
@@ -588,36 +489,27 @@ mod test {
             endpoints: Ok(vec![endpoint.clone()]),
             ..Default::default()
         };
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
-        let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            subchannel,
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_two_policies_same_type-one",
-        );
+        let subchannel = env.expect_new_subchannel();
+        env.send_subchannel_update(&subchannel, &SubchannelState::ready());
+        env.verify_correct_picker("stub-gracefulswitch_two_policies_same_type-one");
 
         let parsed_config2 = stub_lb_config("stub-gracefulswitch_two_policies_same_type-one");
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config2, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config2, &mut env.tcc)
             .unwrap();
-        let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
+        let subchannel = env.expect_new_subchannel();
         assert_eq!(&*subchannel.address().address, "127.0.0.1:1234");
-        assert_channel_empty(&mut rx_events);
+        env.expect_no_events();
     }
 
     // Tests that the gracefulswitch policy should replace the current child
     // with the pending child if the current child isn't ready.
     #[test]
     fn gracefulswitch_current_not_ready_pending_update() {
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         reg_stub_policy(
             "stub-gracefulswitch_current_not_ready_pending_update-one",
             create_funcs_for_gracefulswitch_tests(
@@ -642,12 +534,12 @@ mod test {
         };
 
         // Switch to first one (current)
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
 
-        let current_subchannels = verify_subchannel_creation_from_policy(&mut rx_events);
-        assert_channel_empty(&mut rx_events);
+        env.expect_new_subchannel();
+        env.expect_no_events();
 
         let second_update = ResolverUpdate {
             endpoints: Ok(vec![second_endpoint.clone()]),
@@ -655,32 +547,23 @@ mod test {
         };
         let new_parsed_config =
             stub_lb_config("stub-gracefulswitch_current_not_ready_pending_update-two");
-        graceful_switch
-            .resolver_update(second_update.clone(), &new_parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(second_update.clone(), &new_parsed_config, &mut env.tcc)
             .unwrap();
 
-        let second_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        assert_channel_empty(&mut rx_events);
+        let second_subchannel = env.expect_new_subchannel();
+        env.expect_no_events();
 
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            second_subchannel,
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_current_not_ready_pending_update-two",
-        );
-        assert_channel_empty(&mut rx_events);
+        env.send_subchannel_update(&second_subchannel, &SubchannelState::ready());
+        env.verify_correct_picker("stub-gracefulswitch_current_not_ready_pending_update-two");
+        env.expect_no_events();
     }
 
     // Tests that the gracefulswitch policy should replace the current child
     // with the pending child if the current child was ready but then leaves ready.
     #[test]
     fn gracefulswitch_current_leaving_ready() {
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         reg_stub_policy(
             "stub-gracefulswitch_current_leaving_ready-one",
             create_funcs_for_gracefulswitch_tests("stub-gracefulswitch_current_leaving_ready-one"),
@@ -699,60 +582,36 @@ mod test {
         };
 
         // Switch to first one (current)
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
 
-        let current_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            current_subchannel.clone(),
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_current_leaving_ready-one",
-        );
+        let current_subchannel = env.expect_new_subchannel();
+        env.send_subchannel_update(&current_subchannel, &SubchannelState::ready());
+        env.verify_correct_picker("stub-gracefulswitch_current_leaving_ready-one");
         let new_update = ResolverUpdate {
             endpoints: Ok(vec![endpoint2.clone()]),
             ..Default::default()
         };
         let new_parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-two");
-        graceful_switch
-            .resolver_update(new_update.clone(), &new_parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(new_update.clone(), &new_parsed_config, &mut env.tcc)
             .unwrap();
 
-        let pending_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
+        let pending_subchannel = env.expect_new_subchannel();
 
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            pending_subchannel,
-            tcc.as_mut(),
-            &SubchannelState::connecting(),
-        );
+        env.send_subchannel_update(&pending_subchannel, &SubchannelState::connecting());
         // This should not produce an update.
-        assert_channel_empty(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            current_subchannel,
-            tcc.as_mut(),
-            &SubchannelState::connecting(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_current_leaving_ready-two",
-        );
+        env.expect_no_events();
+        env.send_subchannel_update(&current_subchannel, &SubchannelState::connecting());
+        env.verify_correct_picker("stub-gracefulswitch_current_leaving_ready-two");
     }
 
     // Tests that the gracefulswitch policy should replace the current child
     // with the pending child if the pending child leaves connecting.
     #[test]
     fn gracefulswitch_pending_leaving_connecting() {
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         reg_stub_policy(
             "stub-gracefulswitch_current_leaving_ready-one",
             create_funcs_for_gracefulswitch_tests("stub-gracefulswitch_current_leaving_ready-one"),
@@ -770,63 +629,39 @@ mod test {
         };
 
         // Switch to first one (current)
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
 
-        let current_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            current_subchannel,
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_current_leaving_ready-one",
-        );
+        let current_subchannel = env.expect_new_subchannel();
+        env.send_subchannel_update(&current_subchannel, &SubchannelState::ready());
+        env.verify_correct_picker("stub-gracefulswitch_current_leaving_ready-one");
         let new_update = ResolverUpdate {
             endpoints: Ok(vec![endpoint2.clone()]),
             ..Default::default()
         };
         let new_parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-two");
 
-        graceful_switch
-            .resolver_update(new_update.clone(), &new_parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(new_update.clone(), &new_parsed_config, &mut env.tcc)
             .unwrap();
 
-        let pending_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
+        let pending_subchannel = env.expect_new_subchannel();
 
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            pending_subchannel.clone(),
-            tcc.as_mut(),
+        env.send_subchannel_update(
+            &pending_subchannel,
             &SubchannelState::transient_failure("n/a"),
         );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_current_leaving_ready-two",
-        );
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            pending_subchannel,
-            tcc.as_mut(),
-            &SubchannelState::connecting(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
-            "stub-gracefulswitch_current_leaving_ready-two",
-        );
+        env.verify_correct_picker("stub-gracefulswitch_current_leaving_ready-two");
+        env.send_subchannel_update(&pending_subchannel, &SubchannelState::connecting());
+        env.verify_correct_picker("stub-gracefulswitch_current_leaving_ready-two");
     }
 
     // Tests that the gracefulswitch policy should remove the current child's
     // subchannels after swapping.
     #[test]
     fn gracefulswitch_subchannels_removed_after_current_child_swapped() {
-        let (mut rx_events, mut graceful_switch, mut tcc) = setup();
+        let mut env = new_env();
         reg_stub_policy(
             "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-one",
             create_funcs_for_gracefulswitch_tests(
@@ -847,20 +682,13 @@ mod test {
             endpoints: Ok(vec![endpoint.clone()]),
             ..Default::default()
         };
-        graceful_switch
-            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(update.clone(), &parsed_config, &mut env.tcc)
             .unwrap();
 
-        let current_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            current_subchannel.clone(),
-            tcc.as_mut(),
-            &SubchannelState::ready(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
+        let current_subchannel = env.expect_new_subchannel();
+        env.send_subchannel_update(&current_subchannel, &SubchannelState::ready());
+        env.verify_correct_picker(
             "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-one",
         );
         let second_endpoint = create_endpoint_with_one_address("127.0.0.1:1235".to_string());
@@ -871,20 +699,13 @@ mod test {
         let new_parsed_config = stub_lb_config(
             "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-two",
         );
-        graceful_switch
-            .resolver_update(second_update.clone(), &new_parsed_config, &mut *tcc)
+        env.policy
+            .resolver_update(second_update.clone(), &new_parsed_config, &mut env.tcc)
             .unwrap();
-        let pending_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
+        let pending_subchannel = env.expect_new_subchannel();
         println!("moving subchannel to idle");
-        move_subchannel_to_state(
-            &mut graceful_switch,
-            &rx_events,
-            pending_subchannel,
-            tcc.as_mut(),
-            &SubchannelState::idle(),
-        );
-        verify_correct_picker_from_policy(
-            &mut rx_events,
+        env.send_subchannel_update(&pending_subchannel, &SubchannelState::idle());
+        env.verify_correct_picker(
             "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-two",
         );
         assert!(Arc::strong_count(&current_subchannel) == 1);

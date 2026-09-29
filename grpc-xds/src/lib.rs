@@ -50,7 +50,7 @@ pub(crate) mod resource;
 
 /// xDS load balancing policies (gRFC A31 and friends), plus
 /// [`load_balancing::register`] to install them in the gRPC LB registry.
-pub(crate) mod load_balancing;
+mod load_balancing;
 
 /// [`xds_config::XdsConfig`]: the atomic xDS configuration snapshot assembled
 /// from a channel's Listener/RouteConfiguration/Cluster/Endpoints resources.
@@ -66,10 +66,10 @@ mod tests {
     //! `generated` module is `pub(crate)` — doctests compile as an external
     //! crate and can only reach the public API.
 
-    use crate::generated::envoy::config::{
-        cluster::v3::Cluster, endpoint::v3::ClusterLoadAssignment, listener::v3::Listener,
-        route::v3::RouteConfiguration,
-    };
+    use crate::generated::envoy::config::cluster::v3::Cluster;
+    use crate::generated::envoy::config::endpoint::v3::ClusterLoadAssignment;
+    use crate::generated::envoy::config::listener::v3::Listener;
+    use crate::generated::envoy::config::route::v3::RouteConfiguration;
 
     /// Encodes then decodes a message. `serialize` / `parse` are methods of the
     /// `protobuf::Message` trait (in scope via the `M: protobuf::Message` bound).

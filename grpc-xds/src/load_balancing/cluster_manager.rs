@@ -54,7 +54,6 @@ use grpc::__unstable::client::load_balancing::Picker;
 use grpc::__unstable::client::load_balancing::WorkData;
 use grpc::__unstable::client::load_balancing::child_manager::ChildManager;
 use grpc::__unstable::client::load_balancing::child_manager::ChildUpdate;
-use grpc::__unstable::client::load_balancing::endpoint_filtering;
 use grpc::__unstable::client::load_balancing::registry::GLOBAL_LB_REGISTRY;
 use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::StatusCodeError;
@@ -72,7 +71,7 @@ struct XdsCluster(Arc<str>);
 // Validated configuration for `xds_cluster_manager_experimental`.
 // Maps a cluster name to a load balancing configuration for that cluster.
 #[derive(Clone, Debug, Deserialize)]
-pub(super) struct ClusterManagerConfig {
+struct ClusterManagerConfig {
     children: HashMap<String, ClusterChildConfig>,
 }
 
@@ -83,7 +82,7 @@ struct ClusterChildConfig {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ClusterManagerBuilder;
+struct ClusterManagerBuilder;
 
 impl LbPolicyBuilder for ClusterManagerBuilder {
     type LbPolicy = ClusterManagerPolicy;
@@ -114,7 +113,7 @@ impl LbPolicyBuilder for ClusterManagerBuilder {
 
 // An instance of the Cluster Manager Load Balancing policy.
 #[derive(Debug)]
-pub(super) struct ClusterManagerPolicy {
+struct ClusterManagerPolicy {
     child_manager: ChildManager<String>,
 }
 
@@ -151,25 +150,16 @@ impl LbPolicy for ClusterManagerPolicy {
         config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let mut grouped_endpoints = update.endpoints.map(endpoint_filtering::group_by_path);
-
         // `ChildManager::update` removes any existing child that is absent from
         // this list, so clusters dropped from the config are removed here.
-        let child_updates = config.children.iter().map(|(cluster, child_cfg)| {
-            let mut child_update = ResolverUpdate::default();
-            child_update.attributes = update.attributes.clone();
-            child_update.endpoints = match &mut grouped_endpoints {
-                Ok(grouped) => Ok(grouped.remove(cluster).unwrap_or_default()),
-                Err(status) => Err(status.clone()),
-            };
-            child_update.service_config = update.service_config.clone();
-            child_update.resolution_note = update.resolution_note.clone();
-            ChildUpdate {
+        let child_updates = config
+            .children
+            .iter()
+            .map(|(cluster, child_cfg)| ChildUpdate {
                 child_identifier: cluster.clone(),
                 child_policy_builder: child_cfg.child_policy.builder.clone(),
-                child_update: Some((child_update, &child_cfg.child_policy.config)),
-            }
-        });
+                child_update: Some((update.clone(), &child_cfg.child_policy.config)),
+            });
 
         let result = self.child_manager.update(child_updates, channel_controller);
         self.update_picker(channel_controller);
@@ -222,6 +212,7 @@ impl Picker for ClusterPicker {
                 // cluster, INTERNAL for an unknown cluster. These cases are
                 // indistinguishable here, so INTERNAL is used for both here.
                 self.children.get(&*cluster.0).ok_or_else(|| {
+                    debug_assert!(false, "cluster manager: unknown cluster '{cluster:?}'");
                     StatusError::new(
                         StatusCodeError::Internal,
                         format!("cluster manager: unknown cluster '{cluster:?}'"),
@@ -233,7 +224,6 @@ impl Picker for ClusterPicker {
 }
 
 /// Register cluster manager as a LbPolicy.
-#[expect(dead_code, reason = "no caller until there is an xDS resolver.")]
 pub(crate) fn reg() {
     START.call_once(|| {
         GLOBAL_LB_REGISTRY.add_builder(ClusterManagerBuilder {});
@@ -244,6 +234,7 @@ pub(crate) fn reg() {
 mod tests {
     use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
     use grpc::__unstable::client::load_balancing::WorkScheduler;
+    use grpc::__unstable::client::load_balancing::endpoint_filtering;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
     use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
@@ -282,11 +273,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "unknown cluster"))]
     fn cluster_picker_routing() {
         let mut children: HashMap<String, Arc<dyn Picker>> = HashMap::new();
         children.insert(
             "cluster_one".to_string(),
-            Arc::new(TaggedPicker("child_one".to_string())),
+            Arc::new(TaggedPicker {
+                tag: "child_one".to_string(),
+                endpoints: Vec::new(),
+            }),
         );
         let cluster_picker = ClusterPicker { children };
         let req = RequestHeaders::new();
@@ -303,7 +298,7 @@ mod tests {
             Some(&PickedChild("child_one".into()))
         );
 
-        // Unknown cluster -> Drop(Internal).
+        // Unknown cluster -> debug_assert panic, or Drop(Internal) in release.
         let mut attrs = CallAttributes::new();
         attrs.add(XdsCluster("cluster_unknown".into()));
         match cluster_picker.pick(PickOptions::new(&req, &mut attrs)) {
@@ -334,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_update_splits_endpoints_by_hierarchy() {
+    fn resolver_update_passes_endpoints_to_every_child() {
         let (mut policy, _scheduler, mut controller) = setup_test_policy();
         let json = serde_json::json!({
             "children": {
@@ -345,23 +340,19 @@ mod tests {
         let cfg = ClusterManagerBuilder
             .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
             .unwrap();
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Ok(vec![
+        let endpoints = vec![
             endpoint_with_path(&["cluster_a", "locality_a"]),
             endpoint_with_path(&["cluster_b", "locality_b"]),
-        ]);
+        ];
+        let mut update = ResolverUpdate::default();
+        update.endpoints = Ok(endpoints.clone());
         policy
             .resolver_update(update, &cfg, &mut controller)
             .unwrap();
 
-        assert_eq!(
-            received_endpoints("child_a"),
-            vec![endpoint_with_path(&["locality_a"])]
-        );
-        assert_eq!(
-            received_endpoints("child_b"),
-            vec![endpoint_with_path(&["locality_b"])]
-        );
+        let state = controller.latest_state.take().expect("state update");
+        assert_eq!(picked_endpoints(&state.picker, "cluster_a"), endpoints);
+        assert_eq!(picked_endpoints(&state.picker, "cluster_b"), endpoints);
     }
 
     #[test]
@@ -390,6 +381,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "unknown cluster"))]
     fn removed_cluster_is_shut_down() {
         let (mut policy, _scheduler, mut controller) = setup_test_policy();
 
@@ -403,7 +395,6 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(policy.child_manager.children().count(), 2);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         assert_picks_child(&state.picker, "cluster_a", "child_a");
         assert_picks_child(&state.picker, "cluster_b", "child_b");
@@ -419,12 +410,6 @@ mod tests {
             }),
         );
 
-        let identifiers: Vec<&String> = policy
-            .child_manager
-            .children()
-            .map(|c| &c.identifier)
-            .collect();
-        assert_eq!(identifiers, vec!["cluster_a"]);
         assert_picks_child(&state.picker, "cluster_a", "child_a");
 
         let req = RequestHeaders::new();
@@ -499,10 +484,6 @@ mod tests {
         let scheduler = Arc::new(MockScheduler::default());
         let policy = ClusterManagerBuilder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
-            // TODO: replace with a no-op test runtime once `rt::Runtime` can be
-            // implemented outside the `grpc` crate. That is blocked on
-            // `EndpointListener` being `pub(crate)`; see the TODO on
-            // `default_runtime`.
             runtime: default_runtime(),
         });
         let controller = MockChannelController { latest_state: None };
@@ -537,20 +518,27 @@ mod tests {
         );
     }
 
+    // Picks `cluster` and returns the endpoints its child received.
+    fn picked_endpoints(picker: &Arc<dyn Picker>, cluster: &str) -> Vec<Endpoint> {
+        let req = RequestHeaders::new();
+        let mut attrs = CallAttributes::new();
+        attrs.add(XdsCluster(cluster.into()));
+        assert!(matches!(
+            picker.pick(PickOptions::new(&req, &mut attrs)),
+            PickResult::Queue
+        ));
+        attrs
+            .get::<ChildEndpoints>()
+            .expect("child endpoints attribute")
+            .0
+            .clone()
+    }
+
     fn endpoint_with_path(path: &[&str]) -> Endpoint {
         endpoint_filtering::set_path_in_endpoint(
             Endpoint::default(),
             path.iter().map(|p| p.to_string()).collect(),
         )
-    }
-
-    thread_local! {
-        static RECEIVED_ENDPOINTS: std::cell::RefCell<HashMap<String, Vec<Endpoint>>> =
-            std::cell::RefCell::default();
-    }
-
-    fn received_endpoints(tag: &str) -> Vec<Endpoint> {
-        RECEIVED_ENDPOINTS.with_borrow(|r| r[tag].clone())
     }
 
     #[derive(Debug)]
@@ -565,12 +553,22 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct PickedChild(String);
 
+    // Endpoints the picked child received in its last resolver update.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ChildEndpoints(Vec<Endpoint>);
+
     #[derive(Debug)]
-    struct TaggedPicker(String);
+    struct TaggedPicker {
+        tag: String,
+        endpoints: Vec<Endpoint>,
+    }
 
     impl Picker for TaggedPicker {
         fn pick(&self, options: PickOptions<'_>) -> PickResult {
-            options.call_attributes.add(PickedChild(self.0.clone()));
+            options.call_attributes.add(PickedChild(self.tag.clone()));
+            options
+                .call_attributes
+                .add(ChildEndpoints(self.endpoints.clone()));
             PickResult::Queue
         }
     }
@@ -622,6 +620,16 @@ mod tests {
     struct TestDummyLbPolicy {
         work_scheduler: Arc<dyn WorkScheduler>,
         tag: String,
+        endpoints: Vec<Endpoint>,
+    }
+
+    impl TestDummyLbPolicy {
+        fn tagged_picker(&self) -> Arc<dyn Picker> {
+            Arc::new(TaggedPicker {
+                tag: self.tag.clone(),
+                endpoints: self.endpoints.clone(),
+            })
+        }
     }
 
     impl LbPolicy for TestDummyLbPolicy {
@@ -634,9 +642,7 @@ mod tests {
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
             self.tag = config.tag.clone();
-            RECEIVED_ENDPOINTS.with_borrow_mut(|r| {
-                r.insert(config.tag.clone(), update.endpoints.unwrap_or_default())
-            });
+            self.endpoints = update.endpoints.unwrap_or_default();
             if config.fail_update {
                 return Err(format!("{} failed", config.tag));
             }
@@ -654,7 +660,7 @@ mod tests {
             } else {
                 channel_controller.update_picker(LbState {
                     connectivity_state: ConnectivityState::Ready,
-                    picker: Arc::new(TaggedPicker(config.tag.clone())),
+                    picker: self.tagged_picker(),
                 });
             }
             Ok(())
@@ -667,14 +673,14 @@ mod tests {
         ) {
             channel_controller.update_picker(LbState {
                 connectivity_state: ConnectivityState::Ready,
-                picker: Arc::new(TaggedPicker(self.tag.clone())),
+                picker: self.tagged_picker(),
             });
         }
 
         fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
             channel_controller.update_picker(LbState {
                 connectivity_state: ConnectivityState::Ready,
-                picker: Arc::new(TaggedPicker(self.tag.clone())),
+                picker: self.tagged_picker(),
             });
         }
     }
@@ -689,6 +695,7 @@ mod tests {
             TestDummyLbPolicy {
                 work_scheduler: options.work_scheduler,
                 tag: String::new(),
+                endpoints: Vec::new(),
             }
         }
 

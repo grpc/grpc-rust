@@ -24,8 +24,6 @@
 
 //! xDS-specific load balancing policies.
 
-use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
-
 pub(crate) mod cluster_manager;
 
 /// Registers the xDS load balancing policies into the gRPC global LB registry.
@@ -33,9 +31,8 @@ pub(crate) mod cluster_manager;
 /// The `grpc` crate's registry is populated eagerly for its built-in policies,
 /// but it cannot reference policies defined in this crate. Callers must invoke
 /// this before a channel resolves a service config naming an xDS policy.
-/// Repeated calls overwrite the existing entry with an equivalent builder.
-#[allow(dead_code)]
+/// Only the first call has an effect, any additional ones are ignored.
+#[allow(dead_code, reason = "no caller until there is an xDS resolver.")]
 pub(crate) fn register() {
-    // Todo: assess whether this is a valid time to update the registry.
-    GLOBAL_LB_REGISTRY.add_builder(cluster_manager::ClusterManagerBuilder);
+    cluster_manager::reg()
 }

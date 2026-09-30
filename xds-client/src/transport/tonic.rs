@@ -335,7 +335,8 @@ impl TonicTransportBuilder {
     /// The server URI is passed through unchanged. The connector owns transport
     /// security, so
     /// [`requires_secure_transport`](TonicCallCredentials::requires_secure_transport)
-    /// is not checked.
+    /// is not checked. Call credentials are still attached to each ADS stream
+    /// and sent over the connector's transport.
     pub fn with_connector<C>(mut self, connector: C) -> Self
     where
         C: tower_service::Service<tonic::transport::Uri> + Clone + Send + Sync + 'static,

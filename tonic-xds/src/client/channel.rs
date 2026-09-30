@@ -414,11 +414,13 @@ impl XdsChannelBuilder {
 
     /// Uses a custom connector for the xDS management server.
     ///
-    /// Backend connections are unaffected. The connector owns security, so
-    /// bootstrap TLS and
+    /// Backend connections are unaffected. Custom connectors work with or
+    /// without a TLS feature enabled. Bootstrap control-plane TLS is bypassed
+    /// and the server URI is passed through unchanged. The connector owns
+    /// transport security, so
     /// [`requires_secure_transport`](xds_client::TonicCallCredentials::requires_secure_transport)
-    /// are not applied. Use an `http://` URI with `insecure` bootstrap
-    /// credentials even when the connector uses TLS.
+    /// is not checked. Call credentials are still attached to each ADS stream
+    /// and sent over the connector's transport.
     #[must_use]
     pub fn with_control_plane_connector<C>(mut self, connector: C) -> Self
     where

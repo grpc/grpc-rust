@@ -232,7 +232,6 @@ pub(crate) fn reg() {
 mod tests {
     use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
     use grpc::__unstable::client::load_balancing::WorkScheduler;
-    use grpc::__unstable::client::load_balancing::endpoint_filtering;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
     use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
@@ -338,10 +337,7 @@ mod tests {
         let cfg = ClusterManagerBuilder
             .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
             .unwrap();
-        let endpoints = vec![
-            endpoint_with_path(&["cluster_a", "locality_a"]),
-            endpoint_with_path(&["cluster_b", "locality_b"]),
-        ];
+        let endpoints = vec![Endpoint::default()];
         let mut update = ResolverUpdate::default();
         update.endpoints = Ok(endpoints.clone());
         policy
@@ -530,13 +526,6 @@ mod tests {
             .expect("child endpoints attribute")
             .0
             .clone()
-    }
-
-    fn endpoint_with_path(path: &[&str]) -> Endpoint {
-        endpoint_filtering::set_path_in_endpoint(
-            Endpoint::default(),
-            path.iter().map(|p| p.to_string()).collect(),
-        )
     }
 
     #[derive(Debug)]

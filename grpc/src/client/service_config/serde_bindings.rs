@@ -210,7 +210,7 @@ impl<'de> Deserialize<'de> for SerdeU32 {
             where
                 E: serde::de::Error,
             {
-                if v.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&v) {
+                if v.is_sign_positive() && v.fract() == 0.0 && v <= f64::from(u32::MAX) {
                     Ok(SerdeU32(v as u32))
                 } else {
                     Err(E::custom(format!("invalid u32 value: {v}")))
@@ -346,6 +346,9 @@ mod test {
         assert!(res.is_err());
 
         let res: Result<TestStruct, _> = serde_json::from_value(json!({ "val": -1 }));
+        assert!(res.is_err());
+
+        let res: Result<TestStruct, _> = serde_json::from_str(r#"{"val": -0}"#);
         assert!(res.is_err());
     }
 

@@ -28,9 +28,12 @@ use core::panic;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
+use arc_swap::Guard;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -219,7 +222,8 @@ impl ChannelBuilder {
         };
         Channel {
             inner: Arc::new(PersistentChannel {
-                active_channel: Mutex::default(),
+                active_channel: ArcSwapOption::empty(),
+                active_channel_init: Mutex::new(()),
                 target,
                 security_opts,
                 runtime: self.runtime,
@@ -239,7 +243,12 @@ impl ChannelBuilder {
 }
 
 struct PersistentChannel {
-    active_channel: Mutex<Option<Arc<ActiveChannel>>>,
+    /// The current active channel, or `None` if the channel is idle. Reads are
+    /// lock-free. Writers must hold `active_channel_init`.
+    active_channel: ArcSwapOption<ActiveChannel>,
+    /// Serializes creation (and, in the future, idle teardown) of the active
+    /// channel so that at most one `ActiveChannel` is built at a time.
+    active_channel_init: Mutex<()>,
 
     // Configuration
     target: Target,
@@ -255,32 +264,35 @@ impl PersistentChannel {
     /// channel, returns Idle. If `connect` is true, will create a new active
     /// channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
-        // Done this away to avoid potentially locking twice.
-        let active_channel = if connect {
-            self.get_active_channel()
-        } else {
-            match self.active_channel.lock().unwrap().clone() {
-                Some(x) => x,
-                None => {
-                    return ConnectivityState::Idle;
-                }
-            }
-        };
-
-        active_channel.lb_watcher.cur().connectivity_state
+        if connect {
+            return self
+                .get_active_channel()
+                .lb_watcher
+                .cur()
+                .connectivity_state;
+        }
+        match &*self.active_channel.load() {
+            Some(ac) => ac.lb_watcher.cur().connectivity_state,
+            None => ConnectivityState::Idle,
+        }
     }
 
     /// Gets the underlying active channel. If there is no current connection,
     /// it will create one. This cannot fail and will always return a valid
     /// active channel.
     fn get_active_channel(&self) -> Arc<ActiveChannel> {
-        let mut active_channel = self.active_channel.lock().unwrap();
-
-        if active_channel.is_none() {
-            *active_channel = Some(ActiveChannel::new_arc_for(self));
+        // Fast path: lock-free.
+        if let Some(ac) = self.active_channel.load_full() {
+            return ac;
         }
-
-        active_channel.clone().unwrap() // We have ensured this is not None.
+        // Slow path: serialize creation so only one ActiveChannel is built.
+        let _init = self.active_channel_init.lock();
+        if let Some(ac) = self.active_channel.load_full() {
+            return ac; // Another caller created it while we waited.
+        }
+        let ac = ActiveChannel::new_arc_for(self);
+        self.active_channel.store(Some(ac.clone()));
+        ac
     }
 }
 
@@ -354,15 +366,12 @@ impl Invoke for Arc<ActiveChannel> {
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
-        let mut i = self.lb_watcher.iter();
+        // Fast path: pick with the latest picker without locking. The guard
+        // returned by cur() is dropped at the end of this statement.
+        let mut result = self.lb_watcher.cur().picker.pick(&headers);
+        // Slow path: created only if the pick is queued.
+        let mut lb_states = None;
         loop {
-            let Some(state) = i.next().await else {
-                return FailingRecvStream::new_stream_pair(
-                    StatusError::new(StatusCodeError::Internal, "channel has been closed"),
-                    None,
-                );
-            };
-            let result = &state.picker.pick(&headers);
             match result {
                 PickResult::Pick(pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
@@ -373,16 +382,23 @@ impl Invoke for Arc<ActiveChannel> {
                         );
                     }
                 }
-                PickResult::Queue => {
-                    // Continue and retry the RPC with the next picker.
-                }
+                PickResult::Queue => {}
                 PickResult::Fail(status) => {
-                    return FailingRecvStream::new_stream_pair(status.clone(), None);
+                    return FailingRecvStream::new_stream_pair(status, None);
                 }
                 PickResult::Drop(status) => {
                     todo!("dropped pick: {:?}", status);
                 }
             }
+            // Queued: wait for the next picker and retry the RPC with it.
+            let lb_states = lb_states.get_or_insert_with(|| self.lb_watcher.iter());
+            let Some(state) = lb_states.next().await else {
+                return FailingRecvStream::new_stream_pair(
+                    StatusError::new(StatusCodeError::Internal, "channel has been closed"),
+                    None,
+                );
+            };
+            result = state.picker.pick(&headers);
         }
     }
 }
@@ -523,17 +539,22 @@ pub(super) enum WorkQueueItem {
 pub(crate) struct Todo;
 
 // Enables multiple receivers to view data output from a single producer.
-// Producer calls update.  Consumers call iter() and call next() until they find
-// a good value or encounter None.
+// Producer calls update.  Consumers call cur() for a lock-free read of the
+// latest value, or iter() and call next() until they find a good value or
+// encounter None.
 pub(crate) struct Watcher<T> {
+    // Latest value, for lock-free reads via cur().
+    cur: ArcSwap<T>,
+    // Used by iter() to wait for new values.
     tx: watch::Sender<T>,
     rx: watch::Receiver<T>,
 }
 
 impl<T: Clone> Watcher<T> {
     fn new(initial: T) -> Self {
+        let cur = ArcSwap::from_pointee(initial.clone());
         let (tx, rx) = watch::channel(initial);
-        Self { tx, rx }
+        Self { cur, tx, rx }
     }
 
     pub(crate) fn iter(&self) -> WatcherIter<T> {
@@ -542,13 +563,15 @@ impl<T: Clone> Watcher<T> {
         WatcherIter { rx }
     }
 
-    pub(crate) fn cur(&self) -> T {
-        let mut rx = self.rx.clone();
-        rx.mark_changed();
-        rx.borrow().clone()
+    /// Returns the latest value without locking. The returned guard should be
+    /// short-lived and must not be held across an `.await`.
+    pub(crate) fn cur(&self) -> Guard<Arc<T>> {
+        self.cur.load()
     }
 
     fn update(&self, item: T) {
+        // Publish for cur() before waking iter() consumers.
+        self.cur.store(Arc::new(item.clone()));
         self.tx.send(item).unwrap();
     }
 }
@@ -556,9 +579,6 @@ impl<T: Clone> Watcher<T> {
 pub(crate) struct WatcherIter<T> {
     rx: watch::Receiver<T>,
 }
-// TODO: Use an arc_swap::ArcSwap instead that contains T and a channel closed
-// when T is updated.  Even if the channel needs a lock, the fast path becomes
-// lock-free.
 
 impl<T: Clone> WatcherIter<T> {
     /// Returns the next unseen value
@@ -600,4 +620,100 @@ fn setup_registeries() {
     name_resolution::unix_abstract::reg();
     #[cfg(feature = "_runtime-tokio")]
     tonic_transport::reg();
+}
+
+#[cfg(all(test, feature = "_runtime-tokio"))]
+mod tests {
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::credentials::LocalChannelCredentials;
+
+    fn new_channel() -> Channel {
+        Channel::builder(
+            "dns:///localhost:1234",
+            Arc::new(LocalChannelCredentials::new()),
+        )
+        .build()
+    }
+
+    #[tokio::test]
+    async fn get_state_without_connect_stays_idle() {
+        let mut channel = new_channel();
+        assert_eq!(channel.get_state(false), ConnectivityState::Idle);
+        assert!(channel.inner.active_channel.load().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_active_channel_creates_one() {
+        const THREADS: usize = 16;
+        let channel = new_channel();
+        let handle = tokio::runtime::Handle::current();
+        let barrier = Barrier::new(THREADS);
+
+        let active_channels: Vec<Arc<ActiveChannel>> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        // ActiveChannel creation spawns tasks on the runtime.
+                        let _rt = handle.enter();
+                        barrier.wait();
+                        channel.inner.get_active_channel()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+
+        let first = &active_channels[0];
+        for ac in &active_channels {
+            assert!(Arc::ptr_eq(first, ac), "multiple ActiveChannels created");
+        }
+        assert!(Arc::ptr_eq(
+            first,
+            &channel.inner.active_channel.load_full().unwrap()
+        ));
+        assert_ne!(channel.inner.get_state(false), ConnectivityState::Idle);
+    }
+
+    #[test]
+    fn watcher_cur_reflects_update() {
+        let watcher = Watcher::new(1u32);
+        assert_eq!(**watcher.cur(), 1);
+        watcher.update(2);
+        assert_eq!(**watcher.cur(), 2);
+    }
+
+    // Covers the handoff in ActiveChannel::invoke: an update that lands after
+    // a cur() read must be returned by a subsequently created iter().
+    #[tokio::test]
+    async fn watcher_iter_sees_update_after_cur() {
+        let watcher = Watcher::new(1u32);
+        assert_eq!(**watcher.cur(), 1);
+        watcher.update(2);
+        let mut iter = watcher.iter();
+        assert_eq!(iter.next().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn watcher_iter_waits_for_update() {
+        let watcher = Arc::new(Watcher::new(1u32));
+        let mut iter = watcher.iter();
+        assert_eq!(iter.next().await, Some(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), iter.next())
+                .await
+                .is_err(),
+            "next() returned without an update"
+        );
+
+        let updater = {
+            let watcher = watcher.clone();
+            tokio::spawn(async move { watcher.update(2) })
+        };
+        assert_eq!(iter.next().await, Some(2));
+        updater.await.unwrap();
+        assert_eq!(**watcher.cur(), 2);
+    }
 }

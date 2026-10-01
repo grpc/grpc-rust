@@ -782,9 +782,15 @@ where
                 res = read_rx.recv() => {
                     match res {
                         Some((bytes, done)) => {
+                            let response = match self.codec.decode_response(bytes) {
+                                Ok(response) => response,
+                                Err(_) => return ConnectedOutcome::Failed { saw_response },
+                            };
                             saw_response = true;
                             self.record_healthy(healthy);
-                            if self.handle_response(&write_tx, bytes, done).await.is_err() {
+                            if self.handle_response(&write_tx, response, done).await.is_err() {
+                                // All errors are related to sending a request, not `response` whose
+                                // problems are handled by notifying the server.
                                 return ConnectedOutcome::Failed { saw_response };
                             }
                         }
@@ -1077,7 +1083,8 @@ where
         Ok(())
     }
 
-    /// Handle a response from the server.
+    /// Handle a response from the server. Problems with `response` will be handled directly, and
+    /// not cause an `Err` return.
     ///
     /// Implements partial success per gRFC A46: valid resources are accepted even
     /// if some resources in the response fail validation. Each resource is processed
@@ -1095,10 +1102,9 @@ where
     async fn handle_response(
         &mut self,
         sender: &mpsc::UnboundedSender<Bytes>,
-        bytes: Bytes,
+        response: DiscoveryResponse,
         done: ProcessingDone,
     ) -> Result<()> {
-        let response = self.codec.decode_response(bytes)?;
         let type_url = response.type_url.clone();
 
         let (type_url_arc, decoder) = match self.type_states.get(&type_url) {

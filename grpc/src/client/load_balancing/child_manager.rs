@@ -255,18 +255,13 @@ where
                     .policy
                     .resolver_update(resolver_update, config, &mut channel_controller)
             {
-                errs.push(err);
+                errs.push(format!("child {:?}: {err}", child.identifier));
             }
         }
         if errs.is_empty() {
             Ok(())
         } else {
-            let err = errs
-                .into_iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err(err)
+            Err(errs.join("; "))
         }
     }
 

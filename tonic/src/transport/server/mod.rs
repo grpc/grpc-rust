@@ -918,26 +918,14 @@ impl<L> Server<L> {
     }
 }
 
-enum TimeoutAction {
-    GracefulShutdown,
-    ForcefulShutdown,
-}
-
-async fn connection_timeout_future(
-    max_connection_age: Option<Duration>,
-    max_connection_age_grace: Option<Duration>,
-) -> TimeoutAction {
-    if let Some(age) = max_connection_age {
-        tokio::time::sleep(age).await;
-
-        if let Some(grace) = max_connection_age_grace {
-            tokio::time::sleep(grace).await;
-            TimeoutAction::ForcefulShutdown
-        } else {
-            TimeoutAction::GracefulShutdown
-        }
-    } else {
-        future::pending().await
+/// Resolves once `max_connection_age` has elapsed, or never when it is unset.
+///
+/// Reaching the age starts a graceful shutdown; `max_connection_age_grace`, when
+/// set, is a second, separate timer that starts only then.
+async fn connection_age_future(max_connection_age: Option<Duration>) {
+    match max_connection_age {
+        Some(age) => tokio::time::sleep(age).await,
+        None => future::pending().await,
     }
 }
 
@@ -968,12 +956,10 @@ fn serve_connection<B, IO, S, E>(
 
             let mut conn = pin!(builder.serve_connection(hyper_io, hyper_svc));
 
-            let mut connection_timeout = pin!(Fuse {
-                inner: Some(connection_timeout_future(
-                    max_connection_age,
-                    max_connection_age_grace,
-                )),
+            let mut connection_age = pin!(Fuse {
+                inner: Some(connection_age_future(max_connection_age)),
             });
+            let mut connection_grace = pin!(Fuse::<tokio::time::Sleep> { inner: None });
 
             loop {
                 tokio::select! {
@@ -983,16 +969,15 @@ fn serve_connection<B, IO, S, E>(
                         }
                         break;
                     },
-                    timeout_action = &mut connection_timeout => {
-                        match timeout_action {
-                            TimeoutAction::GracefulShutdown => {
-                                conn.as_mut().graceful_shutdown();
-                            },
-                            TimeoutAction::ForcefulShutdown => {
-                                debug!("forcefully closed connection");
-                                break;
-                            }
+                    () = &mut connection_age => {
+                        conn.as_mut().graceful_shutdown();
+                        if let Some(grace) = max_connection_age_grace {
+                            connection_grace.set(Fuse { inner: Some(tokio::time::sleep(grace)) });
                         }
+                    },
+                    () = &mut connection_grace => {
+                        debug!("forcefully closed connection");
+                        break;
                     },
                     _ = &mut sig => {
                         conn.as_mut().graceful_shutdown();
@@ -1326,78 +1311,48 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test(start_paused = true)]
-    async fn test_connection_timeout_no_max_age() {
-        let future = connection_timeout_future(None, None);
+    async fn test_connection_age_no_max_age() {
+        tokio::select! {
+            () = connection_age_future(None) => {
+                panic!("age future should never complete when max_connection_age is None");
+            }
+            () = tokio::time::sleep(Duration::from_secs(1000)) => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_age_completes_at_max_connection_age() {
+        let mut future = pin!(connection_age_future(Some(Duration::from_secs(10))));
 
         tokio::select! {
-            _ = future => {
-                panic!("timeout future should never complete when max_connection_age is None");
-            }
-            _ = tokio::time::sleep(Duration::from_secs(1000)) => {
+            () = &mut future => panic!("should not complete before max_connection_age"),
+            () = tokio::time::sleep(Duration::from_secs(9)) => {}
+        }
+        tokio::select! {
+            () = &mut future => {}
+            () = tokio::time::sleep(Duration::from_secs(2)) => {
+                panic!("should complete at max_connection_age, not after it");
             }
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_connection_timeout_with_max_connection_age() {
-        let future = connection_timeout_future(Some(Duration::from_secs(10)), None);
-
-        let action = future.await;
-        assert!(matches!(action, TimeoutAction::GracefulShutdown));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_connection_timeout_with_max_connection_age_grace() {
-        let mut future = pin!(connection_timeout_future(
-            Some(Duration::from_secs(10)),
-            Some(Duration::from_secs(5)),
-        ));
-
-        tokio::select! {
-            _ = &mut future => {
-                panic!("should not complete before max_connection_age");
-            }
-            _ = tokio::time::sleep(Duration::from_secs(9)) => {}
-        }
-
-        tokio::select! {
-            _ = &mut future => {
-                panic!("should not complete before max_connection_age_grace");
-            }
-            _ = tokio::time::sleep(Duration::from_secs(4)) => {}
-        }
-
-        let action = future.await;
-        assert!(matches!(action, TimeoutAction::ForcefulShutdown));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_connection_timeout_polled_after_graceful_shutdown() {
-        // Reproduce #2522: connection_timeout polled after GracefulShutdown
+    async fn test_connection_age_polled_after_completion() {
+        // Reproduce #2522: the age future must not be polled again after it fires.
         let mut future = pin!(Fuse {
-            inner: Some(connection_timeout_future(
-                Some(Duration::from_secs(10)),
-                None,
-            ))
+            inner: Some(connection_age_future(Some(Duration::from_secs(10)))),
         });
 
-        // First poll: should return GracefulShutdown after 10s
-        let action = tokio::select! {
-            action = &mut future => action,
-            _ = tokio::time::sleep(Duration::from_secs(11)) => {
-                panic!("timeout future should complete after max_connection_age");
-            }
-        };
-        assert!(matches!(action, TimeoutAction::GracefulShutdown));
-
-        // Second poll: Fuse should return Pending, not panic
         tokio::select! {
-            _ = &mut future => {
-                panic!("fused future should not complete again");
+            () = &mut future => {}
+            () = tokio::time::sleep(Duration::from_secs(11)) => {
+                panic!("age future should complete after max_connection_age");
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                // OK: future is fused, returns Pending
-            }
+        }
+
+        tokio::select! {
+            () = &mut future => panic!("fused future should not complete again"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
 

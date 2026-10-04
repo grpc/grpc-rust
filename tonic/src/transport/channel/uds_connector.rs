@@ -9,10 +9,10 @@ use tower::Service;
 
 use crate::status::ConnectError;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 async fn connect_uds(uds_path: String) -> Result<UnixStream, ConnectError> {
     UnixStream::connect(uds_path)
         .await
@@ -21,14 +21,14 @@ async fn connect_uds(uds_path: String) -> Result<UnixStream, ConnectError> {
 
 // Dummy type that will allow us to compile and match trait bounds
 // but is never used.
-#[cfg(target_os = "windows")]
+#[cfg(not(unix))]
 #[allow(dead_code)]
 type UnixStream = tokio::io::DuplexStream;
 
-#[cfg(target_os = "windows")]
+#[cfg(not(unix))]
 async fn connect_uds(_uds_path: String) -> Result<UnixStream, ConnectError> {
     Err(ConnectError(
-        "uds connections are not allowed on windows".into(),
+        "uds connections are not supported on this platform".into(),
     ))
 }
 
@@ -76,5 +76,46 @@ impl Future for UdsConnecting {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().inner.as_mut().poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connects_to_unix_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("socket");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let mut connector = UdsConnector::new(path.to_str().unwrap());
+
+        let stream = connector
+            .call(Uri::from_static("http://localhost"))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_accepted, _) = listener.accept().await.unwrap();
+
+        assert_eq!(
+            stream.peer_addr().unwrap().as_pathname(),
+            Some(path.as_path())
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn rejects_unix_socket_on_unsupported_platform() {
+        let mut connector = UdsConnector::new("socket");
+        let error = connector
+            .call(Uri::from_static("http://localhost"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "uds connections are not supported on this platform"
+        );
     }
 }

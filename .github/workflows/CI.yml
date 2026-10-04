@@ -25,6 +25,17 @@ jobs:
         components: rustfmt
     - run: cargo fmt --all --check
 
+  wasi-channel:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "--cfg tokio_unstable -D warnings"
+    steps:
+    - uses: actions/checkout@v5
+    - uses: hecrj/setup-rust-action@v2
+    - run: rustup target add wasm32-wasip2
+    - name: Check Tonic channel on WASI Preview 2
+      run: cargo check -p tonic --lib --no-default-features --features channel --target wasm32-wasip2
+
   build-protoc-plugin:
     runs-on: ${{ matrix.os }}
     strategy:

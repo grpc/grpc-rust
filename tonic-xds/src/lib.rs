@@ -218,6 +218,7 @@
 //! | Weighted cluster traffic splitting | [A28] | Supported |
 //! | Case-insensitive header matching | [A63] | Supported |
 //! | Client-side P2C load balancing | | Supported |
+//! | Connection jitter for new endpoints | | Supported |
 //! | ADS TLS and mTLS credentials | [A65] | Supported |
 //! | TLS endpoint connections | [A29] | Supported |
 //! | Least-request load balancing | [A48] | Planned |

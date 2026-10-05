@@ -36,6 +36,10 @@
 //!
 //! On a CDS update whose security config fails validation, the previous
 //! connector is kept and a warning is logged.
+//!
+//! With connection jitter configured, the resulting change stream is wrapped in
+//! a [`ConnectionJitter`] that holds newly discovered endpoints back for a
+//! random delay.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +51,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::BoxError;
 
+use crate::client::connection_jitter::{ConnectionJitter, ConnectionJitterConfig};
 use crate::client::endpoint::{
     ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
 };
@@ -103,6 +108,7 @@ pub(crate) struct XdsClusterDiscovery<MC = GrpcMakeConnector> {
     make_connector: Arc<MC>,
     #[cfg(feature = "_tls-any")]
     registry: Arc<CertProviderRegistry>,
+    connection_jitter: Option<ConnectionJitterConfig>,
 }
 
 impl<MC> XdsClusterDiscovery<MC> {
@@ -116,6 +122,7 @@ impl<MC> XdsClusterDiscovery<MC> {
             cache,
             make_connector: Arc::new(make_connector),
             registry,
+            connection_jitter: None,
         }
     }
 
@@ -124,7 +131,15 @@ impl<MC> XdsClusterDiscovery<MC> {
         Self {
             cache,
             make_connector: Arc::new(make_connector),
+            connection_jitter: None,
         }
+    }
+
+    /// Holds each cluster's newly discovered endpoints back for a random delay
+    /// before the load balancer sees them. `None` disables jitter.
+    pub(crate) fn with_connection_jitter(mut self, config: Option<ConnectionJitterConfig>) -> Self {
+        self.connection_jitter = config;
+        self
     }
 }
 
@@ -190,7 +205,11 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
             }
         });
 
-        Box::pin(ReceiverStream::new(rx))
+        let discover: BoxDiscover<EndpointAddress, MC::Service> = Box::pin(ReceiverStream::new(rx));
+        match self.connection_jitter {
+            Some(config) => Box::pin(ConnectionJitter::new(discover, config)),
+            None => discover,
+        }
     }
 }
 
@@ -363,7 +382,11 @@ impl Connector for TlsConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::cluster::{ClusterResource, LbPolicy};
+    use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
+    use tokio::time::Instant;
+    use tower::discover::Change;
 
     #[cfg(feature = "_tls-any")]
     use crate::xds::cert_provider::verifier::XdsServerCertVerifier;
@@ -578,5 +601,99 @@ mod tests {
             2,
             "TlsConnector should fetch identity provider on every connect call",
         );
+    }
+
+    /// [`Connector`] whose services are the endpoint addresses as strings.
+    struct StringConnector;
+
+    impl Connector for StringConnector {
+        type Service = String;
+        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+            let s = addr.to_string();
+            Box::pin(async move { s })
+        }
+    }
+
+    struct StringMakeConnector;
+
+    impl MakeConnector for StringMakeConnector {
+        type Service = String;
+        fn make_connector(
+            &self,
+            _cluster: ClusterConfig<'_>,
+        ) -> Result<Arc<dyn Connector<Service = String> + Send + Sync>, BoxError> {
+            Ok(Arc::new(StringConnector))
+        }
+    }
+
+    fn string_discovery(cache: Arc<XdsCache>) -> XdsClusterDiscovery<StringMakeConnector> {
+        #[cfg(feature = "_tls-any")]
+        {
+            XdsClusterDiscovery::new(cache, StringMakeConnector, Arc::new(empty_registry()))
+        }
+        #[cfg(not(feature = "_tls-any"))]
+        {
+            XdsClusterDiscovery::new(cache, StringMakeConnector)
+        }
+    }
+
+    fn endpoints(ports: &[u16]) -> Arc<EndpointsResource> {
+        Arc::new(EndpointsResource {
+            cluster_name: "c".to_string(),
+            localities: vec![LocalityEndpoints {
+                locality: None,
+                endpoints: ports
+                    .iter()
+                    .map(|port| ResolvedEndpoint {
+                        address: EndpointAddress::new("10.0.0.1", *port),
+                        health_status: HealthStatus::Healthy,
+                        load_balancing_weight: 1,
+                    })
+                    .collect(),
+                load_balancing_weight: 100,
+                priority: 0,
+            }],
+        })
+    }
+
+    async fn next_two_inserts(discover: &mut BoxDiscover<EndpointAddress, String>) -> Vec<String> {
+        let mut released = Vec::new();
+        for _ in 0..2 {
+            match discover.next().await {
+                Some(Ok(Change::Insert(_, svc))) => released.push(svc),
+                other => panic!("expected an insert, got {other:?}"),
+            }
+        }
+        released.sort();
+        released
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discover_cluster_applies_connection_jitter() {
+        const MAX_JITTER: Duration = Duration::from_secs(10);
+        let cache = Arc::new(XdsCache::new());
+        cache.update_cluster("c", Arc::new(plaintext_cluster()));
+        cache.update_endpoints("c", endpoints(&[8080, 8081]));
+        let expected = ["10.0.0.1:8080", "10.0.0.1:8081"];
+
+        let start = Instant::now();
+        let mut discover = string_discovery(cache.clone()).discover_cluster("c");
+        assert_eq!(next_two_inserts(&mut discover).await, expected);
+        assert_eq!(start.elapsed(), Duration::ZERO, "jitter is off by default");
+
+        // A ratio of 1.0 lets every new endpoint wait. The delays come from
+        // this thread's RNG, which polls the stream; seeding it fixes them.
+        fastrand::seed(7);
+        let start = Instant::now();
+        let config = ConnectionJitterConfig::new(MAX_JITTER, 1.0).unwrap();
+        let mut discover = string_discovery(cache)
+            .with_connection_jitter(config)
+            .discover_cluster("c");
+        assert_eq!(next_two_inserts(&mut discover).await, expected);
+        assert!(
+            start.elapsed() > Duration::ZERO,
+            "endpoints were not delayed"
+        );
+        assert!(start.elapsed() <= MAX_JITTER, "endpoints waited too long");
     }
 }

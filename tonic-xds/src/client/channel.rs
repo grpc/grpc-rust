@@ -23,6 +23,7 @@
  */
 
 use crate::client::cluster::ClusterClientRegistry;
+use crate::client::connection_jitter::ConnectionJitterConfig;
 use crate::client::endpoint::{EndpointAddress, MakeConnector};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
@@ -46,6 +47,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 #[cfg(feature = "_tls-any")]
@@ -64,6 +66,8 @@ pub struct XdsChannelConfig {
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
+    /// `(max_jitter, max_delayed_ratio)`, validated when the channel is built.
+    connection_jitter: Option<(Duration, f64)>,
 }
 
 impl XdsChannelConfig {
@@ -76,6 +80,7 @@ impl XdsChannelConfig {
             call_creds: None,
             max_decoding_message_size: None,
             max_encoding_message_size: None,
+            connection_jitter: None,
         }
     }
 
@@ -128,6 +133,34 @@ impl XdsChannelConfig {
         self.max_encoding_message_size = Some(limit);
         self
     }
+
+    /// Delays the use of newly discovered endpoints by a random amount of time,
+    /// so that a host joining a cluster is not hit by every client at once.
+    ///
+    /// Each endpoint that EDS adds to a cluster is held back from the load
+    /// balancer for a uniformly random delay in `[0, max_jitter)`. The built-in
+    /// gRPC connector connects lazily, on an endpoint's first request, so its
+    /// connections are delayed too. A custom [`Connector`](crate::Connector)
+    /// that connects eagerly has already connected when the delay starts, so
+    /// only its traffic is delayed.
+    ///
+    /// At most `max_delayed_ratio` (capped at 1.0) of a cluster's endpoints are
+    /// held back at a time. Endpoints beyond that limit are used immediately,
+    /// and removals release held-back endpoints early to keep the ratio.
+    ///
+    /// The ratio also applies to a cluster's first EDS update. A ratio close to
+    /// 1.0 can hold back nearly all of a new cluster's endpoints and delay its
+    /// first RPCs by up to `max_jitter`.
+    ///
+    /// Jitter is disabled by default. A zero `max_jitter` or a zero
+    /// `max_delayed_ratio` also disables it. Building the channel fails with
+    /// [`BuildError::ConnectionJitter`] if `max_delayed_ratio` is not in the
+    /// range `[0.0, 1.0]`.
+    #[must_use]
+    pub fn with_connection_jitter(mut self, max_jitter: Duration, max_delayed_ratio: f64) -> Self {
+        self.connection_jitter = Some((max_jitter, max_delayed_ratio));
+        self
+    }
 }
 
 /// Errors that can occur when building an [`XdsChannel`].
@@ -145,6 +178,9 @@ pub enum BuildError {
     #[cfg(feature = "_tls-any")]
     #[error("ADS TLS credentials: {0}")]
     AdsTls(#[source] CertProviderError),
+    /// The connection jitter settings are invalid.
+    #[error("connection jitter: {0}")]
+    ConnectionJitter(String),
 }
 
 #[cfg(feature = "_tls-any")]
@@ -210,6 +246,7 @@ struct XdsRuntimeParts {
     resource_manager: XdsResourceManager,
     #[cfg(feature = "_tls-any")]
     cert_provider_registry: Arc<CertProviderRegistry>,
+    connection_jitter: Option<ConnectionJitterConfig>,
 }
 
 /// `XdsChannel` is an xDS-capable [`tower::Service`] implementation.
@@ -429,8 +466,16 @@ impl XdsChannelBuilder {
 
     /// Builds the transport-agnostic xDS runtime (cache, ADS client, resource
     /// manager, and — under a TLS feature — the cert-provider registry) from
-    /// bootstrap. Shared by the gRPC and transport-generic build entry points.
+    /// bootstrap, and validates the connection jitter settings. Shared by the
+    /// gRPC and transport-generic build entry points.
     fn build_xds_parts(&self) -> Result<XdsRuntimeParts, BuildError> {
+        // Checked first so invalid settings fail before the xDS client starts.
+        let connection_jitter = match self.config.connection_jitter {
+            Some((max_jitter, ratio)) => ConnectionJitterConfig::new(max_jitter, ratio)
+                .map_err(BuildError::ConnectionJitter)?,
+            None => None,
+        };
+
         let bootstrap = match self.config.bootstrap.clone() {
             Some(b) => b,
             None => BootstrapConfig::from_env()?,
@@ -494,6 +539,7 @@ impl XdsChannelBuilder {
             resource_manager,
             #[cfg(feature = "_tls-any")]
             cert_provider_registry,
+            connection_jitter,
         })
     }
 
@@ -543,12 +589,12 @@ impl XdsChannelBuilder {
         let retry_layer = RetryLayer::new(fallback_retry);
 
         #[cfg(feature = "_tls-any")]
-        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> = Arc::new(
-            XdsClusterDiscovery::new(parts.cache, make_connector, parts.cert_provider_registry),
-        );
+        let discovery =
+            XdsClusterDiscovery::new(parts.cache, make_connector, parts.cert_provider_registry);
         #[cfg(not(feature = "_tls-any"))]
+        let discovery = XdsClusterDiscovery::new(parts.cache, make_connector);
         let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> =
-            Arc::new(XdsClusterDiscovery::new(parts.cache, make_connector));
+            Arc::new(discovery.with_connection_jitter(parts.connection_jitter));
 
         let resources = Arc::new(XdsChannelResources {
             _resource_manager: parts.resource_manager,
@@ -1220,6 +1266,32 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
     }
 
+    /// A plain `#[test]` has no tokio runtime, so this also shows the build
+    /// fails before the xDS client starts.
+    #[test]
+    fn invalid_connection_jitter_ratio_fails_channel_build() {
+        use super::BuildError;
+        use crate::BootstrapConfig;
+
+        let bootstrap = BootstrapConfig::from_json(
+            r#"{
+                "xds_servers": [{
+                    "server_uri": "xds.example.com:443",
+                    "channel_creds": [{"type": "insecure"}]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let config = test_config()
+            .with_bootstrap(bootstrap)
+            .with_connection_jitter(std::time::Duration::from_secs(10), 1.5);
+
+        let error = XdsChannelBuilder::new(config)
+            .build_grpc_channel()
+            .unwrap_err();
+        assert!(matches!(&error, BuildError::ConnectionJitter(_)), "{error}");
+    }
+
     #[cfg(feature = "_tls-any")]
     #[test]
     fn a65_empty_config_does_not_create_a_file_watcher() {
@@ -1257,6 +1329,7 @@ mod tests {
                 xds_client,
                 resource_manager,
                 cert_provider_registry,
+                connection_jitter: None,
             }
         };
         #[cfg(not(feature = "_tls-any"))]
@@ -1264,6 +1337,7 @@ mod tests {
             cache,
             xds_client,
             resource_manager,
+            connection_jitter: None,
         };
         let _channel = builder.build_grpc_channel_from_runtime(parts);
         // Construction should succeed without panicking.

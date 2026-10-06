@@ -61,6 +61,12 @@ pub trait Transport: Send + Sync + 'static {
 /// Sealed for now to limit API surface.
 pub trait TransportSender: sealed::Sealed + Send + 'static {
     /// Send serialized DiscoveryRequest bytes to the server.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not intended to be cancellation safe.  If the returned
+    /// future is not polled to completion, the behavior of any subsequent calls
+    /// to the TransportSender are undefined and data may be lost.
     fn send(&mut self, request: Bytes) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -74,6 +80,12 @@ pub trait TransportReceiver: sealed::Sealed + Send + 'static {
     /// - `Ok(Some(bytes))` - Received a response.
     /// - `Ok(None)` - Stream closed normally.
     /// - `Err(_)` - Stream error (connection dropped, etc.)
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not intended to be cancellation safe.  If the returned
+    /// future is not polled to completion, the behavior of any subsequent calls
+    /// to the TransportReceiver are undefined and data may be lost.
     fn recv(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 }
 

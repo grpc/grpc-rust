@@ -25,6 +25,8 @@
 //! Error types for the xDS client.
 
 use thiserror::Error;
+#[cfg(feature = "transport-grpc")]
+use grpc;
 
 /// Error type for the xDS client.
 #[derive(Debug, Error)]
@@ -38,6 +40,11 @@ pub enum Error {
     #[cfg(feature = "transport-tonic")]
     #[error("stream error: {0}")]
     Stream(#[from] tonic::Status),
+
+    /// gRPC RPC failed.
+    #[cfg(feature = "transport-grpc")]
+    #[error("grpc error: {0}")]
+    GrpcStream(#[from] grpc::StatusError),
 
     /// Call credentials failed, or require a secure transport.
     #[error("call credentials error: {0}")]

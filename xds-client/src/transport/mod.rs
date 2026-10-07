@@ -32,6 +32,10 @@ use std::future::Future;
 #[cfg(feature = "transport-tonic")]
 pub mod tonic;
 
+
+#[cfg(feature = "transport-grpc")]
+pub mod grpc;
+
 mod sealed {
     pub trait Sealed {}
 }
@@ -93,6 +97,12 @@ pub trait TransportReceiver: sealed::Sealed + Send + 'static {
 impl sealed::Sealed for tonic::TonicAdsSender {}
 #[cfg(feature = "transport-tonic")]
 impl sealed::Sealed for tonic::TonicAdsReceiver {}
+
+#[cfg(feature = "transport-grpc")]
+impl sealed::Sealed for grpc::GrpcAdsSender {}
+#[cfg(feature = "transport-grpc")]
+impl sealed::Sealed for grpc::GrpcAdsReceiver {}
+
 
 /// Factory for creating transports to xDS servers.
 ///

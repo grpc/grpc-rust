@@ -35,42 +35,183 @@ use tokio::sync::watch;
 
 use crate::xds::resource::{ClusterResource, EndpointsResource, RouteConfigResource};
 
-/// A wrapper around [`watch::Receiver`] that exposes only a single `next()`
-/// method, preventing misuse of the raw watch API.
+enum WatchValue<T> {
+    Pending {
+        generation: u64,
+        revision: u64,
+    },
+    Resource {
+        generation: u64,
+        revision: u64,
+        resource: Arc<T>,
+    },
+    Removed {
+        generation: u64,
+        revision: u64,
+    },
+}
+
+impl<T> Clone for WatchValue<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Pending {
+                generation,
+                revision,
+            } => Self::Pending {
+                generation: *generation,
+                revision: *revision,
+            },
+            Self::Resource {
+                generation,
+                revision,
+                resource,
+            } => Self::Resource {
+                generation: *generation,
+                revision: *revision,
+                resource: Arc::clone(resource),
+            },
+            Self::Removed {
+                generation,
+                revision,
+            } => Self::Removed {
+                generation: *generation,
+                revision: *revision,
+            },
+        }
+    }
+}
+
+impl<T> WatchValue<T> {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Pending { generation, .. }
+            | Self::Resource { generation, .. }
+            | Self::Removed { generation, .. } => *generation,
+        }
+    }
+
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Pending { revision, .. }
+            | Self::Resource { revision, .. }
+            | Self::Removed { revision, .. } => *revision,
+        }
+    }
+}
+
+pub(crate) enum CacheEvent<T> {
+    Resource {
+        generation: u64,
+        revision: u64,
+        resource: Arc<T>,
+    },
+    Removed,
+}
+
+/// A wrapper around [`watch::Receiver`] that preserves resource-removal events.
 pub(crate) struct CacheWatch<T> {
-    rx: watch::Receiver<Option<Arc<T>>>,
+    rx: watch::Receiver<WatchValue<T>>,
+    generation: u64,
+    revision: u64,
+    pending_resource: Option<(u64, u64, Arc<T>)>,
 }
 
 impl<T> CacheWatch<T> {
-    fn new(mut rx: watch::Receiver<Option<Arc<T>>>) -> Self {
+    fn new(mut rx: watch::Receiver<WatchValue<T>>) -> Self {
+        let generation = rx.borrow().generation();
+        let revision = rx.borrow().revision();
         // Ensure late watchers see the existing value on first next().
         rx.mark_changed();
-        Self { rx }
+        Self {
+            rx,
+            generation,
+            revision,
+            pending_resource: None,
+        }
     }
 
     /// Waits for the next resource update and returns it.
     ///
-    /// Returns `None` if the sender was dropped (resource removed from cache).
+    /// Resource removals are skipped; use [`Self::next_event`] when they must be
+    /// observed. Returns `None` only when the cache is dropped.
     pub(crate) async fn next(&mut self) -> Option<Arc<T>> {
+        while let Some(event) = self.next_event().await {
+            if let CacheEvent::Resource { resource, .. } = event {
+                return Some(resource);
+            }
+        }
+        None
+    }
+
+    /// Waits for the next resource update or removal.
+    pub(crate) async fn next_event(&mut self) -> Option<CacheEvent<T>> {
+        if let Some((generation, revision, resource)) = self.pending_resource.take() {
+            return Some(CacheEvent::Resource {
+                generation,
+                revision,
+                resource,
+            });
+        }
+
         loop {
             if self.rx.changed().await.is_err() {
                 return None;
             }
-            let val = self.rx.borrow_and_update().clone();
-            if val.is_some() {
-                return val;
+            match self.rx.borrow_and_update().clone() {
+                WatchValue::Pending {
+                    generation,
+                    revision,
+                } => {
+                    self.generation = generation;
+                    self.revision = revision;
+                }
+                WatchValue::Resource {
+                    generation,
+                    revision,
+                    resource,
+                } if generation != self.generation => {
+                    self.generation = generation;
+                    self.revision = revision;
+                    self.pending_resource = Some((generation, revision, resource));
+                    return Some(CacheEvent::Removed);
+                }
+                WatchValue::Resource {
+                    generation,
+                    revision,
+                    resource,
+                } => {
+                    self.generation = generation;
+                    self.revision = revision;
+                    return Some(CacheEvent::Resource {
+                        generation,
+                        revision,
+                        resource,
+                    });
+                }
+                WatchValue::Removed {
+                    generation,
+                    revision,
+                } => {
+                    self.generation = generation;
+                    self.revision = revision;
+                    return Some(CacheEvent::Removed);
+                }
             }
         }
+    }
+
+    pub(crate) fn current_revision(&self) -> u64 {
+        self.rx.borrow().revision()
     }
 }
 
 /// A keyed collection of [`watch`] channels for a single xDS resource type.
 ///
 /// Each entry is lazily created on first access (watch or update) and
-/// starts with `None`. Writers call [`update`](Self::update) to set the value;
-/// consumers call [`watch`](Self::watch) to receive changes.
+/// starts pending. Removed entries remain as tombstones so late watchers do not
+/// mistake a known removal for a resource that has not arrived yet.
 struct WatchMap<T> {
-    inner: DashMap<String, watch::Sender<Option<Arc<T>>>>,
+    inner: DashMap<String, watch::Sender<WatchValue<T>>>,
 }
 
 impl<T> WatchMap<T> {
@@ -85,7 +226,13 @@ impl<T> WatchMap<T> {
     /// Lazily creates the watch channel if this is the first access for the key.
     fn update(&self, key: &str, value: Arc<T>) {
         let tx = self.ensure(key);
-        tx.send_replace(Some(value));
+        tx.send_modify(move |current| {
+            *current = WatchValue::Resource {
+                generation: current.generation(),
+                revision: current.revision().wrapping_add(1),
+                resource: value,
+            };
+        });
     }
 
     /// Watches resource changes for the given key.
@@ -96,18 +243,28 @@ impl<T> WatchMap<T> {
         CacheWatch::new(tx.subscribe())
     }
 
-    /// Removes the watch channel for the given key.
-    ///
-    /// Dropping the sender closes all watcher receivers.
+    /// Marks the resource removed and notifies current and future watchers.
     fn remove(&self, key: &str) {
-        self.inner.remove(key);
+        let tx = self.ensure(key);
+        tx.send_modify(|current| {
+            *current = WatchValue::Removed {
+                generation: current.generation().wrapping_add(1),
+                revision: current.revision().wrapping_add(1),
+            };
+        });
     }
 
     /// Returns the sender for `key`, creating the watch channel if needed.
-    fn ensure(&self, key: &str) -> watch::Sender<Option<Arc<T>>> {
+    fn ensure(&self, key: &str) -> watch::Sender<WatchValue<T>> {
         self.inner
             .entry(key.to_string())
-            .or_insert_with(|| watch::channel(None).0)
+            .or_insert_with(|| {
+                watch::channel(WatchValue::Pending {
+                    generation: 0,
+                    revision: 0,
+                })
+                .0
+            })
             .value()
             .clone()
     }
@@ -124,7 +281,7 @@ impl<T> WatchMap<T> {
 ///   CDS readiness, then [`watch_endpoints`](Self::watch_endpoints) to track EDS updates.
 pub(crate) struct XdsCache {
     /// Active route configuration (from LDS inline or RDS).
-    route_config_tx: watch::Sender<Option<Arc<RouteConfigResource>>>,
+    route_config_tx: watch::Sender<WatchValue<RouteConfigResource>>,
 
     /// Per-cluster CDS state with readiness gating.
     clusters: WatchMap<ClusterResource>,
@@ -136,7 +293,10 @@ pub(crate) struct XdsCache {
 impl XdsCache {
     /// Creates a new empty cache with no resources.
     pub(crate) fn new() -> Self {
-        let (route_config_tx, _) = watch::channel(None);
+        let (route_config_tx, _) = watch::channel(WatchValue::Pending {
+            generation: 0,
+            revision: 0,
+        });
         Self {
             route_config_tx,
             clusters: WatchMap::new(),
@@ -146,7 +306,13 @@ impl XdsCache {
 
     /// Updates the active route configuration and notifies all watchers.
     pub(crate) fn update_route_config(&self, config: Arc<RouteConfigResource>) {
-        self.route_config_tx.send_replace(Some(config));
+        self.route_config_tx.send_modify(move |current| {
+            *current = WatchValue::Resource {
+                generation: current.generation(),
+                revision: current.revision().wrapping_add(1),
+                resource: config,
+            };
+        });
     }
 
     /// Watches route configuration changes.
@@ -216,11 +382,14 @@ mod tests {
     }
 
     fn make_cluster(name: &str, lb: LbPolicy) -> Arc<ClusterResource> {
+        use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
+
         Arc::new(ClusterResource {
             name: name.to_string(),
             eds_service_name: None,
             lb_policy: lb,
             security: None,
+            circuit_breaking: CircuitBreakingConfig::default(),
         })
     }
 
@@ -280,14 +449,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_remove_closes_watcher() {
+    async fn cluster_remove_notifies_watcher() {
         let cache = XdsCache::new();
         let mut watch = cache.watch_cluster("c1");
         cache.update_cluster("c1", make_cluster("c1", LbPolicy::RoundRobin));
         watch.next().await; // consume
 
         cache.remove_cluster("c1");
-        assert!(watch.next().await.is_none());
+        assert!(matches!(
+            watch.next_event().await,
+            Some(CacheEvent::Removed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_cluster_watcher_observes_removal_and_readd() {
+        let cache = XdsCache::new();
+        cache.remove_cluster("c1");
+
+        let mut event_watch = cache.watch_cluster("c1");
+        assert!(matches!(
+            event_watch.next_event().await,
+            Some(CacheEvent::Removed)
+        ));
+
+        let mut standard_watch = cache.watch_cluster("c1");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), standard_watch.next())
+                .await
+                .is_err(),
+            "generic late watchers should await a future re-add",
+        );
+
+        cache.update_cluster("c1", make_cluster("c1", LbPolicy::LeastRequest));
+        let cluster = standard_watch.next().await.unwrap();
+        assert_eq!(cluster.lb_policy, LbPolicy::LeastRequest);
+    }
+
+    #[tokio::test]
+    async fn watcher_preserves_coalesced_removal_before_readd() {
+        let cache = XdsCache::new();
+        let mut watch = cache.watch_cluster("c1");
+        cache.update_cluster("c1", make_cluster("c1", LbPolicy::RoundRobin));
+        watch.next().await.unwrap();
+
+        cache.remove_cluster("c1");
+        cache.update_cluster("c1", make_cluster("c1", LbPolicy::LeastRequest));
+
+        assert!(matches!(
+            watch.next_event().await,
+            Some(CacheEvent::Removed)
+        ));
+        let Some(CacheEvent::Resource {
+            resource: cluster, ..
+        }) = watch.next_event().await
+        else {
+            panic!("expected re-added cluster after removal");
+        };
+        assert_eq!(cluster.lb_policy, LbPolicy::LeastRequest);
     }
 
     #[tokio::test]
@@ -315,14 +534,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_endpoints_closes_watchers() {
+    async fn remove_endpoints_notifies_watchers() {
         let cache = XdsCache::new();
         let mut watch = cache.watch_endpoints("c1");
         cache.update_endpoints("c1", make_endpoints("c1"));
         watch.next().await; // consume
 
         cache.remove_endpoints("c1");
-        assert!(watch.next().await.is_none());
+        assert!(matches!(
+            watch.next_event().await,
+            Some(CacheEvent::Removed)
+        ));
     }
 
     #[tokio::test]

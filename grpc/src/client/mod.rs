@@ -49,6 +49,7 @@
 //!   trailers received from the server during its response.
 
 use std::fmt::Display;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::async_trait;
@@ -137,6 +138,64 @@ impl CallOptions {
     /// Reads the deadline currently set in the [`CallOptions`].
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+}
+
+/// Configures the HTTP/2 keepalive pings a channel sends on its connections.
+///
+/// Set on a channel with the `keepalive` method of the builder returned by
+/// [`Channel::builder`].
+#[derive(Debug, Clone)]
+pub struct KeepaliveParams {
+    time: Duration,
+    timeout: Duration,
+    permit_without_stream: bool,
+}
+
+impl KeepaliveParams {
+    /// The shortest interval between pings; a shorter `time` is raised to it.
+    pub const MIN_TIME: Duration = Duration::from_secs(10);
+
+    /// Pings the server after `time` without activity on the connection.
+    ///
+    /// The connection is closed if the server does not acknowledge a ping
+    /// within 20 seconds; see [`with_timeout`](Self::with_timeout).  No pings
+    /// are sent while the connection has no active calls; see
+    /// [`with_permit_without_stream`](Self::with_permit_without_stream).
+    pub fn new(time: Duration) -> Self {
+        Self {
+            time,
+            timeout: Duration::from_secs(20),
+            permit_without_stream: false,
+        }
+    }
+
+    /// Closes the connection if the server does not acknowledge a ping within
+    /// `timeout`.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Pings the server even when the connection has no active calls.
+    pub fn with_permit_without_stream(mut self, permit: bool) -> Self {
+        self.permit_without_stream = permit;
+        self
+    }
+
+    /// The interval between pings, after raising it to [`Self::MIN_TIME`].
+    pub fn time(&self) -> Duration {
+        self.time.max(Self::MIN_TIME)
+    }
+
+    /// How long to wait for a ping's acknowledgement.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Whether pings are sent on a connection with no active calls.
+    pub fn permit_without_stream(&self) -> bool {
+        self.permit_without_stream
     }
 }
 

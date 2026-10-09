@@ -29,6 +29,7 @@ use http::HeaderValue;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::client::KeepaliveParams;
 use crate::core::Address;
 use crate::core::ConnectionInfo;
 use crate::credentials::ChannelCredentials;
@@ -81,6 +82,36 @@ impl Default for TransportOptions {
             rate_limit: None,
             tcp_keepalive: None,
             tcp_nodelay: true,
+        }
+    }
+}
+
+/// The smallest initial flow control window a channel accepts; smaller values
+/// are ignored.
+const MIN_WINDOW_SIZE: u32 = 64 * 1024;
+
+impl TransportOptions {
+    pub(crate) fn set_keepalive(&mut self, params: &KeepaliveParams) {
+        self.http2_keep_alive_interval = Some(params.time());
+        self.http2_keep_alive_timeout = Some(params.timeout());
+        self.http2_keep_alive_while_idle = Some(params.permit_without_stream());
+    }
+
+    /// Fixes each stream's initial flow control window at `size` bytes, which
+    /// turns off adaptive (BDP-based) window sizing.
+    pub(crate) fn set_initial_window_size(&mut self, size: u32) {
+        if size >= MIN_WINDOW_SIZE {
+            self.init_stream_window_size = Some(size);
+            self.http2_adaptive_window = false;
+        }
+    }
+
+    /// Fixes the connection's initial flow control window at `size` bytes,
+    /// which turns off adaptive (BDP-based) window sizing.
+    pub(crate) fn set_initial_connection_window_size(&mut self, size: u32) {
+        if size >= MIN_WINDOW_SIZE {
+            self.init_connection_window_size = Some(size);
+            self.http2_adaptive_window = false;
         }
     }
 }
@@ -198,5 +229,70 @@ impl ProxyOptions {
     /// Adds these `ProxyOptions` to the given `Address` attributes.
     pub(crate) fn add_to_addr(addr: &mut Address, options: Arc<Self>) {
         addr.attributes = addr.attributes.add(options);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn keepalive() {
+        let mut opts = TransportOptions::default();
+        opts.set_keepalive(
+            &KeepaliveParams::new(Duration::from_secs(30))
+                .with_timeout(Duration::from_secs(5))
+                .with_permit_without_stream(true),
+        );
+        assert_eq!(
+            opts.http2_keep_alive_interval,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(opts.http2_keep_alive_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(opts.http2_keep_alive_while_idle, Some(true));
+    }
+
+    #[test]
+    fn keepalive_defaults() {
+        let mut opts = TransportOptions::default();
+        opts.set_keepalive(&KeepaliveParams::new(Duration::from_secs(30)));
+        assert_eq!(opts.http2_keep_alive_timeout, Some(Duration::from_secs(20)));
+        assert_eq!(opts.http2_keep_alive_while_idle, Some(false));
+    }
+
+    #[test]
+    fn keepalive_time_is_raised_to_minimum() {
+        let mut opts = TransportOptions::default();
+        opts.set_keepalive(&KeepaliveParams::new(Duration::from_secs(1)));
+        assert_eq!(
+            opts.http2_keep_alive_interval,
+            Some(KeepaliveParams::MIN_TIME)
+        );
+    }
+
+    #[test]
+    fn window_sizes_turn_off_adaptive_window() {
+        let mut opts = TransportOptions::default();
+        assert!(opts.http2_adaptive_window);
+        opts.set_initial_window_size(1 << 20);
+        assert_eq!(opts.init_stream_window_size, Some(1 << 20));
+        assert!(!opts.http2_adaptive_window);
+
+        let mut opts = TransportOptions::default();
+        opts.set_initial_connection_window_size(1 << 26);
+        assert_eq!(opts.init_connection_window_size, Some(1 << 26));
+        assert!(!opts.http2_adaptive_window);
+    }
+
+    #[test]
+    fn window_sizes_below_minimum_are_ignored() {
+        let mut opts = TransportOptions::default();
+        opts.set_initial_window_size(MIN_WINDOW_SIZE - 1);
+        opts.set_initial_connection_window_size(MIN_WINDOW_SIZE - 1);
+        assert_eq!(opts.init_stream_window_size, None);
+        assert_eq!(opts.init_connection_window_size, None);
+        assert!(opts.http2_adaptive_window);
     }
 }

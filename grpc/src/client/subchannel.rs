@@ -311,6 +311,7 @@ impl InternalSubchannel {
         backoff: Arc<dyn Backoff>,
         runtime: GrpcRuntime,
         mut security_opts: SecurityOpts,
+        transport_options: TransportOptions,
         work_scheduler: Arc<dyn WorkScheduler>,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
@@ -332,7 +333,7 @@ impl InternalSubchannel {
                 state: InternalSubchannelState::Idle,
                 work_scheduler,
                 on_drop,
-                transport_options: TransportOptions::default(), // TODO: should be configurable
+                transport_options,
                 security_opts,
             })),
         });

@@ -42,6 +42,7 @@ use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::KeepaliveParams;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
@@ -72,6 +73,7 @@ use crate::client::subchannel::InternalSubchannel;
 use crate::client::subchannel::NopBackoff;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
+use crate::client::transport::TransportOptions;
 use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
@@ -136,6 +138,7 @@ impl Channel {
             target: target.into(),
             credentials,
             authority: None,
+            transport_options: TransportOptions::default(),
             runtime: default_runtime(),
         }
     }
@@ -180,6 +183,7 @@ pub struct ChannelBuilder {
 
     // Optional values.
     authority: Option<String>,
+    transport_options: TransportOptions,
 }
 
 impl ChannelBuilder {
@@ -222,6 +226,7 @@ impl ChannelBuilder {
                 active_channel: Mutex::default(),
                 target,
                 security_opts,
+                transport_options: self.transport_options,
                 runtime: self.runtime,
                 resolver_builder,
             }),
@@ -236,6 +241,32 @@ impl ChannelBuilder {
         self.authority = Some(authority.into());
         self
     }
+
+    /// Sends HTTP/2 keepalive pings on the channel's connections, as `params`
+    /// describes.  By default no pings are sent.
+    pub fn keepalive(mut self, params: KeepaliveParams) -> Self {
+        self.transport_options.set_keepalive(&params);
+        self
+    }
+
+    /// Sets the initial HTTP/2 flow control window of each stream to `size`
+    /// bytes.  Values below 64 KiB are ignored.  Setting it turns off the
+    /// default adaptive window sizing, which estimates the bandwidth-delay
+    /// product, for both streams and the connection.
+    pub fn initial_window_size(mut self, size: u32) -> Self {
+        self.transport_options.set_initial_window_size(size);
+        self
+    }
+
+    /// Sets the initial HTTP/2 flow control window of each connection to
+    /// `size` bytes.  Values below 64 KiB are ignored.  Setting it turns off
+    /// the default adaptive window sizing, which estimates the bandwidth-delay
+    /// product, for both streams and the connection.
+    pub fn initial_connection_window_size(mut self, size: u32) -> Self {
+        self.transport_options
+            .set_initial_connection_window_size(size);
+        self
+    }
 }
 
 struct PersistentChannel {
@@ -244,6 +275,7 @@ struct PersistentChannel {
     // Configuration
     target: Target,
     security_opts: SecurityOpts,
+    transport_options: TransportOptions,
     runtime: GrpcRuntime,
 
     // Inferred Configuration
@@ -307,6 +339,7 @@ impl ActiveChannel {
             runtime.clone(),
             lb_watcher.clone(),
             persistent_channel.security_opts.clone(),
+            persistent_channel.transport_options.clone(),
         );
 
         let work_scheduler = Arc::new(ResolverWorkScheduler { wqtx });
@@ -419,6 +452,7 @@ impl ResolverChannelController {
         runtime: GrpcRuntime,
         lb_watcher: Arc<Watcher<LbState>>,
         security_opts: SecurityOpts,
+        transport_options: TransportOptions,
     ) -> Self {
         let lb_work_scheduler = Arc::new(LbWorkScheduler { wqtx: wqtx.clone() });
         let lb_channel_controller = LbChannelController {
@@ -427,6 +461,7 @@ impl ResolverChannelController {
             lb_watcher,
             runtime: runtime.clone(),
             security_opts,
+            transport_options,
         };
         Self {
             lb_policy: SubchannelSharing::new(
@@ -465,6 +500,7 @@ struct LbChannelController {
     lb_watcher: Arc<Watcher<LbState>>,
     runtime: GrpcRuntime, // For creating subchannels
     security_opts: SecurityOpts,
+    transport_options: TransportOptions,
 }
 
 impl load_balancing::ChannelController for LbChannelController {
@@ -484,6 +520,7 @@ impl load_balancing::ChannelController for LbChannelController {
                 Arc::new(NopBackoff {}),
                 self.runtime.clone(),
                 self.security_opts.clone(),
+                self.transport_options.clone(),
                 work_scheduler,
             ),
             SubchannelState::idle(),

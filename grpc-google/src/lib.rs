@@ -123,7 +123,7 @@ impl<P: TokenProvider> CallCredentials for GcpCallCredentials<P> {
 
 #[cfg(test)]
 mod tests {
-    use grpc::attributes::Attributes;
+    use grpc::immutable_attributes::ImmutableAttributes;
 
     use super::*;
 
@@ -143,7 +143,7 @@ mod tests {
         let auth_info = ClientConnectionSecurityInfo::new(
             "tls",
             SecurityLevel::PrivacyAndIntegrity,
-            Attributes::new(),
+            ImmutableAttributes::new(),
         );
         (call_details, auth_info)
     }

@@ -70,6 +70,8 @@ use crate::StatusError;
 use crate::attributes::Attributes;
 use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
+use crate::client::DEFAULT_MAX_RECV_MESSAGE_SIZE;
+use crate::client::DEFAULT_MAX_SEND_MESSAGE_SIZE;
 use crate::client::Invoke;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
@@ -167,7 +169,19 @@ impl Invoke for TonicTransport {
                 .local_err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));
         };
 
-        let mut grpc = self.grpc.clone();
+        let mut grpc = self
+            .grpc
+            .clone()
+            .max_decoding_message_size(
+                options
+                    .max_recv_message_size()
+                    .unwrap_or(DEFAULT_MAX_RECV_MESSAGE_SIZE),
+            )
+            .max_encoding_message_size(
+                options
+                    .max_send_message_size()
+                    .unwrap_or(DEFAULT_MAX_SEND_MESSAGE_SIZE),
+            );
         if let Err(e) = grpc.ready().await {
             return self.local_err_streams(StatusError::new(
                 StatusCodeError::Unavailable,

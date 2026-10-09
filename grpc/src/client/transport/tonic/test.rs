@@ -1256,3 +1256,118 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     let req = WrappedEchoRequest(EchoRequest::default());
     assert!(tx.send(&req, SendOptions::default()).await.is_err());
 }
+
+/// Serves the echo service on a local port with no message size limits of its
+/// own, so the limits under test are the client's.
+async fn spawn_unlimited_echo_server() -> (SocketAddr, Arc<Notify>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+    tokio::spawn(async move {
+        let svc = EchoServer::new(EchoService {
+            response_headers: None,
+            response_error: None,
+        })
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+    (addr, shutdown_notify)
+}
+
+async fn unary_echo_with_options(
+    channel: &Channel,
+    message: String,
+    options: CallOptions,
+) -> Result<String, StatusError> {
+    let (mut tx, mut rx) = channel
+        .invoke(
+            RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
+            options,
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest { message });
+    _ = tx
+        .send(
+            &req,
+            SendOptions {
+                final_msg: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    loop {
+        match rx.recv(&mut resp).await {
+            ResponseStreamItem::Headers(_) | ResponseStreamItem::Message => {}
+            ResponseStreamItem::Trailers(trailers) => {
+                return trailers.status().clone().map(|()| resp.0.message);
+            }
+            ResponseStreamItem::StreamClosed => panic!("stream closed before trailers"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn max_recv_message_size() {
+    let (addr, shutdown_notify) = spawn_unlimited_echo_server().await;
+    let target = format!("dns:///{}", addr);
+    let large = "a".repeat(crate::client::DEFAULT_MAX_RECV_MESSAGE_SIZE + 1);
+
+    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    unary_echo_with_options(&channel, large.clone(), CallOptions::default())
+        .await
+        .expect_err("a response over the default limit should fail the call");
+
+    let mut options = CallOptions::default();
+    options.set_max_recv_message_size(2 * large.len());
+    let resp = unary_echo_with_options(&channel, large.clone(), options)
+        .await
+        .expect("a call's own limit should admit the response");
+    assert_eq!(resp, large);
+
+    let mut defaults = CallOptions::default();
+    defaults.set_max_recv_message_size(2 * large.len());
+    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc())
+        .default_call_options(defaults)
+        .build();
+    let resp = unary_echo_with_options(&channel, large.clone(), CallOptions::default())
+        .await
+        .expect("the channel's default limit should admit the response");
+    assert_eq!(resp, large);
+
+    let mut options = CallOptions::default();
+    options.set_max_recv_message_size(1024);
+    unary_echo_with_options(&channel, large, options)
+        .await
+        .expect_err("a call's own limit should take precedence over the channel's");
+
+    shutdown_notify.notify_one();
+}
+
+#[tokio::test]
+async fn max_send_message_size() {
+    let (addr, shutdown_notify) = spawn_unlimited_echo_server().await;
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+
+    let mut options = CallOptions::default();
+    options.set_max_send_message_size(1024);
+    unary_echo_with_options(&channel, "a".repeat(2048), options.clone())
+        .await
+        .expect_err("a request over the send limit should fail the call");
+
+    let resp = unary_echo_with_options(&channel, "a".repeat(512), options)
+        .await
+        .expect("a request under the send limit should succeed");
+    assert_eq!(resp, "a".repeat(512));
+
+    shutdown_notify.notify_one();
+}

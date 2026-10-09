@@ -120,7 +120,17 @@ impl Display for ConnectivityState {
 pub struct CallOptions {
     /// The deadline for the call.  If unset, the call may run indefinitely.
     deadline: Option<Instant>,
+    max_recv_message_size: Option<usize>,
+    max_send_message_size: Option<usize>,
 }
+
+/// The largest message, in bytes, a call receives unless
+/// [`CallOptions::set_max_recv_message_size`] says otherwise.
+pub const DEFAULT_MAX_RECV_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// The largest message, in bytes, a call sends unless
+/// [`CallOptions::set_max_send_message_size`] says otherwise.
+pub const DEFAULT_MAX_SEND_MESSAGE_SIZE: usize = i32::MAX as usize;
 
 impl CallOptions {
     /// Constructs a new [`CallOptions`] with the default settings.
@@ -137,6 +147,43 @@ impl CallOptions {
     /// Reads the deadline currently set in the [`CallOptions`].
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Sets the largest message, in bytes, the call accepts from the server.
+    /// A larger message fails the call.  Defaults to
+    /// [`DEFAULT_MAX_RECV_MESSAGE_SIZE`].
+    pub fn set_max_recv_message_size(&mut self, bytes: usize) {
+        self.max_recv_message_size = Some(bytes);
+    }
+
+    /// Reads the receive limit set in the [`CallOptions`], if any.
+    pub fn max_recv_message_size(&self) -> Option<usize> {
+        self.max_recv_message_size
+    }
+
+    /// Sets the largest message, in bytes, the call sends to the server.
+    /// Sending a larger message fails the call.  Defaults to
+    /// [`DEFAULT_MAX_SEND_MESSAGE_SIZE`].
+    pub fn set_max_send_message_size(&mut self, bytes: usize) {
+        self.max_send_message_size = Some(bytes);
+    }
+
+    /// Reads the send limit set in the [`CallOptions`], if any.
+    pub fn max_send_message_size(&self) -> Option<usize> {
+        self.max_send_message_size
+    }
+
+    /// Fills every option this [`CallOptions`] leaves unset from `defaults`.
+    pub(crate) fn or(self, defaults: &CallOptions) -> CallOptions {
+        CallOptions {
+            deadline: self.deadline.or(defaults.deadline),
+            max_recv_message_size: self
+                .max_recv_message_size
+                .or(defaults.max_recv_message_size),
+            max_send_message_size: self
+                .max_send_message_size
+                .or(defaults.max_send_message_size),
+        }
     }
 }
 

@@ -136,6 +136,7 @@ impl Channel {
             target: target.into(),
             credentials,
             authority: None,
+            default_call_options: CallOptions::default(),
             runtime: default_runtime(),
         }
     }
@@ -167,6 +168,7 @@ impl Invoke for Channel {
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
+        let options = options.or(&self.inner.default_call_options);
         let ac = self.inner.get_active_channel();
         ac.invoke(headers, options).await
     }
@@ -180,6 +182,7 @@ pub struct ChannelBuilder {
 
     // Optional values.
     authority: Option<String>,
+    default_call_options: CallOptions,
 }
 
 impl ChannelBuilder {
@@ -222,6 +225,7 @@ impl ChannelBuilder {
                 active_channel: Mutex::default(),
                 target,
                 security_opts,
+                default_call_options: self.default_call_options,
                 runtime: self.runtime,
                 resolver_builder,
             }),
@@ -236,6 +240,13 @@ impl ChannelBuilder {
         self.authority = Some(authority.into());
         self
     }
+
+    /// Sets the [`CallOptions`] every call on the channel starts from.  An
+    /// option a call sets itself takes precedence.
+    pub fn default_call_options(mut self, options: CallOptions) -> Self {
+        self.default_call_options = options;
+        self
+    }
 }
 
 struct PersistentChannel {
@@ -244,6 +255,7 @@ struct PersistentChannel {
     // Configuration
     target: Target,
     security_opts: SecurityOpts,
+    default_call_options: CallOptions,
     runtime: GrpcRuntime,
 
     // Inferred Configuration

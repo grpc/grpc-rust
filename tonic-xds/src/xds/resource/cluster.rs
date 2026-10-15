@@ -32,6 +32,9 @@ use xds_client::{Error, Resource};
 
 use super::security::{ClusterSecurityConfig, parse_transport_socket};
 
+// Re-exported so other modules keep using the `cluster::LbPolicy` path.
+pub(crate) use super::lb_policy::{LbPolicy, RingHashSettings};
+
 /// Validated Cluster resource.
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterResource {
@@ -44,13 +47,6 @@ pub(crate) struct ClusterResource {
     /// TLS security config parsed from `transport_socket`. `None` means the
     /// cluster uses plaintext connections.
     pub security: Option<ClusterSecurityConfig>,
-}
-
-/// Load balancing policies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LbPolicy {
-    RoundRobin,
-    LeastRequest,
 }
 
 impl Resource for ClusterResource {
@@ -82,6 +78,9 @@ impl Resource for ClusterResource {
         let lb_policy = match cluster::LbPolicy::try_from(message.lb_policy) {
             Ok(cluster::LbPolicy::RoundRobin) => LbPolicy::RoundRobin,
             Ok(cluster::LbPolicy::LeastRequest) => LbPolicy::LeastRequest,
+            Ok(cluster::LbPolicy::RingHash) => {
+                LbPolicy::RingHash(RingHashSettings::validate(message.lb_config)?)
+            }
             _ => {
                 return Err(Error::Validation(format!(
                     "unsupported load balancing policy: {}",
@@ -168,9 +167,10 @@ mod tests {
 
     #[test]
     fn test_unsupported_lb_policy_is_rejected() {
+        // A policy we don't support (e.g. MAGLEV) is still NACKed.
         let cluster = Cluster {
-            name: "rh-cluster".to_string(),
-            lb_policy: cluster::LbPolicy::RingHash as i32,
+            name: "mg-cluster".to_string(),
+            lb_policy: cluster::LbPolicy::Maglev as i32,
             ..Default::default()
         };
         let err = ClusterResource::validate(cluster).unwrap_err();
@@ -178,6 +178,24 @@ mod tests {
             err.to_string()
                 .contains("unsupported load balancing policy")
         );
+    }
+
+    #[test]
+    fn test_ring_hash_lb_policy() {
+        // A RING_HASH cluster validates to LbPolicy::RingHash with the parsed
+        // (here defaulted) settings. Detailed ring_hash_lb_config validation is
+        // covered in the `lb_policy` module.
+        let cluster = Cluster {
+            name: "rh-cluster".to_string(),
+            lb_policy: cluster::LbPolicy::RingHash as i32,
+            ..Default::default()
+        };
+        let validated = ClusterResource::validate(cluster).unwrap();
+        let LbPolicy::RingHash(settings) = validated.lb_policy else {
+            panic!("expected RingHash, got {:?}", validated.lb_policy);
+        };
+        assert_eq!(settings.min_ring_size(), 1024);
+        assert_eq!(settings.max_ring_size(), 4096);
     }
 
     #[test]

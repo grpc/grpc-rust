@@ -33,42 +33,55 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::BoxError;
 use tower::discover::Change;
 
 use crate::client::endpoint::{Connector, EndpointAddress};
 use crate::client::lb::BoxDiscover;
-use crate::xds::cache::CacheWatch;
+use crate::xds::cache::{CacheEvent, CacheWatch};
 use crate::xds::resource::EndpointsResource;
 
 /// Buffer capacity for the endpoint change channel between the diff loop
 /// and Tower's load balancer.
 const ENDPOINT_CHANNEL_CAPACITY: usize = 64;
 
-/// An atomically-swappable [`Connector`] held by an [`EndpointManager`].
-///
-/// `XdsClusterDiscovery` stores a snapshot of the cluster's per-CDS-update
-/// connector here. The diff loop calls `load_full()` on every new endpoint
-/// so each connection picks up the latest snapshot. Existing endpoint
-/// channels keep their `EndpointChannel` instance (and any in-flight TLS
-/// session) — only freshly-discovered endpoints see the swapped value.
-pub(crate) type ConnectorSwap<S> = Arc<ArcSwap<Arc<dyn Connector<Service = S> + Send + Sync>>>;
+pub(crate) struct ConnectorState<S> {
+    generation: u64,
+    connector: Arc<dyn Connector<Service = S> + Send + Sync>,
+}
+
+impl<S> ConnectorState<S> {
+    pub(crate) fn new(
+        generation: u64,
+        connector: Arc<dyn Connector<Service = S> + Send + Sync>,
+    ) -> Self {
+        Self {
+            generation,
+            connector,
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+pub(crate) type ConnectorWatch<S> = watch::Receiver<Arc<ConnectorState<S>>>;
 
 /// Converts endpoint cache watches into incremental [`Change`] streams.
 ///
 /// `EndpointManager` is a pure diff-and-connect component: the caller
 /// (typically `XdsClusterDiscovery`) obtains a [`CacheWatch`] from the
 /// [`XdsCache`](crate::xds::cache::XdsCache) and passes it here, plus a
-/// [`ConnectorSwap`] that the caller may swap on CDS updates.
+/// [`ConnectorWatch`] updated from CDS.
 pub(crate) struct EndpointManager<S: Send + 'static> {
-    connector: ConnectorSwap<S>,
+    connector: ConnectorWatch<S>,
 }
 
 impl<S: Send + 'static> EndpointManager<S> {
-    pub(crate) fn new(connector: ConnectorSwap<S>) -> Self {
+    pub(crate) fn new(connector: ConnectorWatch<S>) -> Self {
         Self { connector }
     }
 
@@ -84,9 +97,7 @@ impl<S: Send + 'static> EndpointManager<S> {
         let connector = self.connector.clone();
         let (tx, rx) = mpsc::channel(ENDPOINT_CHANNEL_CAPACITY);
 
-        // The spawned task exits naturally when either:
-        // - The CacheWatch closes (cache.remove_endpoints() drops the watch sender)
-        // - The receiver is dropped (consumer no longer reading Change events)
+        // The spawned task exits when the cache or the consumer is dropped.
         tokio::spawn(diff_loop(watch, connector, tx));
 
         Box::pin(ReceiverStream::new(rx))
@@ -100,19 +111,58 @@ impl<S: Send + 'static> EndpointManager<S> {
 /// new endpoints followed by `Remove` for gone ones.
 async fn diff_loop<S: Send + 'static>(
     mut watch: CacheWatch<EndpointsResource>,
-    connector: ConnectorSwap<S>,
+    mut connector: ConnectorWatch<S>,
     tx: mpsc::Sender<Result<Change<EndpointAddress, S>, BoxError>>,
 ) {
     let mut active: HashSet<EndpointAddress> = HashSet::new();
 
-    while let Some(endpoints) = watch.next().await {
+    'events: loop {
+        let event = tokio::select! {
+            _ = tx.closed() => return,
+            event = watch.next_event() => event,
+        };
+        let Some(event) = event else {
+            return;
+        };
+        let CacheEvent::Resource {
+            generation,
+            revision,
+            resource: endpoints,
+        } = event
+        else {
+            for removed in active.drain() {
+                if tx.send(Ok(Change::Remove(removed))).await.is_err() {
+                    return;
+                }
+            }
+            continue;
+        };
+        let connector = tokio::select! {
+            _ = tx.closed() => return,
+            connector = connector_for_generation(&mut connector, generation) => connector,
+        };
+        let Some(connector) = connector else {
+            continue;
+        };
+        if watch.current_revision() != revision {
+            continue;
+        }
+
         let new_set: HashSet<EndpointAddress> = endpoints
             .healthy_endpoints()
             .map(|ep| ep.address.clone())
             .collect();
+        let added: Vec<_> = new_set.difference(&active).cloned().collect();
+        let removed: Vec<_> = active.difference(&new_set).cloned().collect();
 
-        for added in new_set.difference(&active) {
-            let svc = connector.load_full().connect(added).await;
+        for added in added {
+            if watch.current_revision() != revision {
+                continue 'events;
+            }
+            let svc = connector.connect(&added).await;
+            if watch.current_revision() != revision {
+                continue 'events;
+            }
             if tx
                 .send(Ok(Change::Insert(added.clone(), svc)))
                 .await
@@ -120,15 +170,35 @@ async fn diff_loop<S: Send + 'static>(
             {
                 return;
             }
+            active.insert(added);
         }
 
-        for removed in active.difference(&new_set) {
+        for removed in removed {
+            if watch.current_revision() != revision {
+                continue 'events;
+            }
             if tx.send(Ok(Change::Remove(removed.clone()))).await.is_err() {
                 return;
             }
+            active.remove(&removed);
         }
+    }
+}
 
-        active = new_set;
+async fn connector_for_generation<S>(
+    connector: &mut ConnectorWatch<S>,
+    generation: u64,
+) -> Option<Arc<dyn Connector<Service = S> + Send + Sync>> {
+    loop {
+        let current = connector.borrow().clone();
+        match current.generation.cmp(&generation) {
+            std::cmp::Ordering::Equal => return Some(Arc::clone(&current.connector)),
+            std::cmp::Ordering::Greater => return None,
+            std::cmp::Ordering::Less => {}
+        }
+        if connector.changed().await.is_err() {
+            return None;
+        }
     }
 }
 
@@ -152,9 +222,18 @@ mod tests {
         }
     }
 
-    fn test_swap() -> ConnectorSwap<String> {
+    fn test_connector_channel(
+        generation: u64,
+    ) -> (
+        watch::Sender<Arc<ConnectorState<String>>>,
+        ConnectorWatch<String>,
+    ) {
         let conn: Arc<dyn Connector<Service = String> + Send + Sync> = Arc::new(StringConnector);
-        Arc::new(ArcSwap::from_pointee(conn))
+        watch::channel(Arc::new(ConnectorState::new(generation, conn)))
+    }
+
+    fn test_connector_watch() -> ConnectorWatch<String> {
+        test_connector_channel(0).1
     }
 
     fn make_endpoints(cluster: &str, addrs: &[(&str, u16)]) -> Arc<EndpointsResource> {
@@ -179,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn initial_endpoints_emitted_as_inserts() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector_watch());
 
         cache.update_endpoints(
             "c1",
@@ -202,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn added_endpoint_emits_insert() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector_watch());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
@@ -223,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn removed_endpoint_emits_remove() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector_watch());
 
         cache.update_endpoints(
             "c1",
@@ -247,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn unhealthy_endpoint_removed() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector_watch());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
@@ -276,9 +355,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_removal_closes_stream() {
+    async fn cache_removal_clears_endpoints_and_readd_recovers() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let (connector_tx, connector_rx) = test_connector_channel(0);
+        let manager = EndpointManager::new(connector_rx);
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
@@ -287,13 +367,58 @@ mod tests {
 
         cache.remove_endpoints("c1");
 
-        assert!(stream.next().await.is_none());
+        match stream.next().await.unwrap().unwrap() {
+            Change::Remove(addr) => assert_eq!(addr.to_string(), "10.0.0.1:8080"),
+            Change::Insert(..) => panic!("expected Remove after cache removal"),
+        }
+
+        let connector: Arc<dyn Connector<Service = String> + Send + Sync> =
+            Arc::new(StringConnector);
+        connector_tx.send_replace(Arc::new(ConnectorState::new(1, connector)));
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
+        match stream.next().await.unwrap().unwrap() {
+            Change::Insert(addr, _) => assert_eq!(addr.to_string(), "10.0.0.1:8080"),
+            Change::Remove(..) => panic!("expected Insert after cache re-add"),
+        }
+    }
+
+    #[tokio::test]
+    async fn readded_endpoints_wait_for_matching_connector_generation() {
+        let cache = XdsCache::new();
+        let (connector_tx, connector_rx) = test_connector_channel(0);
+        let manager = EndpointManager::new(connector_rx);
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
+        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let _ = stream.next().await; // consume initial insert
+
+        cache.remove_endpoints("c1");
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.2", 8080)]));
+
+        match stream.next().await.unwrap().unwrap() {
+            Change::Remove(addr) => assert_eq!(addr.to_string(), "10.0.0.1:8080"),
+            Change::Insert(..) => panic!("expected old endpoint removal"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "re-added endpoints must wait for their CDS connector generation",
+        );
+
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.3", 8080)]));
+        let connector: Arc<dyn Connector<Service = String> + Send + Sync> =
+            Arc::new(StringConnector);
+        connector_tx.send_replace(Arc::new(ConnectorState::new(1, connector)));
+        match stream.next().await.unwrap().unwrap() {
+            Change::Insert(addr, _) => assert_eq!(addr.to_string(), "10.0.0.3:8080"),
+            Change::Remove(..) => panic!("expected re-added endpoint insert"),
+        }
     }
 
     #[tokio::test]
     async fn multiple_clusters_independent() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector_watch());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
         cache.update_endpoints("c2", make_endpoints("c2", &[("10.0.0.2", 9090)]));
@@ -314,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_swap_emits_insert_then_remove() {
         let cache = XdsCache::new();
-        let manager = EndpointManager::new(test_swap());
+        let manager = EndpointManager::new(test_connector_watch());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 

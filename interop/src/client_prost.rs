@@ -22,7 +22,7 @@
  *
  */
 
-use crate::client::{InteropTest, InteropTestUnimplemented};
+use crate::client::{InteropTest, InteropTestUnimplemented, MetadataInterceptor};
 use crate::{
     TestAssertion, pb::test_service_client::*, pb::unimplemented_service_client::*, pb::*,
     test_assert,
@@ -30,11 +30,13 @@ use crate::{
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::async_trait;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status, metadata::MetadataValue};
 
-pub type TestClient = TestServiceClient<Channel>;
-pub type UnimplementedClient = UnimplementedServiceClient<Channel>;
+pub type TestClient = TestServiceClient<InterceptedService<Channel, MetadataInterceptor>>;
+pub type UnimplementedClient =
+    UnimplementedServiceClient<InterceptedService<Channel, MetadataInterceptor>>;
 
 const LARGE_REQ_SIZE: usize = 271_828;
 const LARGE_RSP_SIZE: i32 = 314_159;

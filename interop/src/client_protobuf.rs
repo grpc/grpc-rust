@@ -23,6 +23,7 @@
  */
 
 use grpc::client::Channel;
+use grpc::client::interceptor::Intercepted;
 use grpc::client::metadata_utils::AttachHeadersInterceptor;
 use grpc::client::metadata_utils::CaptureHeadersInterceptor;
 use grpc::client::metadata_utils::CaptureTrailersInterceptor;
@@ -36,6 +37,7 @@ use protobuf::proto;
 use tonic::async_trait;
 
 use crate::TestAssertion;
+use crate::client::GrpcMetadataInterceptor;
 use crate::client::InteropTest;
 use crate::client::InteropTestUnimplemented;
 use crate::grpc_pb::test_service_client::*;
@@ -43,8 +45,9 @@ use crate::grpc_pb::unimplemented_service_client::*;
 use crate::grpc_pb::*;
 use crate::test_assert;
 
-pub type TestClient = TestServiceClient<Channel>;
-pub type UnimplementedClient = UnimplementedServiceClient<Channel>;
+pub type TestClient = TestServiceClient<Intercepted<Channel, GrpcMetadataInterceptor>>;
+pub type UnimplementedClient =
+    UnimplementedServiceClient<Intercepted<Channel, GrpcMetadataInterceptor>>;
 
 const LARGE_REQ_SIZE: usize = 271_828;
 const LARGE_RSP_SIZE: i32 = 314_159;

@@ -133,9 +133,10 @@ where
             let deadline = request_headers
                 .deadline()
                 .map(|d| runtime.sleep(d.saturating_duration_since(Instant::now())));
-            // TODO: Handle mid-stream handler panics (panicking after `ResponseHeaders` are
-            // sent drops `tx` without calling `send_trailers`, closing `body_rx` cleanly so
-            // `EncodeBody` emits `grpc-status: 0`).
+            // TODO: If the handler task ends without calling `send_trailers` (e.g. it
+            // panics), the client gets a generic `INTERNAL`, before or after headers,
+            // because `TaskHandle` can't report how the task ended (panic vs. abort).
+            // Extending `TaskHandle` to report this would allow a more specific status.
             let task_handle = runtime.spawn(Box::pin(async move {
                 let options = CallOptions::default();
                 let trailers = with_deadline(
@@ -352,6 +353,8 @@ mod tests {
         let collected = resp.into_body().collect().await.unwrap();
         let trailers = collected.trailers().expect("expected trailers frame");
         assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert!(trailers.get("grpc-message").is_none());
+        assert_eq!(trailers.len(), 1);
     }
 
     #[tokio::test]
@@ -407,6 +410,85 @@ mod tests {
             "handler%20did%20not%20send%20response%20headers%20or%20trailers"
         );
         assert!(resp.body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn grpc_service_returns_internal_when_handler_panics_after_headers() {
+        struct PanicAfterHeadersHandle;
+
+        impl Handle for PanicAfterHeadersHandle {
+            async fn handle(
+                &self,
+                _headers: RequestHeaders,
+                _options: CallOptions,
+                tx: &mut impl SendStream,
+                _rx: impl RecvStream + 'static,
+            ) -> Trailers {
+                tx.send(
+                    ResponseStreamItem::Headers(ResponseHeaders::new()),
+                    SendOptions::default(),
+                )
+                .await
+                .unwrap();
+                panic!("handler panicked after sending headers");
+            }
+        }
+
+        let service = test_grpc_service(Arc::new(PanicAfterHeadersHandle));
+        let resp = service.call(valid_grpc_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let collected = resp.into_body().collect().await.unwrap();
+        let trailers = collected.trailers().expect("expected trailers frame");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "handler%20ended%20without%20sending%20trailers"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_service_returns_internal_when_handler_panics_after_message() {
+        struct PanicAfterMessageHandle;
+
+        impl Handle for PanicAfterMessageHandle {
+            async fn handle(
+                &self,
+                _headers: RequestHeaders,
+                _options: CallOptions,
+                tx: &mut impl SendStream,
+                _rx: impl RecvStream + 'static,
+            ) -> Trailers {
+                tx.send(
+                    ResponseStreamItem::Headers(ResponseHeaders::new()),
+                    SendOptions::default(),
+                )
+                .await
+                .unwrap();
+                let msg = TestSendMessage::new(Bytes::from_static(b"partial"));
+                tx.send(ResponseStreamItem::Message(&msg), SendOptions::default())
+                    .await
+                    .unwrap();
+                panic!("handler panicked after sending a message");
+            }
+        }
+
+        let service = test_grpc_service(Arc::new(PanicAfterMessageHandle));
+        let resp = service.call(valid_grpc_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let collected = resp.into_body().collect().await.unwrap();
+        let trailers = collected
+            .trailers()
+            .cloned()
+            .expect("expected trailers frame");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "handler%20ended%20without%20sending%20trailers"
+        );
+        // "partial" (7 bytes) plus the 5-byte message prefix.
+        assert_eq!(collected.to_bytes().len(), 12);
     }
 
     #[tokio::test(start_paused = true)]

@@ -1036,6 +1036,7 @@ async fn outgoing_reserved_headers_stripped_and_messages_delivered() {
         trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
         Some("0")
     );
+    assert!(trailers.get("grpc-message").is_none());
 
     drop(sender);
     timeout(FINISH_TIMEOUT, client_task)

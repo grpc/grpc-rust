@@ -26,6 +26,7 @@ use std::error::Error as StdError;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use std::task::ready;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -107,6 +108,10 @@ pub enum InitialResponse {
 /// - `Message`: Encodes and pushes payload buffers via an mpsc channel to
 ///   `tonic::codec::EncodeBody`, which frames them with LPM headers and yields
 ///   them as HTTP/2 DATA frames.
+/// - Trailers ([`Self::send_trailers`]): sent as a `Trailers-Only` initial
+///   response if no headers were sent; otherwise always sent as a final
+///   `Err(trailers)` item on `body_tx`, OK included. [`ResponseMessageStream`]
+///   reports `INTERNAL` if `body_tx` closes without that item.
 pub struct HyperServerSendStream {
     initial_tx: Option<oneshot::Sender<InitialResponse>>,
     /// `Ok` carries an encoded message; `Err` carries the final [`Trailers`],
@@ -129,10 +134,14 @@ impl HyperServerSendStream {
     /// Consumes the send stream and dispatches the final [`Trailers`] to either
     /// the initial `Trailers-Only` response channel (if no headers were sent)
     /// or the streaming [`EncodeBody`] channel (if headers were already sent).
+    ///
+    /// After headers, the trailers are always sent, even for an empty OK:
+    /// dropping the stream without calling this method is reported to the
+    /// client as `INTERNAL`.
     pub async fn send_trailers(self, trailers: Trailers) {
         if let Some(initial_tx) = self.initial_tx {
             let _ = initial_tx.send(InitialResponse::TrailersOnly(trailers));
-        } else if trailers.status().is_err() || !trailers.metadata().is_empty() {
+        } else {
             let _ = self.body_tx.send(Err(trailers)).await;
         }
     }
@@ -185,12 +194,18 @@ impl Drop for AbortTaskOnDrop {
 
 /// Adapts the handler's response channel into the `Result<_, TonicStatus>`
 /// stream required by [`EncodeBody`], converting the final [`Trailers`] into a
-/// [`TonicStatus`].
+/// [`TonicStatus`]. If the channel closes before the final [`Trailers`] arrive,
+/// the handler went away (e.g. it panicked), so the stream ends with
+/// `INTERNAL` instead of OK.
 ///
 /// Also keeps an [`AbortTaskOnDrop`] guard alive for as long as Hyper holds the
 /// response body.
 pub struct ResponseMessageStream {
     body_rx: mpsc::Receiver<Result<Box<dyn Buf + Send + Sync>, Trailers>>,
+    /// Set once the terminal status has been yielded: either the handler's
+    /// final [`Trailers`] or the synthesized `INTERNAL`. Later polls return
+    /// `None` instead of a second status.
+    finished: bool,
     _task_guard: AbortTaskOnDrop,
 }
 
@@ -198,9 +213,17 @@ impl Stream for ResponseMessageStream {
     type Item = Result<Box<dyn Buf + Send + Sync>, TonicStatus>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.body_rx
-            .poll_recv(cx)
-            .map(|item| item.map(|res| res.map_err(tonic_status_from_trailers)))
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        let status = match ready!(self.body_rx.poll_recv(cx)) {
+            Some(Ok(message)) => return Poll::Ready(Some(Ok(message))),
+            Some(Err(trailers)) => tonic_status_from_trailers(trailers),
+            // The handler task ended without calling `send_trailers` (e.g. it panicked).
+            None => TonicStatus::internal("handler ended without sending trailers"),
+        };
+        self.finished = true;
+        Poll::Ready(Some(Err(status)))
     }
 }
 
@@ -223,7 +246,9 @@ pin_project! {
 
 impl ServerResponseBody {
     /// Creates a streaming body that LPM-frames messages received on `body_rx`
-    /// and emits the final [`Trailers`] as a trailing `HEADERS` frame.
+    /// and emits the final [`Trailers`] as a trailing `HEADERS` frame. If
+    /// `body_rx` closes without a final `Err(trailers)` item, the trailing
+    /// frame carries `INTERNAL` instead.
     ///
     /// `task_handle` is aborted when the body is dropped.
     pub fn streaming(
@@ -232,6 +257,7 @@ impl ServerResponseBody {
     ) -> Self {
         let messages = ResponseMessageStream {
             body_rx,
+            finished: false,
             _task_guard: AbortTaskOnDrop(task_handle),
         };
         let body = EncodeBody::new_server(
@@ -617,43 +643,39 @@ mod tests {
         assert!(body_rx.recv().await.is_none());
     }
 
-    #[tokio::test]
-    async fn send_trailers_after_headers_with_empty_ok_closes_body_channel() {
-        let (initial_tx, initial_rx) = oneshot::channel();
-        let (body_tx, mut body_rx) = mpsc::channel(4);
+    /// Returns a send stream that has already sent its response headers, and
+    /// the receiving end of its body channel.
+    async fn send_stream_after_headers() -> (
+        HyperServerSendStream,
+        mpsc::Receiver<Result<Box<dyn Buf + Send + Sync>, Trailers>>,
+    ) {
+        let (initial_tx, _initial_rx) = oneshot::channel();
+        let (body_tx, body_rx) = mpsc::channel(4);
         let mut tx = HyperServerSendStream::new(initial_tx, body_tx);
-
         tx.send(
             ResponseStreamItem::Headers(ResponseHeaders::default()),
             SendOptions::default(),
         )
         .await
-        .unwrap();
-        assert!(matches!(
-            initial_rx.await.unwrap(),
-            InitialResponse::Headers(_)
-        ));
+        .expect("sending headers should succeed");
+        (tx, body_rx)
+    }
+
+    #[tokio::test]
+    async fn send_trailers_after_headers_with_empty_ok_sends_trailers_on_body_channel() {
+        let (tx, mut body_rx) = send_stream_after_headers().await;
 
         tx.send_trailers(Trailers::new(Ok(()))).await;
+        let item = body_rx.recv().await.expect("expected Err(trailers) item");
+        let delivered = item.err().expect("expected Err variant");
+        assert!(delivered.status().is_ok());
+        assert!(delivered.metadata().is_empty());
         assert!(body_rx.recv().await.is_none());
     }
 
     #[tokio::test]
     async fn send_trailers_after_headers_with_error_sends_trailers_on_body_channel() {
-        let (initial_tx, initial_rx) = oneshot::channel();
-        let (body_tx, mut body_rx) = mpsc::channel(4);
-        let mut tx = HyperServerSendStream::new(initial_tx, body_tx);
-
-        tx.send(
-            ResponseStreamItem::Headers(ResponseHeaders::default()),
-            SendOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            initial_rx.await.unwrap(),
-            InitialResponse::Headers(_)
-        ));
+        let (tx, mut body_rx) = send_stream_after_headers().await;
 
         tx.send_trailers(Trailers::new(Err(StatusError::new(
             StatusCodeError::Internal,
@@ -670,20 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_trailers_after_headers_with_ok_metadata_sends_trailers_on_body_channel() {
-        let (initial_tx, initial_rx) = oneshot::channel();
-        let (body_tx, mut body_rx) = mpsc::channel(4);
-        let mut tx = HyperServerSendStream::new(initial_tx, body_tx);
-
-        tx.send(
-            ResponseStreamItem::Headers(ResponseHeaders::default()),
-            SendOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            initial_rx.await.unwrap(),
-            InitialResponse::Headers(_)
-        ));
+        let (tx, mut body_rx) = send_stream_after_headers().await;
 
         let mut md = MetadataMap::new();
         md.insert("x-trailer-meta", MetadataValue::from_static("present"));
@@ -738,6 +747,7 @@ mod tests {
         assert!(!streaming_body.is_end_stream());
         assert!(!aborted.load(Ordering::SeqCst));
 
+        body_tx.send(Err(Trailers::new(Ok(())))).await.unwrap();
         drop(body_tx);
 
         let trailers_frame = streaming_body
@@ -752,6 +762,8 @@ mod tests {
             trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
             Some("0")
         );
+        assert!(trailers.get("grpc-message").is_none());
+        assert_eq!(trailers.len(), 1);
         assert!(streaming_body.is_end_stream());
         assert!(streaming_body.frame().await.is_none());
         assert!(aborted.load(Ordering::SeqCst));
@@ -787,6 +799,67 @@ mod tests {
         assert_eq!(trailers.get("grpc-message").unwrap(), "try%20later");
         assert_eq!(trailers.get("x-trailer-meta").unwrap(), "present");
         assert!(trailers.get("grpc-timeout").is_none());
+        assert!(streaming_body.is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn server_response_body_streaming_emits_internal_when_channel_closes_without_trailers() {
+        let task_handle: BoxedTaskHandle =
+            Box::new(TrackingTaskHandle(Arc::new(AtomicBool::new(false))));
+        let (body_tx, body_rx) = mpsc::channel(4);
+        drop(body_tx);
+
+        let mut streaming_body = pin!(ServerResponseBody::streaming(body_rx, task_handle));
+        let trailers = streaming_body
+            .frame()
+            .await
+            .expect("expected trailers frame")
+            .expect("trailers frame should be Ok")
+            .into_trailers()
+            .expect("expected TRAILERS frame");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "handler%20ended%20without%20sending%20trailers"
+        );
+        assert!(streaming_body.is_end_stream());
+        assert!(streaming_body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn server_response_body_streaming_emits_internal_when_channel_closes_after_message() {
+        let task_handle: BoxedTaskHandle =
+            Box::new(TrackingTaskHandle(Arc::new(AtomicBool::new(false))));
+        let (body_tx, body_rx) = mpsc::channel(4);
+        body_tx
+            .send(Ok(
+                Box::new(Bytes::from_static(b"partial")) as Box<dyn Buf + Send + Sync>
+            ))
+            .await
+            .unwrap();
+        drop(body_tx);
+
+        let mut streaming_body = pin!(ServerResponseBody::streaming(body_rx, task_handle));
+        let data = streaming_body
+            .frame()
+            .await
+            .expect("expected data frame")
+            .expect("data frame should be Ok")
+            .into_data()
+            .expect("expected DATA frame");
+        assert_eq!(data, make_lpm_frame(b"partial"));
+        let trailers = streaming_body
+            .frame()
+            .await
+            .expect("expected trailers frame")
+            .expect("trailers frame should be Ok")
+            .into_trailers()
+            .expect("expected TRAILERS frame");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "handler%20ended%20without%20sending%20trailers"
+        );
         assert!(streaming_body.is_end_stream());
     }
 

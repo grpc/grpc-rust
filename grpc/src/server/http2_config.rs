@@ -26,6 +26,9 @@ use std::time::Duration;
 
 /// Largest HTTP/2 flow-control window size (RFC 9113 §6.9.1).
 const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
+/// Smallest static window size accepted, the default HTTP/2 window size.
+/// Smaller values are ignored.
+const MIN_WINDOW_SIZE: u32 = 65_535;
 
 /// Configuration for the HTTP/2 transport.
 ///
@@ -64,30 +67,32 @@ impl Http2Config {
         self
     }
 
-    /// Sets the initial HTTP/2 connection-level flow control window size, and
-    /// turns off dynamic flow control. Values above 2^31 - 1 are ignored.
+    /// Sets a static HTTP/2 connection-level flow control window size, which
+    /// turns off dynamic flow control. Values below 65,535 are ignored, and
+    /// values above 2^31 - 1 are clamped to 2^31 - 1.
     ///
     /// If neither window size is set, both start at 64 KiB and grow with the
     /// connection's measured bandwidth-delay product. Setting this also stops
     /// the stream-level window from growing: it stays at 64 KiB unless set with
-    /// [`Http2Config::with_initial_stream_window_size`].
-    pub fn with_initial_connection_window_size(mut self, size: u32) -> Self {
-        if size <= MAX_WINDOW_SIZE {
-            self.initial_connection_window_size = Some(size);
+    /// [`Http2Config::with_static_stream_window_size`].
+    pub fn with_static_connection_window_size(mut self, size: u32) -> Self {
+        if size >= MIN_WINDOW_SIZE {
+            self.initial_connection_window_size = Some(size.min(MAX_WINDOW_SIZE));
         }
         self
     }
 
-    /// Sets the initial HTTP/2 stream-level flow control window size, and
-    /// turns off dynamic flow control. Values above 2^31 - 1 are ignored.
+    /// Sets a static HTTP/2 stream-level flow control window size, which
+    /// turns off dynamic flow control. Values below 65,535 are ignored, and
+    /// values above 2^31 - 1 are clamped to 2^31 - 1.
     ///
     /// If neither window size is set, both start at 64 KiB and grow with the
     /// connection's measured bandwidth-delay product. Setting this also stops
     /// the connection-level window from growing: it stays at 64 KiB unless set
-    /// with [`Http2Config::with_initial_connection_window_size`].
-    pub fn with_initial_stream_window_size(mut self, size: u32) -> Self {
-        if size <= MAX_WINDOW_SIZE {
-            self.initial_stream_window_size = Some(size);
+    /// with [`Http2Config::with_static_connection_window_size`].
+    pub fn with_static_stream_window_size(mut self, size: u32) -> Self {
+        if size >= MIN_WINDOW_SIZE {
+            self.initial_stream_window_size = Some(size.min(MAX_WINDOW_SIZE));
         }
         self
     }
@@ -207,8 +212,8 @@ mod tests {
         let cfg = Http2Config::new()
             .with_max_recv_message_size(8 * 1024 * 1024)
             .with_max_concurrent_streams(100)
-            .with_initial_connection_window_size(1024 * 1024)
-            .with_initial_stream_window_size(512 * 1024)
+            .with_static_connection_window_size(1024 * 1024)
+            .with_static_stream_window_size(512 * 1024)
             .with_keep_alive(Duration::from_secs(30), Duration::from_secs(10))
             .with_max_connection_age(Duration::from_secs(300))
             .with_max_connection_age_grace(Duration::from_secs(15))
@@ -229,10 +234,15 @@ mod tests {
     }
 
     #[test]
-    fn initial_connection_window_size_ignores_values_above_http2_maximum() {
-        let cfg = Http2Config::new()
-            .with_initial_connection_window_size(MAX_WINDOW_SIZE)
-            .with_initial_connection_window_size(MAX_WINDOW_SIZE + 1);
+    fn static_connection_window_size_ignores_values_below_default() {
+        let cfg = Http2Config::new().with_static_connection_window_size(MIN_WINDOW_SIZE - 1);
+
+        assert_eq!(cfg.get_initial_connection_window_size(), None);
+    }
+
+    #[test]
+    fn static_connection_window_size_clamps_values_above_http2_maximum() {
+        let cfg = Http2Config::new().with_static_connection_window_size(MAX_WINDOW_SIZE + 1);
 
         assert_eq!(
             cfg.get_initial_connection_window_size(),
@@ -241,10 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn initial_stream_window_size_ignores_values_above_http2_maximum() {
-        let cfg = Http2Config::new()
-            .with_initial_stream_window_size(MAX_WINDOW_SIZE)
-            .with_initial_stream_window_size(MAX_WINDOW_SIZE + 1);
+    fn static_stream_window_size_ignores_values_below_default() {
+        let cfg = Http2Config::new().with_static_stream_window_size(MIN_WINDOW_SIZE - 1);
+
+        assert_eq!(cfg.get_initial_stream_window_size(), None);
+    }
+
+    #[test]
+    fn static_stream_window_size_clamps_values_above_http2_maximum() {
+        let cfg = Http2Config::new().with_static_stream_window_size(MAX_WINDOW_SIZE + 1);
 
         assert_eq!(cfg.get_initial_stream_window_size(), Some(MAX_WINDOW_SIZE));
     }

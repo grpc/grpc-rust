@@ -981,14 +981,19 @@ where
 
         let subscriptions_changed = type_state.subscription != old_subscription;
 
+        // Resource state follows current interest; protocol state survives unwatch.
+        type_state
+            .cache
+            .retain(|name, _| type_state.subscription.includes(name));
+        self.resource_timers
+            .retain(|(url, name), _| *url != type_url || type_state.subscription.includes(name));
         if type_state.watchers.is_empty() {
-            // Keep the accepted version for rewatch, including after reconnect.
-            type_state.cache.clear();
-            self.recorder
-                .sync_resource_counts(&type_state.type_url, &HashMap::new());
-            // Cancel all pending resource timers for this type.
-            self.resource_timers.retain(|key, _| key.0 != type_url);
+            type_state.cache = HashMap::new();
+            type_state.watchers = HashMap::new();
         }
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
 
         Some((type_url, subscriptions_changed))
     }
@@ -1176,6 +1181,9 @@ where
 
         for (resource, accepted) in resources {
             let resource_name = resource.name().to_string();
+            if !type_state.subscription.includes(&resource_name) {
+                continue;
+            }
             let resource = Arc::new(resource);
             type_state.cache.insert(
                 resource_name.clone(),
@@ -1212,6 +1220,10 @@ where
             Some(s) => s,
             None => return,
         };
+
+        if !type_state.subscription.includes(resource_name) {
+            return;
+        }
 
         let error = rejected.details.clone();
         let accepted = type_state
@@ -2122,6 +2134,117 @@ mod tests {
         assert!(next_changed(&mut second).await.0.is_ok());
         assert!(next_changed(&mut third).await.0.is_ok());
         expect_request(&mut server, response("2", "n2", &["res-0"])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_unsubscribe_evicts_resource_cache() {
+        let (client, mut first, mut server) = connected_client().await;
+        let mut other = watch_synced(&client, &mut server, "res-1").await;
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut first).await.0.is_ok());
+        assert!(next_changed(&mut other).await.0.is_ok());
+        server.requests.recv().await.unwrap(); // ACK names have no defined order.
+
+        drop(first);
+        expect_request(&mut server, response("1", "n1", &["res-1"])).await;
+        let mut rewatch = watch_synced(&client, &mut server, "res-0").await;
+        assert_no_event(&mut rewatch, "partial unsubscribe retained stale cache").await;
+
+        // The resource that remained watched still has its cached value.
+        let mut other_rewatch = client.watch::<TestResource>("res-1").await;
+        assert!(next_changed(&mut other_rewatch).await.0.is_ok());
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatch).await.0.is_ok());
+        assert!(next_changed(&mut other).await.0.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_unsubscribe_cancels_resource_timer() {
+        let (client, first, mut server) = connected_client().await;
+        let mut other = watch_synced(&client, &mut server, "res-1").await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(first);
+        expect_request(&mut server, response("", "", &["res-1"])).await;
+        let mut rewatch = watch_synced(&client, &mut server, "res-0").await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        // B keeps its original deadline; A must get a fresh fifteen seconds.
+        assert!(matches!(
+            next_changed(&mut other).await.0,
+            Err(Error::ResourceDoesNotExist)
+        ));
+        assert_no_event(&mut rewatch, "partial unsubscribe retained the old timer").await;
+        let event = tokio::time::timeout(Duration::from_secs(10), rewatch.next())
+            .await
+            .expect("rewatch did not start a fresh timer")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_unsubscribe_ignores_late_resource_updates() {
+        let (client, first, mut server) = connected_client_for::<VersionedResource>().await;
+        let _other = client.watch::<VersionedResource>("res-1").await;
+        server.requests.recv().await.unwrap();
+        drop(first);
+        expect_request(&mut server, versioned_response("", "", &["res-1"])).await;
+        for (version, nonce, name, accepted) in
+            [("1", "n1", "res-0", "1"), ("2", "n2", "res-0#bad", "1")]
+        {
+            server
+                .responses
+                .send(Ok(Some(versioned_response(version, nonce, &[name]))))
+                .unwrap();
+            expect_request(&mut server, versioned_response(accepted, nonce, &["res-1"])).await;
+            let mut rewatch = client.watch::<VersionedResource>("res-0").await;
+            server.requests.recv().await.unwrap();
+            assert_no_event(&mut rewatch, "late update restored unsubscribed resource").await;
+            let snapshot = take_snapshot(&client).await;
+            let resource = snapshot.iter().find(|r| r.name == "res-0").unwrap();
+            assert!(resource.accepted.is_none());
+            assert!(resource.rejected.is_none());
+            drop(rewatch);
+            expect_request(&mut server, versioned_response(accepted, nonce, &["res-1"])).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wildcard_interest_retains_cache_until_named_transition() {
+        let (client, first, mut server) = connected_client().await;
+        let mut wildcard = watch_synced(&client, &mut server, "").await;
+        drop(first);
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut wildcard).await.0.is_ok());
+        assert!(next_changed(&mut wildcard).await.0.is_ok());
+        expect_request(&mut server, response("1", "n1", &[])).await;
+        let mut first = client.watch::<TestResource>("res-0").await;
+        assert!(next_changed(&mut first).await.0.is_ok());
+        let mut other = client.watch::<TestResource>("res-1").await;
+        assert!(next_changed(&mut other).await.0.is_ok());
+        drop(other);
+        drop(wildcard);
+        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        let mut other = watch_synced(&client, &mut server, "res-1").await;
+        assert_no_event(
+            &mut other,
+            "wildcard removal retained an unsubscribed resource",
+        )
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3839,8 +3962,7 @@ mod tests {
         assert!(next_changed(&mut watcher).await.0.is_ok());
         let _ack = server.requests.recv().await.unwrap();
 
-        // The cache keeps res-1 after its last watcher goes away, but the
-        // client no longer subscribes to it.
+        // Removing the last watcher for res-1 also removes its cached state.
         drop(other);
         let _unsubscribe = server.requests.recv().await.unwrap();
 

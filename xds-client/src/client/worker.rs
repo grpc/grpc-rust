@@ -405,8 +405,6 @@ struct TypeState {
     decoder: DecoderFn,
     /// Last accepted version, retained across watch cycles and stream restarts.
     version_info: String,
-    /// Last response nonce, retained across watch cycles but cleared on a new stream.
-    nonce: String,
     /// Active watchers for this type.
     watchers: HashMap<WatcherId, WatcherEntry>,
     /// Current subscription mode (wildcard or named resources).
@@ -423,7 +421,6 @@ impl std::fmt::Debug for TypeState {
             .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
             .field("version_info", &self.version_info)
-            .field("nonce", &self.nonce)
             .field("watchers", &self.watchers)
             .field("subscription", &self.subscription)
             .field("cache", &format!("<{} entries>", self.cache.len()))
@@ -441,7 +438,6 @@ impl TypeState {
             type_url,
             decoder,
             version_info: String::new(),
-            nonce: String::new(),
             watchers: HashMap::new(),
             subscription: SubscriptionMode::Named(HashSet::new()),
             cache: HashMap::new(),
@@ -724,12 +720,8 @@ where
         while let Some(message) = self.command_rx.recv().await {
             let result = match message {
                 WorkerCommand::Watcher(cmd) => {
-                    let sender = context
-                        .session
-                        .as_ref()
-                        .filter(|s| s.cancel.is_some())
-                        .map(|s| &s.writes);
-                    let result = self.handle_command(sender, cmd);
+                    let stream = context.session.as_mut().filter(|s| s.cancel.is_some());
+                    let result = self.handle_command(stream, cmd);
                     if !self.type_states.is_empty()
                         && let Some(task) = transport_task.take()
                     {
@@ -765,12 +757,9 @@ where
     ) -> Result<()> {
         match event {
             TransportEvent::Ready { writes, cancel } => {
-                for state in self.type_states.values_mut() {
-                    state.nonce.clear();
-                }
-                let active = ActiveStream::new(writes, cancel);
+                let mut active = ActiveStream::new(writes, cancel);
                 // Reconcile subscriptions from current actor state after setup.
-                let result = self.send_initial_requests(&active.writes);
+                let result = self.send_initial_requests(&mut active);
                 context.session = Some(active);
                 result
             }
@@ -782,7 +771,7 @@ where
                 let response = self.codec.decode_response(bytes)?;
                 active.saw_response = true;
                 self.record_healthy(&mut context.healthy);
-                self.handle_response(&active.writes, response, done)
+                self.handle_response(active, response, done)
             }
             TransportEvent::Failed { saw_response_tx } => {
                 // Dropping the handles cancels timers while the stream is unavailable.
@@ -822,7 +811,7 @@ where
     }
 
     /// Send initial DiscoveryRequests for all active subscriptions.
-    fn send_initial_requests(&mut self, sender: &mpsc::UnboundedSender<Bytes>) -> Result<()> {
+    fn send_initial_requests(&mut self, stream: &mut ActiveStream) -> Result<()> {
         let type_urls: Vec<_> = self
             .type_states
             .iter()
@@ -830,7 +819,7 @@ where
             .map(|(type_url, _)| type_url.clone())
             .collect();
         for type_url in type_urls {
-            self.send_request(sender, &type_url)?;
+            self.send_request(stream, &type_url)?;
         }
 
         Ok(())
@@ -838,14 +827,10 @@ where
 
     /// Handle a command, optionally sending network requests if connected.
     ///
-    /// When `sender` is `None`, only state updates are performed (disconnected mode).
-    /// When `sender` is `Some`, subscription changes trigger network requests via
+    /// When `stream` is `None`, only state updates are performed (disconnected mode).
+    /// When `stream` is `Some`, subscription changes trigger network requests via
     /// the unbounded write channel.
-    fn handle_command(
-        &mut self,
-        sender: Option<&mpsc::UnboundedSender<Bytes>>,
-        cmd: WatchEvent,
-    ) -> Result<()> {
+    fn handle_command(&mut self, stream: Option<&mut ActiveStream>, cmd: WatchEvent) -> Result<()> {
         match cmd {
             WatchEvent::Watch {
                 type_url,
@@ -863,9 +848,9 @@ where
                     decoder,
                     all_resources_required_in_sotw,
                 );
-                if let Some(sender) = sender {
+                if let Some(stream) = stream {
                     if subscriptions_changed {
-                        self.send_request(sender, type_url)?;
+                        self.send_request(stream, type_url)?;
                     } else {
                         // The current subscription already covers this watch,
                         // including a named watch added under a wildcard.
@@ -875,9 +860,9 @@ where
             }
             WatchEvent::Unwatch { watcher_id } => {
                 if let Some((type_url, true)) = self.remove_watcher(watcher_id)
-                    && let Some(sender) = sender
+                    && let Some(stream) = stream
                 {
-                    self.send_request(sender, &type_url)?;
+                    self.send_request(stream, &type_url)?;
                 }
             }
             WatchEvent::ResourceTimerExpired {
@@ -997,7 +982,7 @@ where
         let subscriptions_changed = type_state.subscription != old_subscription;
 
         if type_state.watchers.is_empty() {
-            // Keep the accepted version and stream nonce for unsubscribe and rewatch.
+            // Keep the accepted version for rewatch, including after reconnect.
             type_state.cache.clear();
             self.recorder
                 .sync_resource_counts(&type_state.type_url, &HashMap::new());
@@ -1009,28 +994,33 @@ where
     }
 
     /// Send a DiscoveryRequest for a type to the unbounded write channel.
-    fn send_request(
-        &mut self,
-        sender: &mpsc::UnboundedSender<Bytes>,
-        type_url: &str,
-    ) -> Result<()> {
+    fn send_request(&mut self, stream: &mut ActiveStream, type_url: &str) -> Result<()> {
         let type_state = match self.type_states.get(type_url) {
             Some(s) => s,
             None => return Ok(()),
         };
 
+        // An empty initial request could accidentally establish a wildcard subscription.
+        if type_state.watchers.is_empty() && !stream.types.contains_key(type_url) {
+            return Ok(());
+        }
+        let nonce = stream
+            .types
+            .get(type_url)
+            .map_or("", |state| state.nonce.as_str());
         let resource_names = type_state.resource_names_for_request();
         let request = DiscoveryRequest {
             node: &self.node,
             type_url,
             resource_names: &resource_names,
             version_info: &type_state.version_info,
-            response_nonce: &type_state.nonce,
+            response_nonce: nonce,
             error_detail: None,
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+        stream.writes.send(bytes).map_err(|_| Error::StreamClosed)?;
+        stream.types.entry(type_url.to_owned()).or_default();
         self.start_pending_resource_timers(type_url);
         Ok(())
     }
@@ -1077,11 +1067,16 @@ where
     /// cannot suspend this turn. `ProcessingDone` gates only the next stream read.
     fn handle_response(
         &mut self,
-        sender: &mpsc::UnboundedSender<Bytes>,
+        stream: &mut ActiveStream,
         response: DiscoveryResponse,
         done: ProcessingDone,
     ) -> Result<()> {
         let type_url = response.type_url.clone();
+        // Only types requested on this stream have protocol state to advance.
+        let Some(stream_type) = stream.types.get_mut(&type_url) else {
+            return Ok(());
+        };
+        stream_type.nonce.clone_from(&response.nonce);
 
         let (type_url_arc, decoder, has_watchers) = match self.type_states.get(&type_url) {
             Some(s) => (Arc::clone(&s.type_url), &s.decoder, !s.watchers.is_empty()),
@@ -1126,10 +1121,6 @@ where
         self.recorder
             .record_resource_updates(&type_url_arc, valid_count, invalid_count);
 
-        if let Some(type_state) = self.type_states.get_mut(&type_url) {
-            type_state.nonce = response.nonce.clone();
-        }
-
         let nack_error = nack_error_message(&top_level_errors, &per_resource_errors);
 
         // Late responses still advance protocol state, but cannot refill an idle cache.
@@ -1161,9 +1152,9 @@ where
                 if let Some(ts) = self.type_states.get_mut(&type_url) {
                     ts.version_info = response.version_info.clone();
                 }
-                self.send_ack(sender, &response)?;
+                self.send_ack(&stream.writes, &response)?;
             }
-            Some(error) => self.send_nack(sender, &response, error)?,
+            Some(error) => self.send_nack(&stream.writes, &response, error)?,
         }
 
         Ok(())
@@ -1576,6 +1567,14 @@ struct ActiveStream {
     writes: mpsc::UnboundedSender<Bytes>,
     cancel: Option<oneshot::Sender<()>>,
     saw_response: bool,
+    /// Presence records a subscription queued on this stream, even after unwatch.
+    types: HashMap<String, StreamTypeState>,
+}
+
+#[derive(Default)]
+struct StreamTypeState {
+    /// Latest response nonce, including rejected responses.
+    nonce: String,
 }
 
 impl ActiveStream {
@@ -1584,6 +1583,7 @@ impl ActiveStream {
             writes,
             cancel: Some(cancel),
             saw_response: false,
+            types: HashMap::new(),
         }
     }
 }
@@ -2011,15 +2011,23 @@ mod tests {
         assert_eq!(request, expected);
     }
 
+    /// Deliver `res-0` and verify both watcher delivery and the ACK.
+    async fn accept_resource<T: Resource>(
+        server: &mut MockServer,
+        watcher: &mut ResourceWatcher<T>,
+        version: &str,
+        nonce: &str,
+    ) {
+        let bytes = response_for(T::TYPE_URL.as_str(), version, nonce, &["res-0"]);
+        server.responses.send(Ok(Some(bytes.clone()))).unwrap();
+        assert!(next_changed(watcher).await.0.is_ok());
+        expect_request(server, bytes).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn last_watcher_drop_unsubscribes_and_rewatch_retains_nonce() {
         let (client, mut watcher, mut server) = connected_client().await;
-        server
-            .responses
-            .send(Ok(Some(response("1", "n1", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut watcher).await.0.is_ok());
-        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
 
         drop(watcher);
         // Queue the rewatch without waiting for the worker to process Unwatch.
@@ -2027,12 +2035,7 @@ mod tests {
         expect_request(&mut server, response("1", "n1", &[])).await;
         expect_request(&mut server, response("1", "n1", &["res-0"])).await;
         assert_no_event(&mut rewatch, "last watcher removal retained the cache").await;
-        server
-            .responses
-            .send(Ok(Some(response("1", "n2", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut rewatch).await.0.is_ok());
-        expect_request(&mut server, response("1", "n2", &["res-0"])).await;
+        accept_resource(&mut server, &mut rewatch, "1", "n2").await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2086,12 +2089,7 @@ mod tests {
             "late first response repopulated the idle cache",
         )
         .await;
-        server
-            .responses
-            .send(Ok(Some(response("1", "n2", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut rewatch).await.0.is_ok());
-        expect_request(&mut server, response("1", "n2", &["res-0"])).await;
+        accept_resource(&mut server, &mut rewatch, "1", "n2").await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2150,22 +2148,12 @@ mod tests {
         }
 
         let (client, mut watcher, mut server) = connected_client().await;
-        server
-            .responses
-            .send(Ok(Some(response("1", "n1", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut watcher).await.0.is_ok());
-        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
         drop(watcher);
         let mut alternate = client.watch::<AlternateResource>("res-0").await;
         expect_request(&mut server, response("1", "n1", &[])).await;
         expect_request(&mut server, response("1", "n1", &["res-0"])).await;
-        server
-            .responses
-            .send(Ok(Some(response("2", "n2", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut alternate).await.0.is_ok());
-        expect_request(&mut server, response("2", "n2", &["res-0"])).await;
+        accept_resource(&mut server, &mut alternate, "2", "n2").await;
         server
             .responses
             .send(Ok(Some(response("3", "n3", &[]))))
@@ -2180,12 +2168,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn late_responses_after_unsubscribe_do_not_repopulate_cache() {
         let (client, mut watcher, mut server) = connected_client_for::<VersionedResource>().await;
-        server
-            .responses
-            .send(Ok(Some(versioned_response("1", "n1", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut watcher).await.0.is_ok());
-        expect_request(&mut server, versioned_response("1", "n1", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
         drop(watcher);
         expect_request(&mut server, versioned_response("1", "n1", &[])).await;
 
@@ -2219,12 +2202,7 @@ mod tests {
         let mut watcher = client.watch::<TestResource>("res-0").await;
         let mut server = servers.recv().await.unwrap();
         expect_request(&mut server, response("", "", &["res-0"])).await;
-        server
-            .responses
-            .send(Ok(Some(response("1", "n1", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut watcher).await.0.is_ok());
-        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
         drop(watcher);
         expect_request(&mut server, response("1", "n1", &[])).await;
         server.responses.send(Ok(None)).unwrap();
@@ -2239,6 +2217,21 @@ mod tests {
             replacement.requests.try_recv().is_err(),
             "idle type resubscribed on reconnect"
         );
+        // A retained type was never requested on this stream. Ignore unsolicited
+        // responses without ACKing or changing the version/nonce used by rewatch.
+        let (done, processed) = ProcessingDone::channel();
+        client
+            .command_tx
+            .send(WorkerCommand::Transport(TransportEvent::Response {
+                bytes: response("unsolicited", "unsolicited", &["res-0"]),
+                done,
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), processed)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(replacement.requests.try_recv().is_err());
         let mut rewatch = client.watch::<TestResource>("res-0").await;
         expect_request(&mut replacement, response("1", "", &["res-0"])).await;
         assert_no_event(
@@ -2246,12 +2239,7 @@ mod tests {
             "rewatch replayed evicted cache after reconnect",
         )
         .await;
-        replacement
-            .responses
-            .send(Ok(Some(response("1", "new-nonce", &["res-0"]))))
-            .unwrap();
-        assert!(next_changed(&mut rewatch).await.0.is_ok());
-        expect_request(&mut replacement, response("1", "new-nonce", &["res-0"])).await;
+        accept_resource(&mut replacement, &mut rewatch, "1", "new-nonce").await;
     }
 
     #[tokio::test(start_paused = true)]

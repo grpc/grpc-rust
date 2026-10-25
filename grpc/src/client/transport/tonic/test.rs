@@ -1249,3 +1249,66 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     let req = WrappedEchoRequest(EchoRequest::default());
     assert!(tx.send(&req, SendOptions::default()).await.is_err());
 }
+
+#[tokio::test]
+async fn tonic_transport_recv_cancel_safety() {
+    use ResponseStreamItem as Item;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {
+            response_headers: None,
+            response_error: None,
+        };
+        let svc = EchoServer::new(echo_server);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    let runtime = GrpcRuntime::default();
+    let wait = DEFAULT_TEST_SHORT_DURATION;
+    let opts = SendOptions::new().with_final_msg(true);
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hi".into(),
+    });
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+
+    // Cancel `recv` while in `StreamState::Streaming` (bi-di server sends
+    // headers immediately, then waits for a request before sending a message).
+    let headers = RequestHeaders::new()
+        .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho");
+    let (mut tx, mut rx) = channel.invoke(headers, CallOptions::default()).await;
+    assert!(matches!(rx.recv(&mut resp).await, Item::Headers(_)));
+    assert!(runtime.timeout(wait, rx.recv(&mut resp)).await.is_err());
+
+    tx.send(&req, opts.clone()).await.unwrap();
+    assert!(matches!(rx.recv(&mut resp).await, Item::Message));
+    assert_eq!(resp.0.message, "hi");
+    assert!(matches!(rx.recv(&mut resp).await, Item::Trailers(t) if t.status().is_ok()));
+
+    // Cancel `recv` while in `StreamState::AwaitingHeaders` (unary server does
+    // not send headers until the request message is sent).
+    let headers = RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho");
+    let (mut tx, mut rx) = channel.invoke(headers, CallOptions::default()).await;
+    assert!(runtime.timeout(wait, rx.recv(&mut resp)).await.is_err());
+
+    tx.send(&req, opts).await.unwrap();
+    assert!(matches!(rx.recv(&mut resp).await, Item::Headers(_)));
+    assert!(matches!(rx.recv(&mut resp).await, Item::Message));
+    assert_eq!(resp.0.message, "hi");
+    assert!(matches!(rx.recv(&mut resp).await, Item::Trailers(t) if t.status().is_ok()));
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}

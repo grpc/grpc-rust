@@ -37,6 +37,8 @@ use tokio::sync::Notify;
 use tokio::sync::SetOnce;
 use tokio::sync::mpsc;
 
+use crate::StatusCodeError;
+use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;

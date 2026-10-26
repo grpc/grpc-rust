@@ -410,6 +410,27 @@ mod test {
         env.expect_failing_picker(&resolver_error);
     }
 
+    // The resolver's resolution note is passed to each child, so it appears in
+    // the children's TRANSIENT_FAILURE errors.
+    #[tokio::test]
+    async fn roundrobin_propagates_resolution_note_to_children() {
+        let mut env = new_env();
+        let update = ResolverUpdate {
+            endpoints: Ok(vec![create_endpoint(1)]),
+            resolution_note: Some("note".to_string()),
+            ..Default::default()
+        };
+        env.policy
+            .resolver_update(update, &RoundRobinConfig::default(), &mut env.tcc)
+            .unwrap();
+        let subchannels = env.verify_subchannel_creation(1);
+        env.expect_queuing_picker();
+
+        env.move_subchannel_to_transient_failure(&subchannels[0], "connection refused");
+        env.expect_request_resolution();
+        env.expect_failing_picker("connection refused (note)");
+    }
+
     // Round Robin should round robin across endpoints.
     #[tokio::test]
     async fn roundrobin_picks_are_round_robin() {

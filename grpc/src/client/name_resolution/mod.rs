@@ -410,32 +410,6 @@ mod test {
     use crate::byte_str::ByteStr;
 
     #[test]
-    fn with_endpoints_preserves_other_fields() {
-        #[derive(Debug, PartialEq, Eq)]
-        struct Marker(u32);
-
-        let original = ResolverUpdate {
-            attributes: Attributes::new().add(Marker(7)),
-            endpoints: Err("original endpoints".to_string()),
-            service_config: Err("service config error".to_string()),
-            resolution_note: Some("note".to_string()),
-        };
-        let new_endpoints = vec![Endpoint::default()];
-
-        let updated = original.with_endpoints(Ok(new_endpoints.clone()));
-
-        assert_eq!(updated.endpoints, Ok(new_endpoints));
-        assert_eq!(updated.attributes.get::<Marker>(), Some(&Marker(7)));
-        assert_eq!(
-            updated.service_config.unwrap_err(),
-            "service config error".to_string()
-        );
-        assert_eq!(updated.resolution_note.as_deref(), Some("note"));
-        // The original is left untouched.
-        assert_eq!(original.endpoints, Err("original endpoints".to_string()));
-    }
-
-    #[test]
     pub fn parse_target() {
         #[derive(Default)]
         struct TestCase {

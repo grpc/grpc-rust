@@ -104,20 +104,23 @@ fn header_value<'a>(metadata: &'a MetadataMap, name: &str) -> Option<Cow<'a, str
     if name == "content-type" {
         return Some(Cow::Borrowed("application/grpc"));
     }
-    let mut values = metadata.get_all(name).iter();
-    let first = values.next()?.to_str();
-    let Some(second) = values.next() else {
+    let values = metadata.get_all(name);
+    let mut iter = values.iter().map(|value| value.to_str());
+    let first = iter.next()?;
+    let Some(second) = iter.next() else {
         return Some(Cow::Borrowed(first));
     };
-    let second = second.to_str();
-    let mut joined = String::with_capacity(first.len() + 1 + second.len());
+    // Compute the joined length up front so the string is allocated once.
+    let len = iter.fold(first.len() + 1 + second.len(), |len, value| {
+        len + 1 + value.len()
+    });
+    let mut joined = String::with_capacity(len);
     joined.push_str(first);
-    joined.push(',');
-    joined.push_str(second);
-    for value in values {
+    for value in values.iter().skip(1) {
         joined.push(',');
         joined.push_str(value.to_str());
     }
+    debug_assert_eq!(joined.len(), len);
     Some(Cow::Owned(joined))
 }
 

@@ -26,7 +26,7 @@
 //!
 //! This module provides the core types and traits for building gRPC servers.
 //! While most applications will use generated code (e.g. using
-//! [`protoc-gen-rust-grpc`](https://crates.io/protoc-gen-rust-grpc)) to
+//! [`protoc-gen-grpc-rust`](https://crates.io/protoc-gen-grpc-rust)) to
 //! interact with gRPC services, this module provides the underlying primitives.
 //!
 //! # Key Concepts
@@ -54,6 +54,8 @@ use crate::async_trait;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
+use crate::core::StreamEnded;
+use crate::core::StreamError;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 use crate::send_future::SendFuture;
@@ -363,7 +365,7 @@ impl Handle for DynHandleWrapper {
 #[trait_variant::make(Send)]
 pub trait SendStream {
     /// Sends the next item on the stream. Returns `Ok(())` on success, or
-    /// `Err(())` on failure. `Err(())` is a terminal state.
+    /// [`StreamEnded`] on failure. [`StreamEnded`] is a terminal state.
     /// Calling this method after an error should be avoided and is unspecified.
     ///
     /// # Cancel safety
@@ -371,7 +373,11 @@ pub trait SendStream {
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
     /// to the SendStream are undefined and data may be lost.
-    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()>;
+    async fn send(
+        &mut self,
+        item: ResponseStreamItem<'_>,
+        options: SendOptions,
+    ) -> Result<(), StreamEnded>;
 }
 
 #[doc(hidden)]
@@ -381,7 +387,7 @@ pub trait DynSendStream: Send {
         &mut self,
         item: ResponseStreamItem<'a>,
         options: SendOptions,
-    ) -> Result<(), ()>;
+    ) -> Result<(), StreamEnded>;
 }
 
 #[async_trait]
@@ -390,19 +396,27 @@ impl<T: SendStream> DynSendStream for T {
         &mut self,
         item: ResponseStreamItem<'a>,
         options: SendOptions,
-    ) -> Result<(), ()> {
+    ) -> Result<(), StreamEnded> {
         self.send(item, options).await
     }
 }
 
 impl SendStream for &mut (dyn DynSendStream + '_) {
-    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
+    async fn send(
+        &mut self,
+        item: ResponseStreamItem<'_>,
+        options: SendOptions,
+    ) -> Result<(), StreamEnded> {
         (**self).dyn_send(item, options).await
     }
 }
 
 impl SendStream for Box<dyn DynSendStream + '_> {
-    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
+    async fn send(
+        &mut self,
+        item: ResponseStreamItem<'_>,
+        options: SendOptions,
+    ) -> Result<(), StreamEnded> {
         (**self).dyn_send(item, options).await
     }
 }
@@ -422,9 +436,9 @@ pub struct SendOptions {
 #[trait_variant::make(Send)]
 pub trait RecvStream {
     /// Returns the next message on the stream. Returns `Some(Ok(()))` on
-    /// success, `None` on normal stream end, or `Some(Err(()))` if the stream
-    /// encountered an error before the client's final request message. Both
-    /// `None` and `Some(Err(()))` are terminal states.
+    /// success, `None` on normal stream end, or `Some(Err(`[`StreamError`]`))`
+    /// if the stream encountered an error before the client's final request
+    /// message. Both `None` and `Some(Err(StreamError))` are terminal states.
     /// Calling this method again after reaching a terminal state is unspecified
     /// and should be avoided.
     ///
@@ -436,24 +450,24 @@ pub trait RecvStream {
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
     /// to the RecvStream are undefined and data may be lost.
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>>;
+    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>>;
 }
 
 #[doc(hidden)]
 #[async_trait]
 pub trait DynRecvStream: Send {
-    async fn dyn_next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>>;
+    async fn dyn_next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>>;
 }
 
 #[async_trait]
 impl<T: RecvStream> DynRecvStream for T {
-    async fn dyn_next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+    async fn dyn_next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>> {
         self.next(msg).await
     }
 }
 
 impl RecvStream for Box<dyn DynRecvStream + '_> {
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>> {
         (**self).dyn_next(msg).await
     }
 }
@@ -738,7 +752,8 @@ mod tests {
         let _ = shutdown_tx.send(());
 
         // Server should exit promptly.
-        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+        GrpcRuntime::default()
+            .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down within 2s")
             .unwrap();
@@ -758,7 +773,8 @@ mod tests {
         // Closing the listener makes accept() return None.
         listener.close().await;
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+        GrpcRuntime::default()
+            .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not exit after listener close")
             .unwrap();
@@ -779,7 +795,8 @@ mod tests {
 
         // The watched task should exit promptly because `rx.changed()` returns `Err` -> `break`.
         // If the old busy-loop bug existed, this `await` would time out / hang forever.
-        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+        GrpcRuntime::default()
+            .timeout(std::time::Duration::from_secs(1), handle)
             .await
             .expect("watched connection did not exit when coordinator was dropped")
             .unwrap();
@@ -806,7 +823,9 @@ mod tests {
             });
             let _ = serve_started_tx.send(());
             // Wrap in a short timeout so the future drops mid-flight while connections are active.
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), serve_fut).await;
+            let _ = GrpcRuntime::default()
+                .timeout(std::time::Duration::from_millis(50), serve_fut)
+                .await;
         });
 
         serve_started_rx.await.unwrap();
@@ -836,7 +855,7 @@ mod tests {
         drop(coordinator);
 
         // The watched task MUST self-terminate (`rx.changed()` returns `Err` -> `break`) despite being mid-drain.
-        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+        GrpcRuntime::default().timeout(std::time::Duration::from_secs(1), handle)
             .await
             .expect("infinite watched connection did not exit when coordinator was dropped after graceful shutdown")
             .unwrap();
@@ -904,7 +923,7 @@ mod tests {
             &mut self,
             _item: ResponseStreamItem<'_>,
             _options: SendOptions,
-        ) -> Result<(), ()> {
+        ) -> Result<(), StreamEnded> {
             Ok(())
         }
     }
@@ -912,7 +931,7 @@ mod tests {
     struct NopRecvStream;
 
     impl RecvStream for NopRecvStream {
-        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>> {
             None
         }
     }
@@ -984,7 +1003,8 @@ mod tests {
         let _ = shutdown_tx.send(());
 
         // Server should exit promptly and drop the listener.
-        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+        GrpcRuntime::default()
+            .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down within 2s")
             .unwrap();
@@ -1082,7 +1102,9 @@ mod tests {
             if handler_started.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            GrpcRuntime::default()
+                .sleep(std::time::Duration::from_millis(10))
+                .await;
         }
         assert!(handler_started.load(Ordering::SeqCst));
 
@@ -1097,7 +1119,9 @@ mod tests {
             if dropped.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            GrpcRuntime::default()
+                .sleep(std::time::Duration::from_millis(10))
+                .await;
         }
 
         // 1. The listener must be dropped immediately, even though the RPC connection is still draining.
@@ -1121,7 +1145,8 @@ mod tests {
         // Unblock the handler so the RPC finishes and graceful shutdown completes.
         let _ = unblock_tx.send(());
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+        GrpcRuntime::default()
+            .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down after connection drained")
             .unwrap();

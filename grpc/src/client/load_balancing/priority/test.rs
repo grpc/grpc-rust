@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::*;
+use crate::attributes::Attributes;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
@@ -249,6 +250,58 @@ async fn empty_priorities_reports_transient_failure() {
 
     env.expect_failing_picker("priority policy has empty priority list");
     env.expect_no_events();
+}
+
+/// Verifies that every field of the resolver update is passed to the child
+/// policy.
+#[tokio::test]
+async fn child_receives_all_resolver_update_fields() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct Marker(u32);
+
+    let received: Arc<Mutex<Option<ResolverUpdate>>> = Arc::default();
+    let received_clone = received.clone();
+    test_utils::reg_stub_policy(
+        "stub_propagate_fields",
+        StubPolicyFuncs {
+            resolver_update: Some(Arc::new(move |_data, update, _cfg, _controller| {
+                *received_clone.lock().unwrap() = Some(update);
+                Ok(())
+            })),
+            ..Default::default()
+        },
+    );
+
+    let mut env = setup_test_env();
+    let js = r#"{
+  "priorities": ["child-0"],
+  "children": {
+    "child-0": {"config": [{"stub_propagate_fields": {}}]}
+  }
+}"#;
+    let cfg = Builder {}
+        .parse_config(&LbConfigJson::new(js).unwrap())
+        .unwrap();
+    let endpoint = new_test_endpoint("child-0", "127.0.0.1:8000");
+    let update = ResolverUpdate {
+        attributes: Attributes::new().add(Marker(7)),
+        endpoints: Ok(vec![endpoint.clone()]),
+        service_config: Err("service config error".to_string()),
+        resolution_note: Some("note".to_string()),
+    };
+    let _ = env.policy.resolver_update(update, &cfg, &mut env.tcc);
+
+    let got = received
+        .lock()
+        .unwrap()
+        .take()
+        .expect("child received no resolver update");
+    assert_eq!(got.attributes.get::<Marker>(), Some(&Marker(7)));
+    assert_eq!(got.service_config.unwrap_err(), "service config error");
+    assert_eq!(got.resolution_note.as_deref(), Some("note"));
+    // The child's name is removed from the front of the endpoint's path.
+    let want_endpoint = endpoint_filtering::set_path_in_endpoint(endpoint, vec![]);
+    assert_eq!(got.endpoints, Ok(vec![want_endpoint]));
 }
 
 /// Verifies that when a high-priority child is READY, traffic routes to it

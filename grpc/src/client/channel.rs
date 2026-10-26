@@ -64,7 +64,6 @@ use crate::client::load_balancing::{self};
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
-use crate::client::name_resolution::config_selector;
 use crate::client::name_resolution::config_selector::ConfigSelector;
 use crate::client::name_resolution::config_selector::DefaultConfigSelector;
 use crate::client::name_resolution::config_selector::RpcConfig;
@@ -464,13 +463,13 @@ impl ResolverChannelController {
 }
 
 impl name_resolution::ChannelController for ResolverChannelController {
-    fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
+    fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
         let (builder, config) = match update.service_config.as_ref() {
             Ok(Some(sc)) => sc.lb_config(),
             _ => ServiceConfig::default_lb_policy(),
         };
 
-        let (cfg_selector, update) = config_selector::from_resolver_update(update);
+        let cfg_selector = update.take_config_selector();
 
         let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 

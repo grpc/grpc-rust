@@ -37,6 +37,9 @@ use crate::client::name_resolution::ResolverUpdate;
 
 /// The configuration to apply to a single RPC, as chosen by a
 /// [`ConfigSelector`].
+// TODO: Add support for the following:
+// * MethodConfig
+// * Interceptors
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct RpcConfig {}
@@ -77,40 +80,34 @@ pub trait ConfigSelector: Send + Sync + Debug {
 }
 
 /// The config selector a channel uses when its resolver does not supply one.
+// TODO: Store the default service config once support for overriding a
+// call's method config is added.
 #[derive(Debug)]
 pub(crate) struct DefaultConfigSelector;
 
 impl ConfigSelector for DefaultConfigSelector {
     fn select_config(&self, _options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError> {
+        // TODO: Return a MethodConfig derived from the channel's default
+        // service config.
         Ok(RpcConfig::default())
     }
 }
 
-/// Returns the `ConfigSelector` stored in the attributes of `update`, if
-/// any. Returns the [`ResolverUpdate`] with the [`ConfigSelector`] removed.
-pub(crate) fn from_resolver_update(
-    mut update: ResolverUpdate,
-) -> (Option<Arc<dyn ConfigSelector>>, ResolverUpdate) {
-    if let Some(cs) = update
-        .attributes
-        .get::<ConfigSelectorAttr>()
-        .map(|attr| attr.0.clone())
-    {
-        update.attributes = update.attributes.remove::<ConfigSelectorAttr>();
-        return (Some(cs), update);
+impl ResolverUpdate {
+    /// Stores `cs` in the attributes of this update, replacing any previously
+    /// stored [`ConfigSelector`], and returns the updated `ResolverUpdate`.
+    pub fn with_config_selector(mut self, cs: Arc<dyn ConfigSelector>) -> Self {
+        self.attributes = self.attributes.add(ConfigSelectorAttr(cs));
+        self
     }
-    (None, update)
-}
 
-/// Stores this `ConfigSelector` in the attributes of `update`, replacing
-/// any previously stored selector, and returns the updated
-/// `ResolverUpdate`.
-pub fn set_in_resolver_update(
-    cs: Arc<dyn ConfigSelector>,
-    mut update: ResolverUpdate,
-) -> ResolverUpdate {
-    update.attributes = update.attributes.add(ConfigSelectorAttr(cs));
-    update
+    /// Removes the [`ConfigSelector`] stored in the attributes of this update,
+    /// if any, and returns it.
+    pub(crate) fn take_config_selector(&mut self) -> Option<Arc<dyn ConfigSelector>> {
+        let cs = self.attributes.get::<ConfigSelectorAttr>()?.0.clone();
+        self.attributes = self.attributes.remove::<ConfigSelectorAttr>();
+        Some(cs)
+    }
 }
 
 /// Wrapper that allows an `Arc<dyn ConfigSelector>` to be stored in
@@ -605,7 +602,7 @@ mod tests {
         let (addr, channel, resolver) = setup().await;
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
         resolver
-            .update(set_in_resolver_update(selector.clone(), update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector.clone()))
             .await
             .unwrap();
 
@@ -622,7 +619,7 @@ mod tests {
         // gRFC A54 doesn't allow config selectors to return NOT_FOUND.
         let selector = FakeConfigSelector::new_arc(StatusCodeError::NotFound);
         resolver
-            .update(set_in_resolver_update(selector, update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector))
             .await
             .unwrap();
 
@@ -648,7 +645,7 @@ mod tests {
 
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
         resolver
-            .update(set_in_resolver_update(selector.clone(), update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector.clone()))
             .await
             .unwrap();
 
@@ -665,7 +662,7 @@ mod tests {
         let (addr, channel, resolver) = setup().await;
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
         resolver
-            .update(set_in_resolver_update(selector.clone(), update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector.clone()))
             .await
             .unwrap();
         assert!(unary_echo(&channel, "hello").await.is_err());
@@ -683,10 +680,7 @@ mod tests {
 
         // pick_first rejects updates without addresses.
         let result = resolver
-            .update(set_in_resolver_update(
-                selector.clone(),
-                ResolverUpdate::default(),
-            ))
+            .update(ResolverUpdate::default().with_config_selector(selector.clone()))
             .await;
         assert!(result.is_err());
 
@@ -704,7 +698,7 @@ mod tests {
         let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
         let (selector, cluster_a) = ClusterConfigSelector::new_arc(selected_tx.clone());
         resolver
-            .update(set_in_resolver_update(selector, update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector))
             .await
             .unwrap();
         // The config selector holds one reference.
@@ -730,7 +724,7 @@ mod tests {
         // Replacing the config selector releases the subscription.
         let (selector, cluster_b) = ClusterConfigSelector::new_arc(selected_tx);
         resolver
-            .update(set_in_resolver_update(selector, update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector))
             .await
             .unwrap();
         assert_eq!(cluster_a.strong_count(), 0);
@@ -744,7 +738,7 @@ mod tests {
         let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
         let (selector, cluster_a) = ClusterConfigSelector::new_arc(selected_tx.clone());
         resolver
-            .update(set_in_resolver_update(selector, update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector))
             .await
             .unwrap();
         let rpc1_handle = spawn_unary_echo(&channel, &mut selected_rx).await;
@@ -756,7 +750,7 @@ mod tests {
         // RPCs keep the subscription.
         let (selector, cluster_b) = ClusterConfigSelector::new_arc(selected_tx);
         resolver
-            .update(set_in_resolver_update(selector, update_for(addr)))
+            .update(update_for(addr).with_config_selector(selector))
             .await
             .unwrap();
         assert_eq!(cluster_a.strong_count(), 2);

@@ -137,15 +137,11 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Server;
     use tonic_prost::prost::Message as _;
 
     use super::*;
@@ -182,11 +178,11 @@ mod tests {
     use crate::credentials::common::Authority;
     use crate::echo_pb::EchoRequest;
     use crate::echo_pb::EchoResponse;
-    use crate::echo_pb::echo_server::Echo;
-    use crate::echo_pb::echo_server::EchoServer;
     use crate::private;
     use crate::rt::BoxEndpoint;
     use crate::rt::GrpcRuntime;
+    use crate::stub_server::RunningStubServer;
+    use crate::stub_server::StubServer;
 
     const UNARY_ECHO_METHOD: &str = "/grpc.examples.echo.Echo/UnaryEcho";
     /// How long to wait for events that are expected to happen.
@@ -365,60 +361,6 @@ mod tests {
         }
     }
 
-    /// An echo service that only implements unary RPCs.
-    struct EchoService;
-
-    #[async_trait]
-    impl Echo for EchoService {
-        async fn unary_echo(
-            &self,
-            request: tonic::Request<EchoRequest>,
-        ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
-            Ok(tonic::Response::new(EchoResponse {
-                message: request.into_inner().message,
-            }))
-        }
-
-        type ServerStreamingEchoStream = ReceiverStream<Result<EchoResponse, tonic::Status>>;
-
-        async fn server_streaming_echo(
-            &self,
-            _: tonic::Request<EchoRequest>,
-        ) -> Result<tonic::Response<Self::ServerStreamingEchoStream>, tonic::Status> {
-            Err(tonic::Status::unimplemented("not used by these tests"))
-        }
-
-        async fn client_streaming_echo(
-            &self,
-            _: tonic::Request<tonic::Streaming<EchoRequest>>,
-        ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("not used by these tests"))
-        }
-
-        type BidirectionalStreamingEchoStream = ReceiverStream<Result<EchoResponse, tonic::Status>>;
-
-        async fn bidirectional_streaming_echo(
-            &self,
-            _: tonic::Request<tonic::Streaming<EchoRequest>>,
-        ) -> Result<tonic::Response<Self::BidirectionalStreamingEchoStream>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented("not used by these tests"))
-        }
-    }
-
-    /// Starts an echo server on a local port and returns its address.
-    async fn start_echo_server() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(EchoServer::new(EchoService))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await;
-        });
-        addr
-    }
-
     /// Local channel credentials that hold every handshake until
     /// [`open`](Self::open) is called. Until then, the channel's subchannels
     /// stay CONNECTING, so its RPCs stay queued waiting for a pick.
@@ -471,17 +413,19 @@ mod tests {
     }
 
     /// Starts an echo server and creates a channel that uses a
-    /// [`FakeResolver`]. Returns the server's address, the channel, and the
-    /// handle of the channel's resolver, which has not sent any updates yet.
-    async fn setup() -> (SocketAddr, Channel, FakeResolverHandle) {
+    /// [`FakeResolver`]. Returns the server, the channel, and the handle of
+    /// the channel's resolver, which has not sent any updates yet. The server
+    /// shuts down when it's dropped.
+    async fn setup() -> (RunningStubServer, Channel, FakeResolverHandle) {
         setup_with_credentials(LocalChannelCredentials::new_arc()).await
     }
 
     /// Like [`setup`], but the channel uses `credentials`.
     async fn setup_with_credentials(
         credentials: Arc<dyn ChannelCredentials>,
-    ) -> (SocketAddr, Channel, FakeResolverHandle) {
-        let addr = start_echo_server().await;
+    ) -> (RunningStubServer, Channel, FakeResolverHandle) {
+        let server = StubServer::new().start().await;
+        let addr = server.addr();
         let (scheme, mut handle_rx) = FakeResolverBuilder::register();
         let mut channel = Channel::builder(format!("{scheme}:///{addr}"), credentials).build();
         // Exit idle so the channel builds its resolver.
@@ -490,7 +434,7 @@ mod tests {
             .await
             .expect("timed out waiting for the channel to build its resolver")
             .unwrap();
-        (addr, channel, resolver)
+        (server, channel, resolver)
     }
 
     /// Returns a resolver update with a single endpoint for `addr`.
@@ -591,18 +535,18 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_succeeds_without_config_selector() {
-        let (addr, channel, resolver) = setup().await;
-        resolver.update(update_for(addr)).await.unwrap();
+        let (server, channel, resolver) = setup().await;
+        resolver.update(update_for(server.addr())).await.unwrap();
 
         assert_eq!(unary_echo(&channel, "hello").await.unwrap(), "hello");
     }
 
     #[tokio::test]
     async fn config_selector_error_fails_rpc() {
-        let (addr, channel, resolver) = setup().await;
+        let (server, channel, resolver) = setup().await;
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
         resolver
-            .update(update_for(addr).with_config_selector(selector.clone()))
+            .update(update_for(server.addr()).with_config_selector(selector.clone()))
             .await
             .unwrap();
 
@@ -615,11 +559,11 @@ mod tests {
 
     #[tokio::test]
     async fn restricted_config_selector_status_becomes_internal() {
-        let (addr, channel, resolver) = setup().await;
+        let (server, channel, resolver) = setup().await;
         // gRFC A54 doesn't allow config selectors to return NOT_FOUND.
         let selector = FakeConfigSelector::new_arc(StatusCodeError::NotFound);
         resolver
-            .update(update_for(addr).with_config_selector(selector))
+            .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
 
@@ -634,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_waits_for_first_resolver_update() {
-        let (addr, channel, resolver) = setup().await;
+        let (server, channel, resolver) = setup().await;
         let rpc_channel = channel.clone();
         let mut rpc = tokio::spawn(async move { unary_echo(&rpc_channel, "hello").await });
 
@@ -645,7 +589,7 @@ mod tests {
 
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
         resolver
-            .update(update_for(addr).with_config_selector(selector.clone()))
+            .update(update_for(server.addr()).with_config_selector(selector.clone()))
             .await
             .unwrap();
 
@@ -659,15 +603,15 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_update_without_config_selector_restores_default() {
-        let (addr, channel, resolver) = setup().await;
+        let (server, channel, resolver) = setup().await;
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
         resolver
-            .update(update_for(addr).with_config_selector(selector.clone()))
+            .update(update_for(server.addr()).with_config_selector(selector.clone()))
             .await
             .unwrap();
         assert!(unary_echo(&channel, "hello").await.is_err());
 
-        resolver.update(update_for(addr)).await.unwrap();
+        resolver.update(update_for(server.addr())).await.unwrap();
 
         assert_eq!(unary_echo(&channel, "hello").await.unwrap(), "hello");
         assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
@@ -675,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_selector_applied_when_lb_policy_rejects_update() {
-        let (_, channel, resolver) = setup().await;
+        let (_server, channel, resolver) = setup().await;
         let selector = FakeConfigSelector::new_arc(StatusCodeError::Unavailable);
 
         // pick_first rejects updates without addresses.
@@ -694,11 +638,11 @@ mod tests {
     #[tokio::test]
     async fn rpcs_hold_cluster_subscription_until_invoke_returns() {
         let credentials = GatedChannelCredentials::new_arc();
-        let (addr, channel, resolver) = setup_with_credentials(credentials.clone()).await;
+        let (server, channel, resolver) = setup_with_credentials(credentials.clone()).await;
         let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
         let (selector, cluster_a) = ClusterConfigSelector::new_arc(selected_tx.clone());
         resolver
-            .update(update_for(addr).with_config_selector(selector))
+            .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
         // The config selector holds one reference.
@@ -724,7 +668,7 @@ mod tests {
         // Replacing the config selector releases the subscription.
         let (selector, cluster_b) = ClusterConfigSelector::new_arc(selected_tx);
         resolver
-            .update(update_for(addr).with_config_selector(selector))
+            .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
         assert_eq!(cluster_a.strong_count(), 0);
@@ -734,11 +678,11 @@ mod tests {
     #[tokio::test]
     async fn queued_rpcs_hold_cluster_subscription_after_config_selector_update() {
         let credentials = GatedChannelCredentials::new_arc();
-        let (addr, channel, resolver) = setup_with_credentials(credentials.clone()).await;
+        let (server, channel, resolver) = setup_with_credentials(credentials.clone()).await;
         let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
         let (selector, cluster_a) = ClusterConfigSelector::new_arc(selected_tx.clone());
         resolver
-            .update(update_for(addr).with_config_selector(selector))
+            .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
         let rpc1_handle = spawn_unary_echo(&channel, &mut selected_rx).await;
@@ -750,7 +694,7 @@ mod tests {
         // RPCs keep the subscription.
         let (selector, cluster_b) = ClusterConfigSelector::new_arc(selected_tx);
         resolver
-            .update(update_for(addr).with_config_selector(selector))
+            .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
         assert_eq!(cluster_a.strong_count(), 2);

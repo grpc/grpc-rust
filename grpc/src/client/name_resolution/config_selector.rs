@@ -141,7 +141,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
-    use tokio::time::timeout;
     use tonic_prost::prost::Message as _;
 
     use super::*;
@@ -338,7 +337,8 @@ mod tests {
             let (result_tx, result_rx) = oneshot::channel();
             self.update_tx.send((update, result_tx)).unwrap();
             self.work_scheduler.schedule_work();
-            timeout(DEFAULT_TEST_TIMEOUT, result_rx)
+            GrpcRuntime::default()
+                .timeout(DEFAULT_TEST_TIMEOUT, result_rx)
                 .await
                 .expect("timed out waiting for the channel to apply the update")
                 .unwrap()
@@ -430,7 +430,8 @@ mod tests {
         let mut channel = Channel::builder(format!("{scheme}:///{addr}"), credentials).build();
         // Exit idle so the channel builds its resolver.
         channel.get_state(true);
-        let resolver = timeout(DEFAULT_TEST_TIMEOUT, handle_rx.recv())
+        let resolver = GrpcRuntime::default()
+            .timeout(DEFAULT_TEST_TIMEOUT, handle_rx.recv())
             .await
             .expect("timed out waiting for the channel to build its resolver")
             .unwrap();
@@ -459,12 +460,13 @@ mod tests {
     /// the RPC stays in progress until it's passed to [`finish_unary_echo`].
     async fn start_unary_echo(channel: &Channel) -> UnaryEchoRpc {
         let headers = RequestHeaders::new().with_method_name(UNARY_ECHO_METHOD);
-        timeout(
-            DEFAULT_TEST_TIMEOUT,
-            channel.invoke(headers, CallOptions::default()),
-        )
-        .await
-        .expect("timed out waiting for the RPC to start")
+        GrpcRuntime::default()
+            .timeout(
+                DEFAULT_TEST_TIMEOUT,
+                channel.invoke(headers, CallOptions::default()),
+            )
+            .await
+            .expect("timed out waiting for the RPC to start")
     }
 
     /// Starts a unary echo RPC like [`start_unary_echo`], but in a new task.
@@ -476,7 +478,8 @@ mod tests {
     ) -> JoinHandle<UnaryEchoRpc> {
         let channel = channel.clone();
         let rpc_handle = tokio::spawn(async move { start_unary_echo(&channel).await });
-        timeout(DEFAULT_TEST_TIMEOUT, selections.recv())
+        GrpcRuntime::default()
+            .timeout(DEFAULT_TEST_TIMEOUT, selections.recv())
             .await
             .expect("timed out waiting for the RPC's config to be selected")
             .unwrap();
@@ -521,7 +524,8 @@ mod tests {
                 }
             }
         };
-        timeout(DEFAULT_TEST_TIMEOUT, finish)
+        GrpcRuntime::default()
+            .timeout(DEFAULT_TEST_TIMEOUT, finish)
             .await
             .expect("timed out waiting for the RPC to end")
     }
@@ -583,7 +587,10 @@ mod tests {
         let mut rpc = tokio::spawn(async move { unary_echo(&rpc_channel, "hello").await });
 
         assert!(
-            timeout(DEFAULT_TEST_SHORT_TIMEOUT, &mut rpc).await.is_err(),
+            GrpcRuntime::default()
+                .timeout(DEFAULT_TEST_SHORT_TIMEOUT, &mut rpc)
+                .await
+                .is_err(),
             "RPC completed before the resolver's first update"
         );
 

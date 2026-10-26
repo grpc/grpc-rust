@@ -31,52 +31,42 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::StatusError;
-use crate::client::CallOptions;
-use crate::client::RequestHeaders;
+use crate::client::interceptor::DynIntercept;
 use crate::client::name_resolution::ResolverUpdate;
 
 /// The configuration to apply to a single RPC, as chosen by a
 /// [`ConfigSelector`].
 // TODO: Add support for the following:
 // * MethodConfig
-// * Interceptors
-#[derive(Debug, Default)]
+#[derive(Default)]
 #[non_exhaustive]
-pub struct RpcConfig {}
+pub struct RpcConfig {
+    /// The interceptor to run the RPC through, if any.
+    pub interceptor: Option<Arc<dyn DynIntercept>>,
+}
 
 /// The data provided to a [`ConfigSelector`] when selecting the configuration
-/// for an RPC.
+/// for an RPC. Currently empty; reserved for future additions.
+#[derive(Debug, Default)]
 #[non_exhaustive]
-pub struct SelectConfigOptions<'a> {
-    /// The headers of the request.
-    pub request_headers: &'a RequestHeaders,
-    /// The options of the call.  Config selectors may modify them, e.g. to
-    /// attach per-RPC state via [`CallOptions::set_option`] for later stages
-    /// (such as the picker) to read.
-    pub call_options: &'a mut CallOptions,
-}
-
-impl<'a> SelectConfigOptions<'a> {
-    /// Creates a new `SelectConfigOptions`.
-    pub fn new(request_headers: &'a RequestHeaders, call_options: &'a mut CallOptions) -> Self {
-        Self {
-            request_headers,
-            call_options,
-        }
-    }
-}
+pub struct SelectConfigOptions {}
 
 /// Controls what configuration to use for every RPC.
 ///
 /// A `ConfigSelector` is supplied by a name resolver through the attributes of
 /// a `ResolverUpdate` and is consulted by the channel once per RPC.
+///
+/// Work that depends on the request, such as matching on its headers, or that
+/// attaches per-RPC state to its [`CallOptions`](crate::client::CallOptions)
+/// for later stages (such as the picker), belongs in the
+/// [`RpcConfig::interceptor`] that the selector returns.
 pub trait ConfigSelector: Send + Sync + Debug {
     /// Selects the configuration for the RPC, or terminates it with the
     /// returned error.
     ///
     /// Errors with a status code that the control plane may not use, as
     /// defined by gRFC A54, are converted to INTERNAL by the channel.
-    fn select_config(&self, options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError>;
+    fn select_config(&self, options: SelectConfigOptions) -> Result<RpcConfig, StatusError>;
 }
 
 /// The config selector a channel uses when its resolver does not supply one.
@@ -86,7 +76,7 @@ pub trait ConfigSelector: Send + Sync + Debug {
 pub(crate) struct DefaultConfigSelector;
 
 impl ConfigSelector for DefaultConfigSelector {
-    fn select_config(&self, _options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError> {
+    fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
         // TODO: Return a MethodConfig derived from the channel's default
         // service config.
         Ok(RpcConfig::default())
@@ -130,7 +120,6 @@ impl Eq for ConfigSelectorAttr {}
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::Mutex;
     use std::sync::Weak;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -148,6 +137,7 @@ mod tests {
     use crate::async_trait;
     use crate::client::CallOptions;
     use crate::client::Channel;
+    use crate::client::DynInvoke;
     use crate::client::DynRecvStream;
     use crate::client::DynSendStream;
     use crate::client::Invoke as _;
@@ -189,84 +179,95 @@ mod tests {
     /// How long to wait when checking that an event does not happen.
     const DEFAULT_TEST_SHORT_TIMEOUT: Duration = Duration::from_millis(10);
 
-    /// A config selector that fails every RPC with a fixed status and records
-    /// the method name of each RPC it is consulted for.
+    /// A config selector that fails every RPC with a fixed status and counts
+    /// how many times it is consulted.
     #[derive(Debug)]
     struct FakeConfigSelector {
         status: StatusError,
-        methods: Mutex<Vec<String>>,
+        calls: AtomicUsize,
     }
 
     impl FakeConfigSelector {
         fn new_arc(code: StatusCodeError) -> Arc<Self> {
             Arc::new(Self {
                 status: StatusError::new(code, "fake config selector error"),
-                methods: Mutex::default(),
+                calls: AtomicUsize::new(0),
             })
         }
 
-        /// Returns the method names of the RPCs this selector was consulted
-        /// for, in order.
-        fn methods(&self) -> Vec<String> {
-            self.methods.lock().unwrap().clone()
+        /// Returns how many times this selector was consulted.
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
         }
     }
 
     impl ConfigSelector for FakeConfigSelector {
-        fn select_config(
-            &self,
-            options: SelectConfigOptions<'_>,
-        ) -> Result<RpcConfig, StatusError> {
-            self.methods
-                .lock()
-                .unwrap()
-                .push(options.request_headers.method_name().to_string());
+        fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Err(self.status.clone())
         }
     }
 
     /// A subscription to an xDS cluster. The xDS resolver keeps a cluster
-    /// subscribed while its config selector, or an RPC routed to the cluster
-    /// that hasn't been committed yet, holds a reference.
+    /// subscribed while anything holds a reference to it.
     #[derive(Debug)]
     struct ClusterSubscription;
 
-    /// Mimics the xDS resolver's config selector: it holds a reference to a
-    /// cluster subscription, and gives each RPC another reference through the
-    /// RPC's call attributes.
+    /// Holds a cluster subscription on behalf of the config selector and of
+    /// every RPC routed to the cluster. The selector holds one reference to
+    /// the interceptor, and each RPC holds another, through its `RpcConfig`,
+    /// until the RPC's `invoke` returns. The cluster stays subscribed while
+    /// any reference exists.
+    #[derive(Debug)]
+    struct ClusterInterceptor {
+        _subscription: ClusterSubscription,
+        /// Notified each time an RPC reaches the interceptor.
+        intercepted_tx: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl DynIntercept for ClusterInterceptor {
+        async fn dyn_intercept(
+            &self,
+            headers: RequestHeaders,
+            options: CallOptions,
+            next: Arc<dyn DynInvoke>,
+        ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+            // The test may have stopped listening.
+            let _ = self.intercepted_tx.send(());
+            next.dyn_invoke(headers, options).await
+        }
+    }
+
+    /// Mimics the xDS resolver's config selector: every RPC is routed through
+    /// the same cluster interceptor.
     #[derive(Debug)]
     struct ClusterConfigSelector {
-        subscription: Arc<ClusterSubscription>,
-        /// Notified each time a config is selected for an RPC.
-        selected_tx: mpsc::UnboundedSender<()>,
+        interceptor: Arc<ClusterInterceptor>,
     }
 
     impl ClusterConfigSelector {
         /// Returns a config selector for a new cluster subscription, and a
-        /// weak reference for counting the subscription's references. The
-        /// selector notifies `selected_tx` each time it selects a config.
+        /// weak reference for counting the references to its interceptor.
+        /// The interceptor notifies `intercepted_tx` each time an RPC reaches
+        /// it.
         fn new_arc(
-            selected_tx: mpsc::UnboundedSender<()>,
-        ) -> (Arc<Self>, Weak<ClusterSubscription>) {
-            let subscription = Arc::new(ClusterSubscription);
-            let refs = Arc::downgrade(&subscription);
-            let selector = Self {
-                subscription,
-                selected_tx,
-            };
-            (Arc::new(selector), refs)
+            intercepted_tx: mpsc::UnboundedSender<()>,
+        ) -> (Arc<Self>, Weak<ClusterInterceptor>) {
+            let interceptor = Arc::new(ClusterInterceptor {
+                _subscription: ClusterSubscription,
+                intercepted_tx,
+            });
+            let refs = Arc::downgrade(&interceptor);
+            (Arc::new(Self { interceptor }), refs)
         }
     }
 
     impl ConfigSelector for ClusterConfigSelector {
-        fn select_config(
-            &self,
-            options: SelectConfigOptions<'_>,
-        ) -> Result<RpcConfig, StatusError> {
-            options.call_options.set_option(self.subscription.clone());
-            // The test may have stopped listening.
-            let _ = self.selected_tx.send(());
-            Ok(RpcConfig::default())
+        fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
+            Ok(RpcConfig {
+                interceptor: Some(self.interceptor.clone()),
+            })
         }
     }
 
@@ -470,18 +471,18 @@ mod tests {
     }
 
     /// Starts a unary echo RPC like [`start_unary_echo`], but in a new task.
-    /// Returns once `selections` is notified that the RPC's config was
-    /// selected. The task outputs the RPC's streams once `invoke` returns.
+    /// Returns once `interceptions` is notified that the RPC reached its
+    /// interceptor. The task outputs the RPC's streams once `invoke` returns.
     async fn spawn_unary_echo(
         channel: &Channel,
-        selections: &mut mpsc::UnboundedReceiver<()>,
+        interceptions: &mut mpsc::UnboundedReceiver<()>,
     ) -> JoinHandle<UnaryEchoRpc> {
         let channel = channel.clone();
         let rpc_handle = tokio::spawn(async move { start_unary_echo(&channel).await });
         GrpcRuntime::default()
-            .timeout(DEFAULT_TEST_TIMEOUT, selections.recv())
+            .timeout(DEFAULT_TEST_TIMEOUT, interceptions.recv())
             .await
-            .expect("timed out waiting for the RPC's config to be selected")
+            .expect("timed out waiting for the RPC to reach its interceptor")
             .unwrap();
         rpc_handle
     }
@@ -558,7 +559,7 @@ mod tests {
 
         assert_eq!(status.code(), StatusCodeError::Unavailable);
         assert_eq!(status.message(), "fake config selector error");
-        assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
+        assert_eq!(selector.calls(), 1);
     }
 
     #[tokio::test]
@@ -605,7 +606,7 @@ mod tests {
         let status = rpc.await.unwrap().unwrap_err();
         assert_eq!(status.code(), StatusCodeError::Unavailable);
         assert_eq!(status.message(), "fake config selector error");
-        assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
+        assert_eq!(selector.calls(), 1);
     }
 
     #[tokio::test]
@@ -621,7 +622,7 @@ mod tests {
         resolver.update(update_for(server.addr())).await.unwrap();
 
         assert_eq!(unary_echo(&channel, "hello").await.unwrap(), "hello");
-        assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
+        assert_eq!(selector.calls(), 1);
     }
 
     #[tokio::test]
@@ -639,27 +640,28 @@ mod tests {
         // policy's.
         let status = unary_echo(&channel, "hello").await.unwrap_err();
         assert_eq!(status.message(), "fake config selector error");
-        assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
+        assert_eq!(selector.calls(), 1);
     }
 
     #[tokio::test]
     async fn rpcs_hold_cluster_subscription_until_invoke_returns() {
         let credentials = GatedChannelCredentials::new_arc();
         let (server, channel, resolver) = setup_with_credentials(credentials.clone()).await;
-        let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
-        let (selector, cluster_a) = ClusterConfigSelector::new_arc(selected_tx.clone());
+        let (intercepted_tx, mut intercepted_rx) = mpsc::unbounded_channel();
+        let (selector, cluster_a) = ClusterConfigSelector::new_arc(intercepted_tx.clone());
         resolver
             .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
-        // The config selector holds one reference.
+        // The config selector holds one reference to the cluster's
+        // interceptor.
         assert_eq!(cluster_a.strong_count(), 1);
 
         // Each RPC holds another one while it's queued waiting for the
         // connection.
-        let rpc1_handle = spawn_unary_echo(&channel, &mut selected_rx).await;
+        let rpc1_handle = spawn_unary_echo(&channel, &mut intercepted_rx).await;
         assert_eq!(cluster_a.strong_count(), 2);
-        let rpc2_handle = spawn_unary_echo(&channel, &mut selected_rx).await;
+        let rpc2_handle = spawn_unary_echo(&channel, &mut intercepted_rx).await;
         assert_eq!(cluster_a.strong_count(), 3);
 
         // The RPCs release their references once `invoke` returns, although
@@ -673,7 +675,7 @@ mod tests {
         assert_eq!(finish_unary_echo(rpc2, "hello").await.unwrap(), "hello");
 
         // Replacing the config selector releases the subscription.
-        let (selector, cluster_b) = ClusterConfigSelector::new_arc(selected_tx);
+        let (selector, cluster_b) = ClusterConfigSelector::new_arc(intercepted_tx);
         resolver
             .update(update_for(server.addr()).with_config_selector(selector))
             .await
@@ -686,20 +688,20 @@ mod tests {
     async fn queued_rpcs_hold_cluster_subscription_after_config_selector_update() {
         let credentials = GatedChannelCredentials::new_arc();
         let (server, channel, resolver) = setup_with_credentials(credentials.clone()).await;
-        let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
-        let (selector, cluster_a) = ClusterConfigSelector::new_arc(selected_tx.clone());
+        let (intercepted_tx, mut intercepted_rx) = mpsc::unbounded_channel();
+        let (selector, cluster_a) = ClusterConfigSelector::new_arc(intercepted_tx.clone());
         resolver
             .update(update_for(server.addr()).with_config_selector(selector))
             .await
             .unwrap();
-        let rpc1_handle = spawn_unary_echo(&channel, &mut selected_rx).await;
+        let rpc1_handle = spawn_unary_echo(&channel, &mut intercepted_rx).await;
         assert_eq!(cluster_a.strong_count(), 2);
-        let rpc2_handle = spawn_unary_echo(&channel, &mut selected_rx).await;
+        let rpc2_handle = spawn_unary_echo(&channel, &mut intercepted_rx).await;
         assert_eq!(cluster_a.strong_count(), 3);
 
         // Replacing the config selector drops its reference, but the queued
         // RPCs keep the subscription.
-        let (selector, cluster_b) = ClusterConfigSelector::new_arc(selected_tx);
+        let (selector, cluster_b) = ClusterConfigSelector::new_arc(intercepted_tx);
         resolver
             .update(update_for(server.addr()).with_config_selector(selector))
             .await

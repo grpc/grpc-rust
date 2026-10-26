@@ -37,8 +37,6 @@ use http::HeaderValue;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
-use tokio::time;
-use tokio::time::timeout;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -230,7 +228,8 @@ pub(crate) async fn tonic_transport_rpc() {
         Err(oneshot::error::TryRecvError::Empty),
     );
     shutdown_notify.notify_waiters();
-    let res = timeout(DEFAULT_TEST_DURATION, disconnection_listener)
+    let res = GrpcRuntime::default()
+        .timeout(DEFAULT_TEST_DURATION, disconnection_listener)
         .await
         .unwrap()
         .unwrap();
@@ -740,11 +739,12 @@ async fn tonic_transport_invalid_base64_headers() {
     };
     let req = WrappedEchoRequest(request);
 
-    time::timeout(DEFAULT_TEST_DURATION, async {
-        while tx.send(&req, SendOptions::default()).await.is_ok() {}
-    })
-    .await
-    .expect("timed out waiting for stream to close");
+    GrpcRuntime::default()
+        .timeout(DEFAULT_TEST_DURATION, async {
+            while tx.send(&req, SendOptions::default()).await.is_ok() {}
+        })
+        .await
+        .expect("timed out waiting for stream to close");
 
     shutdown_notify.notify_one();
     server_handle.await.unwrap();
@@ -812,11 +812,12 @@ async fn tonic_transport_recv_drop_cancels_send() {
     };
     let req = WrappedEchoRequest(request);
 
-    time::timeout(DEFAULT_TEST_DURATION, async {
-        while tx.send(&req, SendOptions::default()).await.is_ok() {}
-    })
-    .await
-    .expect("timed out waiting for stream to close");
+    GrpcRuntime::default()
+        .timeout(DEFAULT_TEST_DURATION, async {
+            while tx.send(&req, SendOptions::default()).await.is_ok() {}
+        })
+        .await
+        .expect("timed out waiting for stream to close");
 
     shutdown_notify.notify_one();
     server_handle.await.unwrap();
@@ -904,7 +905,7 @@ async fn connect_timeout_exceeded() {
     let rpc_handle = tokio::spawn(async move { perform_unary_echo_failure(&channel).await });
 
     // Advance time to trigger the timeout in subchannel connect.
-    time::sleep(Duration::from_secs(21)).await;
+    GrpcRuntime::default().sleep(Duration::from_secs(21)).await;
 
     // The RPC should have failed with a timeout.
     let trailers = rpc_handle.await.unwrap();
@@ -979,6 +980,95 @@ async fn trailers_only_metadata() {
     server_handle.await.unwrap();
 }
 
+// Verifies that trailer metadata is preserved when the server returns an error
+// status in trailers after sending headers and a message (i.e. not a
+// Trailers-Only response).
+#[tokio::test]
+async fn error_trailers_after_headers_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+
+    let mut metadata = TonicMetadata::new();
+    metadata.insert(
+        "x-custom-trailer",
+        TonicMetadataValue::from_static("custom-value"),
+    );
+    let status =
+        TonicStatus::with_metadata(tonic::Code::InvalidArgument, "test error message", metadata);
+
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {
+            response_headers: None,
+            response_error: Some(status),
+        };
+        let svc = EchoServer::new(echo_server);
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    let target = format!("dns:///{}", addr);
+    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+
+    let (mut tx, mut rx) = channel
+        .invoke(
+            RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/ServerStreamingEcho"),
+            CallOptions::default(),
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(
+        &req,
+        SendOptions {
+            final_msg: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    let ResponseStreamItem::Headers(_) = item else {
+        panic!("Expected Headers first, got {item:?}");
+    };
+    let item = rx.recv(&mut resp).await;
+    let ResponseStreamItem::Message = item else {
+        panic!("Expected Message after Headers, got {item:?}");
+    };
+    assert_eq!(resp.0.message, "hello");
+    let item = rx.recv(&mut resp).await;
+    let ResponseStreamItem::Trailers(trailers) = item else {
+        panic!("Expected Trailers after Message, got {item:?}");
+    };
+
+    let status_err = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status_err.code(), StatusCodeError::InvalidArgument);
+    assert_eq!(status_err.message(), "test error message");
+
+    let value = trailers
+        .metadata()
+        .get("x-custom-trailer")
+        .expect("trailer metadata should be preserved on error status");
+    assert_eq!(value, "custom-value");
+
+    assert!(
+        trailers.connection_info().is_none(),
+        "trailers should not contain connection_info when headers were present"
+    );
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
 struct WrappedEchoRequest(EchoRequest);
 struct WrappedEchoResponse(EchoResponse);
 
@@ -1024,11 +1114,22 @@ impl Echo for EchoService {
 
     type ServerStreamingEchoStream = ReceiverStream<Result<EchoResponse, tonic::Status>>;
 
+    // Echoes the request message once, then ends the stream with
+    // `response_error` (if set) in the trailers, or OK otherwise.  Unlike
+    // `unary_echo`, this always sends response headers first, so an error is
+    // delivered in trailers after headers rather than as a Trailers-Only
+    // response.
     async fn server_streaming_echo(
         &self,
-        _: tonic::Request<EchoRequest>,
+        request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<Self::ServerStreamingEchoStream>, tonic::Status> {
-        unimplemented!()
+        let message = request.into_inner().message;
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(EchoResponse { message })).await.unwrap();
+        if let Some(err) = &self.response_error {
+            tx.send(Err(err.clone())).await.unwrap();
+        }
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
     async fn client_streaming_echo(
@@ -1138,7 +1239,8 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     drop(rx);
 
     // Wait for the server to verify the reset.
-    tokio::time::timeout(Duration::from_secs(5), server_handle)
+    GrpcRuntime::default()
+        .timeout(Duration::from_secs(5), server_handle)
         .await
         .expect("Test timed out waiting for server to verify reset")
         .unwrap();

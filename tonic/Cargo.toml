@@ -90,7 +90,7 @@ webpki-roots = { version = "1.0.10", optional = true }
 
 # compression
 flate2 = {version = "1.0", optional = true}
-zstd = { version = "0.13.0", optional = true }
+zstd = { version = "0.14.3", optional = true }
 
 # channel
 hyper-timeout = {version = "0.5", optional = true}

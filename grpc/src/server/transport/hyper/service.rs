@@ -135,8 +135,8 @@ where
                 .map(|d| runtime.sleep(d.saturating_duration_since(Instant::now())));
             // TODO: If the handler task ends without calling `send_trailers` (e.g. it
             // panics), the client gets a generic `INTERNAL`, before or after headers,
-            // because `TaskHandle` can't report how the task ended (panic vs. abort).
-            // Extending `TaskHandle` to report this would allow a more specific status.
+            // because `TaskHandle` can't report that the task panicked. Extending
+            // `TaskHandle` to report this would allow a more specific status.
             let task_handle = runtime.spawn(Box::pin(async move {
                 let options = CallOptions::default();
                 let trailers = with_deadline(
@@ -147,7 +147,11 @@ where
                 // TODO: Consider overriding the handler-returned status (or surfacing a rich
                 // status through `RecvStream::next`) when a transport/framing receive error
                 // (e.g. `RESOURCE_EXHAUSTED` on `max_recv_message_size` exceeded) occurs.
-                tx.send_trailers(trailers).await;
+                // TODO: The deadline doesn't cover sending the trailers, which can wait for
+                // the client to read earlier messages.
+                // This fails only if the client went away, in which case this task is
+                // being aborted and there is nobody left to send the status to.
+                let _ = tx.send_trailers(trailers).await;
             }));
             // Built before awaiting `initial_rx` so that dropping this future aborts the handler.
             let body = ServerResponseBody::streaming(body_rx, task_handle);

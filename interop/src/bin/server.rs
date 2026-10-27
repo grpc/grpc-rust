@@ -112,14 +112,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let test_service = server_protobuf::TestServiceServer::new(
                 server_protobuf::InteropTestService::default(),
             );
-            let unimplemented_service = server_protobuf::UnimplementedServiceServer::new(
-                server_protobuf::UnimplementedInteropService::default(),
-            );
 
             let server = GrpcServer::builder()
                 .interceptor(server_protobuf::EchoHeaders::new())
                 .add_service(test_service)
-                .add_service(unimplemented_service)
                 .build();
 
             let creds: Arc<dyn ServerCredentials> = if matches.use_tls {

@@ -25,20 +25,24 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Use protoc-gen-rust-grpc for tonic_prost_build when it is available
-    #[cfg(feature = "protoc-gen-rust-grpc")]
-    if protoc_gen_rust_grpc::protoc().exists() {
+    // Use protoc-gen-grpc-rust for tonic_prost_build when it is available
+    #[cfg(feature = "protoc-gen-grpc-rust")]
+    if protoc_gen_grpc_rust::protoc().exists() {
         unsafe {
-            std::env::set_var("PROTOC", protoc_gen_rust_grpc::protoc());
+            std::env::set_var("PROTOC", protoc_gen_grpc_rust::protoc());
         }
     }
 
-    let proto = "proto/grpc/testing/test.proto";
-
-    tonic_prost_build::compile_protos(proto).unwrap();
+    tonic_prost_build::configure()
+        .compile_protos(&["grpc/testing/test.proto"], &["proto"])
+        .unwrap();
     grpc_protobuf_build::CodeGen::new()
-        .include("proto/grpc/testing")
-        .inputs(["test.proto", "empty.proto", "messages.proto"])
+        .include("proto")
+        .inputs([
+            "grpc/testing/test.proto",
+            "grpc/testing/empty.proto",
+            "grpc/testing/messages.proto",
+        ])
         .compile()
         .unwrap();
 }

@@ -89,6 +89,7 @@ impl LbPolicyBuilder for PickFirstBuilder {
             // Not yet reported. IDLE, not CONNECTING, so that `update_picker`
             // doesn't drop the first CONNECTING as a repeat.
             connectivity_state: ConnectivityState::Idle,
+            resolution_note: None,
         }
     }
 
@@ -120,6 +121,9 @@ pub(crate) struct PickFirstPolicy {
     // in TRANSIENT_FAILURE keeps reporting TRANSIENT_FAILURE (sticky-TF, gRFC
     // A62), even when the LB's internal state is FirstPass.
     connectivity_state: ConnectivityState,
+    // The resolution note from the latest resolver update. It is added to the
+    // status of every TRANSIENT_FAILURE this policy reports.
+    resolution_note: Option<String>,
 }
 
 impl Debug for PickFirstPolicy {
@@ -127,6 +131,7 @@ impl Debug for PickFirstPolicy {
         f.debug_struct("PickFirstPolicy")
             .field("state", &self.state)
             .field("connectivity_state", &self.connectivity_state)
+            .field("resolution_note", &self.resolution_note)
             .finish_non_exhaustive()
     }
 }
@@ -220,6 +225,7 @@ impl PickFirstPolicy {
             runtime: &self.runtime,
             work_scheduler: &self.work_scheduler,
             connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
             controller,
         };
         let current = std::mem::take(&mut self.state);
@@ -236,13 +242,15 @@ impl PickFirstPolicy {
             runtime: &self.runtime,
             work_scheduler: &self.work_scheduler,
             connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
             controller,
         };
 
         // No previous good update: there is nothing to connect to.
         if matches!(&self.state, PickFirstState::Idle(s) if s.addresses.is_empty()) {
-            self.state = SteadyState::enter(&mut ctx, Vec::new(), error.clone());
-            return Err(error);
+            let err = ctx.format_error(&error);
+            self.state = SteadyState::enter(&mut ctx, Vec::new(), error);
+            return Err(err);
         }
 
         // Keep using the previous addresses. If already failing, surface the
@@ -251,7 +259,7 @@ impl PickFirstPolicy {
             ctx.set_failing_picker(&error);
         }
         // Returning the error tells the resolver to re-resolve with backoff.
-        Err(error)
+        Err(ctx.format_error(&error))
     }
 }
 
@@ -264,6 +272,8 @@ impl LbPolicy for PickFirstPolicy {
         config: &Self::LbConfig,
         controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
+        self.resolution_note = update.resolution_note;
+
         let addresses = match update.endpoints {
             Ok(endpoints) => self.compile_address(endpoints, config),
             Err(error) => return self.resolver_error(error, controller),
@@ -273,6 +283,7 @@ impl LbPolicy for PickFirstPolicy {
             runtime: &self.runtime,
             work_scheduler: &self.work_scheduler,
             connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
             controller,
         };
 
@@ -283,8 +294,9 @@ impl LbPolicy for PickFirstPolicy {
                 Ok(())
             }
             Err(e) => {
-                self.state = SteadyState::enter(&mut ctx, Vec::new(), e.clone());
-                Err(e)
+                let err = ctx.format_error(&e);
+                self.state = SteadyState::enter(&mut ctx, Vec::new(), e);
+                Err(err)
             }
         }
     }
@@ -312,6 +324,7 @@ impl LbPolicy for PickFirstPolicy {
                     runtime: &self.runtime,
                     work_scheduler: &self.work_scheduler,
                     connectivity_state: &mut self.connectivity_state,
+                    resolution_note: self.resolution_note.as_deref(),
                     controller,
                 };
                 let current = std::mem::take(&mut self.state);
@@ -325,6 +338,7 @@ impl LbPolicy for PickFirstPolicy {
             runtime: &self.runtime,
             work_scheduler: &self.work_scheduler,
             connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
             controller,
         };
         let current = std::mem::take(&mut self.state);
@@ -338,6 +352,7 @@ struct PickFirstContext<'a> {
     // The policy's reported connectivity state. Only `update_picker` writes
     // it.
     connectivity_state: &'a mut ConnectivityState,
+    resolution_note: Option<&'a str>,
     // Publish pickers via `update_picker` rather than directly, so that
     // `connectivity_state` stays accurate.
     controller: &'a mut dyn ChannelController,
@@ -368,12 +383,20 @@ impl PickFirstContext<'_> {
         });
     }
 
+    // Includes the resolver's note, which may explain the failure (e.g. why
+    // the address list is empty).
+    fn format_error(&self, err: &str) -> String {
+        match self.resolution_note {
+            Some(note) if !note.is_empty() => format!("{err} ({note})"),
+            _ => err.to_string(),
+        }
+    }
+
     fn set_failing_picker(&mut self, error: &str) {
+        let error = self.format_error(error);
         self.update_picker(
             ConnectivityState::TransientFailure,
-            Arc::new(FailingPicker {
-                error: error.to_string(),
-            }),
+            Arc::new(FailingPicker { error }),
         );
     }
 }
@@ -1212,6 +1235,22 @@ mod test {
             let data = self.expect_timer_work().await;
             self.policy.work(data, &mut self.tcc);
         }
+
+        /// Sends a resolver update with `endpoints` and resolution note
+        /// `note`, using the default config.
+        fn send_resolver_update_with_note(
+            &mut self,
+            endpoints: Vec<Endpoint>,
+            note: &str,
+        ) -> Result<(), String> {
+            let update = ResolverUpdate {
+                endpoints: Ok(endpoints),
+                resolution_note: Some(note.to_string()),
+                ..Default::default()
+            };
+            self.policy
+                .resolver_update(update, &PickFirstConfig::default(), &mut self.tcc)
+        }
     }
 
     // The LB can successfully connect to the first address, and updates the
@@ -1504,6 +1543,57 @@ mod test {
         let res = env.send_resolver_update(vec![]);
         assert_eq!(res.unwrap_err(), "empty address list");
 
+        env.expect_failing_picker("empty address list");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // The resolver's resolution note is added to the error of the
+    // TransientFailure picker, e.g. to explain why the address list is empty.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_empty_update_includes_resolution_note() {
+        let mut env = new_env();
+
+        let res = env.send_resolver_update_with_note(vec![], "no xDS config");
+
+        assert_eq!(res, Err("empty address list (no xDS config)".to_string()));
+        env.expect_failing_picker("empty address list (no xDS config)");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // The resolution note is also added to connection failures.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_connection_failure_includes_resolution_note() {
+        let mut env = new_env();
+        env.send_resolver_update_with_note(create_endpoints(vec!["addr1"], None), "note")
+            .unwrap();
+        let sc1 = env.expect_new_subchannel_for("addr1");
+        env.expect_connect_to("addr1");
+        env.expect_queuing_picker();
+
+        env.send_subchannel_update(
+            &sc1,
+            &SubchannelState::transient_failure("connection refused"),
+        );
+
+        env.expect_failing_picker("connection refused (note)");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // Each resolver update replaces the resolution note, so a note isn't used
+    // after an update without one.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolution_note_replaced_by_next_update() {
+        let mut env = new_env();
+        let _ = env.send_resolver_update_with_note(vec![], "old note");
+        env.expect_failing_picker("empty address list (old note)");
+        env.expect_request_resolution();
+
+        let res = env.send_resolver_update(vec![]);
+
+        assert_eq!(res, Err("empty address list".to_string()));
         env.expect_failing_picker("empty address list");
         env.expect_request_resolution();
         env.expect_no_events();

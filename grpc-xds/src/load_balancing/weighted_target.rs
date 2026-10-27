@@ -59,10 +59,8 @@ use grpc::StatusCodeError;
 use grpc::StatusError;
 use serde::Deserialize;
 
-use crate::wrr::RandomWrr;
-use crate::wrr::RandomWrrBuilder;
-use crate::wrr::Wrr;
-use crate::wrr::WrrBuilder;
+use crate::sampling::WeightedSampler;
+use crate::sampling::WeightedSamplerBuilder;
 
 static POLICY_NAME: &str = "weighted_target_experimental";
 
@@ -86,14 +84,7 @@ struct WeightedTargetConfig {
 
 #[derive(Debug, Default)]
 struct WeightedTargetBuilder {
-    wrr: RandomWrrBuilder,
-}
-
-impl WeightedTargetBuilder {
-    #[cfg(test)]
-    fn with_wrr(wrr: RandomWrrBuilder) -> Self {
-        Self { wrr }
-    }
+    sampler: WeightedSamplerBuilder,
 }
 
 impl LbPolicyBuilder for WeightedTargetBuilder {
@@ -103,7 +94,7 @@ impl LbPolicyBuilder for WeightedTargetBuilder {
         WeightedTargetPolicy {
             child_manager: ChildManager::new(options.runtime, options.work_scheduler),
             weights: HashMap::new(),
-            wrr: self.wrr.clone(),
+            sampler: self.sampler.clone(),
         }
     }
 
@@ -138,7 +129,7 @@ impl LbPolicyBuilder for WeightedTargetBuilder {
 struct WeightedTargetPolicy {
     child_manager: ChildManager<String>,
     weights: HashMap<String, u32>,
-    wrr: RandomWrrBuilder,
+    sampler: WeightedSamplerBuilder,
 }
 
 impl WeightedTargetPolicy {
@@ -157,10 +148,10 @@ impl WeightedTargetPolicy {
             .filter(|(_, child)| child.state().connectivity_state == connectivity_state)
             .map(|(target, child)| (child.state().picker.clone(), self.weights[target]));
 
-        let wrr = self.wrr.build(items);
+        let sampler = self.sampler.build(items);
         channel_controller.update_picker(LbState {
             connectivity_state,
-            picker: Arc::new(WeightedPicker { wrr }),
+            picker: Arc::new(WeightedPicker { sampler }),
         });
     }
 }
@@ -224,15 +215,15 @@ impl LbPolicy for WeightedTargetPolicy {
     }
 }
 
-/// Picker that delegates each pick to a child picker selected by [`RandomWrr`].
+/// Picker that delegates each pick to a child picker selected by [`WeightedSampler`].
 #[derive(Debug)]
 struct WeightedPicker {
-    wrr: RandomWrr<Arc<dyn Picker>>,
+    sampler: WeightedSampler<Arc<dyn Picker>>,
 }
 
 impl Picker for WeightedPicker {
     fn pick(&self, options: PickOptions<'_>) -> PickResult {
-        let Some(child_picker) = self.wrr.next() else {
+        let Some(child_picker) = self.sampler.next() else {
             debug_assert!(
                 false,
                 "WeightedPicker constructed with empty pickers or zero total_weight"
@@ -270,7 +261,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::wrr::test_utils::wrr_builder;
+    use crate::sampling::test_utils::sampler_builder;
 
     #[test]
     fn parse_config() {
@@ -313,7 +304,7 @@ mod tests {
     )]
     fn empty_weighted_picker_is_internal_error() {
         let picker = WeightedPicker {
-            wrr: RandomWrrBuilder::default().build(Vec::new()),
+            sampler: WeightedSamplerBuilder::default().build(Vec::new()),
         };
         let headers = RequestHeaders::new();
         let call_options = CallOptions::new();
@@ -538,11 +529,13 @@ mod tests {
         fn new(keys: &[u64]) -> Self {
             GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder);
             let scheduler = Arc::new(RecordingWorkScheduler::default());
-            let policy =
-                WeightedTargetBuilder::with_wrr(wrr_builder(keys)).build(LbPolicyOptions {
-                    work_scheduler: scheduler.clone(),
-                    runtime: grpc::__unstable::rt::default_runtime(),
-                });
+            let policy = WeightedTargetBuilder {
+                sampler: sampler_builder(keys),
+            }
+            .build(LbPolicyOptions {
+                work_scheduler: scheduler.clone(),
+                runtime: grpc::__unstable::rt::default_runtime(),
+            });
             Self {
                 policy,
                 controller: RecordingChannelController::default(),

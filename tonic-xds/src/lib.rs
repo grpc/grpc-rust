@@ -220,6 +220,7 @@
 //! | Client-side P2C load balancing | | Supported |
 //! | ADS TLS and mTLS credentials | [A65] | Supported |
 //! | TLS endpoint connections | [A29] | Supported |
+//! | xDS config dump via CSDS ([`CsdsService`]) | [A40] | Supported |
 //! | Least-request load balancing | [A48] | Planned |
 //! | Dual-stack endpoints (multiple addresses per endpoint) | [A61] | Planned |
 //!
@@ -252,6 +253,7 @@
 //! [A27]: https://github.com/grpc/proposal/blob/master/A27-xds-global-load-balancing.md
 //! [A28]: https://github.com/grpc/proposal/blob/master/A28-xds-traffic-splitting-and-routing.md
 //! [A29]: https://github.com/grpc/proposal/blob/master/A29-xds-tls-security.md
+//! [A40]: https://github.com/grpc/proposal/blob/master/A40-csds-support.md
 //! [A48]: https://github.com/grpc/proposal/blob/master/A48-xds-least-request-lb-policy.md
 //! [A61]: https://github.com/grpc/proposal/blob/master/A61-IPv4-IPv6-dualstack-backends.md
 //! [A63]: https://github.com/grpc/proposal/blob/master/A63-xds-string-matcher-ignore-case.md
@@ -259,6 +261,7 @@
 
 pub(crate) mod client;
 pub(crate) mod common;
+pub(crate) mod csds;
 pub(crate) mod xds;
 
 pub use client::channel::{
@@ -274,6 +277,7 @@ pub use client::retry::{
 };
 pub use client::route::PreRouteInterceptor;
 pub use common::async_util::BoxFuture;
+pub use csds::CsdsService;
 pub use shared_http_body::SharedBody;
 pub use xds::bootstrap::{
     BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,

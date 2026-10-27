@@ -207,6 +207,7 @@ impl HyperServingConnection {
         let handshake_fut = Box::pin(async move { creds.accept(io, rt_clone, Internal).await });
         // TODO: Also time out the wait for the client's HTTP/2 preface. hyper currently
         // has no timeout or API to wait for it, and graceful shutdown can't interrupt it.
+        // See https://github.com/grpc/grpc-rust/issues/2965.
         let handshake_timer = runtime.sleep(handshake_timeout);
 
         let connection_age_state = match config.get_max_connection_age() {

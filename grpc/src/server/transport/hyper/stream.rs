@@ -138,11 +138,16 @@ impl HyperServerSendStream {
     /// After headers, the trailers are always sent, even for an empty OK:
     /// dropping the stream without calling this method is reported to the
     /// client as `INTERNAL`.
-    pub async fn send_trailers(self, trailers: Trailers) {
+    ///
+    /// Returns `Err` if the response was dropped (e.g. the client reset the
+    /// stream), so the trailers can't be delivered.
+    pub async fn send_trailers(self, trailers: Trailers) -> Result<(), ()> {
         if let Some(initial_tx) = self.initial_tx {
-            let _ = initial_tx.send(InitialResponse::TrailersOnly(trailers));
+            initial_tx
+                .send(InitialResponse::TrailersOnly(trailers))
+                .map_err(|_| ())
         } else {
-            let _ = self.body_tx.send(Err(trailers)).await;
+            self.body_tx.send(Err(trailers)).await.map_err(|_| ())
         }
     }
 }
@@ -180,10 +185,10 @@ impl SendStream for HyperServerSendStream {
 
 /// RAII guard that aborts a spawned [`BoxedTaskHandle`] when dropped.
 ///
-/// Stored inside [`ResponseMessageStream`] from the moment the handler task is
-/// spawned and moved into the streaming [`EncodeBody`] once initial
-/// [`ResponseHeaders`] are received, ensuring that `RST_STREAM` or connection
-/// teardown aborts the spawned `dyn_handle` task immediately.
+/// Owned by [`ResponseMessageStream`] inside the streaming [`EncodeBody`], which
+/// is built before the handler's initial response is awaited. Dropping the
+/// response future or the response body (`RST_STREAM`, connection teardown, or
+/// a `Trailers-Only` response) aborts the handler task.
 struct AbortTaskOnDrop(BoxedTaskHandle);
 
 impl Drop for AbortTaskOnDrop {
@@ -295,8 +300,8 @@ impl Body for ServerResponseBody {
 
 /// Builds an HTTP/2 `Trailers-Only` [`Response`]: an empty body with the gRPC
 /// status and trailing metadata in the initial `HEADERS` frame.
-// TODO: Consider serializing `grpc-status`, `grpc-message`, and trailing metadata
-// directly into the `Response` instead of using `TonicStatus::into_http` as a middleman.
+// TODO: Use our own codec instead of tonic's, so `tonic::Status` doesn't leak
+// into the transport.
 pub fn trailers_only_response<B: Default>(trailers: Trailers) -> Response<B> {
     tonic_status_from_trailers(trailers).into_http()
 }
@@ -590,11 +595,13 @@ mod tests {
             .is_err()
         );
 
-        tx.send_trailers(Trailers::new(Err(StatusError::new(
-            StatusCodeError::Internal,
-            "encode failed",
-        ))))
-        .await;
+        let result = tx
+            .send_trailers(Trailers::new(Err(StatusError::new(
+                StatusCodeError::Internal,
+                "encode failed",
+            ))))
+            .await;
+        assert_eq!(result, Ok(()));
         let initial = headers_rx.await.expect("expected TrailersOnly response");
         let InitialResponse::TrailersOnly(trailers) = initial else {
             panic!("expected TrailersOnly response");
@@ -627,11 +634,13 @@ mod tests {
         let (body_tx, mut body_rx) = mpsc::channel(4);
         let tx = HyperServerSendStream::new(initial_tx, body_tx);
 
-        tx.send_trailers(Trailers::new(Err(StatusError::new(
-            StatusCodeError::Unauthenticated,
-            "missing token",
-        ))))
-        .await;
+        let result = tx
+            .send_trailers(Trailers::new(Err(StatusError::new(
+                StatusCodeError::Unauthenticated,
+                "missing token",
+            ))))
+            .await;
+        assert_eq!(result, Ok(()));
 
         let initial = initial_rx.await.expect("expected initial response");
         let InitialResponse::TrailersOnly(trailers) = initial else {
@@ -665,7 +674,8 @@ mod tests {
     async fn send_trailers_after_headers_with_empty_ok_sends_trailers_on_body_channel() {
         let (tx, mut body_rx) = send_stream_after_headers().await;
 
-        tx.send_trailers(Trailers::new(Ok(()))).await;
+        let result = tx.send_trailers(Trailers::new(Ok(()))).await;
+        assert_eq!(result, Ok(()));
         let item = body_rx.recv().await.expect("expected Err(trailers) item");
         let delivered = item.err().expect("expected Err variant");
         assert!(delivered.status().is_ok());
@@ -677,11 +687,13 @@ mod tests {
     async fn send_trailers_after_headers_with_error_sends_trailers_on_body_channel() {
         let (tx, mut body_rx) = send_stream_after_headers().await;
 
-        tx.send_trailers(Trailers::new(Err(StatusError::new(
-            StatusCodeError::Internal,
-            "mid-stream failure",
-        ))))
-        .await;
+        let result = tx
+            .send_trailers(Trailers::new(Err(StatusError::new(
+                StatusCodeError::Internal,
+                "mid-stream failure",
+            ))))
+            .await;
+        assert_eq!(result, Ok(()));
         let item = body_rx.recv().await.expect("expected Err(trailers) item");
         let trailers = item.err().expect("expected Err variant");
         let err = trailers.status().as_ref().unwrap_err();
@@ -696,8 +708,10 @@ mod tests {
 
         let mut md = MetadataMap::new();
         md.insert("x-trailer-meta", MetadataValue::from_static("present"));
-        tx.send_trailers(Trailers::new(Ok(())).with_metadata(md))
+        let result = tx
+            .send_trailers(Trailers::new(Ok(())).with_metadata(md))
             .await;
+        assert_eq!(result, Ok(()));
 
         let item = body_rx.recv().await.expect("expected Err(trailers) item");
         let delivered = item.err().expect("expected Err variant");
@@ -710,6 +724,26 @@ mod tests {
             Some("present")
         );
         assert!(body_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_trailers_without_headers_fails_when_initial_receiver_dropped() {
+        let (initial_tx, initial_rx) = oneshot::channel();
+        let (body_tx, _body_rx) = mpsc::channel(4);
+        let tx = HyperServerSendStream::new(initial_tx, body_tx);
+        drop(initial_rx);
+
+        let result = tx.send_trailers(Trailers::new(Ok(()))).await;
+        assert_eq!(result, Err(()));
+    }
+
+    #[tokio::test]
+    async fn send_trailers_after_headers_fails_when_body_receiver_dropped() {
+        let (tx, body_rx) = send_stream_after_headers().await;
+        drop(body_rx);
+
+        let result = tx.send_trailers(Trailers::new(Ok(()))).await;
+        assert_eq!(result, Err(()));
     }
 
     #[tokio::test]

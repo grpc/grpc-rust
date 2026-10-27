@@ -31,8 +31,28 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::StatusError;
-use crate::client::interceptor::DynIntercept;
+use crate::client::CallOptions;
+use crate::client::DynInvoke;
+use crate::client::DynRecvStream;
+use crate::client::DynSendStream;
+use crate::client::RequestHeaders;
 use crate::client::name_resolution::ResolverUpdate;
+
+/// A dyn-compatible version of
+/// [`Intercept`](crate::client::interceptor::Intercept).
+#[crate::async_trait]
+pub trait DynIntercept: Send + Sync {
+    /// A dynamic version of
+    /// [`Intercept::intercept`](crate::client::interceptor::Intercept::intercept).
+    /// `next` is owned by the interceptor, which may clone it and keep it for
+    /// as long as it likes.
+    async fn dyn_intercept(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        next: Arc<dyn DynInvoke>,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
+}
 
 /// The configuration to apply to a single RPC, as chosen by a
 /// [`ConfigSelector`].

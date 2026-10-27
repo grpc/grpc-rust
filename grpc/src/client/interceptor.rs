@@ -24,12 +24,7 @@
 
 //! Definitions and utilities for client-side interceptors.
 
-use std::sync::Arc;
-
 use crate::client::CallOptions;
-use crate::client::DynInvoke;
-use crate::client::DynRecvStream;
-use crate::client::DynSendStream;
 use crate::client::Invoke;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
@@ -286,19 +281,6 @@ pub trait InvokeOnceExt: InvokeOnce + Sized {
 
 impl<T: Invoke + Sized> InvokeExt for T {}
 impl<T: InvokeOnce + Sized> InvokeOnceExt for T {}
-
-/// A dyn-compatible version of [`Intercept`].
-#[crate::async_trait]
-pub trait DynIntercept: Send + Sync {
-    /// A dynamic version of [`Intercept::intercept`].  `next` is owned by the
-    /// interceptor, which may clone it and keep it for as long as it likes.
-    async fn dyn_intercept(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-        next: Arc<dyn DynInvoke>,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
-}
 
 // Tests for Intercepted and InterceptedOnce and examples of the four types of
 // interceptors, how they are implemented, and how they are combined with

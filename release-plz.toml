@@ -68,5 +68,11 @@ name = "grpc-protobuf-build"
 release = false
 
 [[package]]
-name = "protoc-gen-rust-grpc"
+name = "grpc-rustls"
 release = false
+publish = false
+
+[[package]]
+name = "protoc-gen-grpc-rust"
+release = false
+publish = false

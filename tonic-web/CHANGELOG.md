@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.8](https://github.com/grpc/grpc-rust/compare/tonic-web-v0.14.7...tonic-web-v0.14.8) - 2026-10-27
+
+### Fixed
+
+- *(tonic-web)* fix dropped trailers in combined streaming call. ([#2474](https://github.com/grpc/grpc-rust/pull/2474))
+
+## [0.14.7](https://github.com/grpc/grpc-rust/compare/tonic-web-v0.14.6...tonic-web-v0.14.7) - 2026-10-26
+
+### Other
+
+- fix changelog duplicate and update repository URLs ([#2943](https://github.com/grpc/grpc-rust/pull/2943))
+- License update ([#2749](https://github.com/grpc/grpc-rust/pull/2749))
+
 ## [0.14.6](https://github.com/hyperium/tonic/compare/tonic-web-v0.14.5...tonic-web-v0.14.6) - 2026-05-06
 
 ### Other

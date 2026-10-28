@@ -146,7 +146,13 @@ impl WeightedTargetPolicy {
             .child_manager
             .children()
             .filter(|(_, child)| child.state().connectivity_state == connectivity_state)
-            .map(|(target, child)| (child.state().picker.clone(), self.weights[target]));
+            .map(|(target, child)| {
+                let weight = *self
+                    .weights
+                    .get(target)
+                    .expect("every child should have a weight");
+                (child.state().picker.clone(), weight)
+            });
 
         let sampler = self.sampler.build(items);
         channel_controller.update_picker(LbState {
@@ -161,23 +167,22 @@ impl LbPolicy for WeightedTargetPolicy {
 
     fn resolver_update(
         &mut self,
-        update: ResolverUpdate,
+        mut update: ResolverUpdate,
         config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let mut grouped_endpoints = update.endpoints.map(endpoint_filtering::group_by_path);
+        let mut grouped_endpoints = std::mem::replace(&mut update.endpoints, Ok(Vec::new()))
+            .map(endpoint_filtering::group_by_path);
 
         let child_updates = config.targets.iter().map(|(target_name, target_config)| {
-            let mut child_update = ResolverUpdate::default();
-            child_update.attributes = update
-                .attributes
-                .add(TargetName(Arc::from(target_name.as_str())));
-            child_update.endpoints = match &mut grouped_endpoints {
+            let endpoints = match &mut grouped_endpoints {
                 Ok(grouped) => Ok(grouped.remove(target_name).unwrap_or_default()),
                 Err(err) => Err(err.clone()),
             };
-            child_update.service_config = update.service_config.clone();
-            child_update.resolution_note = update.resolution_note.clone();
+            let mut child_update = update.with_endpoints(endpoints);
+            child_update.attributes = child_update
+                .attributes
+                .add(TargetName(Arc::from(target_name.as_str())));
 
             ChildUpdate {
                 child_identifier: target_name.clone(),

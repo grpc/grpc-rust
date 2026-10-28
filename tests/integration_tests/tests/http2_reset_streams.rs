@@ -28,6 +28,7 @@
 //! it reset the stream again and count that reset, and too many of those close
 //! the connection with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_internal_resets")`.
 
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +56,19 @@ const LATE_FRAMES: usize = 40;
 
 type Writer = Arc<Mutex<OwnedWriteHalf>>;
 
+/// How the connection ended, as the server saw it.
+#[derive(Debug, PartialEq)]
+enum End {
+    /// The connection stayed open.
+    Open,
+    /// The client sent `GOAWAY` with this debug data.
+    GoAway(String),
+    /// The connection was reset before the server read a `GOAWAY`. A client
+    /// that closes the socket with unread late DATA resets the connection, and
+    /// Windows then discards the `GOAWAY` that the server did not read yet.
+    Reset,
+}
+
 /// Writes one frame. It returns `false` if the client closed the connection.
 async fn write_frame(io: &Writer, kind: u8, flags: u8, stream: u32, payload: &[u8]) -> bool {
     let length = u32::try_from(payload.len()).unwrap().to_be_bytes();
@@ -66,13 +80,9 @@ async fn write_frame(io: &Writer, kind: u8, flags: u8, stream: u32, payload: &[u
 
 /// An HTTP/2 server that answers each request with headers only. After the
 /// client resets `STREAMS` streams, it sends `LATE_FRAMES` DATA frames on each
-/// of them. It returns the debug data of the `GOAWAY` that the client sends, if
-/// any.
-///
-/// A separate task writes the late DATA, so that the server keeps reading while
-/// it writes. On Windows, a write after the client closed the connection resets
-/// it, and the reset discards a `GOAWAY` that the server did not read yet.
-async fn late_data_server(listener: TcpListener) -> Option<String> {
+/// of them. A separate task writes the late DATA, so that the server keeps
+/// reading while it writes.
+async fn late_data_server(listener: TcpListener) -> End {
     let (io, _) = listener.accept().await.unwrap();
     let (mut reader, writer) = io.into_split();
     let writer: Writer = Arc::new(Mutex::new(writer));
@@ -84,9 +94,14 @@ async fn late_data_server(listener: TcpListener) -> Option<String> {
         let mut header = [0_u8; 9];
         let read =
             tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut header)).await;
-        // Only a quiet connection means "no GOAWAY".
-        let Ok(read) = read else { return None };
-        read.expect("the client closed the connection without GOAWAY");
+        // Only a quiet connection means that it stayed open.
+        let Ok(read) = read else { return End::Open };
+        if let Err(error) = read {
+            match error.kind() {
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => return End::Reset,
+                _ => panic!("the client closed the connection without GOAWAY: {error}"),
+            }
+        }
         let length =
             usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
         let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
@@ -121,14 +136,14 @@ async fn late_data_server(listener: TcpListener) -> Option<String> {
                     });
                 }
             }
-            GOAWAY => return Some(String::from_utf8_lossy(&payload[8..]).into_owned()),
+            GOAWAY => return End::GoAway(String::from_utf8_lossy(&payload[8..]).into_owned()),
             _ => {}
         }
     }
 }
 
 /// Resets `STREAMS` streams, then lets the server send late DATA on all of them.
-async fn late_data_goaway(configure: impl FnOnce(Endpoint) -> Endpoint) -> Option<String> {
+async fn late_data_end(configure: impl FnOnce(Endpoint) -> Endpoint) -> End {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(late_data_server(listener));
@@ -150,37 +165,40 @@ async fn late_data_goaway(configure: impl FnOnce(Endpoint) -> Endpoint) -> Optio
 
 #[tokio::test]
 async fn late_data_on_remembered_reset_streams_keeps_the_connection() {
-    let goaway = late_data_goaway(|endpoint| {
+    let end = late_data_end(|endpoint| {
         endpoint
             .http2_max_concurrent_reset_streams(10_000)
             .http2_reset_stream_duration(Duration::from_secs(10))
     })
     .await;
-    assert_eq!(goaway, None);
+    assert_eq!(end, End::Open);
 }
 
 /// With the defaults, the same late DATA closes the connection. This shows that
 /// the test above makes the failure that the settings prevent.
 #[tokio::test]
 async fn late_data_on_forgotten_reset_streams_closes_the_connection() {
-    let goaway = late_data_goaway(|endpoint| endpoint).await;
-    assert_eq!(goaway.as_deref(), Some("too_many_internal_resets"));
+    let end = late_data_end(|endpoint| endpoint).await;
+    assert!(
+        matches!(&end, End::GoAway(debug) if debug == "too_many_internal_resets")
+            || (cfg!(windows) && end == End::Reset),
+        "{end:?}"
+    );
 }
 
 /// With the limit disabled, the same late DATA does not close the connection.
 #[tokio::test]
 async fn late_data_without_the_local_error_reset_limit_keeps_the_connection() {
-    let goaway =
-        late_data_goaway(|endpoint| endpoint.http2_max_local_error_reset_streams(None)).await;
-    assert_eq!(goaway, None);
+    let end = late_data_end(|endpoint| endpoint.http2_max_local_error_reset_streams(None)).await;
+    assert_eq!(end, End::Open);
 }
 
 /// A limit above the late DATA that the server sends keeps the connection.
 #[tokio::test]
 async fn late_data_below_a_raised_local_error_reset_limit_keeps_the_connection() {
-    let goaway = late_data_goaway(|endpoint| {
+    let end = late_data_end(|endpoint| {
         endpoint.http2_max_local_error_reset_streams(STREAMS as usize * LATE_FRAMES)
     })
     .await;
-    assert_eq!(goaway, None);
+    assert_eq!(end, End::Open);
 }

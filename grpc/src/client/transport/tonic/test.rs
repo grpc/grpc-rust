@@ -23,6 +23,7 @@
  */
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::result::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,8 @@ use http::HeaderValue;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status as TonicStatus;
 use tonic::metadata::MetadataMap as TonicMetadata;
@@ -1662,7 +1665,7 @@ fn recv_stream_after_send_failure(
     resp_tx.send(result).unwrap();
     let call = Arc::new(super::CallState {
         cancel_tx: tonic::Request::new(()).cancellation_handle(),
-        send_failure: Default::default(),
+        send_failure: Arc::default(),
     });
     call.fail_send(StatusError::new(
         StatusCodeError::Internal,
@@ -1689,4 +1692,79 @@ async fn tonic_recv_stream_reports_received_status_after_send_failure() {
         assert_eq!(status_err.code(), StatusCodeError::from(code as i32));
         assert_eq!(status_err.message(), "server status");
     }
+}
+
+// Records, each time the request body is woken, whether the send failure was
+// already recorded.
+struct SendFailureProbe {
+    send_failure: Arc<super::SendFailure>,
+    recorded_at_wake: std::sync::Mutex<Vec<bool>>,
+}
+
+impl std::task::Wake for SendFailureProbe {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let recorded = self.send_failure.get().is_some();
+        self.recorded_at_wake.lock().unwrap().push(recorded);
+    }
+}
+
+// A request body that ends normally lets the server treat a cut-short request
+// as complete, so after a send failure the body must only end by cancellation.
+// The race this guards against needs a concurrent poll of the body, so the
+// test observes the body directly: the request channel wakes it when it
+// closes, and the failure must be recorded by then.
+#[tokio::test]
+async fn tonic_send_encode_error_never_ends_request_body() {
+    let new_streams = || {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let send_failure = Arc::new(super::SendFailure::default());
+        let body = super::RequestStream {
+            rx: ReceiverStream::new(rx),
+            send_failure: send_failure.clone(),
+        };
+        let call = Arc::new(super::CallState {
+            cancel_tx: tonic::Request::new(()).cancellation_handle(),
+            send_failure: send_failure.clone(),
+        });
+        let send = super::TonicSendStream {
+            state: super::SendState::Open { tx, call },
+        };
+        (send, body, send_failure)
+    };
+
+    // Without a send failure, the final message ends the body.
+    let (mut send, mut body, _) = new_streams();
+    let req = WrappedEchoRequest(EchoRequest::default());
+    send.send(&req, SendOptions::default().with_final_msg(true))
+        .await
+        .unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        Pin::new(&mut body).poll_next(&mut cx),
+        std::task::Poll::Ready(Some(_))
+    ));
+    assert!(matches!(
+        Pin::new(&mut body).poll_next(&mut cx),
+        std::task::Poll::Ready(None)
+    ));
+
+    let (mut send, mut body, send_failure) = new_streams();
+    let probe = Arc::new(SendFailureProbe {
+        send_failure,
+        recorded_at_wake: Default::default(),
+    });
+    let waker = std::task::Waker::from(probe.clone());
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(Pin::new(&mut body).poll_next(&mut cx).is_pending());
+    assert!(
+        send.send(&FailingEncodeRequest, SendOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(*probe.recorded_at_wake.lock().unwrap(), vec![true]);
+    assert!(Pin::new(&mut body).poll_next(&mut cx).is_pending());
 }

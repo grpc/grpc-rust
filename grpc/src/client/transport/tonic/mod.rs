@@ -155,7 +155,11 @@ impl Invoke for TonicTransport {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::channel(1);
-        let request_stream = ReceiverStream::new(req_rx);
+        let send_failure = Arc::new(SendFailure::default());
+        let request_stream = RequestStream {
+            rx: ReceiverStream::new(req_rx),
+            send_failure: send_failure.clone(),
+        };
         let mut request = TonicRequest::new(Box::pin(request_stream));
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
@@ -202,7 +206,7 @@ impl Invoke for TonicTransport {
 
         let call = Arc::new(CallState {
             cancel_tx,
-            send_failure: SendFailure::default(),
+            send_failure,
         });
         (
             TonicSendStream {
@@ -267,10 +271,32 @@ impl SendFailure {
     }
 }
 
+/// The request message stream given to tonic.  Once the send stream fails the
+/// call, it never ends, so the request body cannot end normally before tonic
+/// observes the cancellation.
+///
+/// TODO: remove once https://github.com/grpc/grpc-rust/pull/2985 lands.
+struct RequestStream {
+    rx: ReceiverStream<BoxBuf>,
+    send_failure: Arc<SendFailure>,
+}
+
+impl Stream for RequestStream {
+    type Item = BoxBuf;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<BoxBuf>> {
+        match Pin::new(&mut self.rx).poll_next(cx) {
+            // The send stream records the failure before it drops the sender.
+            Poll::Ready(None) if self.send_failure.get().is_some() => Poll::Pending,
+            poll => poll,
+        }
+    }
+}
+
 /// State shared by the send and recv streams of a call.
 struct CallState {
     cancel_tx: CancellationHandle,
-    send_failure: SendFailure,
+    send_failure: Arc<SendFailure>,
 }
 
 impl CallState {
@@ -303,8 +329,8 @@ impl SendState {
         let SendState::Open { tx, call } = std::mem::replace(self, SendState::Closed) else {
             return;
         };
-        // Cancel before closing the request channel, which ends the request
-        // body normally.
+        // RequestStream relies on the failure being recorded before the
+        // request channel closes.
         call.fail_send(status);
         drop(tx);
     }

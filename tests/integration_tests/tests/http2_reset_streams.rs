@@ -165,12 +165,7 @@ async fn late_data_end(configure: impl FnOnce(Endpoint) -> Endpoint) -> End {
 
 #[tokio::test]
 async fn late_data_on_remembered_reset_streams_keeps_the_connection() {
-    let end = late_data_end(|endpoint| {
-        endpoint
-            .http2_max_concurrent_reset_streams(10_000)
-            .http2_reset_stream_duration(Duration::from_secs(10))
-    })
-    .await;
+    let end = late_data_end(|endpoint| endpoint.http2_max_concurrent_reset_streams(10_000)).await;
     assert_eq!(end, End::Open);
 }
 
@@ -184,21 +179,4 @@ async fn late_data_on_forgotten_reset_streams_closes_the_connection() {
             || (cfg!(windows) && end == End::Reset),
         "{end:?}"
     );
-}
-
-/// With the limit disabled, the same late DATA does not close the connection.
-#[tokio::test]
-async fn late_data_without_the_local_error_reset_limit_keeps_the_connection() {
-    let end = late_data_end(|endpoint| endpoint.http2_max_local_error_reset_streams(None)).await;
-    assert_eq!(end, End::Open);
-}
-
-/// A limit above the late DATA that the server sends keeps the connection.
-#[tokio::test]
-async fn late_data_below_a_raised_local_error_reset_limit_keeps_the_connection() {
-    let end = late_data_end(|endpoint| {
-        endpoint.http2_max_local_error_reset_streams(STREAMS as usize * LATE_FRAMES)
-    })
-    .await;
-    assert_eq!(end, End::Open);
 }

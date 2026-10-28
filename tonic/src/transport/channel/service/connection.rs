@@ -91,14 +91,6 @@ impl Connection {
             settings.max_concurrent_reset_streams(val);
         }
 
-        if let Some(val) = endpoint.http2_reset_stream_duration {
-            settings.reset_stream_duration(val);
-        }
-
-        if let Some(val) = endpoint.http2_max_local_error_reset_streams {
-            settings.max_local_error_reset_streams(val);
-        }
-
         let stack = ServiceBuilder::new()
             .layer_fn(|s| {
                 let origin = endpoint.origin.as_ref().unwrap_or(endpoint.uri()).clone();

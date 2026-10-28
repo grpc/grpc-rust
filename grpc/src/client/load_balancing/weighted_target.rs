@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::Once;
 
 use serde::Deserialize;
 
@@ -63,6 +64,7 @@ use crate::client::load_balancing::sampling::WeightedSamplerBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 
 static POLICY_NAME: &str = "weighted_target_experimental";
+static START: Once = Once::new();
 
 /// Resolver attribute carrying the name of the target a child serves.
 ///
@@ -78,12 +80,12 @@ struct TargetConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct WeightedTargetConfig {
+pub(super) struct WeightedTargetConfig {
     targets: BTreeMap<String, TargetConfig>,
 }
 
 #[derive(Debug, Default)]
-struct WeightedTargetBuilder {
+pub(super) struct WeightedTargetBuilder {
     sampler: WeightedSamplerBuilder,
 }
 
@@ -126,7 +128,7 @@ impl LbPolicyBuilder for WeightedTargetBuilder {
 }
 
 #[derive(Debug)]
-struct WeightedTargetPolicy {
+pub(super) struct WeightedTargetPolicy {
     child_manager: ChildManager<String>,
     weights: HashMap<String, u32>,
     sampler: WeightedSamplerBuilder,
@@ -244,8 +246,10 @@ impl Picker for WeightedPicker {
 }
 
 /// Register weighted target as an LbPolicy.
-fn reg() {
-    GLOBAL_LB_REGISTRY.add_builder(WeightedTargetBuilder::default());
+pub(crate) fn reg() {
+    START.call_once(|| {
+        GLOBAL_LB_REGISTRY.add_builder(WeightedTargetBuilder::default());
+    });
 }
 
 #[cfg(test)]

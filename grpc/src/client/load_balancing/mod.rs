@@ -42,9 +42,9 @@ use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
 pub(crate) mod subchannel_sharing;
+pub(crate) mod weighted_target;
 
 mod sampling;
-mod weighted_target;
 
 pub mod child_manager;
 pub mod endpoint_filtering;

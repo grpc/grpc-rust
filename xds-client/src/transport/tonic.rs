@@ -80,10 +80,15 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// stream pends forever and the client keeps serving its last known
 /// resources. Keepalives surface such connections as transport errors, which
 /// triggers the worker's reconnect + re-subscribe path.
-const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// Five minutes matches other gRPC clients' default keepalive.
+/// Also matches the A8 server side `PERMIT_KEEPALIVE_TIME` default.
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Default time to wait for a keepalive PING ack before closing the connection.
-const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Matches other gRPC clients' default keepalive timeout.
+const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A codec that passes bytes through without serialization.
 ///
@@ -461,6 +466,9 @@ impl Transport for TonicTransport {
             grpc = grpc.max_encoding_message_size(limit);
         }
 
+        // The worker uses new_stream() completion as its resource-timer readiness
+        // fallback. This checks service capacity, not channel connectivity or ADS
+        // stream dispatch; the streaming RPC is started when the receiver is polled.
         grpc.ready()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;

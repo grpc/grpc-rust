@@ -306,6 +306,29 @@ impl Default for ResolverUpdate {
     }
 }
 
+impl ResolverUpdate {
+    /// Returns a copy of this update with `endpoints` replaced and every other
+    /// field cloned.
+    ///
+    /// LB policies that shard an update across children should use this
+    /// rather than constructing a new `ResolverUpdate`, so that no fields are
+    /// accidentally dropped.
+    pub fn with_endpoints(&self, endpoints: Result<Vec<Endpoint>, String>) -> Self {
+        let Self {
+            attributes,
+            endpoints: _,
+            service_config,
+            resolution_note,
+        } = self;
+        Self {
+            attributes: attributes.clone(),
+            endpoints,
+            service_config: service_config.clone(),
+            resolution_note: resolution_note.clone(),
+        }
+    }
+}
+
 /// An Endpoint is an address or a collection of addresses which reference one
 /// logical server.  Multiple addresses may be used if there are multiple ways
 /// which the server can be reached, e.g. via IPv4 and IPv6 addresses.

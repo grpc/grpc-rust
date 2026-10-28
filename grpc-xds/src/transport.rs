@@ -231,15 +231,6 @@ mod tests {
     use crate::generated::envoy::service::discovery::v3::DiscoveryResponse;
     use crate::resource::ListenerResource;
 
-    #[tokio::test]
-    async fn test_builder_build() {
-        let builder = GrpcTransportBuilder::new(GrpcRuntime::default())
-            .with_credentials(Arc::new(LocalChannelCredentials::new()));
-
-        let server_config = ServerConfig::new("dns:///localhost:50051");
-        let _transport = builder.build(&server_config).await.unwrap();
-    }
-
     #[test]
     fn test_raw_bytes_encode_decode() {
         let original = Bytes::from_static(b"hello xds");

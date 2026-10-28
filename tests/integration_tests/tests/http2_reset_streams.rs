@@ -28,10 +28,13 @@
 //! it reset the stream again and count that reset, and too many of those close
 //! the connection with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_internal_resets")`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tonic::body::Body;
 use tonic::transport::Endpoint;
 use tower::ServiceExt;
@@ -50,28 +53,37 @@ const STREAMS: u32 = 100;
 /// streams get more than 1024 of them in total.
 const LATE_FRAMES: usize = 40;
 
-async fn write_frame(io: &mut TcpStream, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
+type Writer = Arc<Mutex<OwnedWriteHalf>>;
+
+/// Writes one frame. It returns `false` if the client closed the connection.
+async fn write_frame(io: &Writer, kind: u8, flags: u8, stream: u32, payload: &[u8]) -> bool {
     let length = u32::try_from(payload.len()).unwrap().to_be_bytes();
     let mut frame = vec![length[1], length[2], length[3], kind, flags];
     frame.extend_from_slice(&stream.to_be_bytes());
     frame.extend_from_slice(payload);
-    // The client can close the connection while the late DATA goes out.
-    let _ = io.write_all(&frame).await;
+    io.lock().await.write_all(&frame).await.is_ok()
 }
 
 /// An HTTP/2 server that answers each request with headers only. After the
 /// client resets `STREAMS` streams, it sends `LATE_FRAMES` DATA frames on each
 /// of them. It returns the debug data of the `GOAWAY` that the client sends, if
 /// any.
+///
+/// A separate task writes the late DATA, so that the server keeps reading while
+/// it writes. On Windows, a write after the client closed the connection resets
+/// it, and the reset discards a `GOAWAY` that the server did not read yet.
 async fn late_data_server(listener: TcpListener) -> Option<String> {
-    let (mut io, _) = listener.accept().await.unwrap();
+    let (io, _) = listener.accept().await.unwrap();
+    let (mut reader, writer) = io.into_split();
+    let writer: Writer = Arc::new(Mutex::new(writer));
     let mut preface = [0_u8; 24];
-    io.read_exact(&mut preface).await.unwrap();
-    write_frame(&mut io, SETTINGS, 0, 0, &[]).await;
+    reader.read_exact(&mut preface).await.unwrap();
+    write_frame(&writer, SETTINGS, 0, 0, &[]).await;
     let mut reset = Vec::new();
     loop {
         let mut header = [0_u8; 9];
-        let read = tokio::time::timeout(Duration::from_secs(2), io.read_exact(&mut header)).await;
+        let read =
+            tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut header)).await;
         // Only a quiet connection means "no GOAWAY".
         let Ok(read) = read else { return None };
         read.expect("the client closed the connection without GOAWAY");
@@ -79,22 +91,34 @@ async fn late_data_server(listener: TcpListener) -> Option<String> {
             usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
         let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
         let mut payload = vec![0_u8; length];
-        io.read_exact(&mut payload).await.unwrap();
+        reader.read_exact(&mut payload).await.unwrap();
         match header[3] {
-            SETTINGS if header[4] & ACK == 0 => write_frame(&mut io, SETTINGS, ACK, 0, &[]).await,
-            PING if header[4] & ACK == 0 => write_frame(&mut io, PING, ACK, 0, &payload).await,
+            SETTINGS if header[4] & ACK == 0 => {
+                write_frame(&writer, SETTINGS, ACK, 0, &[]).await;
+            }
+            PING if header[4] & ACK == 0 => {
+                write_frame(&writer, PING, ACK, 0, &payload).await;
+            }
             // `0x88` is `:status: 200` from the HPACK static table.
-            HEADERS => write_frame(&mut io, HEADERS, END_HEADERS, stream, &[0x88]).await,
+            HEADERS => {
+                write_frame(&writer, HEADERS, END_HEADERS, stream, &[0x88]).await;
+            }
             RST_STREAM => {
                 reset.push(stream);
                 if reset.len() == STREAMS as usize {
-                    // Frames above 256 bytes, so that h2 does not count them as small frames.
-                    let late = [0_u8; 1024];
-                    for _ in 0..LATE_FRAMES {
-                        for &stream in &reset {
-                            write_frame(&mut io, DATA, 0, stream, &late).await;
+                    let writer = writer.clone();
+                    let reset = reset.clone();
+                    tokio::spawn(async move {
+                        // Frames above 256 bytes, so that h2 does not count them as small frames.
+                        let late = [0_u8; 1024];
+                        for _ in 0..LATE_FRAMES {
+                            for &stream in &reset {
+                                if !write_frame(&writer, DATA, 0, stream, &late).await {
+                                    return;
+                                }
+                            }
                         }
-                    }
+                    });
                 }
             }
             GOAWAY => return Some(String::from_utf8_lossy(&payload[8..]).into_owned()),

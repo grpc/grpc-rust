@@ -213,7 +213,6 @@ impl RecvMessage for RawBytesBuffer {
 mod tests {
     use std::collections::HashMap;
 
-    use grpc::credentials::LocalChannelCredentials;
     use protobuf::Parse as _;
     use protobuf::Serialize as _;
     use xds_client::ClientConfig;

@@ -1197,6 +1197,12 @@ mod test {
                 .collect()
         }
 
+        // Verifies that the policy asked the subchannel for `addr` to connect.
+        fn expect_connect_to(&mut self, addr: &str) {
+            let got = self.expect_connect();
+            assert_eq!(&*got.address, addr);
+        }
+
         // Advances virtual time by `duration` on the paused Tokio runtime,
         // yielding before and after so spawned timer tasks can register on the
         // timer wheel and schedule their completion work.

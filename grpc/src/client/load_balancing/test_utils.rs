@@ -292,13 +292,6 @@ impl<P> TestEnv<P> {
         }
     }
 
-    /// Calls [`Self::expect_connect`] and verifies that the connected
-    /// subchannel's address equals `addr`.
-    pub(crate) fn expect_connect_to(&mut self, addr: &str) {
-        let got = self.expect_connect();
-        assert_eq!(&*got.address, addr);
-    }
-
     /// Verifies that the policy produced a new picker, and returns the
     /// [`LbState`] containing the connectivity state and picker without
     /// inspecting either.

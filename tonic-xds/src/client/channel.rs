@@ -50,6 +50,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 #[cfg(feature = "_tls-any")]
@@ -68,6 +69,7 @@ pub struct XdsChannelConfig {
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
+    ads_keep_alive: Option<(Option<Duration>, Duration)>,
 }
 
 impl XdsChannelConfig {
@@ -80,6 +82,7 @@ impl XdsChannelConfig {
             call_creds: None,
             max_decoding_message_size: None,
             max_encoding_message_size: None,
+            ads_keep_alive: None,
         }
     }
 
@@ -130,6 +133,21 @@ impl XdsChannelConfig {
     /// Defaults to tonic's `usize::MAX`.
     pub fn with_max_encoding_message_size(mut self, limit: usize) -> Self {
         self.max_encoding_message_size = Some(limit);
+        self
+    }
+
+    /// Configure HTTP/2 keepalives on the ADS connection.
+    ///
+    /// A PING is sent every `interval`. If no ack arrives within `timeout`, the
+    /// connection is closed and the client reconnects and re-subscribes. Pass
+    /// `interval = None` to disable keepalives. Defaults to the ADS transport's
+    /// keepalive settings.
+    ///
+    /// gRPC servers by default close connections that PING more often than
+    /// every 5 minutes with GOAWAY `too_many_pings` (gRFC A8), so keep
+    /// `interval` at or above the control plane's minimum.
+    pub fn with_ads_keep_alive(mut self, interval: Option<Duration>, timeout: Duration) -> Self {
+        self.ads_keep_alive = Some((interval, timeout));
         self
     }
 }
@@ -483,6 +501,9 @@ impl XdsChannelBuilder {
         }
         if let Some(limit) = self.config.max_encoding_message_size {
             transport_builder = transport_builder.with_max_encoding_message_size(limit);
+        }
+        if let Some((interval, timeout)) = self.config.ads_keep_alive {
+            transport_builder = transport_builder.with_keep_alive(interval, timeout);
         }
 
         #[cfg(feature = "_tls-any")]

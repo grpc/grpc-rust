@@ -39,28 +39,28 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use grpc::__unstable::client::load_balancing::ChannelController;
-use grpc::__unstable::client::load_balancing::LbConfigJson;
-use grpc::__unstable::client::load_balancing::LbPolicy;
-use grpc::__unstable::client::load_balancing::LbPolicyBuilder;
-use grpc::__unstable::client::load_balancing::LbPolicyOptions;
-use grpc::__unstable::client::load_balancing::LbState;
-use grpc::__unstable::client::load_balancing::ParsedLbConfig;
-use grpc::__unstable::client::load_balancing::PickOptions;
-use grpc::__unstable::client::load_balancing::PickResult;
-use grpc::__unstable::client::load_balancing::Picker;
-use grpc::__unstable::client::load_balancing::WorkData;
-use grpc::__unstable::client::load_balancing::child_manager::ChildManager;
-use grpc::__unstable::client::load_balancing::child_manager::ChildUpdate;
-use grpc::__unstable::client::load_balancing::endpoint_filtering;
-use grpc::__unstable::client::load_balancing::registry::GLOBAL_LB_REGISTRY;
-use grpc::__unstable::client::name_resolution::ResolverUpdate;
-use grpc::StatusCodeError;
-use grpc::StatusError;
 use serde::Deserialize;
 
-use crate::sampling::WeightedSampler;
-use crate::sampling::WeightedSamplerBuilder;
+use crate::StatusCodeError;
+use crate::StatusError;
+use crate::client::load_balancing::ChannelController;
+use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+use crate::client::load_balancing::LbConfigJson;
+use crate::client::load_balancing::LbPolicy;
+use crate::client::load_balancing::LbPolicyBuilder;
+use crate::client::load_balancing::LbPolicyOptions;
+use crate::client::load_balancing::LbState;
+use crate::client::load_balancing::ParsedLbConfig;
+use crate::client::load_balancing::PickOptions;
+use crate::client::load_balancing::PickResult;
+use crate::client::load_balancing::Picker;
+use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::child_manager::ChildManager;
+use crate::client::load_balancing::child_manager::ChildUpdate;
+use crate::client::load_balancing::endpoint_filtering;
+use crate::client::load_balancing::sampling::WeightedSampler;
+use crate::client::load_balancing::sampling::WeightedSamplerBuilder;
+use crate::client::name_resolution::ResolverUpdate;
 
 static POLICY_NAME: &str = "weighted_target_experimental";
 
@@ -244,7 +244,7 @@ impl Picker for WeightedPicker {
 }
 
 /// Register weighted target as an LbPolicy.
-pub(crate) fn reg() {
+fn reg() {
     GLOBAL_LB_REGISTRY.add_builder(WeightedTargetBuilder::default());
 }
 
@@ -252,21 +252,23 @@ pub(crate) fn reg() {
 mod tests {
     use std::sync::Mutex;
 
-    use grpc::__unstable::client::load_balancing::WorkScheduler;
-    use grpc::__unstable::client::load_balancing::endpoint_filtering::set_path_in_endpoint;
-    use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
-    use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
-    use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
-    use grpc::__unstable::client::name_resolution::Endpoint;
-    use grpc::client::CallOptions;
-    use grpc::client::ConnectivityState;
-    use grpc::client::RequestHeaders;
-    use grpc::core::Address;
     use serde::Serialize;
     use serde_json::json;
 
     use super::*;
-    use crate::sampling::test_utils::sampler_builder;
+    use crate::attributes::Attributes;
+    use crate::client::CallOptions;
+    use crate::client::ConnectivityState;
+    use crate::client::RequestHeaders;
+    use crate::client::load_balancing::WorkScheduler;
+    use crate::client::load_balancing::endpoint_filtering::set_path_in_endpoint;
+    use crate::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
+    use crate::client::load_balancing::sampling::test_utils::sampler_builder;
+    use crate::client::load_balancing::subchannel::Subchannel;
+    use crate::client::load_balancing::subchannel::SubchannelState;
+    use crate::client::name_resolution::Endpoint;
+    use crate::core::Address;
+    use crate::rt::default_runtime;
 
     #[test]
     fn parse_config() {
@@ -322,13 +324,15 @@ mod tests {
     #[test]
     fn resolver_update_splits_endpoints_and_injects_target_name() {
         let mut t = Harness::new(&[0, 30]);
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Ok(vec![
-            endpoint(&["a", "a1"]),
-            endpoint(&["b", "b1"]),
-            endpoint(&["b", "b2"]),
-            endpoint(&["c", "c1"]),
-        ]);
+        let update = ResolverUpdate {
+            endpoints: Ok(vec![
+                endpoint(&["a", "a1"]),
+                endpoint(&["b", "b1"]),
+                endpoint(&["b", "b2"]),
+                endpoint(&["c", "c1"]),
+            ]),
+            ..Default::default()
+        };
         t.update(update, &[("a", 30, Mock::Ready), ("b", 70, Mock::Ready)])
             .unwrap();
 
@@ -352,11 +356,12 @@ mod tests {
     #[test]
     fn resolver_update_forwards_attributes_errors_and_note_to_children() {
         let mut t = Harness::new(&[0, 30]);
-        let mut update = ResolverUpdate::default();
-        update.attributes = update.attributes.add("parent attribute");
-        update.endpoints = Err("endpoints error".to_string());
-        update.service_config = Err("service config error".to_string());
-        update.resolution_note = Some("note".to_string());
+        let update = ResolverUpdate {
+            attributes: Attributes::new().add("parent attribute"),
+            endpoints: Err("endpoints error".to_string()),
+            service_config: Err("service config error".to_string()),
+            resolution_note: Some("note".to_string()),
+        };
         t.update(update, &[("a", 30, Mock::Ready), ("b", 70, Mock::Ready)])
             .unwrap();
 
@@ -537,7 +542,7 @@ mod tests {
             }
             .build(LbPolicyOptions {
                 work_scheduler: scheduler.clone(),
-                runtime: grpc::__unstable::rt::default_runtime(),
+                runtime: default_runtime(),
             });
             Self {
                 policy,

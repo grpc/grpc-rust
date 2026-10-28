@@ -55,10 +55,6 @@ mod routing;
 /// [`load_balancing::register`] to install them in the gRPC LB registry.
 mod load_balancing;
 
-/// Weighted random sampling used by xDS load balancing policies and config
-/// selectors.
-mod sampling;
-
 /// [`xds_config::XdsConfig`]: the atomic xDS configuration snapshot assembled
 /// from a channel's Listener/RouteConfiguration/Cluster/Endpoints resources.
 mod xds_config;

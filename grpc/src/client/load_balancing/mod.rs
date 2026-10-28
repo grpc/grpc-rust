@@ -43,6 +43,9 @@ use crate::rt::GrpcRuntime;
 
 pub(crate) mod subchannel_sharing;
 
+mod sampling;
+mod weighted_target;
+
 pub mod child_manager;
 pub mod endpoint_filtering;
 pub mod graceful_switch;

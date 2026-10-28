@@ -30,16 +30,16 @@ use std::sync::Arc;
 /// Produces the random keys [`WeightedSampler`] uses to select an item. Tests
 /// supply fixed keys to make selection deterministic.
 trait Rng: Send + Sync + Debug {
-    /// Generates a uniform random value in the half-open range `[0, total_weight)`.
-    fn sample(&self, total_weight: u64) -> u64;
+    /// Generates a uniform random value in the half-open range `[0, upper_bound)`.
+    fn sample(&self, upper_bound: u64) -> u64;
 }
 
 #[derive(Debug)]
 struct DefaultRng;
 
 impl Rng for DefaultRng {
-    fn sample(&self, total_weight: u64) -> u64 {
-        rand::random_range(0..total_weight)
+    fn sample(&self, upper_bound: u64) -> u64 {
+        rand::random_range(0..upper_bound)
     }
 }
 
@@ -60,29 +60,36 @@ impl Default for WeightedSamplerBuilder {
 impl WeightedSamplerBuilder {
     pub(crate) fn build<T>(&self, items: impl IntoIterator<Item = (T, u32)>) -> WeightedSampler<T> {
         let mut cumulative_weight = 0u64;
+        let mut first_weight = None;
+        let mut equal_weights = true;
         let items = items
             .into_iter()
             .filter(|(_, weight)| *weight > 0)
             .map(|(item, weight)| {
+                if *first_weight.get_or_insert(weight) != weight {
+                    equal_weights = false;
+                }
                 cumulative_weight += u64::from(weight);
                 (cumulative_weight, item)
             })
             .collect();
         WeightedSampler {
             items,
+            equal_weights,
             rng: self.rng.clone(),
         }
     }
 }
 
-/// Weighted random item sampler.
+/// Samples items at random in proportion to their configured weights.
 ///
-/// Stores `(cumulative_weight, item)` pairs in ascending order of cumulative
-/// weight and selects items in proportion to their weight by binary-searching
-/// for a uniform sample in `[0, total_weight)`.
+/// Construct an instance with [`WeightedSamplerBuilder::build`] (which filters
+/// out zero-weight items) and call [`WeightedSampler::next`] to draw items.
 #[derive(Debug)]
 pub(crate) struct WeightedSampler<T> {
+    // `(cumulative_weight, item)` pairs in ascending order of cumulative weight.
     items: Vec<(u64, T)>,
+    equal_weights: bool,
     rng: Arc<dyn Rng>,
 }
 
@@ -90,7 +97,18 @@ impl<T> WeightedSampler<T> {
     /// Selects an item from the set, or returns `None` if no items have a
     /// positive weight.
     pub(crate) fn next(&self) -> Option<&T> {
+        // Single item — return directly without invoking the RNG.
+        if let [(_, item)] = self.items.as_slice() {
+            return Some(item);
+        }
         let &(total_weight, _) = self.items.last()?;
+        // Equal weights — sample a uniform index in `0..items.len()`.
+        if self.equal_weights {
+            let index = self.rng.sample(self.items.len() as u64) as usize;
+            return Some(&self.items[index].1);
+        }
+        // Distinct weights — binary-search cumulative weights for a
+        // uniform sample in `[0, total_weight)`.
         let key = self.rng.sample(total_weight);
         let index = self.items.partition_point(|(w, _)| *w <= key);
         Some(&self.items[index].1)
@@ -113,17 +131,17 @@ pub(crate) mod test_utils {
     }
 
     /// Returns the given keys in order. Panics when the keys run out or a key
-    /// is not below the total weight, so no pick depends on an unplanned key.
+    /// is not below `upper_bound`, so no pick depends on an unplanned key.
     #[derive(Debug)]
     struct MockRng(Mutex<VecDeque<u64>>);
 
     impl Rng for MockRng {
-        fn sample(&self, total_weight: u64) -> u64 {
+        fn sample(&self, upper_bound: u64) -> u64 {
             let key = self.0.lock().unwrap().pop_front();
             let key = key.expect("test should provide a key for every weighted pick");
             assert!(
-                key < total_weight,
-                "key {key} should be below total weight {total_weight}"
+                key < upper_bound,
+                "key {key} should be below upper bound {upper_bound}"
             );
             key
         }
@@ -143,8 +161,21 @@ mod tests {
             assert_eq!(sampler.next(), Some(&expected));
         }
 
-        let default_sampler = WeightedSamplerBuilder::default().build([("a", 50)]);
-        assert_eq!(default_sampler.next(), Some(&"a"));
+        let default_sampler = WeightedSamplerBuilder::default().build([("a", 50), ("b", 30)]);
+        assert!(default_sampler.next().is_some());
+    }
+
+    #[test]
+    fn weighted_sampler_fast_paths_single_item_and_equal_weights() {
+        // Single item does not invoke the RNG (no keys provided).
+        let single = sampler_builder(&[]).build([("a", 50)]);
+        assert_eq!(single.next(), Some(&"a"));
+
+        // Equal weights sample directly from `0..items.len()`.
+        let equal = sampler_builder(&[0, 1, 2]).build([("a", 50), ("b", 50), ("c", 50)]);
+        for expected in ["a", "b", "c"] {
+            assert_eq!(equal.next(), Some(&expected));
+        }
     }
 
     #[test]
@@ -155,7 +186,8 @@ mod tests {
         let all_zero = WeightedSamplerBuilder::default().build([("a", 0), ("b", 0)]);
         assert_eq!(all_zero.next(), None);
 
-        let with_zero = sampler_builder(&[0]).build([("a", 0), ("b", 10), ("c", 0)]);
+        let with_zero = sampler_builder(&[0, 10]).build([("a", 0), ("b", 10), ("c", 0), ("d", 20)]);
         assert_eq!(with_zero.next(), Some(&"b"));
+        assert_eq!(with_zero.next(), Some(&"d"));
     }
 }

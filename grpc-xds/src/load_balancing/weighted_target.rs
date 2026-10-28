@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn child_error_still_publishes_picker() {
-        let mut t = Harness::new(&[0]);
+        let mut t = Harness::new(&[]);
         let err = t
             .update(
                 ResolverUpdate::default(),
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn config_update_republishes_picker() {
         // Key 30 selects "b" under weights 30/70 and "a" under 80/20.
-        let mut t = Harness::new(&[30, 30, 0]);
+        let mut t = Harness::new(&[30, 30]);
         let state = t.apply(&[("a", 30, Mock::Ready), ("b", 70, Mock::Ready)]);
         assert_picks(&*state.picker, "b");
 
@@ -402,8 +402,7 @@ mod tests {
 
     #[test]
     fn ready_picker_excludes_non_ready_children() {
-        // Key 0 would select "a" if non-Ready children were included.
-        let mut t = Harness::new(&[0]);
+        let mut t = Harness::new(&[]);
         let state = t.apply(&[
             ("a", 10, Mock::Connecting),
             ("b", 20, Mock::TransientFailure),
@@ -430,8 +429,7 @@ mod tests {
 
     #[test]
     fn connecting_and_idle_pickers_span_children_in_that_state() {
-        // Key 0 would select "a" if the failing child were included.
-        let mut t = Harness::new(&[0, 0]);
+        let mut t = Harness::new(&[]);
         for (behavior, want) in [
             (Mock::Connecting, ConnectivityState::Connecting),
             (Mock::StayIdle, ConnectivityState::Idle),
@@ -455,8 +453,8 @@ mod tests {
 
     #[test]
     fn child_dropping_to_idle_while_others_ready_is_asked_to_exit_idle() {
-        // Key 50 selects "b" under weights 50/50.
-        let mut t = Harness::new(&[50]);
+        // Key 1 selects "b" under equal weights.
+        let mut t = Harness::new(&[1]);
         t.apply(&[("a", 50, Mock::Ready), ("b", 50, Mock::ReadyThenIdle)]);
 
         // "b" drops to IDLE in this `work` call and is asked to exit idle.

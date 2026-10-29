@@ -32,7 +32,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -53,13 +52,12 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tokio::time::timeout;
 
 use super::HyperListener;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
+use crate::core::StreamError;
 use crate::credentials::ProtocolInfo;
 use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
@@ -356,7 +354,7 @@ async fn keep_alive_closes_connection_when_client_stops_responding() {
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
     let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt, Internal));
+    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), Internal));
 
     // Send the HTTP/2 client preface and an empty SETTINGS frame, then never
     // read again, so the server's pings are never acked.
@@ -367,9 +365,10 @@ async fn keep_alive_closes_connection_when_client_stops_responding() {
         .unwrap();
 
     // The first ping goes out at 20ms and its 50ms ack timeout ends at 70ms.
-    sleep(Duration::from_millis(60)).await;
+    rt.sleep(Duration::from_millis(60)).await;
     assert!(!server_task.is_finished());
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should close the unresponsive connection")
         .unwrap();
@@ -391,16 +390,17 @@ async fn keep_alive_keeps_responsive_connection_open() {
     send_req.ready().await.unwrap();
 
     // Dozens of ping rounds; the client acks every one.
-    sleep(Duration::from_secs(1)).await;
+    rt.sleep(Duration::from_secs(1)).await;
     assert!(!server_task.is_finished());
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -430,13 +430,14 @@ async fn send_message_without_headers_auto_flushes_headers_and_delivers_messages
 
     // 3 messages are more than the 1-slot response channel holds, so this
     // only completes if the default headers were flushed automatically.
-    let collected = timeout(FINISH_TIMEOUT, async {
-        let resp = send_req.send_request(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        resp.into_body().collect().await.unwrap()
-    })
-    .await
-    .expect("sending messages without headers deadlocked");
+    let collected = rt
+        .timeout(FINISH_TIMEOUT, async {
+            let resp = send_req.send_request(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.into_body().collect().await.unwrap()
+        })
+        .await
+        .expect("sending messages without headers deadlocked");
     let trailers = collected.trailers().expect("response should have trailers");
     assert_eq!(
         trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
@@ -449,12 +450,13 @@ async fn send_message_without_headers_auto_flushes_headers_and_delivers_messages
     );
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -470,7 +472,7 @@ async fn oversize_request_message_surfaces_recv_error_to_handler() {
     let listener = listener_with(accept_rx, creds).with_config(config);
 
     // Handler that reads a message from rx and returns its own status when
-    // `rx.dyn_next` yields `Some(Err(()))`.
+    // `rx.dyn_next` yields `Some(Err(StreamError))`.
     struct ReadOnceHandler;
     #[crate::async_trait]
     impl DynHandle for ReadOnceHandler {
@@ -484,7 +486,7 @@ async fn oversize_request_message_surfaces_recv_error_to_handler() {
             let mut msg = BytesCapture::new();
             match rx.dyn_next(&mut msg).await {
                 Some(Ok(())) => Trailers::new(Ok(())),
-                Some(Err(())) => Trailers::new(Err(StatusError::new(
+                Some(Err(StreamError)) => Trailers::new(Err(StatusError::new(
                     StatusCodeError::Internal,
                     "generic handler stream failure",
                 ))),
@@ -531,12 +533,13 @@ async fn oversize_request_message_surfaces_recv_error_to_handler() {
     assert!(collected.trailers().is_none());
 
     drop(sender);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -576,18 +579,19 @@ async fn client_rst_stream_before_headers_cancels_handler() {
     // Cancels the RPC: hyper resets the stream with `RST_STREAM(CANCEL)`.
     drop(resp_fut);
 
-    timeout(FINISH_TIMEOUT, dropped_rx.recv())
+    rt.timeout(FINISH_TIMEOUT, dropped_rx.recv())
         .await
         .expect("handler task must be aborted on client RST_STREAM")
         .unwrap();
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -629,18 +633,19 @@ async fn client_rst_stream_after_headers_cancels_handler() {
     // resets the stream with `RST_STREAM(CANCEL)`.
     drop(resp);
 
-    timeout(FINISH_TIMEOUT, dropped_rx.recv())
+    rt.timeout(FINISH_TIMEOUT, dropped_rx.recv())
         .await
         .expect("handler task must be aborted on client RST_STREAM")
         .unwrap();
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -690,11 +695,12 @@ async fn dropping_serving_connection_cancels_in_flight_handler() {
     // Drop `HyperServingConnection` on the server side while the RPC is in flight.
     drop_conn_tx.send(()).unwrap();
 
-    timeout(FINISH_TIMEOUT, dropped_rx.recv())
+    rt.timeout(FINISH_TIMEOUT, dropped_rx.recv())
         .await
         .expect("Dropping HyperServingConnection must abort in-flight handler tasks")
         .unwrap();
-    let server_outcome = timeout(FINISH_TIMEOUT, server_task)
+    let server_outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server task should end once the connection is dropped")
         .unwrap();
@@ -715,7 +721,8 @@ async fn dropping_serving_connection_cancels_in_flight_handler() {
 
     drop(body);
     drop(send_req);
-    let client_err = timeout(FINISH_TIMEOUT, client_task)
+    let client_err = rt
+        .timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
@@ -813,12 +820,13 @@ async fn custom_trailer_metadata_preserved_on_streaming_response() {
     );
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -864,12 +872,13 @@ async fn custom_trailer_metadata_preserved_on_trailers_only_response() {
     assert!(collected.to_bytes().is_empty());
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -919,12 +928,13 @@ async fn custom_trailer_metadata_preserved_on_error_response() {
     assert!(collected.to_bytes().is_empty());
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1039,12 +1049,13 @@ async fn outgoing_reserved_headers_stripped_and_messages_delivered() {
     assert!(trailers.get("grpc-message").is_none());
 
     drop(sender);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1127,7 +1138,8 @@ async fn bad_handshake_does_not_kill_accept_loop() {
     creds.first_handshake_started.notified().await;
     let mut bad_client = EndpointIoStream::new(bad_client);
     let mut buf = [0u8; 1];
-    let read = timeout(FINISH_TIMEOUT, bad_client.read(&mut buf))
+    let read = rt
+        .timeout(FINISH_TIMEOUT, bad_client.read(&mut buf))
         .await
         .expect("server should close the failed connection")
         .unwrap();
@@ -1142,13 +1154,13 @@ async fn bad_handshake_does_not_kill_accept_loop() {
     send_req.ready().await.unwrap();
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
     shutdown_tx.send(()).unwrap();
-    timeout(FINISH_TIMEOUT, server_task)
+    rt.timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should stop on shutdown")
         .unwrap()
@@ -1182,15 +1194,16 @@ async fn stalled_handshake_does_not_block_subsequent_connections() {
     // 2. Subsequent client connects and must not be blocked by the stalled handshake.
     let (good_server_ep, good_client) = endpoint_pair();
     accept_tx.send(good_server_ep).unwrap();
-    let (send_req, client_task) = timeout(Duration::from_millis(500), async {
-        let (mut send_req, client_task) = connect_client(good_client, &rt).await.unwrap();
-        send_req.ready().await.unwrap();
-        (send_req, client_task)
-    })
-    .await
-    .expect("subsequent client was blocked by stalled handshake");
+    let (send_req, client_task) = rt
+        .timeout(Duration::from_millis(500), async {
+            let (mut send_req, client_task) = connect_client(good_client, &rt).await.unwrap();
+            send_req.ready().await.unwrap();
+            (send_req, client_task)
+        })
+        .await
+        .expect("subsequent client was blocked by stalled handshake");
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
@@ -1199,14 +1212,15 @@ async fn stalled_handshake_does_not_block_subsequent_connections() {
     // 3. Graceful shutdown must cleanly abort the stalled handshake task, which
     // closes the stalled connection.
     shutdown_tx.send(()).unwrap();
-    timeout(FINISH_TIMEOUT, server_task)
+    rt.timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("graceful shutdown hung on stalled handshake")
         .unwrap()
         .unwrap();
     let mut stalled_client = EndpointIoStream::new(stalled_client);
     let mut buf = [0u8; 1];
-    let read = timeout(FINISH_TIMEOUT, stalled_client.read(&mut buf))
+    let read = rt
+        .timeout(FINISH_TIMEOUT, stalled_client.read(&mut buf))
         .await
         .expect("stalled connection should be closed on shutdown")
         .unwrap();
@@ -1242,14 +1256,15 @@ async fn handshake_timeout_terminates_stalled_connection() {
     // handshake_timeout, and the server drops the connection task and its endpoint.
     // Reading from client should see EOF (0 bytes read).
     let mut buf = [0u8; 1];
-    let read = timeout(Duration::from_millis(200), client.read(&mut buf))
+    let read = rt
+        .timeout(Duration::from_millis(200), client.read(&mut buf))
         .await
         .expect("client read timed out waiting for server socket close")
         .unwrap();
     assert_eq!(read, 0, "expected EOF after handshake timeout");
 
     shutdown_tx.send(()).unwrap();
-    timeout(FINISH_TIMEOUT, server_task)
+    rt.timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should stop on shutdown")
         .unwrap()
@@ -1317,12 +1332,13 @@ async fn malformed_bin_header_returns_internal_error_without_invoking_handler() 
     );
 
     drop(sender);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1376,10 +1392,10 @@ async fn request_reserved_headers_extracted_and_filtered_from_metadata() {
         .header("x-custom-ascii", "allowed-value")
         .body(Empty::<Bytes>::new())
         .unwrap();
-    let before = Instant::now();
+    let before = rt.now();
     let resp = send_req.send_request(req).await.unwrap();
     let headers = headers_rx.await.unwrap();
-    let after = Instant::now();
+    let after = rt.now();
 
     let deadline = headers
         .deadline()
@@ -1405,12 +1421,13 @@ async fn request_reserved_headers_extracted_and_filtered_from_metadata() {
 
     drop(resp);
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1489,12 +1506,13 @@ async fn response_content_type_overwritten_when_handler_sets_it() {
     );
 
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1523,12 +1541,13 @@ async fn invalid_content_type_rejected_with_unsupported_media_type() {
 
     drop(resp);
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1557,12 +1576,13 @@ async fn invalid_method_rejected_with_method_not_allowed() {
 
     drop(resp);
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();
@@ -1597,12 +1617,13 @@ async fn unsupported_grpc_encoding_rejected_with_unimplemented() {
 
     drop(resp);
     drop(send_req);
-    timeout(FINISH_TIMEOUT, client_task)
+    rt.timeout(FINISH_TIMEOUT, client_task)
         .await
         .expect("client connection should close")
         .unwrap()
         .unwrap();
-    let outcome = timeout(FINISH_TIMEOUT, server_task)
+    let outcome = rt
+        .timeout(FINISH_TIMEOUT, server_task)
         .await
         .expect("server should finish once the client closes")
         .unwrap();

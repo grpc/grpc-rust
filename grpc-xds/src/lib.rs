@@ -39,7 +39,10 @@
     clippy::all
 )]
 mod generated {
-    include!(concat!(env!("OUT_DIR"), "/generated/mod.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/generated/google/protobuf/generated.rs"
+    ));
 }
 
 /// Validated xDS resource types (LDS/RDS/CDS/EDS), each implementing
@@ -72,10 +75,10 @@ mod tests {
     //! `generated` module is `pub(crate)` — doctests compile as an external
     //! crate and can only reach the public API.
 
-    use crate::generated::envoy::config::cluster::v3::Cluster;
-    use crate::generated::envoy::config::endpoint::v3::ClusterLoadAssignment;
-    use crate::generated::envoy::config::listener::v3::Listener;
-    use crate::generated::envoy::config::route::v3::RouteConfiguration;
+    use crate::generated::envoy_config_cluster_v3_cluster_proto::Cluster;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_proto::ClusterLoadAssignment;
+    use crate::generated::envoy_config_listener_v3_listener_proto::Listener;
+    use crate::generated::envoy_config_route_v3_route_proto::RouteConfiguration;
 
     /// Encodes then decodes a message. `serialize` / `parse` are methods of the
     /// `protobuf::Message` trait (in scope via the `M: protobuf::Message` bound).

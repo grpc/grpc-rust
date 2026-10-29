@@ -849,6 +849,9 @@ impl<L> Server<L> {
                 builder.http2().max_header_list_size(max_header_list_size);
             }
 
+            // hyper only enforces its default HTTP/1 header read timeout (30s) when a timer is set.
+            builder.http1().timer(TokioTimer::new());
+
             builder
         };
 
@@ -1434,6 +1437,40 @@ mod tests {
         assert_eq!(
             server_via_builder.tcp_keepalive_retries,
             Some(EXAMPLE_TCP_KEEPALIVE_RETRIES)
+        );
+    }
+
+    #[tokio::test]
+    async fn http1_header_read_timeout_is_enforced() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            Server::builder()
+                .accept_http1(true)
+                .add_routes(Routes::default())
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+
+        // Let the server start reading the request head, then jump past hyper's default 30s
+        // header read timeout. Auto-advance is avoided on purpose: it races with socket I/O.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await;
+        assert!(
+            read.is_ok(),
+            "connection with unfinished HTTP/1 headers was not closed"
         );
     }
 }

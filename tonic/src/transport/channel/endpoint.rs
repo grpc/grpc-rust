@@ -549,7 +549,8 @@ impl Endpoint {
     /// Sets the maximum number of local error resets before HTTP2 closes the
     /// connection with `GOAWAY(ENHANCE_YOUR_CALM)`.
     ///
-    /// Pass `None` to disable the limit. Uses `hyper`'s default (1024) otherwise.
+    /// Pass `None` to disable the limit. The limit guards against a misbehaving
+    /// peer, so only disable it for trusted peers. Uses `hyper`'s default (1024) otherwise.
     #[must_use]
     pub fn http2_max_local_error_reset_streams(self, max: impl Into<Option<usize>>) -> Self {
         Endpoint {

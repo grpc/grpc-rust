@@ -33,7 +33,10 @@ mod test {
     use std::collections::HashMap;
     use std::net::SocketAddr;
 
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
     use tokio::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use xds_test_util::RunningControlPlane;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config;
@@ -43,6 +46,7 @@ mod test {
     use crate::XdsChannelConfig;
     use crate::XdsChannelGrpc;
     use crate::XdsUri;
+    use crate::client::channel::{LB_BACKENDS, LbBackend};
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
     use crate::testutil::grpc::spawn_greeter_server;
@@ -59,17 +63,27 @@ mod test {
         (running, addr)
     }
 
-    /// Builds a real xDS channel whose bootstrap points at `cp_addr` and whose
-    /// target resolves the listener `listener_name`.
-    fn build_channel(cp_addr: SocketAddr, listener_name: &str) -> XdsChannelGrpc {
+    /// Builds a real xDS channel whose bootstrap points at `cp_addr`, whose
+    /// target resolves the listener `listener_name`, and whose clusters are
+    /// load-balanced by `backend`.
+    fn build_channel_with_backend(
+        cp_addr: SocketAddr,
+        listener_name: &str,
+        backend: LbBackend,
+    ) -> XdsChannelGrpc {
+        builder_for(cp_addr, listener_name)
+            .with_lb_backend(backend)
+            .build_grpc_channel()
+            .expect("build xds channel")
+    }
+
+    fn builder_for(cp_addr: SocketAddr, listener_name: &str) -> XdsChannelBuilder {
         let bootstrap_json = format!(
             r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
         );
         let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
         let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
         XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap))
-            .build_grpc_channel()
-            .expect("build xds channel")
     }
 
     /// Sends `say_hello` in a loop until a reply starting with `want_prefix` is
@@ -106,6 +120,12 @@ mod test {
     /// correct backend.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_routes_to_backend() {
+        for lb in LB_BACKENDS {
+            routes_to_backend(lb).await;
+        }
+    }
+
+    async fn routes_to_backend(lb: LbBackend) {
         let backend = spawn_greeter_server("backend", None, None)
             .await
             .expect("spawn greeter backend");
@@ -139,15 +159,15 @@ mod test {
             )]),
         );
 
-        let mut client = GreeterClient::new(build_channel(cp_addr, "my-service"));
+        let mut client = GreeterClient::new(build_channel_with_backend(cp_addr, "my-service", lb));
         let reply = say_hello_until_prefix(&mut client, "backend:").await;
-        assert_eq!(reply, "backend: world");
+        assert_eq!(reply, "backend: world", "{lb:?}");
 
         // The control plane observed exactly one ADS stream from the client.
         let counts = control_plane.get_service().get_subscriber_counts();
-        assert_eq!(counts.get(&config::AdsTypeUrl::Lds), Some(&1));
-        assert_eq!(counts.get(&config::AdsTypeUrl::Cds), Some(&1));
-        assert_eq!(counts.get(&config::AdsTypeUrl::Eds), Some(&1));
+        assert_eq!(counts.get(&config::AdsTypeUrl::Lds), Some(&1), "{lb:?}");
+        assert_eq!(counts.get(&config::AdsTypeUrl::Cds), Some(&1), "{lb:?}");
+        assert_eq!(counts.get(&config::AdsTypeUrl::Eds), Some(&1), "{lb:?}");
 
         let _ = backend.shutdown.send(());
     }
@@ -158,6 +178,12 @@ mod test {
     /// plane pushing a live update to a connected client.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_route_update_shifts_traffic() {
+        for lb in LB_BACKENDS {
+            route_update_shifts_traffic(lb).await;
+        }
+    }
+
+    async fn route_update_shifts_traffic(lb: LbBackend) {
         let backend_a = spawn_greeter_server("backend-a", None, None)
             .await
             .expect("spawn backend-a");
@@ -210,11 +236,11 @@ mod test {
             ]),
         );
 
-        let mut client = GreeterClient::new(build_channel(cp_addr, "my-service"));
+        let mut client = GreeterClient::new(build_channel_with_backend(cp_addr, "my-service", lb));
 
         // Initially routed to cluster-a -> backend-a.
         let reply = say_hello_until_prefix(&mut client, "backend-a:").await;
-        assert_eq!(reply, "backend-a: world");
+        assert_eq!(reply, "backend-a: world", "{lb:?}");
 
         // Update the RDS route to target cluster-b; the control plane pushes the new
         // RouteConfiguration to the connected client.
@@ -228,18 +254,24 @@ mod test {
 
         // Traffic shifts to cluster-b -> backend-b.
         let reply = say_hello_until_prefix(&mut client, "backend-b:").await;
-        assert_eq!(reply, "backend-b: world");
+        assert_eq!(reply, "backend-b: world", "{lb:?}");
 
         let _ = backend_a.shutdown.send(());
         let _ = backend_b.shutdown.send(());
     }
 
-    /// P2C load balancing: with several EDS endpoints behind one cluster, traffic
-    /// should spread across all of them. tonic-xds uses power-of-two-choices as
-    /// its balancer (see the unit-level `test_xds_channel_grpc_with_p2c_lb`);
-    /// this is the full-pipeline version through the control plane.
+    /// Load balancing: with several EDS endpoints behind one cluster, traffic
+    /// should spread across all of them. Runs against both balancer backends —
+    /// Tower's P2C and the in-crate one — through the full control-plane
+    /// pipeline.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_p2c_spreads_across_backends() {
+        for lb in LB_BACKENDS {
+            spreads_across_backends(lb).await;
+        }
+    }
+
+    async fn spreads_across_backends(lb: LbBackend) {
         const NUM_BACKENDS: usize = 5;
         const NUM_REQUESTS: usize = 1000;
 
@@ -282,7 +314,7 @@ mod test {
             )]),
         );
 
-        let mut client = GreeterClient::new(build_channel(cp_addr, "my-service"));
+        let mut client = GreeterClient::new(build_channel_with_backend(cp_addr, "my-service", lb));
 
         // Warm up until xDS resolution completes and the first RPC succeeds.
         say_hello_until_prefix(&mut client, "backend-").await;
@@ -303,7 +335,7 @@ mod test {
         }
 
         // Every backend should have received a fair share of the traffic.
-        assert_eq!(counts.values().sum::<usize>(), NUM_REQUESTS);
+        assert_eq!(counts.values().sum::<usize>(), NUM_REQUESTS, "{lb:?}");
         // Each backend should receive at least 50% of the fair share of requests.
         let min_per_backend = (NUM_REQUESTS / NUM_BACKENDS) / 2;
         for i in 0..NUM_BACKENDS {
@@ -311,7 +343,8 @@ mod test {
             let count = counts.get(&name).copied().unwrap_or(0);
             assert!(
                 count >= min_per_backend,
-                "backend {name} received {count} requests (< {min_per_backend}); distribution: {counts:?}",
+                "{lb:?}: backend {name} received {count} requests (< {min_per_backend}); \
+                 distribution: {counts:?}",
             );
         }
 
@@ -383,6 +416,78 @@ mod test {
         assert_eq!(reply, "backend: world");
 
         let _ = backend.shutdown.send(());
+    }
+
+    /// Forwards TCP connections to `upstream` until `blackhole` is cancelled,
+    /// then stops forwarding without closing the sockets, leaving every
+    /// connection half-open. Returns the proxy address and the number of
+    /// connections accepted so far.
+    async fn start_blackhole_proxy(
+        upstream: SocketAddr,
+        blackhole: CancellationToken,
+    ) -> (SocketAddr, watch::Receiver<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        let (accepted_tx, accepted_rx) = watch::channel(0);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                accepted_tx.send_modify(|accepted| *accepted += 1);
+                let blackhole = blackhole.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = blackhole.cancelled() => std::future::pending::<()>().await,
+                    }
+                });
+            }
+        });
+        (addr, accepted_rx)
+    }
+
+    /// When the control plane stops answering, an unacked keepalive PING
+    /// closes the ADS connection and the client dials a new one. Reconnecting
+    /// within seconds, well under the default keepalive interval, proves the
+    /// configured keepalive reached the ADS transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_keep_alive_replaces_half_open_ads_connection() {
+        let (control_plane, cp_addr) = start_control_plane().await;
+        let blackhole = CancellationToken::new();
+        let (proxy_addr, mut accepted) = start_blackhole_proxy(cp_addr, blackhole.clone()).await;
+
+        let bootstrap_json = format!(
+            r#"{{"xds_servers":[{{"server_uri":"http://{proxy_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
+        );
+        let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
+        let target = XdsUri::parse("xds:///my-service").expect("parse target");
+        let _channel = XdsChannelBuilder::new(
+            XdsChannelConfig::new(target)
+                .with_bootstrap(bootstrap)
+                .with_ads_keep_alive(Some(Duration::from_millis(200)), Duration::from_millis(200)),
+        )
+        .build_grpc_channel()
+        .expect("build xds channel");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !control_plane
+                .get_service()
+                .has_subscriber_for(&config::AdsTypeUrl::Lds, "my-service")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ADS stream never established");
+        assert_eq!(*accepted.borrow(), 1);
+
+        blackhole.cancel();
+
+        tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|n| *n >= 2))
+            .await
+            .expect("half-open ADS connection never replaced; keepalive not applied")
+            .expect("proxy stopped accepting");
     }
 }
 

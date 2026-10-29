@@ -30,13 +30,14 @@
 
 use crate::client::config::ServerConfig;
 use crate::error::{Error, Result};
-use crate::transport::{Transport, TransportBuilder, TransportStream};
+use crate::transport::{Transport, TransportBuilder, TransportReceiver, TransportSender};
 use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt as _;
 use tonic::client::Grpc;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Channel, Endpoint};
@@ -79,10 +80,15 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// stream pends forever and the client keeps serving its last known
 /// resources. Keepalives surface such connections as transport errors, which
 /// triggers the worker's reconnect + re-subscribe path.
-const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// Five minutes matches other gRPC clients' default keepalive.
+/// Also matches the A8 server side `PERMIT_KEEPALIVE_TIME` default.
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Default time to wait for a keepalive PING ack before closing the connection.
-const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Matches other gRPC clients' default keepalive timeout.
+const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A codec that passes bytes through without serialization.
 ///
@@ -443,10 +449,14 @@ impl TransportBuilder for TonicTransportBuilder {
     }
 }
 
-impl Transport for TonicTransport {
-    type Stream = TonicAdsStream;
+type StreamingFuture =
+    Box<dyn Future<Output = std::result::Result<Streaming<Bytes>, Status>> + Send>;
 
-    async fn new_stream(&self, initial_requests: Vec<Bytes>) -> Result<Self::Stream> {
+impl Transport for TonicTransport {
+    type Sender = TonicAdsSender;
+    type Receiver = TonicAdsReceiver;
+
+    async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
         let mut grpc = Grpc::new(self.channel.clone());
 
         if let Some(limit) = self.max_decoding_message_size {
@@ -456,22 +466,17 @@ impl Transport for TonicTransport {
             grpc = grpc.max_encoding_message_size(limit);
         }
 
+        // The worker uses new_stream() completion as its resource-timer readiness
+        // fallback. This checks service capacity, not channel connectivity or ADS
+        // stream dispatch; the streaming RPC is started when the receiver is polled.
         grpc.ready()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         let (tx, rx) = mpsc::channel::<Bytes>(ADS_CHANNEL_BUFFER_SIZE);
-
-        // Create a stream that first yields initial requests, then reads from the channel.
-        // This ensures data is available immediately when the stream is polled,
-        // preventing deadlock with servers that don't send response headers
-        // until they receive the first request message.
-        let initial_stream = tokio_stream::iter(initial_requests);
         let channel_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let request_stream = initial_stream.chain(channel_stream);
-
         let path = PathAndQuery::from_static(ADS_PATH);
-        let mut request = tonic::Request::new(request_stream);
+        let mut request = tonic::Request::new(channel_stream);
 
         // Inject the configured call credentials.
         if let Some(creds) = &self.call_creds {
@@ -481,26 +486,26 @@ impl Transport for TonicTransport {
                 .map_err(|e| Error::CallCredentials(e.to_string()))?;
         }
 
-        let response = grpc
-            .streaming(request, path, BytesCodec)
-            .await
-            .map_err(Error::Stream)?;
+        let connect_fut: StreamingFuture = Box::new(async move {
+            let response = grpc.streaming(request, path, BytesCodec).await?;
+            Ok(response.into_inner())
+        });
 
-        Ok(TonicAdsStream {
-            sender: tx,
-            receiver: response.into_inner(),
-        })
+        let receiver = TonicAdsReceiver {
+            state: TonicReceiverState::Connecting(Some(connect_fut)),
+        };
+
+        Ok((TonicAdsSender { sender: tx }, receiver))
     }
 }
 
-/// A bidirectional ADS stream backed by tonic.
+/// Sending half of a `TonicTransport` ADS stream.
 #[derive(Debug)]
-pub struct TonicAdsStream {
+pub struct TonicAdsSender {
     sender: mpsc::Sender<Bytes>,
-    receiver: Streaming<Bytes>,
 }
 
-impl TransportStream for TonicAdsStream {
+impl TransportSender for TonicAdsSender {
     async fn send(&mut self, request: Bytes) -> Result<()> {
         self.sender
             .send(request)
@@ -508,11 +513,47 @@ impl TransportStream for TonicAdsStream {
             .map_err(|_| Error::StreamClosed)?;
         Ok(())
     }
+}
 
+enum TonicReceiverState {
+    Connecting(Option<StreamingFuture>),
+    Connected(Streaming<Bytes>),
+}
+
+impl std::fmt::Debug for TonicReceiverState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connecting(_) => f.write_str("Connecting(...)"),
+            Self::Connected(s) => f.debug_tuple("Connected").field(s).finish(),
+        }
+    }
+}
+
+/// Receiving half of a `TonicTransport` ADS stream.
+#[derive(Debug)]
+pub struct TonicAdsReceiver {
+    state: TonicReceiverState,
+}
+
+impl TransportReceiver for TonicAdsReceiver {
     async fn recv(&mut self) -> Result<Option<Bytes>> {
-        match self.receiver.message().await {
-            Ok(msg) => Ok(msg),
-            Err(status) => Err(Error::Stream(status)),
+        loop {
+            match &mut self.state {
+                TonicReceiverState::Connecting(opt) => {
+                    let fut = opt.take().ok_or(Error::StreamClosed)?;
+                    match Pin::from(fut).await {
+                        Ok(streaming) => {
+                            self.state = TonicReceiverState::Connected(streaming);
+                        }
+                        Err(status) => {
+                            return Err(Error::Stream(status));
+                        }
+                    }
+                }
+                TonicReceiverState::Connected(streaming) => {
+                    return streaming.message().await.map_err(Error::Stream);
+                }
+            }
         }
     }
 }
@@ -534,6 +575,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
+    use tokio_stream::StreamExt as _;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
@@ -686,8 +728,9 @@ mod tests {
             ..Default::default()
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
-        let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
-        let response = stream.recv().await.unwrap().unwrap();
+        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        tx.send(request_bytes).await.unwrap();
+        let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
         assert_eq!(response.version_info, "1");
     }
@@ -704,8 +747,9 @@ mod tests {
             ..Default::default()
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
-        let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
-        let response = stream.recv().await.unwrap().unwrap();
+        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        tx.send(request_bytes).await.unwrap();
+        let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
         assert_eq!(response.version_info, "1");
     }
@@ -720,11 +764,9 @@ mod tests {
             .build(&ServerConfig::new(format!("http://{addr}")))
             .await
             .unwrap();
-        let mut stream = transport
-            .new_stream(vec![discovery_request()])
-            .await
-            .unwrap();
-        let err = stream.recv().await.unwrap_err();
+        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        tx.send(discovery_request()).await.unwrap();
+        let err = rx.recv().await.unwrap_err();
         let Error::Stream(status) = err else {
             panic!("expected a stream error, got {err:?}");
         };
@@ -739,11 +781,9 @@ mod tests {
             .build(&ServerConfig::new(format!("http://{addr}")))
             .await
             .unwrap();
-        let mut stream = transport
-            .new_stream(vec![discovery_request()])
-            .await
-            .unwrap();
-        let response = stream.recv().await.unwrap().unwrap();
+        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        tx.send(discovery_request()).await.unwrap();
+        let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
         assert_eq!(response.resources[0].value.len(), OVERSIZED_RESPONSE);
     }
@@ -875,9 +915,10 @@ mod tests {
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
 
-        let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
+        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        tx.send(request_bytes).await.unwrap();
 
-        let response_bytes = stream.recv().await.unwrap().unwrap();
+        let response_bytes = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response_bytes).unwrap();
 
         assert_eq!(response.version_info, "1");

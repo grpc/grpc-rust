@@ -70,6 +70,8 @@ use crate::core::Address;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
+use crate::core::StreamEnded;
+use crate::core::StreamError;
 use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::private::Internal;
@@ -258,16 +260,16 @@ impl ServerSendStream for InMemoryServerSendStream {
         &mut self,
         item: ServerResponseStreamItem<'_>,
         _options: ServerSendOptions,
-    ) -> Result<(), ()> {
+    ) -> Result<(), StreamEnded> {
         let inmemory_item = match item {
             ServerResponseStreamItem::Headers(h) => InMemoryResponseStreamItem::Headers(h),
             ServerResponseStreamItem::Message(m) => {
-                let buf = m.encode().map_err(|_| ())?;
+                let buf = m.encode().map_err(|_| StreamEnded)?;
                 InMemoryResponseStreamItem::Message(buf)
             }
         };
 
-        self.tx.send(inmemory_item).map_err(|_| ())
+        self.tx.send(inmemory_item).map_err(|_| StreamEnded)
     }
 }
 
@@ -276,11 +278,11 @@ pub struct InMemoryServerRecvStream {
 }
 
 impl ServerRecvStream for InMemoryServerRecvStream {
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>> {
         match self.rx.recv().await {
             Some(InMemoryRequestStreamItem::Message(mut buf)) => {
                 if msg.decode(&mut buf).is_err() {
-                    return Some(Err(()));
+                    return Some(Err(StreamError));
                 }
                 Some(Ok(()))
             }
@@ -343,7 +345,11 @@ pub struct InMemoryClientSendStream {
 }
 
 impl ClientSendStream for InMemoryClientSendStream {
-    async fn send(&mut self, msg: &dyn SendMessage, _options: ClientSendOptions) -> Result<(), ()> {
+    async fn send(
+        &mut self,
+        msg: &dyn SendMessage,
+        _options: ClientSendOptions,
+    ) -> Result<(), StreamEnded> {
         let buf = msg.encode().unwrap();
 
         if self
@@ -354,7 +360,7 @@ impl ClientSendStream for InMemoryClientSendStream {
             .is_err()
         {
             self.tx = None;
-            return Err(());
+            return Err(StreamEnded);
         }
         Ok(())
     }
@@ -621,7 +627,9 @@ mod tests {
                 _: impl RecvStream + 'static,
             ) -> Trailers {
                 self.0.store(true, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                GrpcRuntime::default()
+                    .sleep(std::time::Duration::from_secs(60))
+                    .await;
                 self.1.store(true, Ordering::SeqCst);
                 Trailers::new(Ok(()))
             }
@@ -647,14 +655,16 @@ mod tests {
         // Poll the serving connection briefly to start the handler.
         tokio::select! {
             _ = &mut serving_conn => {}
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            _ = GrpcRuntime::default().sleep(std::time::Duration::from_millis(20)) => {}
         }
         assert!(handler_started.load(Ordering::SeqCst));
 
         // Now DROP `serving_conn` (simulating what watch() does on `break`).
         drop(serving_conn);
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        GrpcRuntime::default()
+            .sleep(std::time::Duration::from_millis(50))
+            .await;
         // With the inline fix, dropping the connection future drops the handler future immediately -> handler never finishes.
         assert!(!handler_finished.load(Ordering::SeqCst));
     }

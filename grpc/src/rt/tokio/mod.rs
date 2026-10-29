@@ -28,6 +28,7 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -108,8 +109,15 @@ impl Runtime for TokioRuntime {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
         Box::pin(tokio::time::sleep(duration))
+    }
+
+    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
+    fn now(&self) -> Instant {
+        // Use tokio's clock so that a paused/advanced test clock is respected.
+        tokio::time::Instant::now().into_std()
     }
 
     fn tcp_stream(
@@ -278,6 +286,7 @@ where
             backoff = policy.initial_backoff;
             continue;
         }
+        #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
         sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
     }
@@ -315,8 +324,6 @@ mod tests {
     use std::io;
     use std::time::Duration;
 
-    use tokio::time::Instant;
-
     use super::AcceptRetryPolicy;
     use super::DnsResolver;
     use super::ResolverOptions;
@@ -345,13 +352,14 @@ mod tests {
     async fn run_script(script: Vec<io::Result<u32>>) -> (u32, usize, Duration) {
         let mut script = VecDeque::from(script);
         let mut calls = 0;
-        let start = Instant::now();
+        let runtime = TokioRuntime::default();
+        let start = runtime.now();
         let result = accept_with_retry(&TEST_POLICY, || -> Ready<io::Result<u32>> {
             calls += 1;
             ready(script.pop_front().expect("script exhausted"))
         })
         .await;
-        (result, calls, start.elapsed())
+        (result, calls, runtime.now() - start)
     }
 
     #[tokio::test(start_paused = true)]
@@ -438,5 +446,17 @@ mod tests {
         };
         let default_resolver = TokioDefaultDnsResolver::new(opts);
         assert!(default_resolver.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn now_reflects_paused_clock() {
+        let runtime = TokioRuntime::default();
+        let start = runtime.now();
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(runtime.now() - start, Duration::from_secs(3600));
+
+        runtime.sleep(Duration::from_secs(60)).await;
+        assert_eq!(runtime.now() - start, Duration::from_secs(3660));
     }
 }

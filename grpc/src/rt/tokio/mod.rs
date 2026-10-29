@@ -28,6 +28,7 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -108,8 +109,15 @@ impl Runtime for TokioRuntime {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
         Box::pin(tokio::time::sleep(duration))
+    }
+
+    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
+    fn now(&self) -> Instant {
+        // Use tokio's clock so that a paused/advanced test clock is respected.
+        tokio::time::Instant::now().into_std()
     }
 
     fn tcp_stream(
@@ -438,5 +446,17 @@ mod tests {
         };
         let default_resolver = TokioDefaultDnsResolver::new(opts);
         assert!(default_resolver.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn now_reflects_paused_clock() {
+        let runtime = TokioRuntime::default();
+        let start = runtime.now();
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(runtime.now() - start, Duration::from_secs(3600));
+
+        runtime.sleep(Duration::from_secs(60)).await;
+        assert_eq!(runtime.now() - start, Duration::from_secs(3660));
     }
 }

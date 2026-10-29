@@ -286,6 +286,7 @@ where
             backoff = policy.initial_backoff;
             continue;
         }
+        #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
         sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
     }
@@ -323,8 +324,6 @@ mod tests {
     use std::io;
     use std::time::Duration;
 
-    use tokio::time::Instant;
-
     use super::AcceptRetryPolicy;
     use super::DnsResolver;
     use super::ResolverOptions;
@@ -353,13 +352,14 @@ mod tests {
     async fn run_script(script: Vec<io::Result<u32>>) -> (u32, usize, Duration) {
         let mut script = VecDeque::from(script);
         let mut calls = 0;
-        let start = Instant::now();
+        let runtime = TokioRuntime::default();
+        let start = runtime.now();
         let result = accept_with_retry(&TEST_POLICY, || -> Ready<io::Result<u32>> {
             calls += 1;
             ready(script.pop_front().expect("script exhausted"))
         })
         .await;
-        (result, calls, start.elapsed())
+        (result, calls, runtime.now() - start)
     }
 
     #[tokio::test(start_paused = true)]

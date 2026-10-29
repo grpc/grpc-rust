@@ -27,12 +27,12 @@ use std::sync::Arc;
 
 use grpc::credentials::LocalServerCredentials;
 use grpc::credentials::ServerCredentials;
-use grpc::credentials::rustls::Identity as GrpcIdentity;
-use grpc::credentials::rustls::StaticProvider;
-use grpc::credentials::rustls::server::RustlsServerCredentials;
-use grpc::credentials::rustls::server::ServerTlsConfig as GrpcServerTlsConfig;
 use grpc::server::Http2Config;
 use grpc::server::Server as GrpcServer;
+use grpc_rustls::Identity as GrpcIdentity;
+use grpc_rustls::StaticProvider;
+use grpc_rustls::server::RustlsServerCredentials;
+use grpc_rustls::server::ServerTlsConfig as GrpcServerTlsConfig;
 use interop::server_prost;
 use interop::server_protobuf;
 use tonic::transport::Identity as TonicIdentity;

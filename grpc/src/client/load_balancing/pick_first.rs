@@ -625,7 +625,9 @@ impl LbPolicy for PickFirstPolicy {
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.start_connection_pass(channel_controller);
+        if self.connectivity_state == ConnectivityState::Idle && !self.subchannels.is_empty() {
+            self.start_connection_pass(channel_controller);
+        }
     }
 }
 

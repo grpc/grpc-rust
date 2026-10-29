@@ -488,8 +488,7 @@ mod test {
         let parsed_config2 = stub_lb_config("stub-gracefulswitch_two_policies_same_type-one");
         env.send_resolver_update_with_config(endpoints, &parsed_config2)
             .unwrap();
-        let subchannel = env.expect_new_subchannel();
-        assert_eq!(&*subchannel.address().address, "127.0.0.1:1234");
+        env.expect_new_subchannel_for("127.0.0.1:1234");
         env.expect_no_events();
     }
 

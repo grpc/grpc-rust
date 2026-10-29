@@ -523,25 +523,10 @@ impl Endpoint {
 
     /// Sets the maximum number of locally reset streams that HTTP2 remembers.
     ///
-    /// When the client resets a stream, for example because it drops a response
-    /// stream before its end, h2 remembers the stream for a while. Frames that the
-    /// peer already sent for that stream are then ignored. A frame for a reset
-    /// stream that h2 no longer remembers makes h2 reset the stream again, and h2
-    /// counts that as a local error reset. Too many of those close the connection
-    /// with `GOAWAY(ENHANCE_YOUR_CALM)`.
+    /// HTTP2 ignores frames for a remembered reset stream. A frame for a forgotten one
+    /// counts toward [`Endpoint::http2_max_local_error_reset_streams`].
     ///
-    /// Raise this, together with [`Endpoint::http2_reset_stream_duration`], for a
-    /// long-lived channel that cancels many streams with data still in flight.
-    ///
-    /// If not set, uses `hyper`'s default, which is determined by `h2`.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use tonic::transport::Endpoint;
-    /// # let builder = Endpoint::from_static("https://example.com");
-    /// let endpoint = builder.http2_max_concurrent_reset_streams(10_000);
-    /// ```
+    /// Uses `hyper`'s default otherwise.
     #[must_use]
     pub fn http2_max_concurrent_reset_streams(self, max: usize) -> Self {
         Endpoint {
@@ -552,18 +537,7 @@ impl Endpoint {
 
     /// Sets how long HTTP2 remembers a locally reset stream.
     ///
-    /// See [`Endpoint::http2_max_concurrent_reset_streams`].
-    ///
-    /// If not set, uses `hyper`'s default, which is determined by `h2`.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use std::time::Duration;
-    /// # use tonic::transport::Endpoint;
-    /// # let builder = Endpoint::from_static("https://example.com");
-    /// let endpoint = builder.http2_reset_stream_duration(Duration::from_secs(10));
-    /// ```
+    /// See [`Endpoint::http2_max_concurrent_reset_streams`]. Uses `hyper`'s default otherwise.
     #[must_use]
     pub fn http2_reset_stream_duration(self, duration: Duration) -> Self {
         Endpoint {
@@ -572,25 +546,10 @@ impl Endpoint {
         }
     }
 
-    /// Sets the maximum number of local error resets that HTTP2 allows on a
-    /// connection before it closes the connection with
-    /// `GOAWAY(ENHANCE_YOUR_CALM)`.
+    /// Sets the maximum number of local error resets before HTTP2 closes the
+    /// connection with `GOAWAY(ENHANCE_YOUR_CALM)`.
     ///
-    /// This is the client-side counterpart of
-    /// `Server::http2_max_local_error_reset_streams`. If not set, uses `hyper`'s
-    /// default, which is 1024. Pass `None` to disable the limit. This removes a
-    /// guard against a misbehaving peer, so only do so for trusted peers. To stop
-    /// late DATA on streams that the client cancelled from counting toward this
-    /// limit, prefer [`Endpoint::http2_max_concurrent_reset_streams`] and
-    /// [`Endpoint::http2_reset_stream_duration`].
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use tonic::transport::Endpoint;
-    /// # let builder = Endpoint::from_static("https://example.com");
-    /// let endpoint = builder.http2_max_local_error_reset_streams(4096);
-    /// ```
+    /// Pass `None` to disable the limit. Uses `hyper`'s default (1024) otherwise.
     #[must_use]
     pub fn http2_max_local_error_reset_streams(self, max: impl Into<Option<usize>>) -> Self {
         Endpoint {

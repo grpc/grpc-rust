@@ -27,7 +27,6 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use http::HeaderValue;
@@ -112,12 +111,11 @@ where
         Box::pin(async move {
             // 1. Validate request and extract gRPC request headers.
             let (parts, body) = req.into_parts();
-            // TODO: Use the runtime's clock, so deadlines follow a paused test clock.
-            let request_headers =
-                match extract_request_headers(&parts, connection_info, Instant::now()) {
-                    Ok(h) => h,
-                    Err(err) => return Ok(err.into_http()),
-                };
+            let now = runtime.now();
+            let request_headers = match extract_request_headers(&parts, connection_info, now) {
+                Ok(h) => h,
+                Err(err) => return Ok(err.into_http()),
+            };
 
             // 2. Create channels.
             let (initial_tx, initial_rx) = oneshot::channel::<InitialResponse>();
@@ -132,7 +130,7 @@ where
             // TODO: Move deadline enforcement to the transport-agnostic Server layer.
             let deadline = request_headers
                 .deadline()
-                .map(|d| runtime.sleep(d.saturating_duration_since(Instant::now())));
+                .map(|d| runtime.sleep(d.saturating_duration_since(now)));
             // TODO: If the handler task ends without calling `send_trailers` (e.g. it
             // panics), the client gets a generic `INTERNAL`, before or after headers,
             // because `TaskHandle` can't report that the task panicked. Extending
@@ -227,7 +225,6 @@ mod tests {
     use http_body_util::BodyExt;
     use http_body_util::Empty;
     use hyper::service::Service as HyperService;
-    use tokio::time::timeout;
 
     use super::*;
     use crate::attributes::Attributes;
@@ -535,12 +532,14 @@ mod tests {
         let service = test_grpc_service(Arc::new(NeverRespondsHandle));
 
         assert!(
-            timeout(
-                Duration::from_secs(24 * 60 * 60),
-                service.call(valid_grpc_request())
-            )
-            .await
-            .is_err(),
+            service
+                .runtime
+                .timeout(
+                    Duration::from_secs(24 * 60 * 60),
+                    service.call(valid_grpc_request()),
+                )
+                .await
+                .is_err(),
             "call completed for a request without grpc-timeout"
         );
     }

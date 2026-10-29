@@ -47,6 +47,8 @@ use super::validation::is_reserved_header;
 use crate::codec::BufEncoder;
 use crate::codec::BytesDecoder;
 use crate::core::RecvMessage;
+use crate::core::StreamEnded;
+use crate::core::StreamError;
 use crate::metadata::KeyAndValueRef;
 use crate::rt::BoxedTaskHandle;
 use crate::server::RecvStream;
@@ -82,13 +84,13 @@ impl RecvStream for HyperServerRecvStream {
     /// Deframes the next message payload from the request body and decodes it into `msg`.
     ///
     /// This implementation does not fuse the stream after returning `None` or
-    /// `Some(Err(()))`; callers must uphold the [`RecvStream`] contract and not
-    /// call `next` again after reaching a terminal state.
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+    /// `Some(Err(StreamError))`; callers must uphold the [`RecvStream`] contract
+    /// and not call `next` again after reaching a terminal state.
+    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), StreamError>> {
         match self.inner.message().await {
-            Ok(Some(mut bytes)) => Some(msg.decode(&mut bytes).map_err(|_| ())),
+            Ok(Some(mut bytes)) => Some(msg.decode(&mut bytes).map_err(|_| StreamError)),
             Ok(None) => None, // Body exhausted.
-            Err(_) => Some(Err(())),
+            Err(_) => Some(Err(StreamError)),
         }
     }
 }
@@ -155,21 +157,22 @@ impl HyperServerSendStream {
 impl SendStream for HyperServerSendStream {
     /// Sends response headers or an encoded message payload on the stream.
     ///
-    /// This implementation does not fuse the stream after returning `Err(())`;
-    /// callers must uphold the [`SendStream`] contract and not call `send`
-    /// again after an error.
+    /// This implementation does not fuse the stream after returning
+    /// `Err(StreamEnded)`; callers must uphold the [`SendStream`] contract and
+    /// not call `send` again after an error.
     async fn send(
         &mut self,
         item: ResponseStreamItem<'_>,
         _options: SendOptions,
-    ) -> Result<(), ()> {
+    ) -> Result<(), StreamEnded> {
         match item {
             ResponseStreamItem::Headers(h) => {
-                let tx = self.initial_tx.take().ok_or(())?;
-                tx.send(InitialResponse::Headers(h)).map_err(|_| ())
+                let tx = self.initial_tx.take().ok_or(StreamEnded)?;
+                tx.send(InitialResponse::Headers(h))
+                    .map_err(|_| StreamEnded)
             }
             ResponseStreamItem::Message(msg) => {
-                let buf = msg.encode().map_err(|_| ())?;
+                let buf = msg.encode().map_err(|_| StreamEnded)?;
 
                 // TODO: Reconsider requiring explicit Headers before Message once all callers
                 // (or a server-side SendStreamValidator) guarantee initial headers are sent first.
@@ -177,7 +180,7 @@ impl SendStream for HyperServerSendStream {
                     let _ = tx.send(InitialResponse::Headers(ResponseHeaders::default()));
                 }
 
-                self.body_tx.send(Ok(buf)).await.map_err(|_| ())
+                self.body_tx.send(Ok(buf)).await.map_err(|_| StreamEnded)
             }
         }
     }
@@ -449,7 +452,7 @@ mod tests {
         let mut msg = BytesCapture::new();
 
         let result = recv.next(&mut msg).await;
-        assert!(matches!(result, Some(Err(()))));
+        assert!(matches!(result, Some(Err(StreamError))));
     }
 
     #[tokio::test]
@@ -460,7 +463,7 @@ mod tests {
         let mut msg = FailingRecvMessage;
 
         let result = recv.next(&mut msg).await;
-        assert!(matches!(result, Some(Err(()))));
+        assert!(matches!(result, Some(Err(StreamError))));
     }
 
     #[tokio::test]

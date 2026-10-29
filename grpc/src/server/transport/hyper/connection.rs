@@ -360,8 +360,6 @@ mod tests {
     use http_body_util::Empty;
     use hyper::client::conn::http2::Builder as ClientHttp2Builder;
     use tokio::sync::oneshot;
-    use tokio::time::sleep;
-    use tokio::time::timeout;
 
     use super::*;
     use crate::credentials::ProtocolInfo;
@@ -426,7 +424,7 @@ mod tests {
             )
             .await
             .unwrap();
-            sleep(self.0).await;
+            default_runtime().sleep(self.0).await;
             Trailers::new(Ok(()))
         }
     }
@@ -499,20 +497,21 @@ mod tests {
         let resp = send_req.send_request(valid_grpc_request()).await.unwrap();
 
         shutdown_tx.send(()).unwrap();
-        sleep(Duration::from_secs(30)).await;
+        rt.sleep(Duration::from_secs(30)).await;
         assert!(!server_task.is_finished());
 
         let collected = resp.into_body().collect().await.unwrap();
         let trailers = collected.trailers().expect("expected trailers frame");
         assert_eq!(trailers.get("grpc-status").unwrap(), "0");
 
-        let outcome = timeout(FINISH_TIMEOUT, server_task)
+        let outcome = rt
+            .timeout(FINISH_TIMEOUT, server_task)
             .await
             .expect("serving connection should close once the last RPC finishes")
             .unwrap();
         assert_eq!(outcome, Ok(()));
         drop(send_req);
-        timeout(FINISH_TIMEOUT, client_task)
+        rt.timeout(FINISH_TIMEOUT, client_task)
             .await
             .expect("client connection should close")
             .unwrap()
@@ -547,20 +546,21 @@ mod tests {
 
         // Well past max_connection_age (30ms), but before the handler finishes
         // at 60s: the connection must still be draining.
-        sleep(Duration::from_secs(30)).await;
+        rt.sleep(Duration::from_secs(30)).await;
         assert!(!server_task.is_finished());
 
         let collected = resp.into_body().collect().await.unwrap();
         let trailers = collected.trailers().expect("expected trailers frame");
         assert_eq!(trailers.get("grpc-status").unwrap(), "0");
 
-        let outcome = timeout(FINISH_TIMEOUT, server_task)
+        let outcome = rt
+            .timeout(FINISH_TIMEOUT, server_task)
             .await
             .expect("serving connection should close once the last RPC finishes")
             .unwrap();
         assert_eq!(outcome, Ok(()));
         drop(send_req);
-        timeout(FINISH_TIMEOUT, client_task)
+        rt.timeout(FINISH_TIMEOUT, client_task)
             .await
             .expect("client connection should close")
             .unwrap()
@@ -597,7 +597,8 @@ mod tests {
         // past max_connection_age and into max_connection_age_grace.
         let resp = send_req.send_request(valid_grpc_request()).await.unwrap();
 
-        let outcome = timeout(FINISH_TIMEOUT, server_task)
+        let outcome = rt
+            .timeout(FINISH_TIMEOUT, server_task)
             .await
             .expect("serving connection should force-close after grace period")
             .unwrap();
@@ -609,7 +610,7 @@ mod tests {
         // The client sees its in-flight RPC cut off.
         assert!(resp.into_body().collect().await.is_err());
         drop(send_req);
-        timeout(FINISH_TIMEOUT, client_task)
+        rt.timeout(FINISH_TIMEOUT, client_task)
             .await
             .expect("client connection should close")
             .unwrap()

@@ -45,7 +45,7 @@ use crate::RootCertificates;
 use crate::StaticProvider;
 use crate::client::ClientTlsConfig;
 use crate::client::RustlsChannelCredentials;
-use grpc::__unstable::Internal;
+use grpc::__unstable::UnstableToken;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::common::Authority;
 use grpc::__unstable::rt;
@@ -175,7 +175,7 @@ async fn test_tls_key_log() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Handshake failed");
@@ -230,7 +230,7 @@ async fn test_tls_handshake_wrong_server_name() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await;
 
@@ -283,7 +283,7 @@ async fn test_tls_validate_authority() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Handshake failed");
@@ -332,7 +332,7 @@ async fn test_mtls_handshake_no_identity() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Client handshake expected to succeed with TLS 1.3");
@@ -380,7 +380,7 @@ async fn test_mtls_handshake_with_identitiy() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Handshake failed with client identity");
@@ -606,7 +606,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await;
 

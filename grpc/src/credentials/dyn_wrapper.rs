@@ -56,7 +56,7 @@ where
         source: BoxEndpoint,
         runtime: GrpcRuntime,
     ) -> Result<ServerHandshakeOutput<BoxEndpoint>, String> {
-        let output = SendFuture::make_send(self.accept(source, runtime, private::Internal)).await?;
+        let output = SendFuture::make_send(self.accept(source, runtime, private::UnstableToken)).await?;
         Ok(ServerHandshakeOutput {
             endpoint: Box::new(output.endpoint),
             security: output.security,

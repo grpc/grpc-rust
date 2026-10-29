@@ -175,7 +175,7 @@ impl MetadataMap {
                     ret.push((key.clone(), mv.into_inner()));
                 }
             } else if Binary::is_valid_key(key_str) {
-                let b = Binary::decode(value.as_bytes(), private::Internal).map_err(|e| {
+                let b = Binary::decode(value.as_bytes(), private::SealedToken).map_err(|e| {
                     format!("failed to decode base64 value for key '{key_str}': {e}")
                 })?;
                 let mv = unsafe { MetadataValue::<Binary>::from_shared_unchecked(b) };
@@ -432,7 +432,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Ascii>,
     {
-        key.get(self, private::Internal)
+        key.get(self, private::SealedToken)
     }
 
     /// Like get, but for Binary keys (for example "trace-proto-bin").
@@ -468,7 +468,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Binary>,
     {
-        key.get(self, private::Internal)
+        key.get(self, private::SealedToken)
     }
 
     /// Returns a view of all values associated with a key. This method is for
@@ -516,7 +516,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Ascii>,
     {
-        key.get_all(self, private::Internal)
+        key.get_all(self, private::SealedToken)
     }
 
     /// Like get_all, but for Binary keys (for example "trace-proto-bin").
@@ -556,7 +556,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Binary>,
     {
-        key.get_all(self, private::Internal)
+        key.get_all(self, private::SealedToken)
     }
 
     /// Returns true if the map contains a value for the specified key. This
@@ -583,7 +583,7 @@ impl MetadataMap {
     where
         K: AsEncodingAgnosticMetadataKey,
     {
-        key.contains_key(self, private::Internal)
+        key.contains_key(self, private::SealedToken)
     }
 
     /// An iterator visiting all key-value pairs (both ascii and binary).
@@ -665,7 +665,7 @@ impl MetadataMap {
     where
         K: IntoMetadataKey<Ascii>,
     {
-        key.insert(self, val, private::Internal)
+        key.insert(self, val, private::SealedToken)
     }
 
     /// Like insert, but for Binary keys (for example "trace-proto-bin").
@@ -706,7 +706,7 @@ impl MetadataMap {
     where
         K: IntoMetadataKey<Binary>,
     {
-        key.insert(self, val, private::Internal)
+        key.insert(self, val, private::SealedToken)
     }
 
     /// Inserts an ascii key-value pair into the map. To insert a binary entry,
@@ -756,7 +756,7 @@ impl MetadataMap {
     where
         K: IntoMetadataKey<Ascii>,
     {
-        key.append(self, value, private::Internal);
+        key.append(self, value, private::SealedToken);
     }
 
     /// Like append, but for binary keys (for example "trace-proto-bin").
@@ -797,7 +797,7 @@ impl MetadataMap {
     where
         K: IntoMetadataKey<Binary>,
     {
-        key.append(self, value, private::Internal);
+        key.append(self, value, private::SealedToken);
     }
 
     /// Removes an ascii key from the map, returning the value associated with
@@ -835,7 +835,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Ascii>,
     {
-        key.remove(self, private::Internal)
+        key.remove(self, private::SealedToken)
     }
 
     /// Like remove, but for Binary keys (for example "trace-proto-bin").
@@ -869,7 +869,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Binary>,
     {
-        key.remove(self, private::Internal)
+        key.remove(self, private::SealedToken)
     }
 
     /// Removes all values for the given key.
@@ -889,7 +889,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Ascii>,
     {
-        key.remove_all(self, private::Internal);
+        key.remove_all(self, private::SealedToken);
     }
 
     /// Removes all entries matching the given binary key.
@@ -901,7 +901,7 @@ impl MetadataMap {
     where
         K: AsMetadataKey<Binary>,
     {
-        key.remove_all(self, private::Internal);
+        key.remove_all(self, private::SealedToken);
     }
 
     pub(crate) fn merge(&mut self, other: MetadataMap) {
@@ -1034,11 +1034,11 @@ pub trait IntoMetadataKey<VE: ValueEncoding> {
         self,
         map: &mut MetadataMap,
         val: MetadataValue<VE>,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Option<MetadataValue<VE>>;
 
     #[doc(hidden)]
-    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, _: private::Internal);
+    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, _: private::SealedToken);
 }
 
 // ==== impls ====
@@ -1050,7 +1050,7 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for MetadataKey<VE> {
         self,
         map: &mut MetadataMap,
         val: MetadataValue<VE>,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Option<MetadataValue<VE>> {
         let key = self.inner;
         let mut new_val = Some(val.into_inner());
@@ -1087,7 +1087,7 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for MetadataKey<VE> {
 
     #[doc(hidden)]
     #[inline]
-    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, _: private::Internal) {
+    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, _: private::SealedToken) {
         map.headers.push((self.inner, val.into_inner()));
     }
 }
@@ -1099,7 +1099,7 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for &MetadataKey<VE> {
         self,
         map: &mut MetadataMap,
         val: MetadataValue<VE>,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Option<MetadataValue<VE>> {
         let key = &self.inner;
         let mut new_val = Some(val.into_inner());
@@ -1136,7 +1136,7 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for &MetadataKey<VE> {
 
     #[doc(hidden)]
     #[inline]
-    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, _: private::Internal) {
+    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, _: private::SealedToken) {
         map.headers.push((self.inner.clone(), val.into_inner()));
     }
 }
@@ -1148,7 +1148,7 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for &'static str {
         self,
         map: &mut MetadataMap,
         val: MetadataValue<VE>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Option<MetadataValue<VE>> {
         // Perform name validation
         let key = MetadataKey::<VE>::from_static(self);
@@ -1156,7 +1156,7 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for &'static str {
     }
     #[doc(hidden)]
     #[inline]
-    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, token: private::Internal) {
+    fn append(self, map: &mut MetadataMap, val: MetadataValue<VE>, token: private::SealedToken) {
         // Perform name validation
         let key = MetadataKey::<VE>::from_static(self);
         key.append(map, val, token);
@@ -1167,16 +1167,16 @@ impl<VE: ValueEncoding> IntoMetadataKey<VE> for &'static str {
 /// to a `MetadataMap`.
 pub trait AsMetadataKey<VE: ValueEncoding> {
     #[doc(hidden)]
-    fn get(self, map: &MetadataMap, _: private::Internal) -> Option<&MetadataValue<VE>>;
+    fn get(self, map: &MetadataMap, _: private::SealedToken) -> Option<&MetadataValue<VE>>;
 
     #[doc(hidden)]
-    fn get_all(self, map: &MetadataMap, _: private::Internal) -> GetAll<'_, VE>;
+    fn get_all(self, map: &MetadataMap, _: private::SealedToken) -> GetAll<'_, VE>;
 
     #[doc(hidden)]
-    fn remove(self, map: &mut MetadataMap, _: private::Internal) -> Option<MetadataValue<VE>>;
+    fn remove(self, map: &mut MetadataMap, _: private::SealedToken) -> Option<MetadataValue<VE>>;
 
     #[doc(hidden)]
-    fn remove_all(self, map: &mut MetadataMap, _: private::Internal);
+    fn remove_all(self, map: &mut MetadataMap, _: private::SealedToken);
 }
 
 // ==== impls ====
@@ -1184,7 +1184,7 @@ pub trait AsMetadataKey<VE: ValueEncoding> {
 impl<VE: ValueEncoding> AsMetadataKey<VE> for MetadataKey<VE> {
     #[doc(hidden)]
     #[inline]
-    fn get(self, map: &MetadataMap, _: private::Internal) -> Option<&MetadataValue<VE>> {
+    fn get(self, map: &MetadataMap, _: private::SealedToken) -> Option<&MetadataValue<VE>> {
         map.headers
             .iter()
             .find(|(k, _)| k == self.inner)
@@ -1193,7 +1193,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for MetadataKey<VE> {
 
     #[doc(hidden)]
     #[inline]
-    fn get_all(self, map: &MetadataMap, _: private::Internal) -> GetAll<'_, VE> {
+    fn get_all(self, map: &MetadataMap, _: private::SealedToken) -> GetAll<'_, VE> {
         GetAll {
             map,
             key: Some(self),
@@ -1202,13 +1202,17 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for MetadataKey<VE> {
 
     #[doc(hidden)]
     #[inline]
-    fn remove(self, map: &mut MetadataMap, token: private::Internal) -> Option<MetadataValue<VE>> {
+    fn remove(
+        self,
+        map: &mut MetadataMap,
+        token: private::SealedToken,
+    ) -> Option<MetadataValue<VE>> {
         self.inner.as_str().remove(map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn remove_all(self, map: &mut MetadataMap, _: private::Internal) {
+    fn remove_all(self, map: &mut MetadataMap, _: private::SealedToken) {
         map.headers.retain(|h| h.0 != self.inner);
     }
 }
@@ -1216,7 +1220,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for MetadataKey<VE> {
 impl<VE: ValueEncoding> AsMetadataKey<VE> for &MetadataKey<VE> {
     #[doc(hidden)]
     #[inline]
-    fn get(self, map: &MetadataMap, _: private::Internal) -> Option<&MetadataValue<VE>> {
+    fn get(self, map: &MetadataMap, _: private::SealedToken) -> Option<&MetadataValue<VE>> {
         map.headers
             .iter()
             .find(|(k, _)| k == self.inner)
@@ -1225,7 +1229,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &MetadataKey<VE> {
 
     #[doc(hidden)]
     #[inline]
-    fn get_all(self, map: &MetadataMap, _: private::Internal) -> GetAll<'_, VE> {
+    fn get_all(self, map: &MetadataMap, _: private::SealedToken) -> GetAll<'_, VE> {
         GetAll {
             map,
             key: Some(self.clone()),
@@ -1234,13 +1238,17 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &MetadataKey<VE> {
 
     #[doc(hidden)]
     #[inline]
-    fn remove(self, map: &mut MetadataMap, token: private::Internal) -> Option<MetadataValue<VE>> {
+    fn remove(
+        self,
+        map: &mut MetadataMap,
+        token: private::SealedToken,
+    ) -> Option<MetadataValue<VE>> {
         self.inner.as_str().remove(map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn remove_all(self, map: &mut MetadataMap, _: private::Internal) {
+    fn remove_all(self, map: &mut MetadataMap, _: private::SealedToken) {
         map.headers.retain(|h| h.0 != self.inner);
     }
 }
@@ -1248,7 +1256,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &MetadataKey<VE> {
 impl<VE: ValueEncoding> AsMetadataKey<VE> for &str {
     #[doc(hidden)]
     #[inline]
-    fn get(self, map: &MetadataMap, _: private::Internal) -> Option<&MetadataValue<VE>> {
+    fn get(self, map: &MetadataMap, _: private::SealedToken) -> Option<&MetadataValue<VE>> {
         if !VE::is_valid_key(self) {
             return None;
         }
@@ -1260,7 +1268,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &str {
 
     #[doc(hidden)]
     #[inline]
-    fn get_all(self, map: &MetadataMap, _: private::Internal) -> GetAll<'_, VE> {
+    fn get_all(self, map: &MetadataMap, _: private::SealedToken) -> GetAll<'_, VE> {
         let key = if VE::is_valid_key(self) {
             Some(MetadataKey::<VE>::from_bytes(self.as_bytes()).unwrap())
         } else {
@@ -1271,7 +1279,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &str {
 
     #[doc(hidden)]
     #[inline]
-    fn remove(self, map: &mut MetadataMap, _: private::Internal) -> Option<MetadataValue<VE>> {
+    fn remove(self, map: &mut MetadataMap, _: private::SealedToken) -> Option<MetadataValue<VE>> {
         if !VE::is_valid_key(self) {
             return None;
         }
@@ -1287,7 +1295,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &str {
 
     #[doc(hidden)]
     #[inline]
-    fn remove_all(self, map: &mut MetadataMap, _: private::Internal) {
+    fn remove_all(self, map: &mut MetadataMap, _: private::SealedToken) {
         if !VE::is_valid_key(self) {
             return;
         }
@@ -1298,25 +1306,29 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &str {
 impl<VE: ValueEncoding> AsMetadataKey<VE> for String {
     #[doc(hidden)]
     #[inline]
-    fn get(self, map: &MetadataMap, token: private::Internal) -> Option<&MetadataValue<VE>> {
+    fn get(self, map: &MetadataMap, token: private::SealedToken) -> Option<&MetadataValue<VE>> {
         AsMetadataKey::<VE>::get(self.as_str(), map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn get_all(self, map: &MetadataMap, token: private::Internal) -> GetAll<'_, VE> {
+    fn get_all(self, map: &MetadataMap, token: private::SealedToken) -> GetAll<'_, VE> {
         AsMetadataKey::<VE>::get_all(self.as_str(), map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn remove(self, map: &mut MetadataMap, token: private::Internal) -> Option<MetadataValue<VE>> {
+    fn remove(
+        self,
+        map: &mut MetadataMap,
+        token: private::SealedToken,
+    ) -> Option<MetadataValue<VE>> {
         AsMetadataKey::<VE>::remove(self.as_str(), map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn remove_all(self, map: &mut MetadataMap, token: private::Internal) {
+    fn remove_all(self, map: &mut MetadataMap, token: private::SealedToken) {
         AsMetadataKey::<VE>::remove_all(self.as_str(), map, token);
     }
 }
@@ -1324,25 +1336,29 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for String {
 impl<VE: ValueEncoding> AsMetadataKey<VE> for &String {
     #[doc(hidden)]
     #[inline]
-    fn get(self, map: &MetadataMap, token: private::Internal) -> Option<&MetadataValue<VE>> {
+    fn get(self, map: &MetadataMap, token: private::SealedToken) -> Option<&MetadataValue<VE>> {
         AsMetadataKey::<VE>::get(self.as_str(), map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn get_all(self, map: &MetadataMap, token: private::Internal) -> GetAll<'_, VE> {
+    fn get_all(self, map: &MetadataMap, token: private::SealedToken) -> GetAll<'_, VE> {
         AsMetadataKey::<VE>::get_all(self.as_str(), map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn remove(self, map: &mut MetadataMap, token: private::Internal) -> Option<MetadataValue<VE>> {
+    fn remove(
+        self,
+        map: &mut MetadataMap,
+        token: private::SealedToken,
+    ) -> Option<MetadataValue<VE>> {
         AsMetadataKey::<VE>::remove(self.as_str(), map, token)
     }
 
     #[doc(hidden)]
     #[inline]
-    fn remove_all(self, map: &mut MetadataMap, token: private::Internal) {
+    fn remove_all(self, map: &mut MetadataMap, token: private::SealedToken) {
         AsMetadataKey::<VE>::remove_all(self.as_str(), map, token);
     }
 }
@@ -1351,7 +1367,7 @@ impl<VE: ValueEncoding> AsMetadataKey<VE> for &String {
 /// to a `MetadataMap`, for operations that don't expose the actual value.
 pub trait AsEncodingAgnosticMetadataKey {
     #[doc(hidden)]
-    fn contains_key(&self, map: &MetadataMap, _: private::Internal) -> bool;
+    fn contains_key(&self, map: &MetadataMap, _: private::SealedToken) -> bool;
 }
 
 // ==== impls ====
@@ -1359,7 +1375,7 @@ pub trait AsEncodingAgnosticMetadataKey {
 impl<VE: ValueEncoding> AsEncodingAgnosticMetadataKey for MetadataKey<VE> {
     #[doc(hidden)]
     #[inline]
-    fn contains_key(&self, map: &MetadataMap, _: private::Internal) -> bool {
+    fn contains_key(&self, map: &MetadataMap, _: private::SealedToken) -> bool {
         map.headers.iter().any(|(k, _)| k == self.inner)
     }
 }
@@ -1367,7 +1383,7 @@ impl<VE: ValueEncoding> AsEncodingAgnosticMetadataKey for MetadataKey<VE> {
 impl<VE: ValueEncoding> AsEncodingAgnosticMetadataKey for &MetadataKey<VE> {
     #[doc(hidden)]
     #[inline]
-    fn contains_key(&self, map: &MetadataMap, _: private::Internal) -> bool {
+    fn contains_key(&self, map: &MetadataMap, _: private::SealedToken) -> bool {
         map.headers.iter().any(|(k, _)| k == self.inner)
     }
 }
@@ -1375,7 +1391,7 @@ impl<VE: ValueEncoding> AsEncodingAgnosticMetadataKey for &MetadataKey<VE> {
 impl AsEncodingAgnosticMetadataKey for &str {
     #[doc(hidden)]
     #[inline]
-    fn contains_key(&self, map: &MetadataMap, _: private::Internal) -> bool {
+    fn contains_key(&self, map: &MetadataMap, _: private::SealedToken) -> bool {
         map.headers.iter().any(|(k, _)| k == *self)
     }
 }
@@ -1383,7 +1399,7 @@ impl AsEncodingAgnosticMetadataKey for &str {
 impl AsEncodingAgnosticMetadataKey for String {
     #[doc(hidden)]
     #[inline]
-    fn contains_key(&self, map: &MetadataMap, _: private::Internal) -> bool {
+    fn contains_key(&self, map: &MetadataMap, _: private::SealedToken) -> bool {
         map.headers.iter().any(|(k, _)| k == self.as_str())
     }
 }
@@ -1391,7 +1407,7 @@ impl AsEncodingAgnosticMetadataKey for String {
 impl AsEncodingAgnosticMetadataKey for &String {
     #[doc(hidden)]
     #[inline]
-    fn contains_key(&self, map: &MetadataMap, _: private::Internal) -> bool {
+    fn contains_key(&self, map: &MetadataMap, _: private::SealedToken) -> bool {
         map.headers.iter().any(|(k, _)| k == self.as_str())
     }
 }

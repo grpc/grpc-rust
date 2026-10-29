@@ -850,7 +850,7 @@ impl ChannelCredentials for SlowChannelCredentials {
         source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-        _token: private::Internal,
+        _token: private::UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         runtime.sleep(self.sleep_duration).await;
         Ok(HandshakeOutput {
@@ -865,7 +865,7 @@ impl ChannelCredentials for SlowChannelCredentials {
         &INFO
     }
 
-    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+    fn get_call_credentials(&self, _: private::UnstableToken) -> Option<&Arc<dyn CallCredentials>> {
         None
     }
 }

@@ -189,7 +189,7 @@ impl InMemoryListener {
 impl Listener for InMemoryListener {
     type Transport = InMemoryServerCall;
 
-    async fn accept(&self, _token: crate::private::Internal) -> Option<Self::Transport> {
+    async fn accept(&self, _token: crate::private::SealedToken) -> Option<Self::Transport> {
         let mut r = self.inner.r.lock().await;
         tokio::select! {
             call = r.recv() => {
@@ -222,7 +222,7 @@ impl std::future::Future for InMemoryServingConnection {
 }
 
 impl GracefulConnection for InMemoryServingConnection {
-    fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+    fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::SealedToken) {
         // No-op: each in-memory "connection" is a single RPC.
     }
 }
@@ -234,7 +234,7 @@ impl ServerTransport for InMemoryServerCall {
         self,
         handler: Arc<dyn DynHandle>,
         _runtime: GrpcRuntime,
-        _token: crate::private::Internal,
+        _token: crate::private::SealedToken,
     ) -> InMemoryServingConnection {
         let mut send = InMemoryServerSendStream { tx: self.resp_tx };
         let recv = Box::new(InMemoryServerRecvStream { rx: self.req_rx });
@@ -649,7 +649,7 @@ mod tests {
         let mut serving_conn = transport.serve(
             Arc::new(HangingHandler(hs, hf)),
             crate::rt::default_runtime(),
-            crate::private::Internal,
+            crate::private::SealedToken,
         );
 
         // Poll the serving connection briefly to start the handler.

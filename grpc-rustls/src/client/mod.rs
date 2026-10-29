@@ -27,7 +27,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use grpc::__unstable::Internal;
+use crate::private::SealedToken;
+use grpc::__unstable::UnstableToken;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::client::HandshakeOutput;
 use grpc::__unstable::credentials::client::ValidateAuthority;
@@ -89,7 +90,7 @@ impl ClientTlsConfig {
     where
         R: Provider<RootCertificates>,
     {
-        self.pem_roots_provider = Some(provider.get_receiver(Internal));
+        self.pem_roots_provider = Some(provider.get_receiver(SealedToken));
         self
     }
 
@@ -102,7 +103,7 @@ impl ClientTlsConfig {
     where
         I: Provider<Identity>,
     {
-        self.identity_provider = Some(provider.get_receiver(Internal));
+        self.identity_provider = Some(provider.get_receiver(SealedToken));
         self
     }
 
@@ -278,7 +279,7 @@ impl ChannelCredentials for RustlsChannelCredentials {
         source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         _rt: &GrpcRuntime,
-        _token: Internal,
+        _token: UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         let (ep, security_info, authority_validator) = self.connect_tls(authority, source).await?;
         Ok(HandshakeOutput {
@@ -292,7 +293,7 @@ impl ChannelCredentials for RustlsChannelCredentials {
         &TLS_PROTO_INFO
     }
 
-    fn get_call_credentials(&self, _: Internal) -> Option<&Arc<dyn CallCredentials>> {
+    fn get_call_credentials(&self, _: UnstableToken) -> Option<&Arc<dyn CallCredentials>> {
         None
     }
 }

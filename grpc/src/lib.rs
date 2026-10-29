@@ -74,7 +74,7 @@ pub use tonic::async_trait;
 #[cfg(feature = "__unstable")]
 #[doc(hidden)]
 pub mod __unstable {
-    pub use crate::private::Internal;
+    pub use crate::private::UnstableToken;
 
     pub mod rt {
         pub use crate::rt::*;
@@ -103,13 +103,62 @@ pub mod __unstable {
     }
 }
 
+#[cfg(feature = "__internal")]
+#[doc(hidden)]
+pub mod __internal {
+    pub use crate::private::InternalToken;
+}
+
+/// These private types are only intended to be used in exported traits, where
+/// the trait must be exposed for direct use, but we need to put some
+/// restrictions on the trait. Prefer to use 'pub use' in __unstable or
+/// __internal instead of using this.
+///
+/// For functions and struct methods, instead of using this, forwarding
+/// functions are added to __unstable or __internal.
+///
+/// For structs and enums, instead of using this, 'pub use' is added to
+/// __unstable or __internal.
 mod private {
-    /// A zero-sized type used to seal methods on a public trait.
+    /// A zero-sized type used on an exported trait so only the grpc crate can
+    /// call or implement methods with this argument. These methods may be
+    /// modified or deleted. The type is private to this crate.
+    pub struct SealedToken;
+    /// A trait used on an exported subtrait so only the grpc crate can
+    /// implement the subtrait and methods may be added. The type is private to
+    /// this crate. The subtraits are unrestricted for consumers.
     ///
-    /// Because this type is private to this crate, it cannot be constructed or
-    /// named by external crates. As a result, any method requiring an `Internal`
-    /// argument becomes uncallable from outside the crate.
-    pub struct Internal;
+    /// This trait does not imply that methods may be modified or deleted.
+    /// [`SealedToken`] must be used in addition to this trait to denote sealed
+    /// methods.
+    pub trait SealedTrait {}
+
+    /// A zero-sized type used on an exported trait where only grpc-authored
+    /// crates should call or implement methods with this argument. These
+    /// methods may be modified or deleted.
+    pub struct InternalToken;
+    /// A trait used on an exported subtrait where only grpc-authored crate
+    /// should implement the subtrait and methods may be added. The subtraits
+    /// are unrestricted for consumers.
+    ///
+    /// This trait does not imply that methods may be modified or deleted.
+    /// [`InternalToken`] must be used in addition to this trait to denote
+    /// internal methods.
+    pub trait InternalTrait {}
+
+    /// A zero-sized type used on an exported trait for methods which may be
+    /// modified or deleted. Unstable methods are generally not safe to use from
+    /// libraries since libraries should not require a specific version of the
+    /// grpc crate.
+    pub struct UnstableToken;
+    /// A trait used on an exported subtrait where methods may be added.
+    /// Unstable subtraits are generally not safe to implement from libraries
+    /// since libraries should not require a specific version of the grpc crate.
+    ///
+    /// This trait does not imply that methods may be modified or deleted.
+    /// [`UnstableToken`] must be used in addition to this trait to denote
+    /// unstable methods.
+    pub trait UnstableTrait {}
 }
 
 #[cfg(test)]

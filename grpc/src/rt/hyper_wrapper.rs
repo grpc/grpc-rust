@@ -124,7 +124,7 @@ impl hyper::rt::Read for HyperStream {
             match self
                 .project()
                 .inner
-                .poll_read_private(cx, &mut tbuf, private::Internal)
+                .poll_read_private(cx, &mut tbuf, private::UnstableToken)
             {
                 Poll::Ready(Ok(())) => tbuf.filled().len(),
                 other => return other,
@@ -146,23 +146,23 @@ impl hyper::rt::Write for HyperStream {
     ) -> Poll<Result<usize, io::Error>> {
         self.project()
             .inner
-            .poll_write_private(cx, buf, private::Internal)
+            .poll_write_private(cx, buf, private::UnstableToken)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         self.project()
             .inner
-            .poll_flush_private(cx, private::Internal)
+            .poll_flush_private(cx, private::UnstableToken)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         self.project()
             .inner
-            .poll_shutdown_private(cx, private::Internal)
+            .poll_shutdown_private(cx, private::UnstableToken)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored_private(private::Internal)
+        self.inner.is_write_vectored_private(private::UnstableToken)
     }
 
     fn poll_write_vectored(
@@ -172,6 +172,6 @@ impl hyper::rt::Write for HyperStream {
     ) -> Poll<Result<usize, io::Error>> {
         self.project()
             .inner
-            .poll_write_vectored_private(cx, bufs, private::Internal)
+            .poll_write_vectored_private(cx, bufs, private::UnstableToken)
     }
 }

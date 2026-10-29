@@ -101,7 +101,7 @@ impl CallOptions {
 #[doc(hidden)]
 pub trait GracefulConnection: Future<Output = ()> + Send + 'static {
     /// Initiate graceful shutdown.
-    fn graceful_shutdown(self: Pin<&mut Self>, token: crate::private::Internal);
+    fn graceful_shutdown(self: Pin<&mut Self>, token: crate::private::SealedToken);
 }
 
 pub struct Server {
@@ -132,7 +132,7 @@ pub trait Listener: sealed::Sealed {
 
     /// Accepts the next incoming connection.
     #[doc(hidden)]
-    async fn accept(&self, token: crate::private::Internal) -> Option<Self::Transport>;
+    async fn accept(&self, token: crate::private::SealedToken) -> Option<Self::Transport>;
 
     /// Returns the address this listener is bound to.
     fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress>;
@@ -150,7 +150,7 @@ pub trait Transport: Send + 'static {
         self,
         handler: Arc<dyn DynHandle>,
         runtime: GrpcRuntime,
-        token: crate::private::Internal,
+        token: crate::private::SealedToken,
     ) -> Self::Connection;
 }
 
@@ -179,7 +179,7 @@ impl GracefulCoordinator {
                         match res {
                             // Operator graceful signal: begin GOAWAY drain,
                             // keep polling the connection to completion.
-                            Ok(()) => conn.as_mut().graceful_shutdown(crate::private::Internal),
+                            Ok(()) => conn.as_mut().graceful_shutdown(crate::private::SealedToken),
                             // Sender dropped == serve future dropped (force
                             // shutdown): stop now. Dropping `conn` closes the
                             // socket and cancels in-flight work.
@@ -255,7 +255,7 @@ impl Server {
 
         loop {
             tokio::select! {
-                conn = listener.accept(crate::private::Internal) => {
+                conn = listener.accept(crate::private::SealedToken) => {
                     let Some(connection) = conn else { break };
                     let handler = match self.handler.as_ref() {
                         Some(h) => h.clone(),
@@ -264,7 +264,7 @@ impl Server {
                     let serving = connection.serve(
                         handler,
                         self.runtime.clone(),
-                        crate::private::Internal,
+                        crate::private::SealedToken,
                     );
                     let fut = graceful.watch(serving);
                     self.runtime.spawn(Box::pin(fut));
@@ -670,7 +670,7 @@ mod tests {
     }
 
     impl GracefulConnection for MockConnection {
-        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::SealedToken) {
             self.shutdown_called.store(true, Ordering::SeqCst);
             self.finish.notify_one();
         }
@@ -907,7 +907,7 @@ mod tests {
     impl Listener for MockListener {
         type Transport = MockTransport;
 
-        async fn accept(&self, _token: crate::private::Internal) -> Option<Self::Transport> {
+        async fn accept(&self, _token: crate::private::SealedToken) -> Option<Self::Transport> {
             self.rx.lock().await.recv().await
         }
 
@@ -949,7 +949,7 @@ mod tests {
     }
 
     impl GracefulConnection for MockServingConnection {
-        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::SealedToken) {
             // No-op for mock connection
         }
     }
@@ -963,7 +963,7 @@ mod tests {
             self,
             handler: Arc<dyn DynHandle>,
             _runtime: GrpcRuntime,
-            _token: crate::private::Internal,
+            _token: crate::private::SealedToken,
         ) -> Self::Connection {
             let inner = Box::pin(async move {
                 let mut tx = NopSendStream;

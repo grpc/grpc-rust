@@ -27,7 +27,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use grpc::__unstable::Internal;
+use crate::private::SealedToken;
+use grpc::__unstable::UnstableToken;
 use grpc::__unstable::credentials::server::HandshakeOutput;
 use grpc::__unstable::rt::BoxEndpoint;
 use grpc::__unstable::rt::EndpointIoStream;
@@ -159,12 +160,12 @@ impl From<TlsClientCertificateRequestType> for InnerClientCertificateRequestType
             }
             TlsClientCertificateRequestType::RequestAndVerify { roots_provider } => {
                 InnerClientCertificateRequestType::RequestClientCertificateAndVerify {
-                    roots_provider: roots_provider.get_receiver(Internal),
+                    roots_provider: roots_provider.get_receiver(SealedToken),
                 }
             }
             TlsClientCertificateRequestType::RequireAndVerify { roots_provider } => {
                 InnerClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                    roots_provider: roots_provider.get_receiver(Internal),
+                    roots_provider: roots_provider.get_receiver(SealedToken),
                 }
             }
         }
@@ -193,7 +194,7 @@ impl ServerTlsConfig {
         I: Provider<IdentityList>,
     {
         ServerTlsConfig {
-            identities_provider: identities_provider.get_receiver(Internal),
+            identities_provider: identities_provider.get_receiver(SealedToken),
             request_type: TlsClientCertificateRequestType::DontRequest.into(),
             key_log_path: None,
         }
@@ -343,7 +344,7 @@ impl ServerCredentials for RustlsServerCredentials {
         &self,
         source: BoxEndpoint,
         _runtime: GrpcRuntime,
-        _token: Internal,
+        _token: UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         let input_io = EndpointIoStream::new(source);
         let tls_stream = self

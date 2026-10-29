@@ -190,7 +190,7 @@ impl DynInvoke for InternalSubchannel {
             let creds = data
                 .security_opts
                 .credentials
-                .get_call_credentials(private::Internal)
+                .get_call_credentials(private::UnstableToken)
                 .cloned();
 
             (state, creds)

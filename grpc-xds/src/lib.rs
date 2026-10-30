@@ -59,6 +59,12 @@ mod load_balancing;
 /// from a channel's Listener/RouteConfiguration/Cluster/Endpoints resources.
 mod xds_config;
 
+/// The xDS resolver, which routes each RPC to a cluster.
+// TODO: remove once the resolver builds config selectors from `XdsConfig`
+// updates.
+#[cfg_attr(not(test), expect(dead_code))]
+mod resolver;
+
 /// `grpc` crate based [`xds_client::Transport`] implementation.
 mod transport;
 

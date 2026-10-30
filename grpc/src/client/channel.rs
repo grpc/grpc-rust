@@ -193,7 +193,7 @@ impl Invoke for Channel {
         let ac = self.inner.get_active_channel();
         let selected = ac
             .config_selector
-            .select_config(SelectConfigOptions::default())
+            .select_config(SelectConfigOptions::new(&headers))
             .await;
         let config = match selected {
             Ok(config) => config,
@@ -735,7 +735,10 @@ impl SharedConfigSelector {
 
     /// Waits for the resolver's first result, then selects the configuration
     /// for an RPC using `current`.
-    async fn select_config(&self, options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
+    async fn select_config(
+        &self,
+        options: SelectConfigOptions<'_>,
+    ) -> Result<RpcConfig, StatusError> {
         // Returns immediately if `resolved` is already set. `SetOnce` stays
         // set, so an `update` that races with this call can't be missed.
         self.inner.resolved.wait().await;

@@ -103,11 +103,16 @@ pub struct InMemoryServerCall {
 enum InMemoryRequestStreamItem {
     Message(Box<dyn Buf + Send + Sync>),
     StreamClosed,
+    // The client failed the RPC before closing the stream.
+    Error,
 }
 
 enum InMemoryResponseStreamItem {
     Headers(ServerResponseHeaders),
     Message(Box<dyn Buf + Send + Sync>),
+    // Sent by the client's send stream, not the server, when it fails the RPC.
+    // Items the server sends afterwards are not delivered.
+    SendError(StatusError),
 }
 #[derive(Debug)]
 struct InMemoryListenerAddress {
@@ -287,6 +292,7 @@ impl ServerRecvStream for InMemoryServerRecvStream {
                 Some(Ok(()))
             }
             Some(InMemoryRequestStreamItem::StreamClosed) => None,
+            Some(InMemoryRequestStreamItem::Error) => Some(Err(StreamError)),
             None => None,
         }
     }
@@ -309,6 +315,7 @@ impl Invoke for InMemoryConnection {
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::unbounded_channel::<InMemoryRequestStreamItem>();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel::<InMemoryResponseStreamItem>();
+        let send_error_tx = resp_tx.downgrade();
         let (trailer_tx, trailer_rx) = oneshot::channel();
 
         let (method_name, metadata) = headers.into_parts();
@@ -325,7 +332,10 @@ impl Invoke for InMemoryConnection {
         let _ = self.s.send(call).await;
 
         (
-            Box::new(InMemoryClientSendStream { tx: Some(req_tx) }),
+            Box::new(InMemoryClientSendStream {
+                tx: Some(req_tx),
+                send_error_tx,
+            }),
             Box::new(InMemoryClientRecvStream {
                 rx: resp_rx,
                 trailer_rx: Some(trailer_rx),
@@ -342,6 +352,9 @@ impl Drop for InMemoryConnection {
 
 pub struct InMemoryClientSendStream {
     tx: Option<mpsc::UnboundedSender<InMemoryRequestStreamItem>>,
+    // Weak so that it does not keep the response stream open after the server
+    // finishes.
+    send_error_tx: mpsc::WeakUnboundedSender<InMemoryResponseStreamItem>,
 }
 
 impl ClientSendStream for InMemoryClientSendStream {
@@ -350,15 +363,31 @@ impl ClientSendStream for InMemoryClientSendStream {
         msg: &dyn SendMessage,
         _options: ClientSendOptions,
     ) -> Result<(), StreamEnded> {
-        let buf = msg.encode().unwrap();
+        let Some(tx) = &self.tx else {
+            return Err(StreamEnded);
+        };
+        let buf = match msg.encode() {
+            Ok(buf) => buf,
+            Err(e) => {
+                // Queue the failure before the server learns of it, so that
+                // the server's reaction cannot be received ahead of it.  If the
+                // server has already finished, the client has received its
+                // status, which stands.
+                if let Some(send_error_tx) = self.send_error_tx.upgrade() {
+                    let _ = send_error_tx.send(InMemoryResponseStreamItem::SendError(
+                        StatusError::new(
+                            StatusCodeError::Internal,
+                            format!("error encoding request: {e}"),
+                        ),
+                    ));
+                }
+                let _ = tx.send(InMemoryRequestStreamItem::Error);
+                self.tx = None;
+                return Err(StreamEnded);
+            }
+        };
 
-        if self
-            .tx
-            .as_mut()
-            .unwrap()
-            .send(InMemoryRequestStreamItem::Message(buf))
-            .is_err()
-        {
+        if tx.send(InMemoryRequestStreamItem::Message(buf)).is_err() {
             self.tx = None;
             return Err(StreamEnded);
         }
@@ -382,6 +411,10 @@ pub struct InMemoryClientRecvStream {
 
 impl ClientRecvStream for InMemoryClientRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        // Trailers have already been returned.
+        if self.trailer_rx.is_none() {
+            return ResponseStreamItem::StreamClosed;
+        }
         match self.rx.recv().await {
             Some(InMemoryResponseStreamItem::Headers(h)) => {
                 // Note: connection_info is always set when the stream is created, and
@@ -400,27 +433,34 @@ impl ClientRecvStream for InMemoryClientRecvStream {
                 msg.decode(&mut buf).unwrap();
                 ResponseStreamItem::Message
             }
-            _ => {
-                if let Some(trailer_rx) = self.trailer_rx.take() {
-                    match trailer_rx.await {
-                        Ok(trailers) => {
-                            let (status, metadata) = trailers.into_parts();
-                            let client_trailers = ClientTrailers::new(status)
-                                .with_metadata(metadata)
-                                .with_connection_info(self.connection_info.take());
-                            return ResponseStreamItem::Trailers(client_trailers);
-                        }
-                        Err(_) => {
-                            return ResponseStreamItem::Trailers(ClientTrailers::new(Err(
-                                StatusError::new(
-                                    StatusCodeError::Internal,
-                                    "stream ended without trailers in in-memory transport",
-                                ),
-                            )));
-                        }
+            Some(InMemoryResponseStreamItem::SendError(err)) => {
+                self.trailer_rx = None;
+                // Fail the server's further sends, as a reset would.
+                self.rx.close();
+                ResponseStreamItem::Trailers(
+                    ClientTrailers::new(Err(err)).with_connection_info(self.connection_info.take()),
+                )
+            }
+            None => {
+                let trailer_rx = self
+                    .trailer_rx
+                    .take()
+                    .expect("trailer_rx is checked at the start of recv");
+                match trailer_rx.await {
+                    Ok(trailers) => {
+                        let (status, metadata) = trailers.into_parts();
+                        let client_trailers = ClientTrailers::new(status)
+                            .with_metadata(metadata)
+                            .with_connection_info(self.connection_info.take());
+                        ResponseStreamItem::Trailers(client_trailers)
+                    }
+                    Err(_) => {
+                        ResponseStreamItem::Trailers(ClientTrailers::new(Err(StatusError::new(
+                            StatusCodeError::Internal,
+                            "stream ended without trailers in in-memory transport",
+                        ))))
                     }
                 }
-                ResponseStreamItem::StreamClosed
             }
         }
     }
@@ -578,6 +618,282 @@ mod tests {
             }
             _ => panic!("expected trailers with error, got {:?}", item),
         }
+    }
+
+    struct FailingEncodeMessage;
+    impl SendMessage for FailingEncodeMessage {
+        fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
+            Err("intentional encode failure".to_string())
+        }
+    }
+
+    struct EmptyMessage;
+    impl SendMessage for EmptyMessage {
+        fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
+            Ok(Box::new(bytes::Bytes::new()))
+        }
+    }
+
+    fn in_memory_test_connection() -> (InMemoryConnection, mpsc::Receiver<InMemoryServerCall>) {
+        let (call_tx, call_rx) = mpsc::channel(1);
+        let (closed_tx, _closed_rx) = oneshot::channel();
+        let connection = InMemoryConnection {
+            s: call_tx,
+            closed_tx: Some(closed_tx),
+            connection_info: test_connection_info(),
+        };
+        (connection, call_rx)
+    }
+
+    fn assert_encode_error_trailers(item: ResponseStreamItem) {
+        let ResponseStreamItem::Trailers(trailers) = item else {
+            panic!("expected trailers with error, got {item:?}");
+        };
+        let status_err = trailers.status().as_ref().unwrap_err();
+        assert_eq!(status_err.code(), StatusCodeError::Internal);
+        assert!(status_err.message().contains("intentional encode failure"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_send_encode_error_fails_rpc() {
+        use std::time::Duration;
+
+        use crate::server::CallOptions as ServerCallOptions;
+        use crate::server::RecvStream;
+        use crate::server::RequestHeaders;
+        use crate::server::SendStream;
+        use crate::server::Trailers;
+
+        // Sends headers and a message, reports what the request stream yields
+        // after the client's encode failure, and then finishes the call
+        // successfully.
+        struct Handler {
+            sent_tx: Mutex<Option<oneshot::Sender<()>>>,
+            report_tx: mpsc::UnboundedSender<Option<Result<(), StreamError>>>,
+        }
+        impl crate::server::Handle for Handler {
+            async fn handle(
+                &self,
+                _: RequestHeaders,
+                _: ServerCallOptions,
+                send: &mut impl SendStream,
+                mut recv: impl RecvStream + 'static,
+            ) -> Trailers {
+                let headers = ServerResponseStreamItem::Headers(ServerResponseHeaders::new());
+                send.send(headers, ServerSendOptions::default())
+                    .await
+                    .unwrap();
+                send.send(
+                    ServerResponseStreamItem::Message(&EmptyMessage),
+                    ServerSendOptions::default(),
+                )
+                .await
+                .unwrap();
+                let _ = self.sent_tx.lock().unwrap().take().unwrap().send(());
+                let _ = self.report_tx.send(recv.next(&mut NopRecvMessage).await);
+                Trailers::new(Ok(()))
+            }
+        }
+
+        let (connection, mut call_rx) = in_memory_test_connection();
+        let (mut send_stream, mut recv_stream) = connection
+            .invoke(ClientRequestHeaders::new(), CallOptions::default())
+            .await;
+        let (sent_tx, sent_rx) = oneshot::channel();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+        let serving = call_rx.recv().await.unwrap().serve(
+            Arc::new(Handler {
+                sent_tx: Mutex::new(Some(sent_tx)),
+                report_tx,
+            }),
+            crate::rt::default_runtime(),
+            crate::private::Internal,
+        );
+        let serving = tokio::spawn(serving);
+        sent_rx.await.unwrap();
+
+        assert!(
+            send_stream
+                .send(&FailingEncodeMessage, ClientSendOptions::default())
+                .await
+                .is_err()
+        );
+        // The send stream has ended, so a message that encodes fine is rejected.
+        assert!(
+            send_stream
+                .send(&EmptyMessage, ClientSendOptions::default())
+                .await
+                .is_err()
+        );
+        // The server sees the RPC fail rather than the request stream end.
+        assert_eq!(report_rx.recv().await.unwrap(), Some(Err(StreamError)));
+        serving.await.unwrap().unwrap();
+
+        // As in gRPC-Go, what the client received before the failure is
+        // returned, then the failure.  What the server sent after the failure,
+        // including its status, is not.
+        let mut msg = NopRecvMessage;
+        assert!(matches!(
+            recv_stream.recv(&mut msg).await,
+            ResponseStreamItem::Headers(_)
+        ));
+        assert!(matches!(
+            recv_stream.recv(&mut msg).await,
+            ResponseStreamItem::Message
+        ));
+        let item = GrpcRuntime::default()
+            .timeout(Duration::from_secs(5), recv_stream.recv(&mut msg))
+            .await
+            .expect("Test timed out waiting for trailers after encode failure");
+        assert_encode_error_trailers(item);
+        assert!(matches!(
+            recv_stream.recv(&mut msg).await,
+            ResponseStreamItem::StreamClosed
+        ));
+    }
+
+    // As in gRPC-Go, a status the client already received from the server is
+    // reported even if the send stream fails before the application reads it.
+    #[tokio::test]
+    async fn in_memory_send_encode_error_after_server_finished_keeps_status() {
+        use crate::server::CallOptions as ServerCallOptions;
+        use crate::server::RecvStream;
+        use crate::server::RequestHeaders;
+        use crate::server::SendStream;
+        use crate::server::Trailers;
+
+        struct Handler;
+        impl crate::server::Handle for Handler {
+            async fn handle(
+                &self,
+                _: RequestHeaders,
+                _: ServerCallOptions,
+                _: &mut impl SendStream,
+                _: impl RecvStream + 'static,
+            ) -> Trailers {
+                Trailers::new(Err(StatusError::new(
+                    StatusCodeError::NotFound,
+                    "server status",
+                )))
+            }
+        }
+
+        let (connection, mut call_rx) = in_memory_test_connection();
+        let (mut send_stream, mut recv_stream) = connection
+            .invoke(ClientRequestHeaders::new(), CallOptions::default())
+            .await;
+        call_rx
+            .recv()
+            .await
+            .unwrap()
+            .serve(
+                Arc::new(Handler),
+                crate::rt::default_runtime(),
+                crate::private::Internal,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            send_stream
+                .send(&FailingEncodeMessage, ClientSendOptions::default())
+                .await
+                .is_err()
+        );
+        let mut msg = NopRecvMessage;
+        let item = recv_stream.recv(&mut msg).await;
+        let ResponseStreamItem::Trailers(trailers) = item else {
+            panic!("expected trailers, got {item:?}");
+        };
+        let status_err = trailers.status().as_ref().unwrap_err();
+        assert_eq!(status_err.code(), StatusCodeError::NotFound);
+        assert_eq!(status_err.message(), "server status");
+    }
+
+    #[tokio::test]
+    async fn in_memory_send_encode_error_wakes_pending_recv() {
+        use std::time::Duration;
+
+        let (connection, mut call_rx) = in_memory_test_connection();
+        // The server never runs its handler, so recv can only complete because
+        // of the encode failure.
+        let (mut send_stream, mut recv_stream) = connection
+            .invoke(ClientRequestHeaders::new(), CallOptions::default())
+            .await;
+        let mut server_send = InMemoryServerSendStream {
+            tx: call_rx.recv().await.unwrap().resp_tx,
+        };
+
+        // join! polls recv first, so it is already waiting when send fails.
+        let mut msg = NopRecvMessage;
+        let runtime = GrpcRuntime::default();
+        let (item, send_result) = tokio::join!(
+            runtime.timeout(Duration::from_secs(5), recv_stream.recv(&mut msg)),
+            send_stream.send(&FailingEncodeMessage, ClientSendOptions::default()),
+        );
+        assert!(send_result.is_err());
+        assert_encode_error_trailers(
+            item.expect("Test timed out waiting for trailers after encode failure"),
+        );
+
+        // As after a reset, the server can no longer send.
+        assert!(
+            server_send
+                .send(
+                    ServerResponseStreamItem::Message(&EmptyMessage),
+                    ServerSendOptions::default(),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    // Records, each time the server's request stream is woken, whether the
+    // client's failure was already queued for its recv stream.
+    struct SendErrorQueuedProbe {
+        resp_rx: Mutex<mpsc::UnboundedReceiver<InMemoryResponseStreamItem>>,
+        queued_at_wake: Mutex<Vec<bool>>,
+    }
+
+    impl std::task::Wake for SendErrorQueuedProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let queued = !self.resp_rx.lock().unwrap().is_empty();
+            self.queued_at_wake.lock().unwrap().push(queued);
+        }
+    }
+
+    // Once the server learns of the failure, its reaction (such as finishing
+    // with OK) must not be received ahead of the failure.  On a multi-threaded
+    // runtime the server can react at once, so the test observes the moment
+    // the server is woken: the failure must already be queued for the client.
+    #[tokio::test]
+    async fn in_memory_send_encode_error_is_queued_before_server_sees_it() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let mut send_stream = InMemoryClientSendStream {
+            tx: Some(req_tx),
+            send_error_tx: resp_tx.downgrade(),
+        };
+        let probe = Arc::new(SendErrorQueuedProbe {
+            resp_rx: Mutex::new(resp_rx),
+            queued_at_wake: Mutex::default(),
+        });
+        let waker = std::task::Waker::from(probe.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(req_rx.poll_recv(&mut cx).is_pending());
+
+        assert!(
+            send_stream
+                .send(&FailingEncodeMessage, ClientSendOptions::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(*probe.queued_at_wake.lock().unwrap(), vec![true]);
+        drop(resp_tx);
     }
 
     #[test]

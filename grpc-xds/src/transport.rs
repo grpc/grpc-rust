@@ -27,9 +27,6 @@
 //! This transport uses the `grpc` crate's [`Channel`] and low-level streams
 //! to send and receive raw bytes.
 
-// TODO: remove once XdsClient is wired up in grpc-xds.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use bytes::Buf;

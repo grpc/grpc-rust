@@ -42,6 +42,9 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated/mod.rs"));
 }
 
+/// xDS Bootstrap data structure and parser.
+mod bootstrap;
+
 /// Validated xDS resource types (LDS/RDS/CDS/EDS), each implementing
 /// `xds_client::Resource` so they can be deserialized, named, and validated
 /// per their respective gRFCs (A27 core resource types, A28 route matching,

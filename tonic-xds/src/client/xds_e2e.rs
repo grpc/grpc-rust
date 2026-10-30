@@ -45,6 +45,7 @@ mod test {
     use crate::XdsChannelBuilder;
     use crate::XdsChannelConfig;
     use crate::XdsChannelGrpc;
+    use crate::XdsClientPool;
     use crate::XdsUri;
     use crate::client::channel::{LB_BACKENDS, LbBackend};
     use crate::testutil::grpc::GreeterClient;
@@ -78,12 +79,15 @@ mod test {
     }
 
     fn builder_for(cp_addr: SocketAddr, listener_name: &str) -> XdsChannelBuilder {
+        let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
+        XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap_for(cp_addr)))
+    }
+
+    fn bootstrap_for(cp_addr: SocketAddr) -> BootstrapConfig {
         let bootstrap_json = format!(
             r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
         );
-        let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
-        let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
-        XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap))
+        BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap")
     }
 
     /// Sends `say_hello` in a loop until a reply starting with `want_prefix` is
@@ -488,6 +492,120 @@ mod test {
             .await
             .expect("half-open ADS connection never replaced; keepalive not applied")
             .expect("proxy stopped accepting");
+    }
+
+    /// Waits until exactly `want` ADS streams are subscribed to LDS.
+    async fn wait_for_lds_streams(control_plane: &RunningControlPlane, want: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let counts = control_plane.get_service().get_subscriber_counts();
+                if counts.get(&config::AdsTypeUrl::Lds).copied().unwrap_or(0) == want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never observed {want} LDS streams"));
+    }
+
+    /// Channels built from one `XdsClientPool` share an ADS stream per key:
+    /// by default per target (gRFC A71), or across targets under one explicit
+    /// key. The stream closes once its last channel is dropped. Channels
+    /// without a pool each have their own, so they share nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_channels_share_ads_stream_per_key() {
+        let backend = spawn_greeter_server("backend", None, None)
+            .await
+            .expect("spawn greeter backend");
+        let backend_addr = backend.addr;
+
+        let (control_plane, cp_addr) = start_control_plane().await;
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Lds,
+            HashMap::from([
+                (
+                    "svc-a".to_string(),
+                    config::build_inline_listener("svc-a", "my-cluster"),
+                ),
+                (
+                    "svc-b".to_string(),
+                    config::build_inline_listener("svc-b", "my-cluster"),
+                ),
+            ]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Cds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cluster("my-cluster"),
+            )]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cla(
+                    "my-cluster",
+                    &[(backend_addr.ip().to_string(), backend_addr.port())],
+                ),
+            )]),
+        );
+
+        let pool = XdsClientPool::builder()
+            .with_bootstrap(bootstrap_for(cp_addr))
+            .build()
+            .expect("build pool");
+        let pooled = |listener_name: &str| {
+            let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
+            XdsChannelBuilder::new(XdsChannelConfig::new(target)).with_xds_client_pool(pool.clone())
+        };
+        let mut clients = Vec::new();
+
+        // Channels for one target share a client; another target gets its own.
+        for listener_name in ["svc-a", "svc-a", "svc-b"] {
+            let channel = pooled(listener_name).build_grpc_channel().expect("build");
+            clients.push(GreeterClient::new(channel));
+        }
+        for client in &mut clients {
+            say_hello_until_prefix(client, "backend:").await;
+        }
+        wait_for_lds_streams(&control_plane, 2).await;
+
+        drop(clients);
+        wait_for_lds_streams(&control_plane, 0).await;
+
+        // Channels for different targets share one client under one key.
+        let mut clients = Vec::new();
+        for listener_name in ["svc-a", "svc-b"] {
+            let channel = pooled(listener_name)
+                .with_xds_client_key("shared")
+                .build_grpc_channel()
+                .expect("build");
+            clients.push(GreeterClient::new(channel));
+        }
+        for client in &mut clients {
+            say_hello_until_prefix(client, "backend:").await;
+        }
+        wait_for_lds_streams(&control_plane, 1).await;
+
+        drop(clients);
+        wait_for_lds_streams(&control_plane, 0).await;
+
+        let mut clients = Vec::new();
+        for listener_name in ["svc-a", "svc-a"] {
+            let channel = builder_for(cp_addr, listener_name)
+                .with_xds_client_key("shared")
+                .build_grpc_channel()
+                .expect("build");
+            clients.push(GreeterClient::new(channel));
+        }
+        for client in &mut clients {
+            say_hello_until_prefix(client, "backend:").await;
+        }
+        wait_for_lds_streams(&control_plane, 2).await;
+
+        let _ = backend.shutdown.send(());
     }
 }
 

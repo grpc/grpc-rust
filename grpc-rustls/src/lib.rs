@@ -35,14 +35,17 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::PrivateKeyDer;
 use rustls_pki_types::CertificateDer;
 use tokio::sync::watch;
+use tokio_rustls::TlsStream;
 
 use grpc::__unstable::Internal;
+use grpc::__unstable::rt::EndpointIoStream;
+use grpc::__unstable::rt::GrpcEndpoint;
+use grpc::__unstable::rt::StreamEndpoint;
 use grpc::credentials::ProtocolInfo;
 
 pub mod client;
 mod key_log;
 pub mod server;
-mod tls_stream;
 
 const ALPN_PROTO_STR_H2: &[u8; 2] = b"h2";
 
@@ -138,6 +141,22 @@ pub type StaticRootCertificatesProvider = StaticProvider<RootCertificates>;
 pub type StaticIdentityProvider = StaticProvider<Identity>;
 
 static TLS_PROTO_INFO: ProtocolInfo = ProtocolInfo::unstable_new("tls");
+
+/// A [`GrpcEndpoint`] that carries TLS over an underlying transport endpoint.
+type TlsEndpoint<T> = StreamEndpoint<TlsStream<EndpointIoStream<T>>>;
+
+/// Adapts an established TLS stream into a [`GrpcEndpoint`], inheriting the
+/// addresses and network type of the underlying transport.
+fn tls_endpoint<T: GrpcEndpoint>(
+    stream: impl Into<TlsStream<EndpointIoStream<T>>>,
+) -> TlsEndpoint<T> {
+    let stream = stream.into();
+    let transport = stream.get_ref().0.get_ref();
+    let local_addr: Box<str> = transport.get_local_address().into();
+    let peer_addr: Box<str> = transport.get_peer_address().into();
+    let network_type = transport.get_network_type();
+    StreamEndpoint::new(stream, local_addr, peer_addr, network_type)
+}
 
 fn sanitize_crypto_provider(mut crypto_provider: CryptoProvider) -> Result<CryptoProvider, String> {
     crypto_provider.cipher_suites.retain(|suite| match suite {

@@ -119,3 +119,6 @@ mod echo_pb {
         "/src/generated/grpc_examples_echo.rs"
     ));
 }
+
+#[cfg(test)]
+mod stub_server;

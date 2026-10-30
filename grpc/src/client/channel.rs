@@ -45,7 +45,14 @@ use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::RecvStream;
 use crate::client::RequestHeaders;
+use crate::client::ResponseStreamItem;
+use crate::client::SendOptions;
+use crate::client::SendStream;
+use crate::client::deadline::DeadlineInvoker;
+use crate::client::deadline::DeadlineRecvStream;
+use crate::client::deadline::DeadlineSendStream;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
@@ -84,6 +91,9 @@ use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
+use crate::core::RecvMessage;
+use crate::core::SendMessage;
+use crate::core::StreamEnded;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
@@ -100,7 +110,13 @@ use crate::rt::default_runtime;
 /// To perform RPCs, use the [`Invoke`] trait implemented by `Channel`.
 #[derive(Clone)]
 pub struct Channel {
-    inner: Arc<PersistentChannel>,
+    /// The layers that RPCs pass through, outermost first:
+    ///
+    /// 1. [`DeadlineInvoker`]: enforces the call's deadline.
+    /// 2. [`PersistentChannel`]: starts RPCs on the current [`ActiveChannel`].
+    /// 3. [`ActiveChannel`]: applies the config chosen by its config selector.
+    /// 4. [`LbInvoker`]: picks a subchannel using the LB policy's picker.
+    inner: Arc<DeadlineInvoker<PersistentChannel>>,
 }
 
 impl Channel {
@@ -167,7 +183,7 @@ impl Channel {
     /// state was [`Idle`](ConnectivityState::Idle), the channel will attempt to
     /// create connections.
     pub fn get_state(&mut self, connect: bool) -> ConnectivityState {
-        self.inner.get_state(connect)
+        self.persistent().get_state(connect)
     }
 
     /// Waits for the state of the channel to change from source.  Times out and
@@ -181,29 +197,45 @@ impl Channel {
     }
 }
 
+impl Channel {
+    fn persistent(&self) -> &PersistentChannel {
+        self.inner.next()
+    }
+}
+
 impl Invoke for Channel {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
+    type SendStream = ChannelSendStream;
+    type RecvStream = ChannelRecvStream;
 
     async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
-        let ac = self.inner.get_active_channel();
-        let selected = ac
-            .config_selector
-            .select_config(SelectConfigOptions::default())
-            .await;
-        let config = match selected {
-            Ok(config) => config,
-            Err(status) => return FailingRecvStream::new_stream_pair(status, None),
-        };
-        match config.interceptor {
-            Some(interceptor) => interceptor.dyn_intercept(headers, options, ac).await,
-            // Avoid heap allocations and dynamic dispatch.
-            None => ac.invoke(headers, options).await,
-        }
+        let (tx, rx) = self.inner.invoke(headers, options).await;
+        (ChannelSendStream(tx), ChannelRecvStream(rx))
+    }
+}
+
+/// The [`SendStream`] of an RPC started on a [`Channel`].
+pub struct ChannelSendStream(DeadlineSendStream<Box<dyn DynSendStream>>);
+
+impl SendStream for ChannelSendStream {
+    async fn send(
+        &mut self,
+        msg: &dyn SendMessage,
+        options: SendOptions,
+    ) -> Result<(), StreamEnded> {
+        self.0.send(msg, options).await
+    }
+}
+
+/// The [`RecvStream`] of an RPC started on a [`Channel`].
+pub struct ChannelRecvStream(DeadlineRecvStream<Box<dyn DynSendStream>, Box<dyn DynRecvStream>>);
+
+impl RecvStream for ChannelRecvStream {
+    async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        self.0.recv(msg).await
     }
 }
 
@@ -252,15 +284,16 @@ impl ChannelBuilder {
             authority: Authority::from_host_port_str(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
+        let persistent = PersistentChannel {
+            active_channel: ArcSwapOption::empty(),
+            active_channel_init: Mutex::new(()),
+            target,
+            security_opts,
+            runtime: self.runtime.clone(),
+            resolver_builder,
+        };
         Channel {
-            inner: Arc::new(PersistentChannel {
-                active_channel: ArcSwapOption::empty(),
-                active_channel_init: Mutex::new(()),
-                target,
-                security_opts,
-                runtime: self.runtime,
-                resolver_builder,
-            }),
+            inner: Arc::new(DeadlineInvoker::new(self.runtime, persistent)),
         }
     }
 
@@ -324,12 +357,25 @@ impl PersistentChannel {
     }
 }
 
+/// Starts RPCs on the current [`ActiveChannel`], creating it if necessary.
+impl Invoke for PersistentChannel {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        self.get_active_channel().invoke(headers, options).await
+    }
+}
+
 // A channel that is not idle (connecting, ready, or erroring).
 struct ActiveChannel {
-    abort_handle: Box<dyn rt::TaskHandle>, /* Work scheduler task killed when ActiveChannel is
-                                            * dropped. */
-    lb_watcher: Arc<Watcher<LbState>>, /* For getting the channel connectivity state and pickers
-                                        * for RPCs. */
+    /// Starts RPCs on subchannels picked by the LB policy.  In an `Arc` so
+    /// that it can be passed to the interceptors chosen by the config selector.
+    lb: Arc<LbInvoker>,
     config_selector: SharedConfigSelector,
 }
 
@@ -382,26 +428,69 @@ impl ActiveChannel {
         }));
 
         Arc::new(Self {
-            abort_handle,
-            lb_watcher,
+            lb: Arc::new(LbInvoker {
+                abort_handle,
+                lb_watcher,
+            }),
             config_selector,
         })
     }
 
     fn connectivity_state(&self) -> ConnectivityState {
-        self.lb_watcher.snapshot().value().connectivity_state
+        self.lb.lb_watcher.snapshot().value().connectivity_state
     }
+}
 
-    /// Starts an RPC on a subchannel picked by the current LB picker, waiting
-    /// for a new picker while picks are queued.
-    ///
-    /// Unlike [`DynInvoke::dyn_invoke`], this doesn't box the returned future,
-    /// so callers that don't need dynamic dispatch avoid an allocation.
+/// Applies the config chosen by the config selector to each RPC.
+impl Invoke for ActiveChannel {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
     async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+    ) -> (Self::SendStream, Self::RecvStream) {
+        let selected = self
+            .config_selector
+            .select_config(SelectConfigOptions::default())
+            .await;
+        let config = match selected {
+            Ok(config) => config,
+            Err(status) => return FailingRecvStream::new_stream_pair(status, None),
+        };
+        match config.interceptor {
+            Some(interceptor) => {
+                interceptor
+                    .dyn_intercept(headers, options, self.lb.clone())
+                    .await
+            }
+            // Avoid heap allocations and dynamic dispatch.
+            None => self.lb.invoke(headers, options).await,
+        }
+    }
+}
+
+/// Starts RPCs on subchannels picked by the LB policy's current picker.
+struct LbInvoker {
+    /// The task running the resolver and LB policy, which update `lb_watcher`.
+    /// Aborted when this is dropped.
+    abort_handle: Box<dyn rt::TaskHandle>,
+    /// For getting the channel connectivity state and pickers for RPCs.
+    lb_watcher: Arc<Watcher<LbState>>,
+}
+
+impl Invoke for LbInvoker {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    /// Starts an RPC on a subchannel picked by the current LB picker, waiting
+    /// for a new picker while picks are queued.
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
         // Fast path: snapshot the latest LB state without locking and pick
         // with its picker.
         let mut snapshot = self.lb_watcher.snapshot();
@@ -435,18 +524,7 @@ impl ActiveChannel {
     }
 }
 
-#[crate::async_trait]
-impl DynInvoke for ActiveChannel {
-    async fn dyn_invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        self.invoke(headers, options).await
-    }
-}
-
-impl Drop for ActiveChannel {
+impl Drop for LbInvoker {
     fn drop(&mut self) {
         self.abort_handle.abort();
     }
@@ -802,7 +880,7 @@ mod tests {
     async fn get_state_without_connect_stays_idle() {
         let mut channel = new_channel();
         assert_eq!(channel.get_state(false), ConnectivityState::Idle);
-        assert!(channel.inner.active_channel.load().is_none());
+        assert!(channel.persistent().active_channel.load().is_none());
     }
 
     #[tokio::test]
@@ -819,7 +897,7 @@ mod tests {
                         // ActiveChannel creation spawns tasks on the runtime.
                         let _rt = handle.enter();
                         barrier.wait();
-                        channel.inner.get_active_channel()
+                        channel.persistent().get_active_channel()
                     })
                 })
                 .collect();
@@ -832,9 +910,12 @@ mod tests {
         }
         assert!(Arc::ptr_eq(
             first,
-            &channel.inner.active_channel.load_full().unwrap()
+            &channel.persistent().active_channel.load_full().unwrap()
         ));
-        assert_ne!(channel.inner.get_state(false), ConnectivityState::Idle);
+        assert_ne!(
+            channel.persistent().get_state(false),
+            ConnectivityState::Idle
+        );
     }
 
     // Fails the test instead of hanging if next() never resolves.

@@ -176,6 +176,19 @@ impl Invoke for TonicTransport {
             ));
         }
 
+        // Compute the timeout as late as possible.  The stream may still block
+        // on quota beyond here, but there is currently no way to avoid this.
+        if let Some(deadline) = options.deadline() {
+            let timeout = deadline.saturating_duration_since(self.runtime.now());
+            if timeout.is_zero() {
+                return self.local_err_streams(StatusError::new(
+                    StatusCodeError::DeadlineExceeded,
+                    "deadline exceeded",
+                ));
+            }
+            request.set_timeout(timeout);
+        }
+
         // Note that Tonic's streaming call blocks until the server's headers
         // are received.  The client needs a SendStream to provide the request
         // message(s), which the server may be awaiting before sending its

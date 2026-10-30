@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::result::Result;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -34,6 +35,7 @@ use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tonic::Response;
 use tonic::Status as TonicStatus;
@@ -47,8 +49,9 @@ use crate::async_trait;
 use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::Channel;
+use crate::client::DynInvoke;
 use crate::client::Invoke as _;
-use crate::client::RecvStream as _;
+use crate::client::RecvStream;
 use crate::client::RequestHeaders;
 use crate::client::ResponseHeaders;
 use crate::client::ResponseStreamItem;
@@ -1029,4 +1032,361 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     // Verify the send stream has ended.
     let req = WrappedEchoRequest(EchoRequest::default());
     assert!(tx.send(&req, SendOptions::default()).await.is_err());
+}
+
+/// Connects the tonic transport directly to `addr`, bypassing the channel.
+/// Returns the connection and its disconnection listener.
+async fn connect_transport(
+    addr: SocketAddr,
+) -> (Box<dyn DynInvoke>, oneshot::Receiver<Result<(), String>>) {
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let security_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+    let (conn, _sec_info, disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &security_opts,
+            &TransportOptions::default(),
+        )
+        .await
+        .unwrap();
+    (conn, disconnection_listener)
+}
+
+/// Call credentials that take `delay` to produce metadata.
+#[derive(Debug)]
+struct DelayedCallCredentials {
+    delay: Duration,
+}
+
+#[async_trait]
+impl CallCredentials for DelayedCallCredentials {
+    async fn get_metadata(
+        &self,
+        _call_details: &CallDetails,
+        _auth_info: &ClientConnectionSecurityInfo,
+        _metadata: &mut MetadataMap,
+    ) -> Result<(), crate::StatusError> {
+        GrpcRuntime::default().sleep(self.delay).await;
+        Ok(())
+    }
+
+    fn minimum_channel_security_level(&self) -> SecurityLevel {
+        SecurityLevel::NoSecurity
+    }
+}
+
+/// Responds to a raw h2 request with a trailers-only, successful gRPC response.
+fn respond_ok(mut respond: h2::server::SendResponse<Bytes>) {
+    let response = http::Response::builder()
+        .status(200)
+        .header("content-type", "application/grpc")
+        .header("grpc-status", "0")
+        .body(())
+        .unwrap();
+    respond.send_response(response, true).unwrap();
+}
+
+type RawH2Request = (
+    http::Request<h2::RecvStream>,
+    h2::server::SendResponse<Bytes>,
+);
+
+/// A raw h2 server, for tests that need to observe or control the HTTP/2
+/// stream directly.
+///
+/// It accepts a single connection and responds successfully to the first RPC on
+/// it, which is expected to be from [`warm_up`].  Later requests are delivered
+/// via [`RawH2Server::next_request`].
+struct RawH2Server {
+    addr: SocketAddr,
+    requests: mpsc::UnboundedReceiver<RawH2Request>,
+}
+
+impl RawH2Server {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, requests) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let Some(Ok((_, respond))) = connection.accept().await else {
+                return;
+            };
+            respond_ok(respond);
+            // Keep accepting, which also drives the connection, until the
+            // client closes it.
+            while let Some(Ok(request)) = connection.accept().await {
+                let _ = tx.send(request);
+            }
+        });
+        Self { addr, requests }
+    }
+
+    /// Returns the next request received after the warm-up RPC.
+    async fn next_request(&mut self) -> RawH2Request {
+        self.requests.recv().await.unwrap()
+    }
+}
+
+/// Performs an RPC without a deadline to ensure `channel` is connected, so that
+/// RPCs later in a test do not race with connection establishment.  (With a
+/// paused clock, tokio may advance time to the RPC's deadline while waiting on
+/// real I/O.)
+///
+/// The server must respond to the RPC successfully.
+async fn warm_up(channel: &Channel) {
+    let (_tx, mut rx) = channel
+        .invoke(
+            RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
+            CallOptions::default(),
+        )
+        .await;
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    loop {
+        match rx.recv(&mut resp).await {
+            ResponseStreamItem::Trailers(trailers) => {
+                let status = trailers.status();
+                assert!(status.is_ok(), "warm-up RPC failed: {status:?}");
+                return;
+            }
+            ResponseStreamItem::StreamClosed => panic!("warm-up RPC ended without trailers"),
+            ResponseStreamItem::Headers(_) | ResponseStreamItem::Message => {}
+        }
+    }
+}
+
+/// Returns the value of the grpc-timeout header in `request`.
+fn grpc_timeout<T>(request: &http::Request<T>) -> &str {
+    request
+        .headers()
+        .get("grpc-timeout")
+        .expect("missing grpc-timeout")
+        .to_str()
+        .unwrap()
+}
+
+/// How the server observed the end of the client's request stream.
+#[derive(Debug)]
+enum RequestStreamEnd {
+    /// The client half-closed the stream (END_STREAM).
+    HalfClosed,
+    /// The client reset the stream (RST_STREAM) with the given reason.
+    Reset(Option<Reason>),
+}
+
+/// Reads `body` until it ends, and reports how it ended.
+async fn read_request_stream_end(mut body: h2::RecvStream) -> RequestStreamEnd {
+    loop {
+        match body.data().await {
+            None => return RequestStreamEnd::HalfClosed,
+            Some(Err(e)) => return RequestStreamEnd::Reset(e.reason()),
+            Some(Ok(data)) => {
+                let _ = body.flow_control().release_capacity(data.len());
+            }
+        }
+    }
+}
+
+/// Returns the current time according to the runtime's clock, which follows
+/// tokio's paused clock in tests that use one.  RPC deadlines must be computed
+/// from this so that they are consistent with the clock used by the channel.
+fn now() -> Instant {
+    GrpcRuntime::default().now()
+}
+
+fn call_options_with_deadline(deadline: Instant) -> CallOptions {
+    let mut opts = CallOptions::new();
+    opts.set_deadline(deadline);
+    opts
+}
+
+/// Receives the next item from `rx` and asserts that it is trailers with a
+/// DeadlineExceeded status.
+async fn recv_deadline_exceeded(rx: &mut impl RecvStream) -> Trailers {
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    let ResponseStreamItem::Trailers(trailers) = item else {
+        panic!("expected trailers due to deadline exceeded, got {item:?}");
+    };
+    assert_eq!(
+        trailers.status().as_ref().unwrap_err().code(),
+        StatusCodeError::DeadlineExceeded
+    );
+    trailers
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_exceeded_waiting_for_connection() {
+    let server = StubServer::new().start().await;
+
+    // Connection handshake takes 5s, but RPC deadline is 1s.
+    let target = format!("dns:///{}", server.addr());
+    let channel = Channel::builder(
+        &target,
+        SlowChannelCredentials::new_arc(Duration::from_secs(5)),
+    )
+    .build();
+
+    let (mut tx, mut rx) = channel
+        .invoke(
+            RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
+            call_options_with_deadline(now() + Duration::from_secs(1)),
+        )
+        .await;
+
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err());
+    let trailers = recv_deadline_exceeded(&mut rx).await;
+    assert!(trailers.connection_info().is_none());
+
+    server.stop().await;
+}
+
+// Verifies that the transport fails a call whose deadline has already expired
+// without starting it.  (The channel normally catches this first, but time may
+// pass before the call reaches the transport.)
+#[tokio::test]
+async fn tonic_transport_deadline_already_expired() {
+    super::reg();
+    let server = StubServer::new().start().await;
+    let (conn, _disconnection_listener) = connect_transport(server.addr()).await;
+
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
+            call_options_with_deadline(now() - Duration::from_secs(1)),
+        )
+        .await;
+
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err());
+    recv_deadline_exceeded(&mut rx).await;
+
+    server.stop().await;
+}
+
+// Verifies that a deadline expiring while awaiting the response cancels the
+// stream, and that the grpc-timeout header is computed when the request headers
+// are written, so that time spent before then is not included in the timeout
+// sent to the server.
+#[tokio::test(start_paused = true)]
+async fn deadline_exceeded_during_recv() {
+    super::reg();
+    let mut server = RawH2Server::start().await;
+
+    const CALL_CREDS_DELAY: Duration = Duration::from_millis(300);
+    let composite_creds = CompositeChannelCredentials::new(
+        LocalChannelCredentials::new(),
+        Arc::new(DelayedCallCredentials {
+            delay: CALL_CREDS_DELAY,
+        }),
+    );
+    let target = format!("dns:///{}", server.addr);
+    let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
+    // Connect first, so that only the call credentials delay the RPC below.
+    warm_up(&channel).await;
+
+    let (mut tx, mut rx) = channel
+        .invoke(
+            RequestHeaders::new()
+                .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
+            call_options_with_deadline(now() + Duration::from_secs(1)),
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(&req, SendOptions::default()).await.unwrap();
+
+    // The server never responds.
+    let (request, _respond) = server.next_request().await;
+    // The clock is paused, so exactly CALL_CREDS_DELAY elapses before the
+    // request is sent.
+    assert_eq!(grpc_timeout(&request), "700000u");
+
+    recv_deadline_exceeded(&mut rx).await;
+    // The stream stays closed after the trailers.
+    let item = rx
+        .recv(&mut WrappedEchoResponse(EchoResponse::default()))
+        .await;
+    assert!(
+        matches!(item, ResponseStreamItem::StreamClosed),
+        "expected StreamClosed after trailers, got {item:?}"
+    );
+
+    let end = read_request_stream_end(request.into_body()).await;
+    assert!(
+        matches!(end, RequestStreamEnd::Reset(Some(Reason::CANCEL))),
+        "expected the request stream to be cancelled, got {end:?}"
+    );
+}
+
+// Verifies that a send blocked on flow control times out on its own (without a
+// concurrent recv), and that the stream is then reset rather than half-closed.
+//
+// Note that hyper does not poll the request body (where tonic observes
+// cancellation) while the stream has no flow control window, so the reset is
+// not sent until the server reads the request body.
+#[tokio::test(start_paused = true)]
+async fn deadline_exceeded_during_send_resets_instead_of_half_closing() {
+    super::reg();
+    let mut server = RawH2Server::start().await;
+    let target = format!("dns:///{}", server.addr);
+    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    warm_up(&channel).await;
+
+    let (mut tx, mut rx) = channel
+        .invoke(
+            RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/ClientStreamingEcho"),
+            call_options_with_deadline(now() + Duration::from_secs(1)),
+        )
+        .await;
+
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "x".repeat(1024),
+    });
+    // The server does not read the request body yet, so flow control
+    // eventually blocks the sends until the deadline expires.  Don't call
+    // rx.recv() concurrently.
+    let mut sent = 0;
+    while tx.send(&req, SendOptions::default()).await.is_ok() {
+        sent += 1;
+    }
+    assert!(sent > 0, "no messages were sent");
+
+    // Dropping the send stream after the deadline must not half-close the
+    // request stream.
+    drop(tx);
+    // Start reading the request body, opening the flow control window so that
+    // the client can make progress on the stream.
+    let (request, _respond) = server.next_request().await;
+    let end = tokio::spawn(read_request_stream_end(request.into_body()));
+    // Give the client time to (incorrectly) half-close the stream before it is
+    // cancelled below.  The clock is paused, so this returns once the client
+    // and server are otherwise idle.
+    GrpcRuntime::default()
+        .sleep(Duration::from_millis(100))
+        .await;
+
+    // The deadline is enforced (and the call cancelled) once rx is used.
+    recv_deadline_exceeded(&mut rx).await;
+
+    let end = end.await.unwrap();
+    assert!(
+        matches!(end, RequestStreamEnd::Reset(Some(Reason::CANCEL))),
+        "expected the request stream to be cancelled, got {end:?}"
+    );
 }

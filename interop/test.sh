@@ -77,18 +77,18 @@ while kill -0 ${SERVER_PID} 2> /dev/null; do
     sleep 0.5
 done
 
-# TODO: Enable protobuf codec once gRPC server transport is implemented.
-CODECS=("prost")
+CODECS=("prost" "protobuf")
 
 for CODEC in "${CODECS[@]}"; do
     # run the test server
     "${TARGET_DIR}/debug/server" "${ARG}" --codec "${CODEC}" &
     SERVER_PID=$!
-    echo ":; started tonic test server with the ${CODEC} codec."
+    echo ":; started rust test server with the ${CODEC} codec."
 
     sleep 3
 
     "${TARGET_DIR}/debug/client" --codec=prost --test_case="${JOINED_TEST_CASES}" "${ARG}"
+    "${TARGET_DIR}/debug/client" --codec=protobuf --test_case="${JOINED_TEST_CASES}" "${ARG}"
 
     # Run client test cases
     if [ -n "${ARG:-}" ]; then

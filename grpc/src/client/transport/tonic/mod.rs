@@ -28,6 +28,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::Context;
 use std::task::Poll;
 
@@ -40,6 +42,7 @@ use http::Uri;
 use http::uri::PathAndQuery;
 use hyper::client::conn::http2::Builder;
 use hyper::client::conn::http2::SendRequest;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
@@ -156,7 +159,11 @@ impl Invoke for TonicTransport {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let (req_tx, req_rx) = mpsc::channel(1);
-        let request_stream = ReceiverStream::new(req_rx);
+        let send_failure = Arc::new(SendFailure::default());
+        let request_stream = RequestStream {
+            rx: ReceiverStream::new(req_rx),
+            send_failure: send_failure.clone(),
+        };
         let mut request = TonicRequest::new(Box::pin(request_stream));
         let (method, metadata) = headers.into_parts();
         *request.metadata_mut() = metadata.into();
@@ -188,11 +195,20 @@ impl Invoke for TonicTransport {
             let _ = resp_tx.send(response);
         }));
 
+        let call = Arc::new(CallState {
+            cancel_tx,
+            send_failure,
+        });
         (
-            TonicSendStream { sender: Ok(req_tx) },
+            TonicSendStream {
+                state: SendState::Open {
+                    tx: req_tx,
+                    call: call.clone(),
+                },
+            },
             TonicRecvStream {
                 state: StreamState::AwaitingHeaders(resp_rx),
-                cancel_tx: Some(cancel_tx),
+                call: Some(call),
                 connection_info: Some(self.connection_info.clone()),
             },
         )
@@ -203,18 +219,112 @@ impl TonicTransport {
     /// Creates a send/recv stream pair representing locally-produced errors.
     fn local_err_streams(&self, status: StatusError) -> (TonicSendStream, TonicRecvStream) {
         (
-            TonicSendStream { sender: Err(()) },
+            TonicSendStream {
+                state: SendState::Closed,
+            },
             TonicRecvStream {
                 state: StreamState::LocalError(status),
-                cancel_tx: None,
+                call: None,
                 connection_info: Some(self.connection_info.clone()),
             },
         )
     }
 }
 
+/// An error from a call's send stream, which the call's recv stream reports as
+/// the call's status.
+#[derive(Default)]
+struct SendFailure {
+    error: OnceLock<StatusError>,
+    notify: Notify,
+}
+
+impl SendFailure {
+    /// Records `error`.  Only the first error recorded is kept.
+    fn set(&self, error: StatusError) {
+        let _ = self.error.set(error);
+        self.notify.notify_one();
+    }
+
+    fn get(&self) -> Option<&StatusError> {
+        self.error.get()
+    }
+
+    /// Waits for an error to be recorded.
+    async fn wait(&self) -> StatusError {
+        loop {
+            if let Some(error) = self.error.get() {
+                return error.clone();
+            }
+            // notify_one stores a permit if it runs before this wait starts.
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// The request message stream given to tonic.  Once the send stream fails the
+/// call, it never ends, so the request body cannot end normally before tonic
+/// observes the cancellation.
+///
+/// TODO: remove once https://github.com/grpc/grpc-rust/pull/2985 lands.
+struct RequestStream {
+    rx: ReceiverStream<BoxBuf>,
+    send_failure: Arc<SendFailure>,
+}
+
+impl Stream for RequestStream {
+    type Item = BoxBuf;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<BoxBuf>> {
+        match Pin::new(&mut self.rx).poll_next(cx) {
+            // The send stream records the failure before it drops the sender.
+            Poll::Ready(None) if self.send_failure.get().is_some() => Poll::Pending,
+            poll => poll,
+        }
+    }
+}
+
+/// State shared by the send and recv streams of a call.
+struct CallState {
+    cancel_tx: CancellationHandle,
+    send_failure: Arc<SendFailure>,
+}
+
+impl CallState {
+    fn cancel(&self) {
+        self.cancel_tx.clone().cancel();
+    }
+
+    /// Fails the call with an error from the send stream.
+    fn fail_send(&self, status: StatusError) {
+        self.send_failure.set(status);
+        self.cancel();
+    }
+}
+
 struct TonicSendStream {
-    sender: Result<mpsc::Sender<BoxBuf>, ()>,
+    state: SendState,
+}
+
+enum SendState {
+    Open {
+        tx: mpsc::Sender<BoxBuf>,
+        call: Arc<CallState>,
+    },
+    Closed,
+}
+
+impl SendState {
+    /// Fails the call with an error from the send stream and closes it.
+    fn fail(&mut self, status: StatusError) {
+        let SendState::Open { tx, call } = std::mem::replace(self, SendState::Closed) else {
+            return;
+        };
+        // RequestStream relies on the failure being recorded before the
+        // request channel closes.
+        call.fail_send(status);
+        drop(tx);
+    }
 }
 
 impl SendStream for TonicSendStream {
@@ -223,22 +333,33 @@ impl SendStream for TonicSendStream {
         msg: &dyn SendMessage,
         options: SendOptions,
     ) -> Result<(), StreamEnded> {
-        if let Ok(tx) = &self.sender
-            && let Ok(buf) = msg.encode()
-            && tx.send(buf).await.is_ok()
-        {
-            if options.final_msg {
-                self.sender = Err(());
+        let SendState::Open { tx, .. } = &self.state else {
+            return Err(StreamEnded);
+        };
+        let buf = match msg.encode() {
+            Ok(buf) => buf,
+            Err(e) => {
+                self.state.fail(StatusError::new(
+                    StatusCodeError::Internal,
+                    format!("error encoding request: {e}"),
+                ));
+                return Err(StreamEnded);
             }
-            return Ok(());
+        };
+        if tx.send(buf).await.is_err() {
+            self.state = SendState::Closed;
+            return Err(StreamEnded);
         }
-        Err(StreamEnded)
+        if options.final_msg {
+            self.state = SendState::Closed;
+        }
+        Ok(())
     }
 }
 
 struct TonicRecvStream {
     state: StreamState,
-    cancel_tx: Option<CancellationHandle>,
+    call: Option<Arc<CallState>>,
     connection_info: Option<ConnectionInfo>,
 }
 
@@ -255,9 +376,18 @@ impl TonicRecvStream {
                 tonic::metadata::MetadataValue::from_bytes(status.details()),
             );
         }
-        let status_res = match status.code() {
-            Code::Ok => Ok(()),
-            code => Err(StatusError::new(
+        // Tonic reports the cancellation caused by a send failure as Cancelled,
+        // with the h2 error as its source.  A Cancelled status sent by the
+        // server has no source.
+        let send_error = self
+            .call
+            .as_ref()
+            .and_then(|call| call.send_failure.get())
+            .filter(|_| status.code() == Code::Cancelled && status.source().is_some());
+        let status_res = match (status.code(), send_error) {
+            (_, Some(send_error)) => Err(send_error.clone()),
+            (Code::Ok, None) => Ok(()),
+            (code, None) => Err(StatusError::new(
                 StatusCodeError::from(code as i32),
                 status.message(),
             )),
@@ -271,8 +401,8 @@ impl TonicRecvStream {
         status: crate::Result<()>,
         md: Option<&TonicMeta>,
     ) -> ResponseStreamItem {
-        if let Some(cancel_tx) = self.cancel_tx.take() {
-            cancel_tx.cancel();
+        if let Some(call) = self.call.take() {
+            call.cancel();
         }
         let trailers = if let Some(md) = md {
             match md.try_into() {
@@ -298,6 +428,29 @@ enum StreamState {
 
 impl RecvStream for TonicRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        let Some(call) = self.call.clone() else {
+            return self.recv_state(msg).await;
+        };
+        // After a send failure, items already received (including the
+        // server's status) are still returned; otherwise the send failure ends
+        // the call.  Tonic only observes the cancellation from a send failure
+        // once hyper polls the request body, which it does not do while the
+        // stream is blocked on flow control or on the server's stream limit, so
+        // recv_state alone may never complete.  See
+        // https://github.com/grpc/grpc-rust/issues/2983.
+        tokio::select! {
+            biased;
+            item = self.recv_state(msg) => item,
+            err = call.send_failure.wait() => {
+                self.state = StreamState::Closed;
+                self.trailers_from_grpc_result(Err(err), None)
+            }
+        }
+    }
+}
+
+impl TonicRecvStream {
+    async fn recv_state(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         // Take the current state, leaving `Closed` in its place temporarily
         let state = std::mem::replace(&mut self.state, StreamState::Closed);
 
@@ -390,8 +543,8 @@ impl RecvStream for TonicRecvStream {
 
 impl Drop for TonicRecvStream {
     fn drop(&mut self) {
-        if let Some(cancel_tx) = self.cancel_tx.take() {
-            cancel_tx.cancel();
+        if let Some(call) = self.call.take() {
+            call.cancel();
         }
     }
 }

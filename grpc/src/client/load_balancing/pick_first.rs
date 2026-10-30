@@ -2321,4 +2321,34 @@ mod test {
         env.expect_connect_to("addr2");
         env.expect_no_events();
     }
+
+    // Tests that exit_idle is a no-op before the first resolver update or
+    // while Connecting or Ready.
+    #[tokio::test]
+    async fn test_pick_first_exit_idle() {
+        let mut env = new_env();
+
+        // Before any resolver update (Idle, but subchannels is empty),
+        // exit_idle should be a no-op.
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
+
+        // While Connecting, exit_idle should be a no-op.
+        env.send_resolver_update(create_endpoints(vec!["addr1"], None))
+            .unwrap();
+        let sc1 = env.expect_new_subchannel_for("addr1");
+        env.expect_connect();
+        env.expect_queuing_picker();
+
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
+
+        // While Ready, exit_idle should be a no-op and keep the selected
+        // subchannel active.
+        env.send_subchannel_update(&sc1, &SubchannelState::ready());
+        env.expect_ready_picker(&sc1);
+
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
+    }
 }

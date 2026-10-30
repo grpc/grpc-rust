@@ -15,7 +15,7 @@ keywords = ["rpc", "grpc", "async", "futures", "protobuf"]
 license = "MIT"
 readme = "../README.md"
 repository = "https://github.com/grpc/grpc-rust"
-version = "0.14.6"
+version = "0.14.9"
 rust-version = {workspace = true}
 exclude = ["benches-disabled"]
 
@@ -76,7 +76,7 @@ async-trait = {version = "0.1.13", optional = true}
 
 # transport
 h2 = {version = "0.4", optional = true}
-hyper = {version = "1", features = ["http1", "http2"], optional = true}
+hyper = {version = "1.10", features = ["http1", "http2"], optional = true}
 hyper-util = { version = "0.1.11", features = ["tokio"], optional = true }
 socket2 = { version = "0.6", optional = true, features = ["all"] }
 tokio = {version = "1", default-features = false, optional = true}
@@ -90,7 +90,7 @@ webpki-roots = { version = "1.0.10", optional = true }
 
 # compression
 flate2 = {version = "1.0", optional = true}
-zstd = { version = "0.13.0", optional = true }
+zstd = { version = "0.14.3", optional = true }
 
 # channel
 hyper-timeout = {version = "0.5", optional = true}

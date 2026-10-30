@@ -279,7 +279,7 @@ mod unix_tests {
 
     async fn run_unix_test(bind_path: &PathBuf, target: &str) {
         let listener = UnixListener::bind(bind_path).unwrap();
-        let expected_remote_addr = format!("{:?}", listener.local_addr().unwrap());
+        let expected_remote_addr = bind_path.to_string_lossy().into_owned();
         let channel = Channel::builder(target, LocalChannelCredentials::new_arc()).build();
 
         let server = StubServer::new().start_with_incoming(UnixListenerStream::new(listener));
@@ -294,7 +294,8 @@ mod unix_tests {
             connection_info.local_address().network_type,
             UNIX_NETWORK_TYPE
         );
-        assert!(!connection_info.local_address().address.is_empty());
+        // The client end of a Unix connection is unnamed.
+        assert_eq!(&*connection_info.local_address().address, "");
         assert_eq!(
             connection_info.remote_address().network_type,
             UNIX_NETWORK_TYPE

@@ -43,7 +43,6 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use tokio::sync::watch::Receiver;
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::TlsStream as RustlsStream;
 use webpki::EndEntityCert;
 
 use crate::ALPN_PROTO_STR_H2;
@@ -56,7 +55,7 @@ use crate::key_log::KeyLogFile;
 use crate::parse_certs;
 use crate::parse_key;
 use crate::sanitize_crypto_provider;
-use crate::tls_stream::TlsStream;
+use crate::tls_endpoint;
 
 #[cfg(test)]
 mod test;
@@ -359,7 +358,7 @@ impl ServerCredentials for RustlsServerCredentials {
 
         let auth_info =
             SecurityInfo::new("tls").with_security_level(SecurityLevel::PrivacyAndIntegrity);
-        let endpoint = TlsStream::new(RustlsStream::Server(tls_stream));
+        let endpoint = tls_endpoint(tls_stream);
         Ok(HandshakeOutput {
             endpoint: Box::new(endpoint),
             security: auth_info,

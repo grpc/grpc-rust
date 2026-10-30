@@ -431,15 +431,12 @@ async fn check_client_resumption_disabled(
             .unwrap();
         let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
-        let (tls_stream, _security, _authority_validator) = creds
+        let (mut tls_stream, _security, _authority_validator) = creds
             .connect_tls(&authority, endpoint)
             .await
             .expect("Handshake failed");
 
-        let connection = match tls_stream.inner() {
-            tokio_rustls::TlsStream::Client(conn) => conn.get_ref().1,
-            _ => panic!("Expected client stream"),
-        };
+        let connection = tls_stream.get_ref().1;
 
         assert_eq!(
             connection.handshake_kind(),
@@ -449,9 +446,7 @@ async fn check_client_resumption_disabled(
         );
 
         let mut buf = Vec::new();
-        let _ = EndpointIoStream::new(tls_stream)
-            .read_to_end(&mut buf)
-            .await;
+        let _ = tls_stream.read_to_end(&mut buf).await;
         assert_eq!(buf, b"Hello world");
     }
 

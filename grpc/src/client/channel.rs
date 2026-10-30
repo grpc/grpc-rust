@@ -61,6 +61,7 @@ use crate::client::load_balancing::round_robin;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel_sharing::SubchannelSharing;
+use crate::client::load_balancing::weighted_target;
 use crate::client::load_balancing::{self};
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
@@ -773,6 +774,7 @@ fn sanitize_config_selector_status(status: StatusError) -> StatusError {
 fn setup_registeries() {
     pick_first::reg();
     round_robin::reg();
+    weighted_target::reg();
     dns::reg();
     #[cfg(unix)]
     name_resolution::unix::reg();

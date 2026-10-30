@@ -83,6 +83,7 @@ pub static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> = LazyLock::new(|| {
     let registry = LbPolicyRegistry::new();
     registry.add_builder(super::pick_first::PickFirstBuilder {});
     registry.add_builder(super::round_robin::RoundRobinBuilder {});
+    registry.add_builder(super::weighted_target::WeightedTargetBuilder::default());
     registry
 });
 

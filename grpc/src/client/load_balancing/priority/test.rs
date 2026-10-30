@@ -42,7 +42,6 @@ use crate::client::load_balancing::test_utils;
 use crate::client::load_balancing::test_utils::StubPolicyFuncs;
 use crate::client::load_balancing::test_utils::TestEnv;
 use crate::client::name_resolution::Endpoint;
-use crate::client::name_resolution::ResolverUpdate;
 use crate::core::Address;
 use crate::rt::default_runtime;
 
@@ -238,15 +237,7 @@ async fn empty_priorities_reports_transient_failure() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(vec![], &cfg).unwrap();
 
     env.expect_failing_picker("priority policy has empty priority list");
     env.expect_no_events();
@@ -325,18 +316,14 @@ async fn high_priority_ready_and_add_remove_lower() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     // child-0 should be lazily instantiated and connecting. child-1 should NOT
     // be created while child-0 is connecting.
@@ -361,19 +348,15 @@ async fn high_priority_ready_and_add_remove_lower() {
     let cfg2 = Builder {}
         .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
-    let update2 = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
             new_test_endpoint("child-2", "127.0.0.1:8002"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update2, &cfg2, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg2,
+    )
+    .unwrap();
 
     // The update is forwarded to child-0, whose stub creates a subchannel for
     // every resolver update.  child-0 is still Ready, so the picker is
@@ -401,18 +384,14 @@ async fn switch_priority_failover_and_failback() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -470,18 +449,14 @@ async fn init_timeout_failover() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     // child-0 is connecting; child-1 is not initialized before the timeout.
     env.expect_new_subchannel_for("127.0.0.1:8000");
@@ -537,18 +512,14 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
@@ -602,18 +573,14 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -666,18 +633,14 @@ async fn deactivation_and_reactivation() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -752,18 +715,14 @@ async fn ignore_reresolution_requests_configuration() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -806,18 +765,14 @@ async fn remove_child_from_config_deletes_immediately() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -835,15 +790,11 @@ async fn remove_child_from_config_deletes_immediately() {
     let cfg2 = Builder {}
         .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
-    let update2 = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![new_test_endpoint("child-0", "127.0.0.1:8000")]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update2, &cfg2, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(
+        vec![new_test_endpoint("child-0", "127.0.0.1:8000")],
+        &cfg2,
+    )
+    .unwrap();
 
     // The update is forwarded to child-0, whose stub creates a subchannel for
     // every resolver update.  The picker is unchanged.
@@ -903,15 +854,11 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![new_test_endpoint("child-0", "127.0.0.1:8000")]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(
+        vec![new_test_endpoint("child-0", "127.0.0.1:8000")],
+        &cfg,
+    )
+    .unwrap();
 
     env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -957,18 +904,14 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
@@ -1045,18 +988,14 @@ async fn exit_idle_wakes_only_current_priority() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);

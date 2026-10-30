@@ -65,6 +65,15 @@ pub struct RpcConfig {
     pub interceptor: Option<Arc<dyn DynIntercept>>,
 }
 
+impl RpcConfig {
+    /// Sets the interceptor to run the RPC through, replacing any previously
+    /// set interceptor, and returns the updated `RpcConfig`.
+    pub fn with_interceptor(mut self, interceptor: Arc<dyn DynIntercept>) -> Self {
+        self.interceptor = Some(interceptor);
+        self
+    }
+}
+
 /// The data provided to a [`ConfigSelector`] when selecting the configuration
 /// for an RPC. Currently empty; reserved for future additions.
 #[derive(Debug, Default)]
@@ -285,9 +294,7 @@ mod tests {
 
     impl ConfigSelector for ClusterConfigSelector {
         fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
-            Ok(RpcConfig {
-                interceptor: Some(self.interceptor.clone()),
-            })
+            Ok(RpcConfig::default().with_interceptor(self.interceptor.clone()))
         }
     }
 

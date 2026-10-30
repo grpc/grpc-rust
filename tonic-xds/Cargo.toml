@@ -24,6 +24,7 @@ exclude = ["proto/test/*"]
 tonic = "0.14.6"
 http = "1"
 http-body = "1"
+hyper-util = { version = "0.1.11", features = ["client-legacy", "tokio"] }
 pin-project-lite = "0.2"
 tower = { version = "0.5", default-features = false, features = ["discover", "retry"] }
 arc-swap = "1"

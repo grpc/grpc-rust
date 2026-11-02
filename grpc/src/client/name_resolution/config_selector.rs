@@ -419,7 +419,7 @@ mod tests {
 
         fn get_call_credentials(
             &self,
-            token: private::Internal,
+            token: private::UnstableToken,
         ) -> Option<&Arc<dyn CallCredentials>> {
             self.local.get_call_credentials(token)
         }
@@ -430,7 +430,7 @@ mod tests {
             source: BoxEndpoint,
             info: &ClientHandshakeInfo,
             runtime: &GrpcRuntime,
-            token: private::Internal,
+            token: private::UnstableToken,
         ) -> Result<HandshakeOutput, String> {
             // Waiting can't fail, since `self` owns the sender.
             let _ = self.is_open.subscribe().wait_for(|is_open| *is_open).await;

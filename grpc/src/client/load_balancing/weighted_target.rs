@@ -275,6 +275,218 @@ mod tests {
     use crate::metadata::MetadataMap;
     use crate::rt::default_runtime;
 
+    struct StubState {
+        subchannel: Arc<dyn Subchannel>,
+        state: ConnectivityState,
+    }
+
+    /// Registers a stub child LB policy named `policy_name`.
+    ///
+    /// On its first resolver update, the stub creates a subchannel whose
+    /// address is the `TargetName` attribute injected by `weighted_target`. On
+    /// every subchannel update, it reports that subchannel's connectivity state
+    /// with a state-appropriate picker (`SubchannelPicker` when `Ready`,
+    /// `FailingPicker` when `TransientFailure`, `QueuingPicker` otherwise). When
+    /// `exit_idle` is called while in `Idle`, it calls `connect()` on its
+    /// subchannel and transitions to `Connecting`.
+    fn reg_stub(policy_name: &'static str) {
+        let funcs = StubPolicyFuncs {
+            resolver_update: Some(Arc::new(|data, update, _cfg, controller| {
+                let TargetName(target) = update
+                    .attributes
+                    .get::<TargetName>()
+                    .expect("parent should inject TargetName");
+                if data.test_data.is_none() {
+                    let address = Address {
+                        address: target.to_string().into(),
+                        ..Default::default()
+                    };
+                    let (subchannel, _) = controller
+                        .new_subchannel(&address, data.lb_policy_options.work_scheduler.clone());
+                    data.test_data = Some(Box::new(StubState {
+                        subchannel,
+                        state: ConnectivityState::Connecting,
+                    }));
+                }
+                Ok(())
+            })),
+            work: Some(Arc::new(|data, work_data, controller| {
+                let update = work_data
+                    .expect("expected work data")
+                    .downcast::<SubchannelUpdate>()
+                    .expect("expected SubchannelUpdate");
+                let stub = data
+                    .test_data
+                    .as_mut()
+                    .and_then(|d| d.downcast_mut::<StubState>())
+                    .expect("stub state should be initialized");
+                let state = update.state.connectivity_state;
+                stub.state = state;
+                let picker: Arc<dyn Picker> = match state {
+                    ConnectivityState::Ready => Arc::new(SubchannelPicker(update.subchannel)),
+                    ConnectivityState::TransientFailure => Arc::new(FailingPicker {
+                        error: update.state.last_connection_error.unwrap_or_default(),
+                    }),
+                    ConnectivityState::Connecting | ConnectivityState::Idle => {
+                        Arc::new(QueuingPicker {})
+                    }
+                };
+                controller.update_picker(LbState {
+                    connectivity_state: state,
+                    picker,
+                });
+            })),
+            exit_idle: Some(Arc::new(|data, controller| {
+                let stub = data
+                    .test_data
+                    .as_mut()
+                    .and_then(|d| d.downcast_mut::<StubState>())
+                    .expect("stub state should be initialized");
+                if stub.state == ConnectivityState::Idle {
+                    stub.state = ConnectivityState::Connecting;
+                    stub.subchannel.connect();
+                    controller.update_picker(LbState::initial());
+                }
+            })),
+        };
+        test_utils::reg_stub_policy(policy_name, funcs);
+    }
+
+    /// Registers a stub child policy that records the `(ResolverUpdate, config)`
+    /// received by each target, keyed by the injected `TargetName` attribute.
+    fn reg_recording_stub(
+        policy_name: &'static str,
+    ) -> Arc<Mutex<HashMap<String, (ResolverUpdate, String)>>> {
+        let received: Arc<Mutex<HashMap<String, (ResolverUpdate, String)>>> = Arc::default();
+        let received_clone = received.clone();
+        test_utils::reg_stub_policy(
+            policy_name,
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new(move |_data, update, config, _controller| {
+                    let TargetName(target) = update
+                        .attributes
+                        .get::<TargetName>()
+                        .expect("parent should inject TargetName");
+                    let config = config
+                        .downcast_ref::<String>()
+                        .expect("child config should be a String")
+                        .clone();
+                    received_clone
+                        .lock()
+                        .unwrap()
+                        .insert(target.to_string(), (update, config));
+                    Ok(())
+                })),
+                ..Default::default()
+            },
+        );
+        received
+    }
+
+    fn new_env() -> TestEnv<WeightedTargetPolicy> {
+        TestEnv::new(|work_scheduler| {
+            WeightedTargetBuilder::default().build(LbPolicyOptions {
+                work_scheduler,
+                runtime: default_runtime(),
+            })
+        })
+    }
+
+    /// Creates a `TestEnv` for a `WeightedTargetPolicy` whose sampler draws
+    /// `keys` in order when selecting among multiple children with distinct
+    /// weights.
+    ///
+    /// A key selects the child whose range of cumulative weight, in target-name
+    /// order, contains it: with weights 30/70, keys 0..30 select the first
+    /// child and keys 30..100 the second.
+    fn new_env_with_keys(keys: &[u64]) -> TestEnv<WeightedTargetPolicy> {
+        TestEnv::new(|work_scheduler| {
+            WeightedTargetBuilder {
+                sampler: sampler_builder(keys),
+            }
+            .build(LbPolicyOptions {
+                work_scheduler,
+                runtime: default_runtime(),
+            })
+        })
+    }
+
+    impl TestEnv<WeightedTargetPolicy> {
+        /// Sends a config with one `policy_name` child per `(target, weight)`
+        /// and no endpoints. Checks that each new child creates its subchannel
+        /// and that the parent publishes an initial `Connecting` picker, and
+        /// returns the subchannels in `targets` order. `targets` must be in
+        /// name order, which is the order in which the parent creates children.
+        fn apply<const N: usize>(
+            &mut self,
+            policy_name: &str,
+            targets: [(&str, u32); N],
+        ) -> [Arc<dyn Subchannel>; N] {
+            self.send_resolver_update_with_config(Vec::new(), &config(policy_name, &targets))
+                .expect("resolver update should succeed");
+            let subchannels = targets.map(|(target, _)| self.expect_new_subchannel_for(target));
+            self.expect_picker_state(ConnectivityState::Connecting);
+            self.expect_no_events();
+            subchannels
+        }
+    }
+
+    /// Returns a `WeightedTargetConfig` with one `policy_name` child per
+    /// `(target, weight)` whose child config is `"<target> config"`.
+    fn config(policy_name: &str, targets: &[(&str, u32)]) -> WeightedTargetConfig {
+        let builder = GLOBAL_LB_REGISTRY
+            .get_policy(policy_name)
+            .expect("stub should be registered");
+        let targets = targets
+            .iter()
+            .map(|&(target, weight)| {
+                let child_policy = ParsedLbConfig {
+                    builder: builder.clone(),
+                    config: Arc::new(format!("{target} config")),
+                };
+                (
+                    target.to_string(),
+                    TargetConfig {
+                        weight,
+                        child_policy,
+                    },
+                )
+            })
+            .collect();
+        WeightedTargetConfig { targets }
+    }
+
+    /// Asserts that a pick returns `subchannel`.
+    fn assert_picks(picker: &dyn Picker, subchannel: &Arc<dyn Subchannel>) {
+        let pick = picker
+            .pick(PickOptions::new(
+                &test_utils::new_request_headers(),
+                &CallOptions::new(),
+            ))
+            .unwrap_pick();
+        assert_eq!(&pick.subchannel, subchannel);
+    }
+
+    fn endpoint(path: &[&str]) -> Endpoint {
+        set_path_in_endpoint(
+            Endpoint::default(),
+            path.iter().map(|p| p.to_string()).collect(),
+        )
+    }
+
+    #[derive(Debug)]
+    struct SubchannelPicker(Arc<dyn Subchannel>);
+
+    impl Picker for SubchannelPicker {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
+            PickResult::Pick(Pick {
+                subchannel: self.0.clone(),
+                metadata: MetadataMap::new(),
+                on_complete: None,
+            })
+        }
+    }
+
     #[test]
     fn parse_config() {
         let parse = |json: serde_json::Value| {
@@ -599,217 +811,5 @@ mod tests {
         t.send_subchannel_update(&sc, &SubchannelState::ready());
         t.policy.exit_idle(&mut t.tcc);
         t.expect_no_events();
-    }
-
-    struct StubState {
-        subchannel: Arc<dyn Subchannel>,
-        state: ConnectivityState,
-    }
-
-    /// Registers a stub child LB policy named `policy_name`.
-    ///
-    /// On its first resolver update, the stub creates a subchannel whose
-    /// address is the `TargetName` attribute injected by `weighted_target`. On
-    /// every subchannel update, it reports that subchannel's connectivity state
-    /// with a state-appropriate picker (`SubchannelPicker` when `Ready`,
-    /// `FailingPicker` when `TransientFailure`, `QueuingPicker` otherwise). When
-    /// `exit_idle` is called while in `Idle`, it calls `connect()` on its
-    /// subchannel and transitions to `Connecting`.
-    fn reg_stub(policy_name: &'static str) {
-        let funcs = StubPolicyFuncs {
-            resolver_update: Some(Arc::new(|data, update, _cfg, controller| {
-                let TargetName(target) = update
-                    .attributes
-                    .get::<TargetName>()
-                    .expect("parent should inject TargetName");
-                if data.test_data.is_none() {
-                    let address = Address {
-                        address: target.to_string().into(),
-                        ..Default::default()
-                    };
-                    let (subchannel, _) = controller
-                        .new_subchannel(&address, data.lb_policy_options.work_scheduler.clone());
-                    data.test_data = Some(Box::new(StubState {
-                        subchannel,
-                        state: ConnectivityState::Connecting,
-                    }));
-                }
-                Ok(())
-            })),
-            work: Some(Arc::new(|data, work_data, controller| {
-                let update = work_data
-                    .expect("expected work data")
-                    .downcast::<SubchannelUpdate>()
-                    .expect("expected SubchannelUpdate");
-                let stub = data
-                    .test_data
-                    .as_mut()
-                    .and_then(|d| d.downcast_mut::<StubState>())
-                    .expect("stub state should be initialized");
-                let state = update.state.connectivity_state;
-                stub.state = state;
-                let picker: Arc<dyn Picker> = match state {
-                    ConnectivityState::Ready => Arc::new(SubchannelPicker(update.subchannel)),
-                    ConnectivityState::TransientFailure => Arc::new(FailingPicker {
-                        error: update.state.last_connection_error.unwrap_or_default(),
-                    }),
-                    ConnectivityState::Connecting | ConnectivityState::Idle => {
-                        Arc::new(QueuingPicker {})
-                    }
-                };
-                controller.update_picker(LbState {
-                    connectivity_state: state,
-                    picker,
-                });
-            })),
-            exit_idle: Some(Arc::new(|data, controller| {
-                let stub = data
-                    .test_data
-                    .as_mut()
-                    .and_then(|d| d.downcast_mut::<StubState>())
-                    .expect("stub state should be initialized");
-                if stub.state == ConnectivityState::Idle {
-                    stub.state = ConnectivityState::Connecting;
-                    stub.subchannel.connect();
-                    controller.update_picker(LbState::initial());
-                }
-            })),
-        };
-        test_utils::reg_stub_policy(policy_name, funcs);
-    }
-
-    /// Registers a stub child policy that records the `(ResolverUpdate, config)`
-    /// received by each target, keyed by the injected `TargetName` attribute.
-    fn reg_recording_stub(
-        policy_name: &'static str,
-    ) -> Arc<Mutex<HashMap<String, (ResolverUpdate, String)>>> {
-        let received: Arc<Mutex<HashMap<String, (ResolverUpdate, String)>>> = Arc::default();
-        let received_clone = received.clone();
-        test_utils::reg_stub_policy(
-            policy_name,
-            StubPolicyFuncs {
-                resolver_update: Some(Arc::new(move |_data, update, config, _controller| {
-                    let TargetName(target) = update
-                        .attributes
-                        .get::<TargetName>()
-                        .expect("parent should inject TargetName");
-                    let config = config
-                        .downcast_ref::<String>()
-                        .expect("child config should be a String")
-                        .clone();
-                    received_clone
-                        .lock()
-                        .unwrap()
-                        .insert(target.to_string(), (update, config));
-                    Ok(())
-                })),
-                ..Default::default()
-            },
-        );
-        received
-    }
-
-    fn new_env() -> TestEnv<WeightedTargetPolicy> {
-        TestEnv::new(|work_scheduler| {
-            WeightedTargetBuilder::default().build(LbPolicyOptions {
-                work_scheduler,
-                runtime: default_runtime(),
-            })
-        })
-    }
-
-    /// Creates a `TestEnv` for a `WeightedTargetPolicy` whose sampler draws
-    /// `keys` in order when selecting among multiple children with distinct
-    /// weights.
-    ///
-    /// A key selects the child whose range of cumulative weight, in target-name
-    /// order, contains it: with weights 30/70, keys 0..30 select the first
-    /// child and keys 30..100 the second.
-    fn new_env_with_keys(keys: &[u64]) -> TestEnv<WeightedTargetPolicy> {
-        TestEnv::new(|work_scheduler| {
-            WeightedTargetBuilder {
-                sampler: sampler_builder(keys),
-            }
-            .build(LbPolicyOptions {
-                work_scheduler,
-                runtime: default_runtime(),
-            })
-        })
-    }
-
-    impl TestEnv<WeightedTargetPolicy> {
-        /// Sends a config with one `policy_name` child per `(target, weight)`
-        /// and no endpoints. Checks that each new child creates its subchannel
-        /// and that the parent publishes an initial `Connecting` picker, and
-        /// returns the subchannels in `targets` order. `targets` must be in
-        /// name order, which is the order in which the parent creates children.
-        fn apply<const N: usize>(
-            &mut self,
-            policy_name: &str,
-            targets: [(&str, u32); N],
-        ) -> [Arc<dyn Subchannel>; N] {
-            self.send_resolver_update_with_config(Vec::new(), &config(policy_name, &targets))
-                .expect("resolver update should succeed");
-            let subchannels = targets.map(|(target, _)| self.expect_new_subchannel_for(target));
-            self.expect_picker_state(ConnectivityState::Connecting);
-            self.expect_no_events();
-            subchannels
-        }
-    }
-
-    /// Returns a `WeightedTargetConfig` with one `policy_name` child per
-    /// `(target, weight)` whose child config is `"<target> config"`.
-    fn config(policy_name: &str, targets: &[(&str, u32)]) -> WeightedTargetConfig {
-        let builder = GLOBAL_LB_REGISTRY
-            .get_policy(policy_name)
-            .expect("stub should be registered");
-        let targets = targets
-            .iter()
-            .map(|&(target, weight)| {
-                let child_policy = ParsedLbConfig {
-                    builder: builder.clone(),
-                    config: Arc::new(format!("{target} config")),
-                };
-                (
-                    target.to_string(),
-                    TargetConfig {
-                        weight,
-                        child_policy,
-                    },
-                )
-            })
-            .collect();
-        WeightedTargetConfig { targets }
-    }
-
-    /// Asserts that a pick returns `subchannel`.
-    fn assert_picks(picker: &dyn Picker, subchannel: &Arc<dyn Subchannel>) {
-        let pick = picker
-            .pick(PickOptions::new(
-                &test_utils::new_request_headers(),
-                &CallOptions::new(),
-            ))
-            .unwrap_pick();
-        assert_eq!(&pick.subchannel, subchannel);
-    }
-
-    fn endpoint(path: &[&str]) -> Endpoint {
-        set_path_in_endpoint(
-            Endpoint::default(),
-            path.iter().map(|p| p.to_string()).collect(),
-        )
-    }
-
-    #[derive(Debug)]
-    struct SubchannelPicker(Arc<dyn Subchannel>);
-
-    impl Picker for SubchannelPicker {
-        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
-            PickResult::Pick(Pick {
-                subchannel: self.0.clone(),
-                metadata: MetadataMap::new(),
-                on_complete: None,
-            })
-        }
     }
 }

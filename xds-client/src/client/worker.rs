@@ -250,7 +250,7 @@ impl Default for WatcherId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SubscriptionMode {
     /// Wildcard subscription - receive all resources of this type.
-    /// In xDS protocol, this is represented by an empty resource_names list.
+    /// Uses an explicit `*` so an empty resource_names list can unsubscribe.
     Wildcard,
     /// Named subscription - receive only specific resources.
     /// Contains the set of resource names to subscribe to.
@@ -259,10 +259,10 @@ enum SubscriptionMode {
 
 impl SubscriptionMode {
     /// Get resource names for DiscoveryRequest.
-    /// Returns empty vec for wildcard (xDS spec: empty = all resources).
+    /// Uses `*` for wildcard and an empty list for no subscriptions.
     fn resource_names_for_request(&self) -> Vec<String> {
         match self {
-            Self::Wildcard => Vec::new(),
+            Self::Wildcard => vec!["*".to_string()],
             Self::Named(names) => names.iter().cloned().collect(),
         }
     }
@@ -2221,6 +2221,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn last_wildcard_drop_unsubscribes_and_rewatch_requests_all_resources() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let mut watcher = client.watch::<VersionedResource>("").await;
+        let mut server = servers.recv().await.unwrap();
+        expect_request(&mut server, versioned_response("", "", &["*"])).await;
+
+        server
+            .responses
+            .send(Ok(Some(versioned_response("1", "n1", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+        expect_request(&mut server, versioned_response("1", "n1", &["*"])).await;
+        drop(watcher);
+        expect_request(&mut server, versioned_response("1", "n1", &[])).await;
+        assert!(take_snapshot(&client).await.is_empty());
+
+        let mut rewatch = client.watch::<VersionedResource>("").await;
+        expect_request(&mut server, versioned_response("1", "n1", &["*"])).await;
+        server
+            .responses
+            .send(Ok(Some(versioned_response("1", "n2", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatch).await.0.is_ok());
+        expect_request(&mut server, versioned_response("1", "n2", &["*"])).await;
+
+        server
+            .responses
+            .send(Ok(Some(versioned_response("2", "n3", &["res-0#bad"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatch).await.0.is_err());
+        expect_request(&mut server, versioned_response("1", "n3", &["*"])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn wildcard_interest_retains_cache_until_named_transition() {
         let (client, first, mut server) = connected_client().await;
         let mut wildcard = watch_synced(&client, &mut server, "").await;
@@ -2231,7 +2267,7 @@ mod tests {
             .unwrap();
         assert!(next_changed(&mut wildcard).await.0.is_ok());
         assert!(next_changed(&mut wildcard).await.0.is_ok());
-        expect_request(&mut server, response("1", "n1", &[])).await;
+        expect_request(&mut server, response("1", "n1", &["*"])).await;
         let mut first = client.watch::<TestResource>("res-0").await;
         assert!(next_changed(&mut first).await.0.is_ok());
         let mut other = client.watch::<TestResource>("res-1").await;

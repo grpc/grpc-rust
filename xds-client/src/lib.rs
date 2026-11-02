@@ -51,11 +51,13 @@
 //!
 //! // Watch for Listener resources
 //! let mut watcher = client.watch::<Listener>("my-listener");
+//! // Keep the cascading watcher alive across listener updates.
+//! let mut route_watcher = None;
 //! while let Some(event) = watcher.next().await {
 //!     match event {
 //!         ResourceEvent::ResourceChanged { result: Ok(resource), done } => {
 //!             // Process the resource, possibly add cascading watches.
-//!             client.watch::<RouteConfiguration>(&resource.route_name());
+//!             route_watcher = Some(client.watch::<RouteConfiguration>(&resource.route_name()));
 //!             // Signal is sent automatically when done is dropped
 //!         }
 //!         ResourceEvent::ResourceChanged { result: Err(error), .. } => {

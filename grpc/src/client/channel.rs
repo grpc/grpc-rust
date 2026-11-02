@@ -53,12 +53,9 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
-use crate::client::load_balancing::pick_first;
-use crate::client::load_balancing::round_robin;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel_sharing::SubchannelSharing;
-use crate::client::load_balancing::weighted_target;
 use crate::client::load_balancing::{self};
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
@@ -653,9 +650,7 @@ fn parse_authority(host_and_port: &str) -> Authority {
 // Sets up the default registries for transports, name resolvers, and load
 // balancers.
 fn setup_registeries() {
-    pick_first::reg();
-    round_robin::reg();
-    weighted_target::reg();
+    load_balancing::register();
     dns::reg();
     #[cfg(unix)]
     name_resolution::unix::reg();

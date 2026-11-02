@@ -28,6 +28,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::Once;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -59,6 +60,20 @@ pub use registry::GLOBAL_LB_REGISTRY;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
+
+static START: Once = Once::new();
+
+/// Registers the built-in load balancing policies into the global LB registry.
+///
+/// Only the first call has an effect; any additional ones are ignored.
+pub(crate) fn register() {
+    START.call_once(|| {
+        pick_first::reg();
+        priority::reg();
+        round_robin::reg();
+        weighted_target::reg();
+    });
+}
 
 /// An LB policy factory that produces LbPolicy instances used by the channel
 /// to manage connections and pick connections for RPCs.

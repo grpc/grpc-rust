@@ -29,7 +29,7 @@
 //! Cluster and its endpoints -- into one immutable value, so a config
 //! update is atomic and never exposes a partial mix of old and new state.
 
-// TODO: remove once the xDS dependency manager is implemented.
+// TODO: remove once the xds resolver uses the dependency manager.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

@@ -28,10 +28,6 @@
 //! (gRFC A27) independently of any live xDS traffic.
 //! The dependency manager assembles these into an [`crate::xds_config::XdsConfig`].
 
-// TODO: remove once the xDS dependency manager subscribes to these resource
-// types and assembles them into an XdsConfig.
-#![allow(dead_code, unused_imports)]
-
 mod cluster;
 mod endpoint;
 mod listener;
@@ -39,13 +35,19 @@ mod route;
 mod safe_regex;
 mod string_matcher;
 
+// TODO: remove the `expect`s below once the xds resolver uses the dependency
+// manager.
 pub(crate) use cluster::ClusterDiscovery;
 pub(crate) use cluster::ClusterResource;
 pub(crate) use endpoint::EndpointAddress;
 pub(crate) use endpoint::EndpointsResource;
+#[expect(unused_imports)]
 pub(crate) use endpoint::HealthStatus;
+#[expect(unused_imports)]
 pub(crate) use endpoint::LbEndpoint;
+#[expect(unused_imports)]
 pub(crate) use endpoint::Locality;
+#[expect(unused_imports)]
 pub(crate) use endpoint::LocalityLbEndpoints;
 pub(crate) use listener::ListenerResource;
 pub(crate) use listener::RouteSource;
@@ -53,11 +55,16 @@ pub(crate) use route::DomainMatcher;
 pub(crate) use route::HeaderMatchSpecifier;
 pub(crate) use route::HeaderMatcher;
 pub(crate) use route::PathSpecifier;
+#[cfg_attr(not(test), expect(unused_imports))]
 pub(crate) use route::Route;
+#[cfg_attr(not(test), expect(unused_imports))]
 pub(crate) use route::RouteAction;
 pub(crate) use route::RouteConfigResource;
 pub(crate) use route::RouteMatch;
 pub(crate) use route::VirtualHost;
+#[expect(unused_imports)]
 pub(crate) use route::WeightedCluster;
+#[cfg_attr(not(test), expect(unused_imports))]
 pub(crate) use safe_regex::SafeRegex;
+#[cfg_attr(not(test), expect(unused_imports))]
 pub(crate) use string_matcher::StringMatcher;

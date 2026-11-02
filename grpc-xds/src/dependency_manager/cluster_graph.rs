@@ -60,43 +60,43 @@ const MAX_AGGREGATE_DEPTH: usize = 16;
 /// [`WatchState::Pending`] and adds the name to
 /// [`ClusterGraph::required_watches`], so the caller starts the watch.
 #[derive(Debug, Default)]
-struct CachedResources {
+pub(crate) struct CachedResources {
     /// The state of each CDS watch, by cluster name.
-    clusters: HashMap<String, WatchState<Arc<ClusterResource>>>,
+    pub(crate) clusters: HashMap<String, WatchState<Arc<ClusterResource>>>,
     /// The state of each EDS watch, by EDS service name.
-    endpoints: HashMap<String, WatchState<Arc<EndpointsResource>>>,
+    pub(crate) endpoints: HashMap<String, WatchState<Arc<EndpointsResource>>>,
     /// The state of each DNS resolution, by LogicalDNS cluster target.
-    dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
+    pub(crate) dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
 }
 
 /// The `host:port` that a LogicalDNS cluster resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DnsTarget {
-    host: String,
-    port: u16,
+pub(crate) struct DnsTarget {
+    pub(crate) host: String,
+    pub(crate) port: u16,
 }
 
 /// The result of a [`walk`].
 #[derive(Debug, Default)]
-struct ClusterGraph {
+pub(crate) struct ClusterGraph {
     /// Every reachable cluster that has resolved, successfully or not.
     /// A cluster is left out exactly while it, or something below it, is
     /// still pending, so the caller can tell whether its roots are ready.
-    cluster_configs: HashMap<String, ClusterResult>,
+    pub(crate) cluster_configs: HashMap<String, ClusterResult>,
     /// The watches that should exist, including those below pending clusters,
     /// so that independent parts of the graph are fetched in parallel.
-    required_watches: RequiredWatches,
+    pub(crate) required_watches: RequiredWatches,
 }
 
 /// The watches that a walk needs.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct RequiredWatches {
+pub(crate) struct RequiredWatches {
     /// CDS resource names.
-    clusters: HashSet<String>,
+    pub(crate) clusters: HashSet<String>,
     /// EDS resource names.
-    eds_services: HashSet<String>,
+    pub(crate) eds_services: HashSet<String>,
     /// LogicalDNS targets.
-    dns_targets: HashSet<DnsTarget>,
+    pub(crate) dns_targets: HashSet<DnsTarget>,
 }
 
 /// Walks the cluster graph from `roots`: the clusters named by the selected
@@ -108,7 +108,7 @@ struct RequiredWatches {
 /// leaf cluster's resolution note. If a leaf has no notes at all, its note is
 /// the xDS node ID instead, so that the client can be found in control plane
 /// logs.
-fn walk<'a>(
+pub(crate) fn walk<'a>(
     cache: &'a CachedResources,
     roots: impl IntoIterator<Item = &'a str>,
     base_notes: &'a [Arc<str>],

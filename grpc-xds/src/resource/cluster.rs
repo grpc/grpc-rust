@@ -46,6 +46,8 @@ const AGGREGATE_CLUSTER_CONFIG_TYPE_URL: &str =
 /// Only the discovery mechanism is modeled for now (gRFC A27/A37).
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterResource {
+    // TODO: remove once the xds resolver uses the dependency manager.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) name: String,
     pub(crate) discovery: ClusterDiscovery,
 }

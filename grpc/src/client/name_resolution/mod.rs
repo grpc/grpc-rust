@@ -46,6 +46,7 @@ use crate::core::Address;
 use crate::rt::GrpcRuntime;
 
 mod backoff;
+pub mod config_selector;
 pub mod registry;
 
 pub(crate) mod dns;
@@ -302,6 +303,29 @@ impl Default for ResolverUpdate {
             attributes: Default::default(),
             endpoints: Ok(Default::default()),
             resolution_note: Default::default(),
+        }
+    }
+}
+
+impl ResolverUpdate {
+    /// Returns a copy of this update with `endpoints` replaced and every other
+    /// field cloned.
+    ///
+    /// LB policies that shard an update across children should use this
+    /// rather than constructing a new `ResolverUpdate`, so that no fields are
+    /// accidentally dropped.
+    pub fn with_endpoints(&self, endpoints: Result<Vec<Endpoint>, String>) -> Self {
+        let Self {
+            attributes,
+            endpoints: _,
+            service_config,
+            resolution_note,
+        } = self;
+        Self {
+            attributes: attributes.clone(),
+            endpoints,
+            service_config: service_config.clone(),
+            resolution_note: resolution_note.clone(),
         }
     }
 }

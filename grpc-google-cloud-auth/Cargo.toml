@@ -1,0 +1,21 @@
+[package]
+name = "grpc-google-cloud-auth"
+version = "0.10.0"
+edition = "2024"
+authors = ["gRPC authors"]
+license = "MIT"
+rust-version = { workspace = true }
+publish = false
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = ["grpc::*"]
+
+[features]
+
+[dependencies]
+google-cloud-auth = { version = "1.9", default-features = false }
+grpc = { version = "0.10.0", path = "../grpc", default-features = false }
+trait-variant = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

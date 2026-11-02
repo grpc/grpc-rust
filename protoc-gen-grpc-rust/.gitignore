@@ -1,0 +1,10 @@
+# Bazel
+bazel-bin
+bazel-genfiles
+bazel-out
+bazel-protoc-gen-grpc-rust
+bazel-testlogs
+MODULE.bazel.lock
+
+build/*
+CMakeFiles/*

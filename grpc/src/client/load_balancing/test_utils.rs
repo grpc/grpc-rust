@@ -275,6 +275,14 @@ impl<P> TestEnv<P> {
         }
     }
 
+    /// Calls [`Self::expect_new_subchannel`], verifies that the created
+    /// subchannel's address equals `addr`, and returns the subchannel.
+    pub(crate) fn expect_new_subchannel_for(&mut self, addr: &str) -> Arc<dyn Subchannel> {
+        let sc = self.expect_new_subchannel();
+        assert_eq!(&*sc.address().address, addr);
+        sc
+    }
+
     /// Verifies that the policy asked a subchannel to connect, and returns that
     /// subchannel's address.
     pub(crate) fn expect_connect(&mut self) -> Address {
@@ -393,18 +401,27 @@ impl<P> TestEnv<P> {
 }
 
 impl<P: LbPolicy> TestEnv<P> {
+    /// Sends a resolver update containing `endpoints` and `config` to the
+    /// policy.
+    pub(crate) fn send_resolver_update_with_config(
+        &mut self,
+        endpoints: Vec<Endpoint>,
+        config: &P::LbConfig,
+    ) -> Result<(), String> {
+        let update = ResolverUpdate {
+            endpoints: Ok(endpoints),
+            ..Default::default()
+        };
+        self.policy.resolver_update(update, config, &mut self.tcc)
+    }
+
     /// Sends a resolver update containing `endpoints` to the policy, using the
     /// policy's default config.
     pub(crate) fn send_resolver_update(&mut self, endpoints: Vec<Endpoint>) -> Result<(), String>
     where
         P::LbConfig: Default,
     {
-        let update = ResolverUpdate {
-            endpoints: Ok(endpoints),
-            ..Default::default()
-        };
-        self.policy
-            .resolver_update(update, &P::LbConfig::default(), &mut self.tcc)
+        self.send_resolver_update_with_config(endpoints, &P::LbConfig::default())
     }
 
     /// Sends a resolver error to the policy, using the policy's default config.

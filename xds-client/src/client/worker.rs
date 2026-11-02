@@ -396,14 +396,14 @@ impl CachedResource {
 }
 
 /// Per-type_url state tracking.
-/// Protocol state survives watcher removal; only the resource cache and timers expire.
+/// Retained for stream bookkeeping; resource state and version expire when idle.
 struct TypeState {
     /// Reference-counted type URL, shared with metric attribute slots so
     /// per-emission attribute construction is a cheap.
     type_url: Arc<str>,
-    /// Decoder for the current watch cycle, also used to validate late idle responses.
+    /// Decoder for the current watch cycle.
     decoder: DecoderFn,
-    /// Last accepted version, retained across watch cycles and stream restarts.
+    /// Last accepted version, retained across stream restarts while watched.
     version_info: String,
     /// Active watchers for this type.
     watchers: HashMap<WatcherId, WatcherEntry>,
@@ -859,10 +859,20 @@ where
                 }
             }
             WatchEvent::Unwatch { watcher_id } => {
-                if let Some((type_url, true)) = self.remove_watcher(watcher_id)
-                    && let Some(stream) = stream
-                {
-                    self.send_request(stream, &type_url)?;
+                if let Some((type_url, subscriptions_changed)) = self.remove_watcher(watcher_id) {
+                    let result = match stream {
+                        Some(stream) if subscriptions_changed => {
+                            self.send_request(stream, &type_url)
+                        }
+                        _ => Ok(()),
+                    };
+                    // Send the unsubscribe with the old version, then forget the evicted data.
+                    if let Some(state) = self.type_states.get_mut(&type_url)
+                        && state.watchers.is_empty()
+                    {
+                        state.version_info.clear();
+                    }
+                    result?;
                 }
             }
             WatchEvent::ResourceTimerExpired {
@@ -974,26 +984,44 @@ where
 
         let type_state = self.type_states.get_mut(&type_url)?;
 
+        let removed = type_state.watchers.remove(&watcher_id)?;
+        if type_state
+            .watchers
+            .values()
+            .any(|watcher| watcher.subscription == removed.subscription)
+        {
+            return Some((type_url, false));
+        }
+
         let old_subscription = type_state.subscription.clone();
-
-        type_state.watchers.remove(&watcher_id);
         type_state.recalculate_subscriptions();
-
         let subscriptions_changed = type_state.subscription != old_subscription;
 
-        // Resource state follows current interest; protocol state survives unwatch.
-        type_state
-            .cache
-            .retain(|name, _| type_state.subscription.includes(name));
-        self.resource_timers
-            .retain(|(url, name), _| *url != type_url || type_state.subscription.includes(name));
+        let old_cache_len = type_state.cache.len();
+        match removed.subscription {
+            WatcherSubscription::Named(name) => {
+                self.resource_timers
+                    .remove(&(type_url.clone(), name.clone()));
+                // A remaining wildcard still needs this resource's data.
+                if !type_state.subscription.includes(&name) {
+                    type_state.cache.remove(&name);
+                }
+            }
+            WatcherSubscription::Wildcard => {
+                type_state
+                    .cache
+                    .retain(|name, _| type_state.subscription.includes(name));
+            }
+        }
         if type_state.watchers.is_empty() {
             type_state.cache = HashMap::new();
             type_state.watchers = HashMap::new();
         }
-        let counts = type_state.resource_state_counts();
-        self.recorder
-            .sync_resource_counts(&type_state.type_url, &counts);
+        if type_state.cache.len() != old_cache_len {
+            let counts = type_state.resource_state_counts();
+            self.recorder
+                .sync_resource_counts(&type_state.type_url, &counts);
+        }
 
         Some((type_url, subscriptions_changed))
     }
@@ -1083,11 +1111,13 @@ where
         };
         stream_type.nonce.clone_from(&response.nonce);
 
-        let (type_url_arc, decoder, has_watchers) = match self.type_states.get(&type_url) {
-            Some(s) => (Arc::clone(&s.type_url), &s.decoder, !s.watchers.is_empty()),
-            None => {
-                return Ok(());
+        let (type_url_arc, decoder) = match self.type_states.get(&type_url) {
+            Some(s) if !s.watchers.is_empty() => (Arc::clone(&s.type_url), &s.decoder),
+            Some(_) => {
+                // Retry a possibly stale unsubscribe, without retaining the idle version or data.
+                return self.send_ack(&stream.writes, &response);
             }
+            None => return Ok(()),
         };
 
         // Decode all resources, tracking valid and invalid separately.
@@ -1128,27 +1158,24 @@ where
 
         let nack_error = nack_error_message(&top_level_errors, &per_resource_errors);
 
-        // Late responses still advance protocol state, but cannot refill an idle cache.
-        if has_watchers {
-            let received_names: HashSet<String> = valid_resources
-                .iter()
-                .map(|(r, _)| r.name().to_string())
-                .collect();
+        let received_names: HashSet<String> = valid_resources
+            .iter()
+            .map(|(r, _)| r.name().to_string())
+            .collect();
 
-            self.dispatch_resources(&type_url, valid_resources, &done);
+        self.dispatch_resources(&type_url, valid_resources, &done);
 
-            // Only notify watchers for per-resource errors (where we know the name).
-            // Top-level errors have no associated name, so no watcher to notify.
-            for (resource_name, error) in per_resource_errors {
-                let rejected = RejectedUpdate::new(response.version_info.clone(), error, now);
-                self.notify_resource_error(&type_url, &resource_name, rejected, &done);
-            }
-
-            // Detect deleted resources (per A53):
-            // For resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
-            // any previously-received resource not in this response is deleted.
-            self.detect_deleted_resources(&type_url, &received_names, &done);
+        // Only notify watchers for per-resource errors (where we know the name).
+        // Top-level errors have no associated name, so no watcher to notify.
+        for (resource_name, error) in per_resource_errors {
+            let rejected = RejectedUpdate::new(response.version_info.clone(), error, now);
+            self.notify_resource_error(&type_url, &resource_name, rejected, &done);
         }
+
+        // Detect deleted resources (per A53):
+        // For resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
+        // any previously-received resource not in this response is deleted.
+        self.detect_deleted_resources(&type_url, &received_names, &done);
 
         match nack_error {
             None => {
@@ -2037,6 +2064,140 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn last_unsubscribe_retries_after_in_flight_response_changes_nonce() {
+        let (client, mut watcher, mut server) = connected_client().await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+
+        // The server has issued n2, but delivery to the client is delayed.
+        let server_nonce = "n2";
+        let in_flight = response("2", server_nonce, &["res-0"]);
+        drop(watcher);
+        let stale_unsubscribe =
+            tokio::time::timeout(Duration::from_secs(1), server.requests.recv())
+                .await
+                .expect("missing initial unsubscribe")
+                .unwrap();
+        assert_eq!(stale_unsubscribe, response("1", "n1", &[]));
+        assert_ne!(parse_request(&stale_unsubscribe).1, server_nonce);
+        // Reject the stale unsubscribe without changing the server subscription,
+        // matching Go Control Plane's SotW nonce check.
+
+        server.responses.send(Ok(Some(in_flight))).unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(1), server.requests.recv())
+            .await
+            .expect("server remains subscribed: idle response did not retry unsubscribe with n2")
+            .expect("stream closed before unsubscribe retry");
+        let retry = FakeCodec.decode_response(retry).unwrap();
+        assert_eq!(retry.type_url, TEST_TYPE_URL);
+        assert_eq!(retry.nonce, server_nonce);
+        assert_eq!(
+            retry.version_info, "2",
+            "idle ACK must echo the response version"
+        );
+        assert!(
+            retry.resources.is_empty(),
+            "retry must unsubscribe all resources"
+        );
+        assert!(
+            take_snapshot(&client).await.is_empty(),
+            "idle response refilled cache"
+        );
+
+        // A server may answer the unsubscribe with an empty SotW response.
+        server
+            .responses
+            .send(Ok(Some(response("2", "n3", &[]))))
+            .unwrap();
+        expect_request(&mut server, response("2", "n3", &[])).await;
+        // A same-version ACK needs no further response; the client must go quiet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.requests.recv())
+                .await
+                .is_err()
+        );
+        assert!(take_snapshot(&client).await.is_empty());
+        let _rewatch = client.watch::<TestResource>("res-0").await;
+        expect_request(&mut server, response("", "n3", &["res-0"])).await;
+    }
+
+    #[test]
+    fn idle_response_acknowledges_without_retaining_version_or_decoding_resources() {
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let recorder = Arc::new(CapturingRecorder::default());
+        let mut worker = AdsWorker::new(
+            FakeCodec,
+            TokioRuntime,
+            &config,
+            commands,
+            command_rx,
+            Some(recorder.clone()),
+        );
+        worker.type_states.insert(
+            TEST_TYPE_URL.to_string(),
+            TypeState::new(
+                Arc::from(TEST_TYPE_URL),
+                Box::new(|_| panic!("idle resource was decoded")),
+                false,
+            ),
+        );
+        let (writes, mut requests) = mpsc::unbounded_channel();
+        let (cancel, _cancel_rx) = oneshot::channel();
+        let mut stream = ActiveStream::new(writes, cancel);
+        stream
+            .types
+            .insert(TEST_TYPE_URL.to_string(), StreamTypeState::default());
+        let response = FakeCodec
+            .decode_response(response("late", "latest-nonce", &["res-0"]))
+            .unwrap();
+        worker
+            .handle_response(&mut stream, response, ProcessingDone::detached())
+            .unwrap();
+        assert_eq!(stream.types[TEST_TYPE_URL].nonce, "latest-nonce");
+        assert!(worker.type_states[TEST_TYPE_URL].version_info.is_empty());
+        assert!(worker.type_states[TEST_TYPE_URL].cache.is_empty());
+        assert!(recorder.take().is_empty());
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            response_for(TEST_TYPE_URL, "late", "latest-nonce", &[])
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_watcher_removed_while_disconnected_clears_version() {
+        let (inner, mut servers) = mock_transport();
+        let (gates_tx, mut gates) = mpsc::unbounded_channel();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(
+            config,
+            GatedBuilder {
+                inner,
+                phase: ReconnectPhase::Stream,
+                gates: gates_tx,
+            },
+            FakeCodec,
+            TokioRuntime,
+        )
+        .build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        gates.recv().await.unwrap().send(()).unwrap();
+        let mut server = servers.recv().await.unwrap();
+        expect_request(&mut server, response("", "", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+        server.responses.send(Ok(None)).unwrap();
+        let gate = gates.recv().await.unwrap();
+        drop(watcher);
+        assert!(take_snapshot(&client).await.is_empty());
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        take_snapshot(&client).await;
+        gate.send(()).unwrap();
+        let mut replacement = servers.recv().await.unwrap();
+        expect_request(&mut replacement, response("", "", &["res-0"])).await;
+        accept_resource(&mut replacement, &mut rewatch, "1", "n2").await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn last_watcher_drop_unsubscribes_and_rewatch_retains_nonce() {
         let (client, mut watcher, mut server) = connected_client().await;
         accept_resource(&mut server, &mut watcher, "1", "n1").await;
@@ -2045,7 +2206,7 @@ mod tests {
         // Queue the rewatch without waiting for the worker to process Unwatch.
         let mut rewatch = client.watch::<TestResource>("res-0").await;
         expect_request(&mut server, response("1", "n1", &[])).await;
-        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        expect_request(&mut server, response("", "n1", &["res-0"])).await;
         assert_no_event(&mut rewatch, "last watcher removal retained the cache").await;
         accept_resource(&mut server, &mut rewatch, "1", "n2").await;
     }
@@ -2095,7 +2256,7 @@ mod tests {
         assert!(take_snapshot(&client).await.is_empty());
 
         let mut rewatch = client.watch::<TestResource>("res-0").await;
-        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        expect_request(&mut server, response("", "n1", &["res-0"])).await;
         assert_no_event(
             &mut rewatch,
             "late first response repopulated the idle cache",
@@ -2240,7 +2401,7 @@ mod tests {
         assert!(take_snapshot(&client).await.is_empty());
 
         let mut rewatch = client.watch::<VersionedResource>("").await;
-        expect_request(&mut server, versioned_response("1", "n1", &["*"])).await;
+        expect_request(&mut server, versioned_response("", "n1", &["*"])).await;
         server
             .responses
             .send(Ok(Some(versioned_response("1", "n2", &["res-0"]))))
@@ -2311,7 +2472,7 @@ mod tests {
         drop(watcher);
         let mut alternate = client.watch::<AlternateResource>("res-0").await;
         expect_request(&mut server, response("1", "n1", &[])).await;
-        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        expect_request(&mut server, response("", "n1", &["res-0"])).await;
         accept_resource(&mut server, &mut alternate, "2", "n2").await;
         server
             .responses
@@ -2331,30 +2492,30 @@ mod tests {
         drop(watcher);
         expect_request(&mut server, versioned_response("1", "n1", &[])).await;
 
-        for (version, nonce, resources, accepted) in [
-            ("2", "n2", vec!["res-0"], "2"),
-            ("3", "n3", vec!["res-0#bad"], "2"),
-            ("4", "n4", vec!["res-0", "other#bad"], "2"),
+        for (version, nonce, resources) in [
+            ("2", "n2", vec!["res-0"]),
+            ("3", "n3", vec!["res-0#bad"]),
+            ("4", "n4", vec!["res-0", "other#bad"]),
         ] {
             server
                 .responses
                 .send(Ok(Some(versioned_response(version, nonce, &resources))))
                 .unwrap();
-            expect_request(&mut server, versioned_response(accepted, nonce, &[])).await;
+            expect_request(&mut server, versioned_response(version, nonce, &[])).await;
             let mut rewatch = client.watch::<VersionedResource>("res-0").await;
-            expect_request(&mut server, versioned_response(accepted, nonce, &["res-0"])).await;
+            expect_request(&mut server, versioned_response("", nonce, &["res-0"])).await;
             assert_no_event(&mut rewatch, "late response repopulated the idle cache").await;
             let snapshot = take_snapshot(&client).await;
             assert_eq!(snapshot.len(), 1);
             assert!(snapshot[0].accepted.is_none());
             assert!(snapshot[0].rejected.is_none());
             drop(rewatch);
-            expect_request(&mut server, versioned_response(accepted, nonce, &[])).await;
+            expect_request(&mut server, versioned_response("", nonce, &[])).await;
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reconnect_while_unwatched_preserves_version_but_resets_nonce() {
+    async fn reconnect_while_unwatched_resets_version_and_nonce() {
         let (builder, mut servers) = mock_transport();
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
@@ -2392,7 +2553,7 @@ mod tests {
             .unwrap_err();
         assert!(replacement.requests.try_recv().is_err());
         let mut rewatch = client.watch::<TestResource>("res-0").await;
-        expect_request(&mut replacement, response("1", "", &["res-0"])).await;
+        expect_request(&mut replacement, response("", "", &["res-0"])).await;
         assert_no_event(
             &mut rewatch,
             "rewatch replayed evicted cache after reconnect",
@@ -2749,6 +2910,64 @@ mod tests {
                     .expect("additional watcher reset the original deadline");
             assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_shared_named_watch_under_wildcard_keeps_original_timer() {
+        let (client, first, mut server) = connected_client().await;
+        let _wildcard = watch_synced(&client, &mut server, "").await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let mut second = client.watch::<TestResource>("res-0").await;
+        drop(first);
+        take_snapshot(&client).await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let event = tokio::time::timeout(Duration::from_millis(100), second.next())
+            .await
+            .expect("remaining named watcher lost its original deadline")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_last_named_watch_under_wildcard_cancels_its_timer() {
+        let (client, first, mut server) = connected_client().await;
+        let mut wildcard = watch_synced(&client, &mut server, "").await;
+        let second = client.watch::<TestResource>("res-0").await;
+        drop(first);
+        take_snapshot(&client).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(second);
+        take_snapshot(&client).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_no_event(
+            &mut wildcard,
+            "removed named watch timed out under wildcard",
+        )
+        .await;
+        assert!(server.requests.try_recv().is_err());
+
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        take_snapshot(&client).await;
+        assert_no_event(&mut rewatch, "removed named watch left a cached timeout").await;
+        let event = tokio::time::timeout(Duration::from_secs(15), rewatch.next())
+            .await
+            .expect("rewatch did not start a fresh timer")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
     }
 
     #[tokio::test(start_paused = true)]

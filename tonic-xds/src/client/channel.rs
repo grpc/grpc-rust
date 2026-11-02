@@ -29,15 +29,12 @@ use crate::client::loadbalance::cluster_factory::XdsLbClusterChannelFactory;
 use crate::client::loadbalance::outcome::{
     GrpcOutcomeClassifier, HttpOutcomeClassifier, OutcomeClassifier,
 };
+use crate::client::pool::{XdsClientPool, XdsClientPoolBuilder};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider::{
-    CertProviderError, CertProviderRegistry, CertificateProvider, file_watcher::FileWatcherProvider,
-};
-#[cfg(feature = "_tls-any")]
-use crate::xds::cert_provider_config::FileWatcherConfig;
+use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
@@ -53,11 +50,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
-#[cfg(feature = "_tls-any")]
-use xds_client::Error as XdsClientError;
-use xds_client::{
-    ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
-};
+use xds_client::{MetricsRecorder, XdsClient};
 
 use crate::client::retry::{RetryClassifierFactory, RetryLayer, RetrySharedConfig};
 
@@ -65,11 +58,9 @@ use crate::client::retry::{RetryClassifierFactory, RetryLayer, RetrySharedConfig
 #[derive(Clone, Debug)]
 pub struct XdsChannelConfig {
     target_uri: XdsUri,
-    bootstrap: Option<BootstrapConfig>,
-    call_creds: Option<Arc<dyn TonicCallCredentials>>,
-    max_decoding_message_size: Option<usize>,
-    max_encoding_message_size: Option<usize>,
-    ads_keep_alive: Option<(Option<Duration>, Duration)>,
+    /// Settings for the pool the channel gets of its own when it is built
+    /// without an [`XdsClientPool`]. `None` until one is set.
+    xds_client: Option<XdsClientPoolBuilder>,
 }
 
 impl XdsChannelConfig {
@@ -78,12 +69,16 @@ impl XdsChannelConfig {
     pub fn new(target_uri: XdsUri) -> Self {
         Self {
             target_uri,
-            bootstrap: None,
-            call_creds: None,
-            max_decoding_message_size: None,
-            max_encoding_message_size: None,
-            ads_keep_alive: None,
+            xds_client: None,
         }
+    }
+
+    fn update_xds_client(
+        mut self,
+        update: impl FnOnce(XdsClientPoolBuilder) -> XdsClientPoolBuilder,
+    ) -> Self {
+        self.xds_client = Some(update(self.xds_client.unwrap_or_default()));
+        self
     }
 
     /// Sets the bootstrap configuration.
@@ -91,9 +86,8 @@ impl XdsChannelConfig {
     /// If not set, the builder falls back to loading from environment
     /// variables (`GRPC_XDS_BOOTSTRAP` or `GRPC_XDS_BOOTSTRAP_CONFIG`).
     #[must_use]
-    pub fn with_bootstrap(mut self, bootstrap: BootstrapConfig) -> Self {
-        self.bootstrap = Some(bootstrap);
-        self
+    pub fn with_bootstrap(self, bootstrap: BootstrapConfig) -> Self {
+        self.update_xds_client(|settings| settings.with_bootstrap(bootstrap))
     }
 
     /// Eagerly loads bootstrap configuration from environment variables.
@@ -104,18 +98,16 @@ impl XdsChannelConfig {
     ///
     /// Reads from `GRPC_XDS_BOOTSTRAP` (file path) first, then falls back to
     /// `GRPC_XDS_BOOTSTRAP_CONFIG` (inline JSON).
-    pub fn with_bootstrap_from_env(mut self) -> Result<Self, BootstrapError> {
-        self.bootstrap = Some(BootstrapConfig::from_env()?);
-        Ok(self)
+    pub fn with_bootstrap_from_env(self) -> Result<Self, BootstrapError> {
+        Ok(self.with_bootstrap(BootstrapConfig::from_env()?))
     }
 
     /// Set per-stream call credentials for the ADS stream (e.g. `google_default`).
     ///
     /// Attached on each (re)connect, only over a secure channel; over an insecure
     /// channel, stream creation fails. Not refreshed mid-stream.
-    pub fn with_call_credentials(mut self, creds: Arc<dyn TonicCallCredentials>) -> Self {
-        self.call_creds = Some(creds);
-        self
+    pub fn with_call_credentials(self, creds: Arc<dyn TonicCallCredentials>) -> Self {
+        self.update_xds_client(|settings| settings.with_call_credentials(creds))
     }
 
     /// Limit the size of a decoded ADS response, in bytes.
@@ -123,17 +115,15 @@ impl XdsChannelConfig {
     /// Defaults to tonic's 4 MiB. A control plane whose response exceeds the
     /// limit breaks the stream, so raise it to match the largest resource set
     /// the server sends.
-    pub fn with_max_decoding_message_size(mut self, limit: usize) -> Self {
-        self.max_decoding_message_size = Some(limit);
-        self
+    pub fn with_max_decoding_message_size(self, limit: usize) -> Self {
+        self.update_xds_client(|settings| settings.with_max_decoding_message_size(limit))
     }
 
     /// Limit the size of an encoded ADS request, in bytes.
     ///
     /// Defaults to tonic's `usize::MAX`.
-    pub fn with_max_encoding_message_size(mut self, limit: usize) -> Self {
-        self.max_encoding_message_size = Some(limit);
-        self
+    pub fn with_max_encoding_message_size(self, limit: usize) -> Self {
+        self.update_xds_client(|settings| settings.with_max_encoding_message_size(limit))
     }
 
     /// Configure HTTP/2 keepalives on the ADS connection.
@@ -146,9 +136,8 @@ impl XdsChannelConfig {
     /// gRPC servers by default close connections that PING more often than
     /// every 5 minutes with GOAWAY `too_many_pings` (gRFC A8), so keep
     /// `interval` at or above the control plane's minimum.
-    pub fn with_ads_keep_alive(mut self, interval: Option<Duration>, timeout: Duration) -> Self {
-        self.ads_keep_alive = Some((interval, timeout));
-        self
+    pub fn with_ads_keep_alive(self, interval: Option<Duration>, timeout: Duration) -> Self {
+        self.update_xds_client(|settings| settings.with_ads_keep_alive(interval, timeout))
     }
 }
 
@@ -167,48 +156,11 @@ pub enum BuildError {
     #[cfg(feature = "_tls-any")]
     #[error("ADS TLS credentials: {0}")]
     AdsTls(#[source] CertProviderError),
-}
-
-#[cfg(feature = "_tls-any")]
-#[derive(Clone)]
-struct AdsTlsConfigProvider {
-    file_watcher: Option<Arc<dyn CertificateProvider>>,
-}
-
-#[cfg(feature = "_tls-any")]
-impl AdsTlsConfigProvider {
-    fn new(config: FileWatcherConfig) -> Result<Self, CertProviderError> {
-        let file_watcher = if config.has_certificate_files() {
-            Some(Arc::new(FileWatcherProvider::new(config)?) as Arc<dyn CertificateProvider>)
-        } else {
-            None
-        };
-        Ok(Self { file_watcher })
-    }
-
-    fn client_tls_config(&self) -> xds_client::Result<tonic::transport::ClientTlsConfig> {
-        let mut tls_config = tonic::transport::ClientTlsConfig::new();
-        if let Some(provider) = &self.file_watcher {
-            let data = provider
-                .fetch()
-                .map_err(|error| XdsClientError::TlsConfig(Box::new(error)))?;
-            if let Some(roots) = data.roots() {
-                tls_config =
-                    tls_config.ca_certificate(tonic::transport::Certificate::from_pem(roots));
-            } else {
-                tls_config = tls_config.with_native_roots();
-            }
-            if let Some(identity) = data.identity() {
-                tls_config = tls_config.identity(tonic::transport::Identity::from_pem(
-                    identity.cert_chain(),
-                    identity.key(),
-                ));
-            }
-        } else {
-            tls_config = tls_config.with_native_roots();
-        }
-        Ok(tls_config)
-    }
+    /// The channel takes its xDS client from an [`XdsClientPool`] but also
+    /// sets the bootstrap, an ADS setting, or a metrics recorder; set them on
+    /// the pool instead.
+    #[error("xDS client settings must be set on the XdsClientPool, not the channel")]
+    ConflictsWithXdsClientPool,
 }
 
 /// Holds owned resources whose background tasks must live as long as the channel.
@@ -217,9 +169,12 @@ impl AdsTlsConfigProvider {
 /// cheaply. When the last clone drops, the resource manager cascade task and
 /// ADS worker are aborted. The `XdsCache` is kept alive separately by
 /// `XdsClusterDiscovery` in the service stack.
+///
+/// A pooled client is shared with other channels and stops only once all of
+/// them have dropped it.
 struct XdsChannelResources {
     _resource_manager: XdsResourceManager,
-    _xds_client: XdsClient,
+    _xds_client: Arc<XdsClient>,
 }
 
 /// xDS runtime built once from bootstrap (cache, ADS client, resource manager,
@@ -228,7 +183,7 @@ struct XdsChannelResources {
 /// [`XdsChannelBuilder::build_transport_channel`].
 struct XdsRuntimeParts {
     cache: Arc<XdsCache>,
-    xds_client: XdsClient,
+    xds_client: Arc<XdsClient>,
     resource_manager: XdsResourceManager,
     #[cfg(feature = "_tls-any")]
     cert_provider_registry: Arc<CertProviderRegistry>,
@@ -320,6 +275,8 @@ pub struct XdsChannelBuilder {
     pre_route: Option<Arc<dyn PreRouteInterceptor>>,
     retry_classifier_factory: Option<Arc<dyn RetryClassifierFactory>>,
     lb_backend: LbBackend,
+    xds_client_pool: Option<XdsClientPool>,
+    xds_client_key: Option<String>,
     #[cfg(feature = "_tls-any")]
     cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
@@ -348,7 +305,9 @@ impl Debug for XdsChannelBuilder {
                     .retry_classifier_factory
                     .as_deref()
                     .map_or("None", |f| std::any::type_name_of_val(f)),
-            );
+            )
+            .field("xds_client_pool", &self.xds_client_pool)
+            .field("xds_client_key", &self.xds_client_key);
         #[cfg(feature = "_tls-any")]
         s.field(
             "cert_providers",
@@ -368,6 +327,8 @@ impl XdsChannelBuilder {
             pre_route: None,
             retry_classifier_factory: None,
             lb_backend: LbBackend::default(),
+            xds_client_pool: None,
+            xds_client_key: None,
             #[cfg(feature = "_tls-any")]
             cert_providers: HashMap::new(),
         }
@@ -427,6 +388,39 @@ impl XdsChannelBuilder {
         self
     }
 
+    /// Takes the channel's xDS client from `pool`, sharing it, and its ADS
+    /// stream, with every other channel that uses the same pool and key.
+    ///
+    /// The key defaults to the channel's target URI, as in gRFC A71; override
+    /// it with [`with_xds_client_key`](Self::with_xds_client_key). Without a
+    /// pool, the channel gets one of its own, built from the settings below,
+    /// so its client is not shared.
+    ///
+    /// The pool supplies the bootstrap and ADS settings, so the build fails
+    /// with [`BuildError::ConflictsWithXdsClientPool`] if the channel also sets
+    /// any of them: [`XdsChannelConfig::with_bootstrap`], the
+    /// `XdsChannelConfig` call-credential, message-size, or ADS keepalive
+    /// settings, or [`with_metrics_recorder`](Self::with_metrics_recorder).
+    #[must_use]
+    pub fn with_xds_client_pool(mut self, pool: XdsClientPool) -> Self {
+        self.xds_client_pool = Some(pool);
+        self
+    }
+
+    /// Overrides the key the channel looks up in its
+    /// [`XdsClientPool`]. Defaults to the channel's target URI.
+    ///
+    /// Channels that use the same pool and key share one xDS client, so
+    /// passing one key for every channel shares a single client across the
+    /// process. A channel without a
+    /// [`with_xds_client_pool`](Self::with_xds_client_pool) has a pool of its
+    /// own, so its key shares nothing.
+    #[must_use]
+    pub fn with_xds_client_key(mut self, key: impl Into<String>) -> Self {
+        self.xds_client_key = Some(key.into());
+        self
+    }
+
     /// Registers a custom [`CertificateProvider`] under an xDS certificate
     /// provider instance name, resolved by CDS `UpstreamTlsContext` references.
     /// Shadows a bootstrap `file_watcher` instance of the same name.
@@ -466,65 +460,35 @@ impl XdsChannelBuilder {
     /// manager, and — under a TLS feature — the cert-provider registry) from
     /// bootstrap. Shared by the gRPC and transport-generic build entry points.
     fn build_xds_parts(&self) -> Result<XdsRuntimeParts, BuildError> {
-        let bootstrap = match self.config.bootstrap.clone() {
-            Some(b) => b,
-            None => BootstrapConfig::from_env()?,
+        let pool = match &self.xds_client_pool {
+            Some(_) if self.config.xds_client.is_some() || self.recorder.is_some() => {
+                return Err(BuildError::ConflictsWithXdsClientPool);
+            }
+            Some(pool) => pool.clone(),
+            None => {
+                let mut settings = self.config.xds_client.clone().unwrap_or_default();
+                if let Some(recorder) = self.recorder.clone() {
+                    settings = settings.with_metrics_recorder(recorder);
+                }
+                settings.build()?
+            }
         };
+        let target = self.config.target_uri.to_string();
+        let key = self.xds_client_key.as_deref().unwrap_or(&target);
 
         let listener_name = self.config.target_uri.target.clone();
 
-        let server_uri = bootstrap.server_uri().to_owned();
-
-        #[allow(unused_mut)]
-        let mut transport_builder = TonicTransportBuilder::new();
-        #[cfg(feature = "_tls-any")]
-        if let Some(tls_config) = bootstrap.tls_config()? {
-            let provider = AdsTlsConfigProvider::new(tls_config).map_err(BuildError::AdsTls)?;
-            transport_builder =
-                transport_builder.with_tls_config_factory(move |_| provider.client_tls_config());
-        }
-        #[cfg(not(feature = "_tls-any"))]
-        if bootstrap.use_tls() {
-            return Err(BuildError::Bootstrap(BootstrapError::Validation(
-                "TLS requested by bootstrap but no TLS feature enabled \
-                 (enable tls-ring or tls-aws-lc)"
-                    .into(),
-            )));
-        }
-
-        if let Some(creds) = self.config.call_creds.clone() {
-            transport_builder = transport_builder.with_call_credentials(creds);
-        }
-
-        if let Some(limit) = self.config.max_decoding_message_size {
-            transport_builder = transport_builder.with_max_decoding_message_size(limit);
-        }
-        if let Some(limit) = self.config.max_encoding_message_size {
-            transport_builder = transport_builder.with_max_encoding_message_size(limit);
-        }
-        if let Some((interval, timeout)) = self.config.ads_keep_alive {
-            transport_builder = transport_builder.with_keep_alive(interval, timeout);
-        }
-
         #[cfg(feature = "_tls-any")]
         let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
-            &bootstrap.certificate_providers,
+            &pool.bootstrap().certificate_providers,
             self.cert_providers.clone(),
         )?);
 
-        let node = Node::try_from(bootstrap.node)?;
-        let client_config =
-            ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
-        let mut client_builder =
-            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
-        if let Some(recorder) = self.recorder.clone() {
-            client_builder = client_builder.with_metrics_recorder(recorder);
-        }
-        let xds_client = client_builder.build();
+        let xds_client = pool.get_or_create(key)?;
 
         let cache = Arc::new(XdsCache::new());
         let resource_manager =
-            XdsResourceManager::new(xds_client.clone(), cache.clone(), listener_name);
+            XdsResourceManager::new((*xds_client).clone(), cache.clone(), listener_name);
 
         Ok(XdsRuntimeParts {
             cache,
@@ -888,6 +852,8 @@ mod tests {
     use crate::client::channel::{GrpcClusterChannelFactory, LB_BACKENDS, LbBackend};
     use crate::client::endpoint::EndpointAddress;
     use crate::client::endpoint::EndpointChannel;
+    use crate::client::pool::XdsClientPool;
+    use crate::xds::bootstrap::BootstrapConfig;
 
     fn test_config() -> XdsChannelConfig {
         XdsChannelConfig::new(XdsUri::parse("xds:///test-service").unwrap())
@@ -1388,7 +1354,93 @@ mod tests {
         }
         let config = XdsChannelConfig::new(XdsUri::parse("xds:///svc").unwrap())
             .with_call_credentials(std::sync::Arc::new(DummyCreds));
-        assert!(config.call_creds.is_some());
+        assert!(config.xds_client.is_some());
+    }
+
+    /// A pool whose clients point at a port nothing listens on.
+    fn test_pool() -> XdsClientPool {
+        XdsClientPool::builder()
+            .with_bootstrap(test_bootstrap())
+            .build()
+            .unwrap()
+    }
+
+    fn test_bootstrap() -> BootstrapConfig {
+        BootstrapConfig::from_json(
+            r#"{"xds_servers":[{"server_uri":"http://127.0.0.1:1","channel_creds":[{"type":"insecure"}]}],"node":{"id":"test"}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn xds_client_pool_rejects_channel_client_settings() {
+        use super::BuildError;
+
+        struct NoopRecorder;
+        impl xds_client::MetricsRecorder for NoopRecorder {
+            fn add_counter_u64(
+                &self,
+                _: &'static xds_client::Instrument,
+                _: u64,
+                _: &[xds_client::KeyValue],
+            ) {
+            }
+            fn add_up_down_counter_i64(
+                &self,
+                _: &'static xds_client::Instrument,
+                _: i64,
+                _: &[xds_client::KeyValue],
+            ) {
+            }
+            fn record_histogram_f64(
+                &self,
+                _: &'static xds_client::Instrument,
+                _: f64,
+                _: &[xds_client::KeyValue],
+            ) {
+            }
+            fn record_gauge_i64(
+                &self,
+                _: &'static xds_client::Instrument,
+                _: i64,
+                _: &[xds_client::KeyValue],
+            ) {
+            }
+        }
+
+        let pool = test_pool();
+        let builders = [
+            XdsChannelBuilder::new(test_config().with_bootstrap(test_bootstrap())),
+            XdsChannelBuilder::new(test_config().with_max_decoding_message_size(1)),
+            XdsChannelBuilder::new(
+                test_config().with_ads_keep_alive(None, std::time::Duration::from_secs(1)),
+            ),
+            XdsChannelBuilder::new(test_config()).with_metrics_recorder(Arc::new(NoopRecorder)),
+        ];
+        for builder in builders {
+            let error = builder
+                .with_xds_client_pool(pool.clone())
+                .build_grpc_channel()
+                .unwrap_err();
+            assert!(
+                matches!(error, BuildError::ConflictsWithXdsClientPool),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn xds_client_pool_key_defaults_to_target() {
+        let pool = test_pool();
+        let config = test_config();
+        let target = config.target_uri.to_string();
+        let _channel = XdsChannelBuilder::new(config)
+            .with_xds_client_pool(pool.clone())
+            .build_grpc_channel()
+            .unwrap();
+
+        let client = pool.get_or_create(&target).unwrap();
+        assert_eq!(Arc::strong_count(&client), 2, "channel holds the client");
     }
 
     #[cfg(feature = "_tls-any")]
@@ -1424,17 +1476,6 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
     }
 
-    #[cfg(feature = "_tls-any")]
-    #[test]
-    fn a65_empty_config_does_not_create_a_file_watcher() {
-        use super::AdsTlsConfigProvider;
-        use crate::xds::cert_provider_config::FileWatcherConfig;
-
-        let provider = AdsTlsConfigProvider::new(FileWatcherConfig::default()).unwrap();
-        assert!(provider.file_watcher.is_none());
-        provider.client_tls_config().unwrap();
-    }
-
     /// Smoke test: verifies builder wiring with a disconnected XdsClient
     /// doesn't panic during construction.
     #[tokio::test]
@@ -1446,6 +1487,7 @@ mod tests {
         let xds_client = xds_client::XdsClient::disconnected();
         let resource_manager =
             XdsResourceManager::new(xds_client.clone(), cache.clone(), "test-listener".into());
+        let xds_client = Arc::new(xds_client);
 
         let builder = XdsChannelBuilder::new(test_config());
 

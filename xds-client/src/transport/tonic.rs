@@ -80,10 +80,15 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// stream pends forever and the client keeps serving its last known
 /// resources. Keepalives surface such connections as transport errors, which
 /// triggers the worker's reconnect + re-subscribe path.
-const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// Five minutes matches other gRPC clients' default keepalive.
+/// Also matches the A8 server side `PERMIT_KEEPALIVE_TIME` default.
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Default time to wait for a keepalive PING ack before closing the connection.
-const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Matches other gRPC clients' default keepalive timeout.
+const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A codec that passes bytes through without serialization.
 ///

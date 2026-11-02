@@ -35,14 +35,16 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::PrivateKeyDer;
 use rustls_pki_types::CertificateDer;
 use tokio::sync::watch;
+use tokio_rustls::TlsStream;
 
+use grpc::__unstable::rt::EndpointIoStream;
+use grpc::__unstable::rt::GrpcEndpoint;
+use grpc::__unstable::rt::StreamEndpoint;
 use grpc::credentials::ProtocolInfo;
-use private::SealedToken;
 
 pub mod client;
 mod key_log;
 pub mod server;
-mod tls_stream;
 
 mod private {
     /// A zero-sized type used so only the grpc-rustls crate can call or
@@ -112,7 +114,7 @@ pub trait Provider<T> {
     /// This allows the consumer to observe the current value and await
     /// future updates.
     #[doc(hidden)]
-    fn get_receiver(self, _token: SealedToken) -> watch::Receiver<T>;
+    fn get_receiver(self, _token: private::SealedToken) -> watch::Receiver<T>;
 }
 
 /// A provider that supplies a constant, immutable value.
@@ -128,7 +130,7 @@ impl<T> StaticProvider<T> {
 }
 
 impl<T> Provider<T> for StaticProvider<T> {
-    fn get_receiver(self, _token: SealedToken) -> watch::Receiver<T> {
+    fn get_receiver(self, _token: private::SealedToken) -> watch::Receiver<T> {
         // We drop the sender (_) immediately.
         // This ensures the receiver sees the initial value but knows
         // no future updates will arrive.
@@ -144,6 +146,22 @@ pub type StaticRootCertificatesProvider = StaticProvider<RootCertificates>;
 pub type StaticIdentityProvider = StaticProvider<Identity>;
 
 static TLS_PROTO_INFO: ProtocolInfo = ProtocolInfo::unstable_new("tls");
+
+/// A [`GrpcEndpoint`] that carries TLS over an underlying transport endpoint.
+type TlsEndpoint<T> = StreamEndpoint<TlsStream<EndpointIoStream<T>>>;
+
+/// Adapts an established TLS stream into a [`GrpcEndpoint`], inheriting the
+/// addresses and network type of the underlying transport.
+fn tls_endpoint<T: GrpcEndpoint>(
+    stream: impl Into<TlsStream<EndpointIoStream<T>>>,
+) -> TlsEndpoint<T> {
+    let stream = stream.into();
+    let transport = stream.get_ref().0.get_ref();
+    let local_addr: Box<str> = transport.get_local_address().into();
+    let peer_addr: Box<str> = transport.get_peer_address().into();
+    let network_type = transport.get_network_type();
+    StreamEndpoint::new(stream, local_addr, peer_addr, network_type)
+}
 
 fn sanitize_crypto_provider(mut crypto_provider: CryptoProvider) -> Result<CryptoProvider, String> {
     crypto_provider.cipher_suites.retain(|suite| match suite {

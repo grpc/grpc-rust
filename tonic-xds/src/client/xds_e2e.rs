@@ -33,7 +33,10 @@ mod test {
     use std::collections::HashMap;
     use std::net::SocketAddr;
 
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
     use tokio::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use xds_test_util::RunningControlPlane;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config;
@@ -413,6 +416,78 @@ mod test {
         assert_eq!(reply, "backend: world");
 
         let _ = backend.shutdown.send(());
+    }
+
+    /// Forwards TCP connections to `upstream` until `blackhole` is cancelled,
+    /// then stops forwarding without closing the sockets, leaving every
+    /// connection half-open. Returns the proxy address and the number of
+    /// connections accepted so far.
+    async fn start_blackhole_proxy(
+        upstream: SocketAddr,
+        blackhole: CancellationToken,
+    ) -> (SocketAddr, watch::Receiver<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        let (accepted_tx, accepted_rx) = watch::channel(0);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                accepted_tx.send_modify(|accepted| *accepted += 1);
+                let blackhole = blackhole.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = blackhole.cancelled() => std::future::pending::<()>().await,
+                    }
+                });
+            }
+        });
+        (addr, accepted_rx)
+    }
+
+    /// When the control plane stops answering, an unacked keepalive PING
+    /// closes the ADS connection and the client dials a new one. Reconnecting
+    /// within seconds, well under the default keepalive interval, proves the
+    /// configured keepalive reached the ADS transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_keep_alive_replaces_half_open_ads_connection() {
+        let (control_plane, cp_addr) = start_control_plane().await;
+        let blackhole = CancellationToken::new();
+        let (proxy_addr, mut accepted) = start_blackhole_proxy(cp_addr, blackhole.clone()).await;
+
+        let bootstrap_json = format!(
+            r#"{{"xds_servers":[{{"server_uri":"http://{proxy_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
+        );
+        let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
+        let target = XdsUri::parse("xds:///my-service").expect("parse target");
+        let _channel = XdsChannelBuilder::new(
+            XdsChannelConfig::new(target)
+                .with_bootstrap(bootstrap)
+                .with_ads_keep_alive(Some(Duration::from_millis(200)), Duration::from_millis(200)),
+        )
+        .build_grpc_channel()
+        .expect("build xds channel");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !control_plane
+                .get_service()
+                .has_subscriber_for(&config::AdsTypeUrl::Lds, "my-service")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ADS stream never established");
+        assert_eq!(*accepted.borrow(), 1);
+
+        blackhole.cancel();
+
+        tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|n| *n >= 2))
+            .await
+            .expect("half-open ADS connection never replaced; keepalive not applied")
+            .expect("proxy stopped accepting");
     }
 }
 

@@ -70,7 +70,9 @@ release = false
 [[package]]
 name = "grpc-rustls"
 release = false
+publish = false
 
 [[package]]
 name = "protoc-gen-grpc-rust"
 release = false
+publish = false

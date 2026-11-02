@@ -47,11 +47,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile = "3.26"
 tokio = { version = "1.37.0", features = ["macros", "net", "rt-multi-thread", "io-util"] }
 tokio-stream = { version = "0.1.17", default-features = false, features = ["net"] }
-tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = [
+tonic = { version = "0.14.9", path = "../tonic", default-features = false, features = [
     "codegen",
     "server",
     "router",
     "tls-ring",
 ] }
-tonic-prost = { version = "0.14.6", path = "../tonic-prost" }
+tonic-prost = { version = "0.14.9", path = "../tonic-prost" }
 

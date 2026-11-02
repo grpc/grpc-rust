@@ -625,7 +625,13 @@ impl LbPolicy for PickFirstPolicy {
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.start_connection_pass(channel_controller);
+        // Only start a connection pass when in Idle and have already
+        // received a non-empty resolver update (`subchannels` is non-empty).
+        // Before the first resolver update, `connectivity_state` is Idle while
+        // `subchannels` is empty.
+        if self.connectivity_state == ConnectivityState::Idle && !self.subchannels.is_empty() {
+            self.start_connection_pass(channel_controller);
+        }
     }
 }
 
@@ -1603,5 +1609,35 @@ mod test {
         // And the picker goes to Connecting.
         let state = env.expect_picker_update();
         assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
+    }
+
+    // Tests that exit_idle is a no-op before the first resolver update or
+    // while Connecting or Ready.
+    #[tokio::test]
+    async fn test_pick_first_exit_idle() {
+        let mut env = new_env();
+
+        // Before any resolver update (Idle, but subchannels is empty),
+        // exit_idle should be a no-op.
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
+
+        // While Connecting, exit_idle should be a no-op.
+        env.send_resolver_update(create_endpoints(vec!["addr1"], None))
+            .unwrap();
+        let sc1 = env.expect_new_subchannel_for("addr1");
+        env.expect_connect();
+        env.expect_queuing_picker();
+
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
+
+        // While Ready, exit_idle should be a no-op and keep the selected
+        // subchannel active.
+        env.send_subchannel_update(&sc1, &SubchannelState::ready());
+        env.expect_ready_picker(&sc1);
+
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
     }
 }

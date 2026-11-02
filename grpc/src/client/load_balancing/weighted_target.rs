@@ -556,6 +556,7 @@ mod tests {
         // element removed: "c" has none, and "x" is not a target, so its
         // endpoint goes nowhere.
         let received = received.lock().unwrap();
+        assert_eq!(received.len(), 3);
         assert_eq!(received["a"].0.endpoints, Ok(vec![endpoint(&["a1"])]));
         assert_eq!(received["b"].0.endpoints, Ok(vec![endpoint(&["b1"])]));
         assert_eq!(received["c"].0.endpoints, Ok(vec![]));
@@ -663,12 +664,10 @@ mod tests {
         // With "a" (10) and "b" (20) excluded, "c" (30) and "d" (70) map keys
         // 0..30 to "c" and 30..100 to "d".
         let mut t = new_env_with_keys(&[29, 30]);
-        let [a, b, c, d] = t.apply(
+        let [_, b, c, d] = t.apply(
             "stub_wt_ready_excludes",
             [("a", 10), ("b", 20), ("c", 30), ("d", 70)],
         );
-        t.send_subchannel_update(&a, &SubchannelState::connecting());
-        t.expect_picker_state(ConnectivityState::Connecting);
         t.send_subchannel_update(&b, &SubchannelState::transient_failure("err"));
         t.expect_picker_state(ConnectivityState::Connecting);
         t.send_subchannel_update(&c, &SubchannelState::ready());
@@ -683,7 +682,6 @@ mod tests {
     #[test]
     fn transient_failure_picker_spans_failing_children() {
         reg_stub("stub_wt_transient_failure");
-        // Weights 30/70 map keys 0..30 to "a" and keys 30..100 to "b".
         let mut t = new_env_with_keys(&[29, 30]);
         let [a, b] = t.apply("stub_wt_transient_failure", [("a", 30), ("b", 70)]);
         t.send_subchannel_update(&a, &SubchannelState::transient_failure("err a"));

@@ -75,6 +75,7 @@ pub use tonic::async_trait;
 #[doc(hidden)]
 pub mod __unstable {
     pub use crate::private::UnstableToken;
+    pub use crate::private::UnstableTrait;
 
     pub mod rt {
         pub use crate::rt::*;
@@ -107,6 +108,7 @@ pub mod __unstable {
 #[doc(hidden)]
 pub mod __internal {
     pub use crate::private::InternalToken;
+    pub use crate::private::InternalTrait;
 }
 
 /// These private types are only intended to be used in exported traits, where

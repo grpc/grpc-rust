@@ -71,7 +71,7 @@ static CHILD_POLICY_NAME: &str = "weighted_target_experimental";
 
 // Endpoint attribute carrying the xDS locality load-balancing weight.
 #[derive(Debug, PartialEq, Eq)]
-struct LocalityWeight(u32);
+pub(super) struct LocalityWeight(pub(super) u32);
 
 // Validated configuration for the WRR Locality LB policy.
 #[derive(Debug, Deserialize)]
@@ -192,11 +192,7 @@ impl WrrLocalityPolicy {
             let &LocalityWeight(weight) = endpoint.attributes.get::<LocalityWeight>()?;
             (weight > 0).then_some((locality, weight))
         }) {
-            let locality_key = format!(
-                "{{region=\"{}\", zone=\"{}\", sub_zone=\"{}\"}}",
-                locality.region, locality.zone, locality.sub_zone
-            );
-            targets.entry(locality_key).or_insert_with(|| {
+            targets.entry(locality.to_string()).or_insert_with(|| {
                 json!({
                     "weight": weight,
                     "childPolicy": child_policy,

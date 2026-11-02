@@ -152,9 +152,9 @@ mod private {
     /// grpc crate.
     pub struct UnstableToken;
     /// A trait used as a supertrait of an exported trait where methods may be
-    /// added. Unstable traits are generally not safe to implement from
-    /// libraries since libraries should not require a specific version of the
-    /// grpc crate.
+    /// added. The traits are unrestricted for consumers. Unstable traits are
+    /// generally not safe to implement from libraries since libraries should
+    /// not require a specific version of the grpc crate.
     ///
     /// This trait does not imply that methods may be modified or deleted.
     /// [`UnstableToken`] must be used in addition to this trait to denote

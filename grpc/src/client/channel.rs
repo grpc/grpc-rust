@@ -149,8 +149,7 @@ impl Channel {
     /// Always available. When the `_runtime-tokio` feature is enabled,
     /// [`builder()`](Channel::builder) can be used instead to use the default
     /// Tokio runtime.
-    #[doc(hidden)]
-    pub fn builder_with_runtime(
+    pub(crate) fn builder_with_runtime(
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
         runtime: GrpcRuntime,

@@ -259,12 +259,6 @@ impl ProtocolInfo {
         Self { security_protocol }
     }
 
-    #[cfg(feature = "__unstable")]
-    #[doc(hidden)]
-    pub const fn unstable_new(security_protocol: &'static str) -> Self {
-        Self::new(security_protocol)
-    }
-
     /// Returns the security protocol name currently in use, e.g. "tls".
     pub fn security_protocol(&self) -> &'static str {
         self.security_protocol

@@ -124,9 +124,9 @@ mod private {
     /// call or implement methods with this argument. These methods may be
     /// modified or deleted. The type is private to this crate.
     pub struct SealedToken;
-    /// A trait used on an exported subtrait so only the grpc crate can
-    /// implement the subtrait and methods may be added. The type is private to
-    /// this crate. The subtraits are unrestricted for consumers.
+    /// A trait used as a supertrait of an exported trait so only the grpc crate
+    /// can implement the trait and methods may be added. The type is private
+    /// to this crate. The traits are unrestricted for consumers.
     ///
     /// This trait does not imply that methods may be modified or deleted.
     /// [`SealedToken`] must be used in addition to this trait to denote sealed
@@ -137,9 +137,9 @@ mod private {
     /// crates should call or implement methods with this argument. These
     /// methods may be modified or deleted.
     pub struct InternalToken;
-    /// A trait used on an exported subtrait where only grpc-authored crate
-    /// should implement the subtrait and methods may be added. The subtraits
-    /// are unrestricted for consumers.
+    /// A trait used as a supertrait of an exported trait where only
+    /// grpc-authored crates should implement the trait and methods may be
+    /// added. The traits are unrestricted for consumers.
     ///
     /// This trait does not imply that methods may be modified or deleted.
     /// [`InternalToken`] must be used in addition to this trait to denote
@@ -151,9 +151,10 @@ mod private {
     /// libraries since libraries should not require a specific version of the
     /// grpc crate.
     pub struct UnstableToken;
-    /// A trait used on an exported subtrait where methods may be added.
-    /// Unstable subtraits are generally not safe to implement from libraries
-    /// since libraries should not require a specific version of the grpc crate.
+    /// A trait used as a supertrait of an exported trait where methods may be
+    /// added. Unstable traits are generally not safe to implement from
+    /// libraries since libraries should not require a specific version of the
+    /// grpc crate.
     ///
     /// This trait does not imply that methods may be modified or deleted.
     /// [`UnstableToken`] must be used in addition to this trait to denote

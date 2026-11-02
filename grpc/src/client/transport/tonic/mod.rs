@@ -463,7 +463,7 @@ impl Transport for TransportBuilder {
                 transport,
                 &security_info.handshake_info,
                 &runtime,
-                private::Internal,
+                private::UnstableToken,
             )
             .await?;
 

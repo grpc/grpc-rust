@@ -54,6 +54,10 @@ pub type BoxEndpoint = Box<dyn GrpcEndpoint>;
 #[crate::async_trait]
 pub(crate) trait EndpointListener: Send + Sync + 'static {
     /// Accepts the next incoming connection.
+    ///
+    /// An error stops the server, so return one only when the listener itself
+    /// can't continue. A failure that affects only one connection must not be
+    /// returned as an error.
     async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String>;
 
     /// Returns the local address this listener is bound to.
@@ -179,7 +183,7 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<()>>;
 
     #[doc(hidden)]
@@ -187,21 +191,21 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<usize>>;
 
     #[doc(hidden)]
     fn poll_flush_private(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<()>>;
 
     #[doc(hidden)]
     fn poll_shutdown_private(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<()>>;
 
     #[doc(hidden)]
@@ -209,7 +213,7 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<usize>> {
         let buf = bufs
             .iter()
@@ -219,7 +223,7 @@ pub trait GrpcEndpoint: Send + Unpin + 'static {
     }
 
     #[doc(hidden)]
-    fn is_write_vectored_private(&self, _: private::Internal) -> bool {
+    fn is_write_vectored_private(&self, _: private::SealedToken) -> bool {
         false
     }
 }
@@ -247,7 +251,7 @@ impl<T: GrpcEndpoint> AsyncRead for EndpointIoStream<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read_private(cx, buf, private::Internal)
+        Pin::new(&mut self.inner).poll_read_private(cx, buf, private::SealedToken)
     }
 }
 
@@ -257,15 +261,15 @@ impl<T: GrpcEndpoint> AsyncWrite for EndpointIoStream<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_private(cx, buf, private::Internal)
+        Pin::new(&mut self.inner).poll_write_private(cx, buf, private::SealedToken)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush_private(cx, private::Internal)
+        Pin::new(&mut self.inner).poll_flush_private(cx, private::SealedToken)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown_private(cx, private::Internal)
+        Pin::new(&mut self.inner).poll_shutdown_private(cx, private::SealedToken)
     }
 
     fn poll_write_vectored(
@@ -273,11 +277,11 @@ impl<T: GrpcEndpoint> AsyncWrite for EndpointIoStream<T> {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored_private(cx, bufs, private::Internal)
+        Pin::new(&mut self.inner).poll_write_vectored_private(cx, bufs, private::SealedToken)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored_private(private::Internal)
+        self.inner.is_write_vectored_private(private::SealedToken)
     }
 }
 
@@ -322,7 +326,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for Stream
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-        _token: private::Internal,
+        _token: private::SealedToken,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
@@ -331,7 +335,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for Stream
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        _token: private::Internal,
+        _token: private::SealedToken,
     ) -> Poll<Result<usize, io::Error>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
@@ -340,19 +344,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for Stream
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
-        _token: private::Internal,
+        _token: private::SealedToken,
     ) -> Poll<Result<usize, io::Error>> {
         Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 
-    fn is_write_vectored_private(&self, _token: private::Internal) -> bool {
+    fn is_write_vectored_private(&self, _token: private::SealedToken) -> bool {
         self.inner.is_write_vectored()
     }
 
     fn poll_flush_private(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        _token: private::Internal,
+        _token: private::SealedToken,
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
@@ -360,7 +364,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> GrpcEndpoint for Stream
     fn poll_shutdown_private(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        _token: private::Internal,
+        _token: private::SealedToken,
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
@@ -383,7 +387,7 @@ impl GrpcEndpoint for Box<dyn GrpcEndpoint> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut **self).poll_read_private(cx, buf, token)
     }
@@ -392,7 +396,7 @@ impl GrpcEndpoint for Box<dyn GrpcEndpoint> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut **self).poll_write_private(cx, buf, token)
     }
@@ -400,7 +404,7 @@ impl GrpcEndpoint for Box<dyn GrpcEndpoint> {
     fn poll_flush_private(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut **self).poll_flush_private(cx, token)
     }
@@ -408,7 +412,7 @@ impl GrpcEndpoint for Box<dyn GrpcEndpoint> {
     fn poll_shutdown_private(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        token: private::Internal,
+        token: private::SealedToken,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut **self).poll_shutdown_private(cx, token)
     }

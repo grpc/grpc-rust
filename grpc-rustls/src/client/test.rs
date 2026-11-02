@@ -45,7 +45,7 @@ use crate::RootCertificates;
 use crate::StaticProvider;
 use crate::client::ClientTlsConfig;
 use crate::client::RustlsChannelCredentials;
-use grpc::__unstable::Internal;
+use grpc::__unstable::UnstableToken;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::common::Authority;
 use grpc::__unstable::rt;
@@ -175,7 +175,7 @@ async fn test_tls_key_log() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Handshake failed");
@@ -230,7 +230,7 @@ async fn test_tls_handshake_wrong_server_name() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await;
 
@@ -283,7 +283,7 @@ async fn test_tls_validate_authority() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Handshake failed");
@@ -332,7 +332,7 @@ async fn test_mtls_handshake_no_identity() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Client handshake expected to succeed with TLS 1.3");
@@ -380,7 +380,7 @@ async fn test_mtls_handshake_with_identitiy() {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await
         .expect("Handshake failed with client identity");
@@ -431,15 +431,12 @@ async fn check_client_resumption_disabled(
             .unwrap();
         let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
-        let (tls_stream, _security, _authority_validator) = creds
+        let (mut tls_stream, _security, _authority_validator) = creds
             .connect_tls(&authority, endpoint)
             .await
             .expect("Handshake failed");
 
-        let connection = match tls_stream.inner() {
-            tokio_rustls::TlsStream::Client(conn) => conn.get_ref().1,
-            _ => panic!("Expected client stream"),
-        };
+        let connection = tls_stream.get_ref().1;
 
         assert_eq!(
             connection.handshake_kind(),
@@ -449,9 +446,7 @@ async fn check_client_resumption_disabled(
         );
 
         let mut buf = Vec::new();
-        let _ = EndpointIoStream::new(tls_stream)
-            .read_to_end(&mut buf)
-            .await;
+        let _ = tls_stream.read_to_end(&mut buf).await;
         assert_eq!(buf, b"Hello world");
     }
 
@@ -606,7 +601,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
             endpoint,
             &ClientHandshakeInfo::default(),
             &runtime,
-            Internal,
+            UnstableToken,
         )
         .await;
 

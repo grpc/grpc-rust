@@ -27,7 +27,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use grpc::__unstable::Internal;
+use crate::private::SealedToken;
+use grpc::__unstable::UnstableToken;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::client::HandshakeOutput;
 use grpc::__unstable::credentials::client::ValidateAuthority;
@@ -47,7 +48,7 @@ use rustls_pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::sync::watch::Receiver;
 use tokio_rustls::TlsConnector;
-use tokio_rustls::TlsStream as RustlsStream;
+use tokio_rustls::client::TlsStream;
 
 use crate::ALPN_PROTO_STR_H2;
 use crate::Identity;
@@ -58,7 +59,7 @@ use crate::key_log::KeyLogFile;
 use crate::parse_certs;
 use crate::parse_key;
 use crate::sanitize_crypto_provider;
-use crate::tls_stream::TlsStream;
+use crate::tls_endpoint;
 
 #[cfg(test)]
 mod test;
@@ -89,7 +90,7 @@ impl ClientTlsConfig {
     where
         R: Provider<RootCertificates>,
     {
-        self.pem_roots_provider = Some(provider.get_receiver(Internal));
+        self.pem_roots_provider = Some(provider.get_receiver(SealedToken));
         self
     }
 
@@ -102,7 +103,7 @@ impl ClientTlsConfig {
     where
         I: Provider<Identity>,
     {
-        self.identity_provider = Some(provider.get_receiver(Internal));
+        self.identity_provider = Some(provider.get_receiver(SealedToken));
         self
     }
 
@@ -199,7 +200,7 @@ impl RustlsChannelCredentials {
         source: BoxEndpoint,
     ) -> Result<
         (
-            TlsStream<BoxEndpoint>,
+            TlsStream<EndpointIoStream<BoxEndpoint>>,
             SecurityInfo,
             Box<dyn ValidateAuthority>,
         ),
@@ -232,9 +233,8 @@ impl RustlsChannelCredentials {
 
         let cs_info =
             SecurityInfo::new("tls").with_security_level(SecurityLevel::PrivacyAndIntegrity);
-        let ep = TlsStream::new(RustlsStream::Client(tls_stream));
         Ok((
-            ep,
+            tls_stream,
             cs_info,
             Box::new(ClientTlsAuthorityValidator {
                 verified_peer_cert: peer_cert,
@@ -278,11 +278,11 @@ impl ChannelCredentials for RustlsChannelCredentials {
         source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         _rt: &GrpcRuntime,
-        _token: Internal,
+        _token: UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         let (ep, security_info, authority_validator) = self.connect_tls(authority, source).await?;
         Ok(HandshakeOutput {
-            endpoint: Box::new(ep),
+            endpoint: Box::new(tls_endpoint(ep)),
             security_info,
             authority_validator,
         })
@@ -292,7 +292,7 @@ impl ChannelCredentials for RustlsChannelCredentials {
         &TLS_PROTO_INFO
     }
 
-    fn get_call_credentials(&self, _: Internal) -> Option<&Arc<dyn CallCredentials>> {
+    fn get_call_credentials(&self, _: UnstableToken) -> Option<&Arc<dyn CallCredentials>> {
         None
     }
 }

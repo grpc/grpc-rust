@@ -32,26 +32,46 @@
 //! and writes the ADS stream concurrently. Network waits and watcher processing
 //! do not block the worker from registering watchers or replaying cached resources.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
-use crate::client::config::{ClientConfig, ServerConfig};
-use crate::client::retry::{Backoff, RetryPolicy};
-use crate::client::snapshot::{AcceptedResource, RejectedUpdate, ResourceSnapshot, ResourceStatus};
-use crate::client::watch::{ProcessingDone, ResourceEvent};
+use crate::client::config::ClientConfig;
+use crate::client::config::ServerConfig;
+use crate::client::retry::Backoff;
+use crate::client::retry::RetryPolicy;
+use crate::client::snapshot::AcceptedResource;
+use crate::client::snapshot::RejectedUpdate;
+use crate::client::snapshot::ResourceSnapshot;
+use crate::client::snapshot::ResourceStatus;
+use crate::client::watch::ProcessingDone;
+use crate::client::watch::ResourceEvent;
 use crate::codec::XdsCodec;
-use crate::error::{Error, Result};
-use crate::message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Node};
-use crate::metrics::{self, KeyValue, MetricsRecorder};
-use crate::resource::{DecodedResource, DecoderFn};
+use crate::error::Error;
+use crate::error::Result;
+use crate::message::DiscoveryRequest;
+use crate::message::DiscoveryResponse;
+use crate::message::ErrorDetail;
+use crate::message::Node;
+use crate::metrics::KeyValue;
+use crate::metrics::MetricsRecorder;
+use crate::metrics::{self};
+use crate::resource::DecodedResource;
+use crate::resource::DecoderFn;
 use crate::runtime::Runtime;
-use crate::transport::{Transport, TransportBuilder, TransportReceiver, TransportSender};
+use crate::transport::Transport;
+use crate::transport::TransportBuilder;
+use crate::transport::TransportReceiver;
+use crate::transport::TransportSender;
 
 /// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
 ///
@@ -1499,10 +1519,7 @@ impl<R: Runtime, TB: TransportBuilder> TransportContext<R, TB> {
             if saw_response {
                 backoff.reset();
             }
-            let Some(delay) = backoff.next_backoff() else {
-                return;
-            };
-            self.runtime.sleep(delay).await;
+            self.runtime.sleep(backoff.next_backoff()).await;
         }
     }
 
@@ -1619,16 +1636,25 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::client::config::{ClientConfig, ServerConfig};
-    use crate::client::watch::{ResourceEvent, ResourceWatcher};
+    use crate::Error;
+    use crate::XdsClient;
+    use crate::client::config::ClientConfig;
+    use crate::client::config::ServerConfig;
+    use crate::client::watch::ResourceEvent;
+    use crate::client::watch::ResourceWatcher;
     use crate::codec::XdsCodec;
     use crate::error::Result;
-    use crate::message::{DiscoveryRequest, DiscoveryResponse, Node, ResourceAny};
-    use crate::resource::{Resource, TypeUrl};
+    use crate::message::DiscoveryRequest;
+    use crate::message::DiscoveryResponse;
+    use crate::message::Node;
+    use crate::message::ResourceAny;
+    use crate::resource::Resource;
+    use crate::resource::TypeUrl;
     use crate::runtime::tokio::TokioRuntime;
     use crate::transport::TransportBuilder;
-    use crate::transport::mock::{MockServer, MockTransport, mock_transport};
-    use crate::{Error, XdsClient};
+    use crate::transport::mock::MockServer;
+    use crate::transport::mock::MockTransport;
+    use crate::transport::mock::mock_transport;
 
     /// Captures every measurement so tests can assert on the call sequence.
     #[derive(Default)]
@@ -2120,7 +2146,8 @@ mod tests {
     async fn cached_eds_during_reconnect(phase: ReconnectPhase) {
         use envoy_types::pb::envoy::config::core::v3 as core;
         use envoy_types::pb::envoy::service::discovery::v3 as discovery;
-        use envoy_types::pb::google::protobuf::{Any, UInt32Value};
+        use envoy_types::pb::google::protobuf::Any;
+        use envoy_types::pb::google::protobuf::UInt32Value;
         use prost::Message;
 
         let (inner, mut servers) = mock_transport();
@@ -2754,16 +2781,18 @@ mod tests {
         );
     }
 
+    /// Backoff resets only after a stream delivers a decoded response, so an
+    /// undecodable response keeps growing the delay (100ms -> 200ms) while a
+    /// decoded one restarts it at the initial backoff (100ms).
     #[tokio::test(start_paused = true)]
-    async fn transport_resets_retry_limit_only_after_a_decoded_response() {
+    async fn transport_resets_backoff_only_after_a_decoded_response() {
         for valid_response in [false, true] {
             let (builder, mut servers) = mock_transport();
             let policy = crate::RetryPolicy::default()
                 .with_initial_backoff(Duration::from_millis(100))
                 .unwrap()
                 .with_jitter(0.0)
-                .unwrap()
-                .with_max_attempts(Some(1));
+                .unwrap();
             let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
                 .with_resource_initial_timeout(None)
                 .with_retry_policy(policy);
@@ -2771,6 +2800,7 @@ mod tests {
             let mut watcher = client.watch::<TestResource>("res-0").await;
             let mut first = servers.recv().await.unwrap();
             first.requests.recv().await.unwrap();
+            // First failure without a response: wait the initial 100ms.
             first.responses.send(Ok(None)).unwrap();
             let mut second = servers.recv().await.unwrap();
             second.requests.recv().await.unwrap();
@@ -2784,24 +2814,50 @@ mod tests {
                 drop(done);
                 second.requests.recv().await.unwrap();
                 second.responses.send(Ok(None)).unwrap();
-                let mut third = tokio::time::timeout(Duration::from_secs(1), servers.recv())
-                    .await
-                    .expect("decoded response did not reset retry limit")
-                    .unwrap();
-                third.requests.recv().await.unwrap();
             } else {
                 second
                     .responses
                     .send(Ok(Some(Bytes::from_static(&[0xff]))))
                     .unwrap();
+            }
+            let failed_at = tokio::time::Instant::now();
+            let mut third = tokio::time::timeout(Duration::from_secs(1), servers.recv())
+                .await
+                .expect("transport stopped reconnecting")
+                .unwrap();
+            let delay = failed_at.elapsed();
+            if valid_response {
                 assert!(
-                    tokio::time::timeout(Duration::from_secs(1), servers.recv())
-                        .await
-                        .expect("retry limit did not stop the transport")
-                        .is_none(),
-                    "undecodable response reset retry limit"
+                    delay < Duration::from_millis(200),
+                    "decoded response did not reset backoff: {delay:?}"
+                );
+            } else {
+                assert!(
+                    delay >= Duration::from_millis(200),
+                    "undecodable response reset backoff: {delay:?}"
                 );
             }
+            third.requests.recv().await.unwrap();
+        }
+    }
+
+    /// The transport never gives up: it keeps reconnecting through a long run
+    /// of consecutive failures, well past the point where an uncapped
+    /// exponential delay would overflow `Duration`.
+    #[tokio::test(start_paused = true)]
+    async fn transport_keeps_retrying_after_many_failures() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(None);
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let _watcher = client.watch::<TestResource>("res-0").await;
+        for attempt in 0..200 {
+            let mut server = tokio::time::timeout(Duration::from_secs(60), servers.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no reconnect for attempt {attempt}"))
+                .expect("transport stopped reconnecting");
+            server.requests.recv().await.unwrap();
+            server.responses.send(Ok(None)).unwrap();
         }
     }
 

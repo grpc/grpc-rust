@@ -2850,7 +2850,7 @@ mod tests {
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
             .with_resource_initial_timeout(None);
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
-        let _watcher = client.watch::<TestResource>("res-0").await;
+        let _watcher = client.watch::<TestResource>("res-0");
         for attempt in 0..200 {
             let mut server = tokio::time::timeout(Duration::from_secs(60), servers.recv())
                 .await

@@ -131,26 +131,26 @@ impl BootstrapConfig {
 
     /// Parses and validates bootstrap configuration from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, BootstrapError> {
-        let raw: RawBootstrapConfig = serde_json::from_str(json)?;
+        let raw: BootstrapConfigSerde = serde_json::from_str(json)?;
         Self::try_from(raw)
     }
 }
 
 #[derive(Deserialize)]
-struct RawBootstrapConfig {
-    xds_servers: Vec<RawXdsServerConfig>,
+struct BootstrapConfigSerde {
+    xds_servers: Vec<XdsServerConfigSerde>,
     #[serde(default)]
-    node: RawNodeConfig,
+    node: NodeConfigSerde,
 }
 
 #[derive(Deserialize)]
-struct RawXdsServerConfig {
+struct XdsServerConfigSerde {
     server_uri: String,
-    channel_creds: Vec<RawChannelCredentialConfig>,
+    channel_creds: Vec<ChannelCredentialConfigSerde>,
 }
 
 #[derive(Deserialize)]
-struct RawChannelCredentialConfig {
+struct ChannelCredentialConfigSerde {
     #[serde(rename = "type")]
     cred_type: String,
     #[serde(default)]
@@ -158,19 +158,19 @@ struct RawChannelCredentialConfig {
 }
 
 #[derive(Default, Deserialize)]
-struct RawNodeConfig {
+struct NodeConfigSerde {
     #[serde(default)]
     id: String,
     #[serde(default)]
     cluster: String,
     #[serde(default)]
-    locality: Option<RawLocalityConfig>,
+    locality: Option<LocalityConfigSerde>,
     #[serde(default)]
     metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Default, Deserialize)]
-struct RawLocalityConfig {
+struct LocalityConfigSerde {
     #[serde(default)]
     region: String,
     #[serde(default)]
@@ -179,10 +179,10 @@ struct RawLocalityConfig {
     sub_zone: String,
 }
 
-impl TryFrom<RawBootstrapConfig> for BootstrapConfig {
+impl TryFrom<BootstrapConfigSerde> for BootstrapConfig {
     type Error = BootstrapError;
 
-    fn try_from(raw: RawBootstrapConfig) -> Result<Self, Self::Error> {
+    fn try_from(raw: BootstrapConfigSerde) -> Result<Self, Self::Error> {
         if raw.xds_servers.is_empty() {
             return Err(BootstrapError::Validation(
                 "xds_servers must not be empty".into(),
@@ -211,7 +211,7 @@ impl TryFrom<RawBootstrapConfig> for BootstrapConfig {
 
 fn select_channel_credentials(
     server_index: usize,
-    channel_creds: Vec<RawChannelCredentialConfig>,
+    channel_creds: Vec<ChannelCredentialConfigSerde>,
 ) -> Result<Arc<dyn ChannelCredentials>, BootstrapError> {
     for cred in channel_creds {
         match cred.cred_type.as_str() {
@@ -233,10 +233,10 @@ fn select_channel_credentials(
     )))
 }
 
-impl TryFrom<RawNodeConfig> for Node {
+impl TryFrom<NodeConfigSerde> for Node {
     type Error = BootstrapError;
 
-    fn try_from(config: RawNodeConfig) -> Result<Self, Self::Error> {
+    fn try_from(config: NodeConfigSerde) -> Result<Self, Self::Error> {
         let mut node = default_node();
 
         if !config.id.is_empty() {

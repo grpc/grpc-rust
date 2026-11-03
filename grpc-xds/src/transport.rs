@@ -301,7 +301,7 @@ mod tests {
         )
         .build();
 
-        let mut watcher = client.watch::<ListenerResource>("listener-1").await;
+        let mut watcher = client.watch::<ListenerResource>("listener-1");
         let event = watcher.next().await.expect("watcher event");
         let ResourceEvent::ResourceChanged {
             result: Ok(listener),

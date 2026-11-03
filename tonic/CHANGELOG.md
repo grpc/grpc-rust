@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.9](https://github.com/grpc/grpc-rust/compare/tonic-v0.14.8...tonic-v0.14.9) - 2026-10-29
+
+### Added
+
+- *(transport)* expose h2 reset stream settings on Endpoint ([#2972](https://github.com/grpc/grpc-rust/pull/2972))
+
+### Fixed
+
+- *(server)* set a timer on HTTP/1 connections so hyper's header read timeout applies ([#2980](https://github.com/grpc/grpc-rust/pull/2980))
+
 ## [0.14.7](https://github.com/grpc/grpc-rust/compare/tonic-v0.14.6...tonic-v0.14.7) - 2026-10-26
 
 ### Fixed

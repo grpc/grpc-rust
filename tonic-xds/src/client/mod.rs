@@ -30,6 +30,7 @@ pub(crate) mod endpoint;
 pub(crate) mod lb;
 #[allow(dead_code)]
 pub(crate) mod loadbalance;
+pub(crate) mod pool;
 #[allow(dead_code)]
 pub(crate) mod retry;
 pub(crate) mod route;

@@ -441,9 +441,6 @@ mod tests {
         }"#;
         let err = BootstrapConfig::from_json(json).unwrap_err();
         assert!(matches!(err, BootstrapError::Validation(_)));
-        assert!(
-            err.to_string()
-                .contains("server_uri must not be empty")
-        );
+        assert!(err.to_string().contains("server_uri must not be empty"));
     }
 }

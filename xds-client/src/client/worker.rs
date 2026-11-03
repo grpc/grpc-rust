@@ -912,19 +912,9 @@ where
         all_resources_required_in_sotw: bool,
     ) -> bool {
         let type_url_string = type_url.to_string();
-        let type_state = match self.type_states.entry(type_url_string) {
-            Entry::Vacant(entry) => entry.insert(TypeState::new(
-                Arc::from(type_url),
-                decoder,
-                all_resources_required_in_sotw,
-            )),
-            Entry::Occupied(entry) => {
-                let state = entry.into_mut();
-                state.decoder = decoder;
-                state.all_resources_required_in_sotw = all_resources_required_in_sotw;
-                state
-            }
-        };
+        let type_state = self.type_states.entry(type_url_string).or_insert_with(|| {
+            TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
+        });
 
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
@@ -2445,44 +2435,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn rewatch_refreshes_decoder_and_resource_rules() {
-        #[derive(Debug)]
-        struct AlternateResource;
-
-        impl Resource for AlternateResource {
-            type Message = String;
-            const TYPE_URL: TypeUrl = TypeUrl::new(TEST_TYPE_URL);
-            const ALL_RESOURCES_REQUIRED_IN_SOTW: bool = true;
-
-            fn deserialize(bytes: Bytes) -> Result<String> {
-                TestResource::deserialize(bytes)
-            }
-
-            fn name(message: &String) -> &str {
-                message
-            }
-
-            fn validate(_: String) -> Result<Self> {
-                Ok(Self)
-            }
-        }
-
-        let (client, mut watcher, mut server) = connected_client().await;
+    async fn rewatch_preserves_decoder_and_resource_rules() {
+        let (client, mut watcher, mut server) = connected_client_for::<SotwResource>().await;
         accept_resource(&mut server, &mut watcher, "1", "n1").await;
         drop(watcher);
-        let mut alternate = client.watch::<AlternateResource>("res-0").await;
-        expect_request(&mut server, response("1", "n1", &[])).await;
-        expect_request(&mut server, response("", "n1", &["res-0"])).await;
-        accept_resource(&mut server, &mut alternate, "2", "n2").await;
+        let mut rewatch = client.watch::<SotwResource>("res-0").await;
+        expect_request(&mut server, sotw_response("1", "n1", &[])).await;
+        expect_request(&mut server, sotw_response("", "n1", &["res-0"])).await;
+        accept_resource(&mut server, &mut rewatch, "2", "n2").await;
         server
             .responses
-            .send(Ok(Some(response("3", "n3", &[]))))
+            .send(Ok(Some(sotw_response("3", "n3", &[]))))
             .unwrap();
         assert!(matches!(
-            next_changed(&mut alternate).await.0,
+            next_changed(&mut rewatch).await.0,
             Err(Error::ResourceDoesNotExist)
         ));
-        expect_request(&mut server, response("3", "n3", &["res-0"])).await;
+        expect_request(&mut server, sotw_response("3", "n3", &["res-0"])).await;
     }
 
     #[tokio::test(start_paused = true)]

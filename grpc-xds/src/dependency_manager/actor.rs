@@ -41,7 +41,6 @@ use xds_client::XdsClient;
 use super::DependencyManagerOptions;
 use super::XdsConfigError;
 use super::XdsConfigErrorKind;
-use super::XdsConfigUpdate;
 use super::XdsConfigWatcher;
 use super::cluster_graph::walk;
 use super::state::WatchState;
@@ -55,7 +54,7 @@ use crate::xds_config::XdsConfig;
 
 /// Runs a dependency manager until the XdsClient stops.
 pub(super) async fn run(options: DependencyManagerOptions) {
-    Actor::new(options).await.run().await;
+    Actor::new(options).await.run_loop().await;
 }
 
 /// A watch on a Listener or RouteConfiguration, and its cached state.
@@ -75,6 +74,25 @@ impl<T: Resource> Watched<T> {
         }
     }
 
+    fn apply(&mut self, event: ResourceEvent<T>) -> ProcessingDone {
+        self.state.apply(event, |e| e.to_string().into())
+    }
+
+    /// The watch's value, or why there isn't one. `failed` makes the error
+    /// from the watch's name and the reason that it failed.
+    fn ready(
+        &self,
+        failed: impl FnOnce(String, Arc<str>) -> XdsConfigErrorKind,
+    ) -> Result<&Arc<T>, Blocked> {
+        match &self.state {
+            WatchState::Pending => Err(Blocked::Pending),
+            WatchState::Failed(reason) => {
+                Err(Blocked::Failed(failed(self.name.clone(), reason.clone())))
+            }
+            WatchState::Ready { value, .. } => Ok(value),
+        }
+    }
+
     /// The watch's ambient error, if any, labelled for a resolution note.
     fn note(&self, label: &str) -> Option<Arc<str>> {
         match &self.state {
@@ -90,7 +108,7 @@ struct Actor {
     client: XdsClient,
     authority: String,
     node_id: Option<Arc<str>>,
-    watcher: Arc<dyn XdsConfigWatcher>,
+    publisher: Publisher,
     listener: Watched<ListenerResource>,
     /// The watch on the RouteConfiguration that the Listener names, if it
     /// names one.
@@ -99,12 +117,6 @@ struct Actor {
     /// that a Listener that recovers unchanged needs no new fetch.
     route_config: Option<Watched<RouteConfigResource>>,
     watches: Watches,
-    /// The selected virtual host, or `None` while there is none: either the
-    /// route is still pending, or there is a top-level error.
-    selection: Option<Selection>,
-    /// The last update published, if it was an error. A lasting error is
-    /// published only once.
-    published_error: Option<XdsConfigError>,
 }
 
 /// The input to the actor: an event from one of its watches.
@@ -117,17 +129,6 @@ enum Input {
     Closed,
 }
 
-/// What a batch of inputs has changed.
-#[derive(Debug, Default)]
-struct Batch {
-    /// The inputs' flow-control tokens. The XdsClient reads the next response
-    /// once they are dropped (gRFC A88), so they are held until the batch's
-    /// update has been published.
-    done: Vec<ProcessingDone>,
-    /// Whether the Listener or RouteConfiguration changed.
-    route_changed: bool,
-}
-
 /// The virtual host selected for the channel's data-plane authority.
 #[derive(Debug)]
 struct Selection {
@@ -137,6 +138,46 @@ struct Selection {
     /// The clusters that the virtual host's routes use: the roots of the
     /// cluster graph.
     clusters: HashSet<String>,
+    /// The Listener's and RouteConfiguration's ambient errors, which are
+    /// added to every leaf cluster's resolution note.
+    notes: Vec<Arc<str>>,
+}
+
+/// Why there is no snapshot to publish.
+#[derive(Debug)]
+enum Blocked {
+    /// Something that the snapshot needs hasn't arrived yet.
+    Pending,
+    /// A top-level error.
+    Failed(XdsConfigErrorKind),
+}
+
+/// Publishes updates to the [`XdsConfigWatcher`].
+struct Publisher {
+    watcher: Arc<dyn XdsConfigWatcher>,
+    node_id: Option<Arc<str>>,
+    /// The last update published, if it was an error. A lasting error is
+    /// published only once.
+    last_error: Option<XdsConfigError>,
+}
+
+impl Publisher {
+    fn config(&mut self, config: XdsConfig) {
+        self.last_error = None;
+        self.watcher.on_update(Ok(Arc::new(config)));
+    }
+
+    /// Publishes a top-level error, unless it was the last update published.
+    fn error(&mut self, kind: XdsConfigErrorKind) {
+        let error = XdsConfigError {
+            kind,
+            node_id: self.node_id.clone(),
+        };
+        if self.last_error.as_ref() != Some(&error) {
+            self.last_error = Some(error.clone());
+            self.watcher.on_update(Err(error));
+        }
+    }
 }
 
 impl Actor {
@@ -153,13 +194,15 @@ impl Actor {
         Self {
             client: xds_client,
             authority: data_plane_authority,
+            publisher: Publisher {
+                watcher,
+                node_id: node_id.clone(),
+                last_error: None,
+            },
             node_id,
-            watcher,
             listener,
             route_config: None,
             watches: Watches::default(),
-            selection: None,
-            published_error: None,
         }
     }
 
@@ -170,12 +213,12 @@ impl Actor {
     /// resources causes one update rather than one per resource. Batches are
     /// bounded, because the XdsClient doesn't read the next response until the
     /// batch releases its flow-control tokens.
-    async fn run(mut self) {
+    async fn run_loop(mut self) {
         loop {
-            let mut batch = Batch::default();
+            let mut done = Vec::new();
             let mut input = poll_fn(|cx| self.poll_input(cx)).await;
             loop {
-                if self.apply(input, &mut batch).await.is_break() {
+                if self.handle(input, &mut done).is_break() {
                     return;
                 }
                 match poll_fn(|cx| Poll::Ready(self.poll_input(cx))).await {
@@ -183,7 +226,7 @@ impl Actor {
                     Poll::Pending => break,
                 }
             }
-            self.finish_batch(batch).await;
+            self.finish_batch(done).await;
         }
     }
 
@@ -204,148 +247,121 @@ impl Actor {
 
     /// Applies `input` to the cached states. Breaks once the XdsClient has
     /// stopped.
-    async fn apply(&mut self, input: Input, batch: &mut Batch) -> ControlFlow<()> {
+    fn handle(&mut self, input: Input, done: &mut Vec<ProcessingDone>) -> ControlFlow<()> {
         match input {
-            Input::Listener(event) => {
-                batch.done.push(self.on_listener(event).await);
-                batch.route_changed = true;
-            }
+            Input::Listener(event) => done.push(self.listener.apply(event)),
             Input::RouteConfig(event) => {
                 let route_config = self
                     .route_config
                     .as_mut()
                     .expect("RouteConfiguration events come from the RouteConfiguration watch");
-                batch
-                    .done
-                    .push(route_config.state.apply(event, |e| e.to_string().into()));
-                batch.route_changed = true;
+                done.push(route_config.apply(event));
             }
-            Input::Watches(update) => batch.done.extend(self.watches.apply(update)),
+            Input::Watches(update) => done.extend(self.watches.apply(update)),
             Input::Closed => {
-                self.publish(Err(self.error(XdsConfigErrorKind::XdsClientClosed)));
+                self.publisher.error(XdsConfigErrorKind::XdsClientClosed);
                 return ControlFlow::Break(());
             }
         }
         ControlFlow::Continue(())
     }
 
-    /// Applies a Listener event, and watches the RouteConfiguration that the
-    /// new Listener names.
-    async fn on_listener(&mut self, event: ResourceEvent<ListenerResource>) -> ProcessingDone {
-        let done = self.listener.state.apply(event, |e| e.to_string().into());
-        if let WatchState::Ready { value, .. } = &self.listener.state {
-            match &value.route_source {
-                RouteSource::Rds(name) => {
-                    if self
-                        .route_config
-                        .as_ref()
-                        .is_none_or(|route_config| route_config.name != *name)
-                    {
-                        // The new watch starts before the old one is dropped,
-                        // so that the RDS subscription is never empty.
-                        self.route_config = Some(Watched::start(&self.client, name.clone()).await);
-                    }
-                }
-                RouteSource::Inline(_) => self.route_config = None,
-            }
-        }
-        done
-    }
-
-    /// Publishes what has changed, and updates the watches to match.
-    async fn finish_batch(&mut self, batch: Batch) {
-        if batch.route_changed {
-            self.reselect();
-        }
-        self.update_clusters().await;
-        drop(batch);
-    }
-
-    /// Selects the virtual host again, and publishes a top-level error if
-    /// there is a new one.
-    fn reselect(&mut self) {
-        self.selection = None;
-        match self.select_route() {
-            None => {}
-            Some(Ok(selection)) => self.selection = Some(selection),
-            Some(Err(kind)) => {
-                let error = self.error(kind);
-                if self.published_error.as_ref() != Some(&error) {
-                    self.publish(Err(error));
-                }
-            }
-        }
-    }
-
-    /// Selects the virtual host, or returns `None` while the Listener or its
-    /// RouteConfiguration is pending.
-    fn select_route(&self) -> Option<Result<Selection, XdsConfigErrorKind>> {
-        let listener = match &self.listener.state {
-            WatchState::Pending => return None,
-            WatchState::Failed(reason) => {
-                return Some(Err(XdsConfigErrorKind::Listener {
-                    name: self.listener.name.clone(),
-                    reason: reason.clone(),
-                }));
-            }
-            WatchState::Ready { value, .. } => value,
-        };
-        let route_config = match &listener.route_source {
-            RouteSource::Inline(route_config) => route_config,
-            RouteSource::Rds(name) => {
-                let watched = self
-                    .route_config
-                    .as_ref()
-                    .filter(|route_config| route_config.name == *name)
-                    .expect("on_listener watches the RouteConfiguration that the Listener names");
-                match &watched.state {
-                    WatchState::Pending => return None,
-                    WatchState::Failed(reason) => {
-                        return Some(Err(XdsConfigErrorKind::RouteConfig {
-                            name: name.clone(),
-                            reason: reason.clone(),
-                        }));
-                    }
-                    WatchState::Ready { value, .. } => value,
-                }
-            }
-        };
-        let Some(virtual_host_index) =
-            find_virtual_host_index(&self.authority, &route_config.virtual_hosts)
-        else {
-            return Some(Err(XdsConfigErrorKind::NoMatchingVirtualHost {
-                route_config: route_config.name.clone(),
-                authority: self.authority.clone(),
-            }));
-        };
-        Some(Ok(Selection {
-            listener: listener.clone(),
-            route_config: route_config.clone(),
-            virtual_host_index,
-            clusters: route_config.virtual_hosts[virtual_host_index].cluster_names(),
-        }))
-    }
-
-    /// Walks the cluster graph, updates the watches to match it, and
-    /// publishes a snapshot if every cluster has resolved.
+    /// Updates the watches to match the cached states, and publishes the
+    /// result.
     ///
-    /// Without a selection, the watches are kept as they are: they will
-    /// likely be needed again once the Listener or RouteConfiguration
-    /// recovers.
-    async fn update_clusters(&mut self) {
-        let Some(selection) = &self.selection else {
+    /// Everything is derived again from the cached states, whatever the batch
+    /// changed. `done` holds the batch's flow-control tokens: the XdsClient
+    /// reads the next response once they are dropped (gRFC A88), so they are
+    /// held until the result has been published.
+    async fn finish_batch(&mut self, done: Vec<ProcessingDone>) {
+        match self.resolve().await {
+            Ok(config) => self.publisher.config(config),
+            Err(Blocked::Pending) => {}
+            Err(Blocked::Failed(kind)) => self.publisher.error(kind),
+        }
+        drop(done);
+    }
+
+    /// Resolves the Listener, its RouteConfiguration, the virtual host and
+    /// its clusters, in that order, and updates the watches to match.
+    async fn resolve(&mut self) -> Result<XdsConfig, Blocked> {
+        self.update_route_watch().await;
+        // While there is no selection, the cluster watches are kept as they
+        // are: they will likely be needed again once the Listener or
+        // RouteConfiguration recovers.
+        let selection = self.select_route()?;
+        self.update_clusters(selection).await
+    }
+
+    /// Watches the RouteConfiguration that the Listener names.
+    ///
+    /// While the Listener is pending or failed, the watch is kept as it is.
+    async fn update_route_watch(&mut self) {
+        let WatchState::Ready { value, .. } = &self.listener.state else {
             return;
         };
-        let base_notes: Vec<Arc<str>> = self
+        match &value.route_source {
+            RouteSource::Rds(name) => {
+                if self
+                    .route_config
+                    .as_ref()
+                    .is_none_or(|route_config| route_config.name != *name)
+                {
+                    // The new watch starts before the old one is dropped, so
+                    // that the RDS subscription is never empty.
+                    self.route_config = Some(Watched::start(&self.client, name.clone()).await);
+                }
+            }
+            RouteSource::Inline(_) => self.route_config = None,
+        }
+    }
+
+    /// Selects the virtual host for the data-plane authority.
+    fn select_route(&self) -> Result<Selection, Blocked> {
+        let listener = self
+            .listener
+            .ready(|name, reason| XdsConfigErrorKind::Listener { name, reason })?;
+        let route_config = match &listener.route_source {
+            RouteSource::Inline(route_config) => route_config,
+            RouteSource::Rds(name) => self
+                .route_config
+                .as_ref()
+                .filter(|route_config| route_config.name == *name)
+                .expect("update_route_watch watches the RouteConfiguration that the Listener names")
+                .ready(|name, reason| XdsConfigErrorKind::RouteConfig { name, reason })?,
+        };
+        let virtual_host_index =
+            find_virtual_host_index(&self.authority, &route_config.virtual_hosts).ok_or_else(
+                || {
+                    Blocked::Failed(XdsConfigErrorKind::NoMatchingVirtualHost {
+                        route_config: route_config.name.clone(),
+                        authority: self.authority.clone(),
+                    })
+                },
+            )?;
+        let notes = self
             .listener
             .note("LDS")
             .into_iter()
             .chain(self.route_config.as_ref().and_then(|rds| rds.note("RDS")))
             .collect();
+        Ok(Selection {
+            listener: listener.clone(),
+            route_config: route_config.clone(),
+            virtual_host_index,
+            clusters: route_config.virtual_hosts[virtual_host_index].cluster_names(),
+            notes,
+        })
+    }
+
+    /// Walks the cluster graph from the selected virtual host, updates the
+    /// watches to match it, and returns the snapshot once every cluster has
+    /// resolved.
+    async fn update_clusters(&mut self, selection: Selection) -> Result<XdsConfig, Blocked> {
         let graph = walk(
             self.watches.cache(),
             selection.clusters.iter().map(String::as_str),
-            &base_notes,
+            &selection.notes,
             self.node_id.as_deref(),
         );
         self.watches
@@ -358,28 +374,15 @@ impl Actor {
             .iter()
             .all(|name| graph.cluster_configs.contains_key(name))
         {
-            return;
+            return Err(Blocked::Pending);
         }
-        let config = XdsConfig::try_new(
-            selection.listener.clone(),
-            selection.route_config.clone(),
+        Ok(XdsConfig::try_new(
+            selection.listener,
+            selection.route_config,
             selection.virtual_host_index,
             graph.cluster_configs,
         )
-        .expect("the selection's route configuration and virtual host are the Listener's");
-        self.publish(Ok(Arc::new(config)));
-    }
-
-    fn error(&self, kind: XdsConfigErrorKind) -> XdsConfigError {
-        XdsConfigError {
-            kind,
-            node_id: self.node_id.clone(),
-        }
-    }
-
-    fn publish(&mut self, update: XdsConfigUpdate) {
-        self.published_error = update.as_ref().err().cloned();
-        self.watcher.on_update(update);
+        .expect("the selection's route configuration and virtual host are the Listener's"))
     }
 }
 
@@ -390,6 +393,7 @@ mod tests {
     use grpc::__unstable::rt::GrpcRuntime;
 
     use super::*;
+    use crate::dependency_manager::XdsConfigUpdate;
     use crate::dependency_manager::cluster_graph::DnsTarget;
     use crate::resource::ClusterDiscovery;
     use crate::resource::ClusterResource;
@@ -430,11 +434,11 @@ mod tests {
 
         /// Handles `inputs` as one batch, and returns what it published.
         async fn batch(&mut self, inputs: impl IntoIterator<Item = Input>) -> Vec<XdsConfigUpdate> {
-            let mut batch = Batch::default();
+            let mut done = Vec::new();
             for input in inputs {
-                assert!(self.actor.apply(input, &mut batch).await.is_continue());
+                assert!(self.actor.handle(input, &mut done).is_continue());
             }
-            self.actor.finish_batch(batch).await;
+            self.actor.finish_batch(done).await;
             std::mem::take(&mut *self.recorder.0.lock().unwrap())
         }
 
@@ -635,23 +639,29 @@ mod tests {
             name: "inline".to_owned(),
             virtual_hosts: vec![virtual_host("other.com", &["a"])],
         };
+        // Each case is a batch that must publish nothing, then one that must
+        // publish the error.
         let cases = [
             (
+                vec![],
                 vec![Input::Listener(does_not_exist())],
                 "[xDS node id: node-1]: LDS resource listener: resource does not exist",
             ),
             (
-                vec![lds_rds("routes"), Input::RouteConfig(does_not_exist())],
+                vec![lds_rds("routes")],
+                vec![Input::RouteConfig(does_not_exist())],
                 "[xDS node id: node-1]: RDS resource routes: resource does not exist",
             ),
             (
+                vec![],
                 vec![lds_inline(no_virtual_host)],
                 "[xDS node id: node-1]: could not find VirtualHost for example.com in \
                  RouteConfiguration inline",
             ),
         ];
-        for (inputs, expected) in cases {
+        for (setup, inputs, expected) in cases {
             let mut harness = Harness::new().await;
+            assert!(harness.batch(setup).await.is_empty());
             let error = harness.error(inputs).await;
             assert_eq!(error.to_string(), expected);
             assert!(harness.watched_clusters().is_empty());
@@ -698,6 +708,8 @@ mod tests {
         assert_eq!(harness.route_config_watch(), Some("routes"));
         assert_eq!(harness.watched_clusters(), ["a"]);
         assert_eq!(harness.watched_endpoints(), ["a-eds"]);
+        // A cluster update can't publish anything until the Listener recovers.
+        assert!(harness.batch([eds("a-eds")]).await.is_empty());
 
         let config = harness.config([lds_rds("routes")]).await;
         assert!(config.clusters["a"].is_ok());

@@ -34,8 +34,8 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
-use grpc::__unstable::rt::GrpcRuntime;
 use grpc::__unstable::client::channel_builder_with_runtime;
+use grpc::__unstable::rt::GrpcRuntime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
 use grpc::client::DynRecvStream;

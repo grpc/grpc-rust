@@ -920,11 +920,8 @@ where
             )),
             Entry::Occupied(entry) => {
                 let state = entry.into_mut();
-                if state.watchers.is_empty() {
-                    // Reactivate with the new watch's resource rules, keeping protocol state.
-                    state.decoder = decoder;
-                    state.all_resources_required_in_sotw = all_resources_required_in_sotw;
-                }
+                state.decoder = decoder;
+                state.all_resources_required_in_sotw = all_resources_required_in_sotw;
                 state
             }
         };

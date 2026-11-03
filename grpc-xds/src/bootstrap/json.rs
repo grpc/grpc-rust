@@ -303,45 +303,16 @@ mod tests {
         });
     }
 
-    fn sample_minimal_json() -> &'static str {
-        r#"{
+    #[test]
+    fn parse_minimal_bootstrap() {
+        init_tls_provider();
+        let json = r#"{
             "xds_servers": [{
                 "server_uri": "xds.example.com:443",
                 "channel_creds": [{"type": "tls"}]
             }]
-        }"#
-    }
-
-    fn sample_full_json() -> &'static str {
-        r#"{
-            "xds_servers": [{
-                "server_uri": "xds.example.com:443",
-                "channel_creds": [
-                    {"type": "google_default"},
-                    {"type": "tls"}
-                ],
-                "server_features": ["ignore_resource_deletion"]
-            }],
-            "node": {
-                "id": "node-123",
-                "cluster": "cluster-abc",
-                "locality": {
-                    "region": "us-west1",
-                    "zone": "us-west1-a",
-                    "sub_zone": "rack-1"
-                },
-                "metadata": {
-                    "env": "prod",
-                    "version": 2
-                }
-            }
-        }"#
-    }
-
-    #[test]
-    fn parse_minimal_bootstrap() {
-        init_tls_provider();
-        let config = BootstrapConfig::from_json(sample_minimal_json()).unwrap();
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
         assert_eq!(config.xds_servers.len(), 1);
         assert_eq!(config.xds_servers[0].server_uri, "xds.example.com:443");
         assert_eq!(
@@ -358,7 +329,36 @@ mod tests {
     #[test]
     fn parse_full_bootstrap() {
         init_tls_provider();
-        let config = BootstrapConfig::from_json(sample_full_json()).unwrap();
+        let json = r#"{
+            "xds_servers": [{
+                "server_uri": "xds.example.com:443",
+                "channel_creds": [
+                    {"type": "ignored"},
+                    {"type": "tls"}
+                ],
+                "server_features": ["ignore_resource_deletion"]
+            }],
+            "node": {
+                "id": "node-123",
+                "cluster": "cluster-abc",
+                "locality": {
+                    "region": "us-west1",
+                    "zone": "us-west1-a",
+                    "sub_zone": "rack-1"
+                },
+                "metadata": {
+                    "env": "prod",
+                    "types": {
+                        "string": "example",
+                        "number": 2.5,
+                        "bool": true,
+                        "list": [1, false],
+                        "nil": null
+                    }
+                }
+            }
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
         assert_eq!(config.xds_servers.len(), 1);
         assert_eq!(config.xds_servers[0].server_uri, "xds.example.com:443");
         assert_eq!(
@@ -382,8 +382,20 @@ mod tests {
             Some(&MetadataValue::String("prod".into()))
         );
         assert_eq!(
-            config.node.metadata.get("version"),
-            Some(&MetadataValue::Number(2.0))
+            config.node.metadata.get("types"),
+            Some(&MetadataValue::Object(HashMap::from([
+                ("string".into(), MetadataValue::String("example".into())),
+                ("number".into(), MetadataValue::Number(2.5)),
+                ("bool".into(), MetadataValue::Bool(true)),
+                (
+                    "list".into(),
+                    MetadataValue::Array(vec![
+                        MetadataValue::Number(1.0),
+                        MetadataValue::Bool(false)
+                    ])
+                ),
+                ("nil".into(), MetadataValue::Null),
+            ])))
         );
     }
 
@@ -416,6 +428,22 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("contains no supported credential types")
+        );
+    }
+
+    #[test]
+    fn validation_fails_empty_server_uri() {
+        let json = r#"{
+            "xds_servers": [{
+                "server_uri": "",
+                "channel_creds": [{"type": "tls"}]
+            }]
+        }"#;
+        let err = BootstrapConfig::from_json(json).unwrap_err();
+        assert!(matches!(err, BootstrapError::Validation(_)));
+        assert!(
+            err.to_string()
+                .contains("server_uri must not be empty")
         );
     }
 }

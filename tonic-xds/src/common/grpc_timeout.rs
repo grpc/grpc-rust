@@ -26,6 +26,9 @@
 
 use std::time::Duration;
 
+/// The request header carrying a call's timeout.
+pub(crate) const GRPC_TIMEOUT_HEADER: &str = "grpc-timeout";
+
 /// Errors that can occur when parsing a gRPC timeout header value.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GrpcTimeoutParseError {
@@ -91,7 +94,7 @@ pub(crate) fn parse_grpc_timeout(s: &str) -> Result<Duration, GrpcTimeoutParseEr
 pub(crate) fn extract_grpc_timeout<B>(
     req: &http::Request<B>,
 ) -> Result<Option<Duration>, GrpcTimeoutParseError> {
-    let Some(header_value) = req.headers().get("grpc-timeout") else {
+    let Some(header_value) = req.headers().get(GRPC_TIMEOUT_HEADER) else {
         return Ok(None);
     };
     let s = header_value

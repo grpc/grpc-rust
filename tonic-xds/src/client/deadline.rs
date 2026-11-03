@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -24,19 +24,25 @@
 
 //! Per-call deadline enforcement (gRFC A31).
 //!
-//! [`DeadlineLayer`] sits between the routing and retry layers. It resolves the
-//! call's deadline from the application's `grpc-timeout` and the matched route's
-//! xDS max stream duration ([`RouteDecision::max_stream_duration`]), taking the
-//! earlier of the two, and enforces it once for the whole call: every retry
-//! attempt, the backoff between them, and (for gRPC) the response stream. An
-//! expired call fails with `DEADLINE_EXCEEDED`.
+//! The routing layer ([`XdsRoutingService`]) enforces each call's deadline with
+//! a [`DeadlineTimer`], so the deadline counts from the start of the call. The
+//! timer starts as the call enters, armed with the application's
+//! `grpc-timeout`, and so also bounds the wait for the first route config. Once
+//! a route is matched, it is tightened to the route's xDS max stream duration
+//! ([`RouteDecision::max_stream_duration`]), also counted from the start of the
+//! call. The earlier deadline wins and holds once for the whole call: every
+//! retry attempt, the backoff between them, and (for gRPC) the response stream.
+//! An expired call fails with `DEADLINE_EXCEEDED`.
 //!
 //! The deadline is also recorded on the request as a [`CallDeadline`] extension,
 //! which the retry layer copies onto each attempt, so
 //! [`set_grpc_timeout_header`] can advertise the remaining budget upstream.
+//!
+//! [`XdsRoutingService`]: crate::client::route::XdsRoutingService
+//! [`RouteDecision::max_stream_duration`]: crate::client::route::RouteDecision::max_stream_duration
 
-use std::future::Future;
-use std::pin::Pin;
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -46,23 +52,21 @@ use http_body::{Body, Frame, SizeHint};
 use pin_project_lite::pin_project;
 use tokio::time::{Instant, Sleep};
 use tonic::body::Body as TonicBody;
-use tower::{BoxError, Layer, Service};
+use tower::BoxError;
 
-use crate::client::route::RouteDecision;
-use crate::common::grpc_timeout::{encode_grpc_timeout, extract_grpc_timeout};
+use crate::common::grpc_timeout::{GRPC_TIMEOUT_HEADER, encode_grpc_timeout, extract_grpc_timeout};
 
-const GRPC_TIMEOUT: &str = "grpc-timeout";
-
-/// The absolute deadline of a call, stamped on the request by [`DeadlineService`].
+/// The absolute deadline of a call, stamped on the request by
+/// [`DeadlineTimer::apply_route`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CallDeadline(pub(crate) Instant);
 
 /// Extends the call deadline over a response body.
 type BodyDeadline<ResBody> = fn(ResBody, Pin<Box<Sleep>>) -> ResBody;
 
-/// Tower [`Layer`] that enforces the per-call deadline. See the
-/// [module docs](self).
-pub(crate) struct DeadlineLayer<ResBody> {
+/// How much of the call deadline a channel enforces. The routing layer holds
+/// one and starts a [`DeadlineTimer`] from it for each call.
+pub(crate) struct DeadlinePolicy<ResBody> {
     /// Whether the application deadline is read from the `grpc-timeout` header.
     app_grpc_timeout: bool,
     /// Extends the deadline over the response body; `None` stops enforcing it
@@ -70,17 +74,17 @@ pub(crate) struct DeadlineLayer<ResBody> {
     body_deadline: Option<BodyDeadline<ResBody>>,
 }
 
-impl<ResBody> Clone for DeadlineLayer<ResBody> {
+impl<ResBody> Clone for DeadlinePolicy<ResBody> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<ResBody> Copy for DeadlineLayer<ResBody> {}
+impl<ResBody> Copy for DeadlinePolicy<ResBody> {}
 
-impl DeadlineLayer<TonicBody> {
-    /// The gRPC deadline layer: honors the application's `grpc-timeout` and
-    /// holds the deadline until the response stream ends.
+impl DeadlinePolicy<TonicBody> {
+    /// The gRPC policy: honors the application's `grpc-timeout` and holds the
+    /// deadline until the response stream ends.
     pub(crate) fn grpc() -> Self {
         Self {
             app_grpc_timeout: true,
@@ -89,96 +93,119 @@ impl DeadlineLayer<TonicBody> {
     }
 }
 
-impl<ResBody> DeadlineLayer<ResBody> {
-    /// The deadline layer for a transport-generic channel: enforces only the
-    /// xDS max stream duration, and only until response headers arrive, since
-    /// neither `grpc-timeout` nor the response body is understood here.
+impl<ResBody> DeadlinePolicy<ResBody> {
+    /// The policy for a transport-generic channel: enforces only the xDS max
+    /// stream duration, and only until response headers arrive, since neither
+    /// `grpc-timeout` nor the response body is understood here.
     pub(crate) fn headers_only() -> Self {
         Self {
             app_grpc_timeout: false,
             body_deadline: None,
         }
     }
-}
 
-impl<S, ResBody> Layer<S> for DeadlineLayer<ResBody> {
-    type Service = DeadlineService<S, ResBody>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        DeadlineService {
-            inner,
-            layer: *self,
-        }
-    }
-}
-
-/// Service produced by [`DeadlineLayer`].
-pub(crate) struct DeadlineService<S, ResBody> {
-    inner: S,
-    layer: DeadlineLayer<ResBody>,
-}
-
-impl<S: Clone, ResBody> Clone for DeadlineService<S, ResBody> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            layer: self.layer,
-        }
-    }
-}
-
-impl<S, ResBody> DeadlineService<S, ResBody> {
-    /// The call's timeout: the earlier of the application deadline and the
-    /// route's xDS max stream duration, or `None` if neither applies.
-    fn timeout<B>(&self, request: &Request<B>) -> Option<Duration> {
-        let xds = request
-            .extensions()
-            .get::<RouteDecision>()
-            .and_then(|decision| decision.max_stream_duration);
+    /// Starts timing a call that enters now, armed with the application
+    /// deadline if this policy honors one.
+    pub(crate) fn start<B>(&self, request: &Request<B>) -> DeadlineTimer<ResBody> {
         // A malformed `grpc-timeout` is treated as absent, as tonic does.
-        let app = if self.layer.app_grpc_timeout {
+        let app = if self.app_grpc_timeout {
             extract_grpc_timeout(request).ok().flatten()
         } else {
             None
         };
-        match (app, xds) {
-            (Some(app), Some(xds)) => Some(app.min(xds)),
-            (app, xds) => app.or(xds),
-        }
+        let mut timer = DeadlineTimer {
+            start: Instant::now(),
+            sleep: None,
+            body_deadline: self.body_deadline,
+        };
+        timer.tighten(app);
+        timer
     }
 }
 
-impl<S, B, ResBody> Service<Request<B>> for DeadlineService<S, ResBody>
-where
-    S: Service<Request<B>, Response = Response<ResBody>>,
-    S::Error: Into<BoxError>,
-{
-    type Response = Response<ResBody>;
-    type Error = BoxError;
-    type Future = ResponseFuture<S::Future, ResBody>;
+/// The deadline of one call, from when it enters the channel until its
+/// response headers arrive or, for gRPC, its response stream ends.
+pub(crate) struct DeadlineTimer<ResBody> {
+    /// When the call started; every timeout counts from here.
+    start: Instant,
+    /// Fires at the deadline; `None` while the call has none.
+    sleep: Option<Pin<Box<Sleep>>>,
+    body_deadline: Option<BodyDeadline<ResBody>>,
+}
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
+impl<ResBody> DeadlineTimer<ResBody> {
+    /// Moves the deadline to `timeout` after the start of the call, if that is
+    /// earlier. A timeout too large to represent as an `Instant` is no deadline.
+    fn tighten(&mut self, timeout: Option<Duration>) {
+        let Some(deadline) = timeout.and_then(|timeout| self.start.checked_add(timeout)) else {
+            return;
+        };
+        match &mut self.sleep {
+            Some(sleep) if sleep.deadline() <= deadline => {}
+            Some(sleep) => sleep.as_mut().reset(deadline),
+            None => self.sleep = Some(Box::pin(tokio::time::sleep_until(deadline))),
+        }
     }
 
-    fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        // A timeout too large to represent as an `Instant` is no deadline.
-        let deadline = self
-            .timeout(&request)
-            .and_then(|timeout| Instant::now().checked_add(timeout));
-        if let Some(deadline) = deadline {
-            request.extensions_mut().insert(CallDeadline(deadline));
+    /// Awaits `fut`, failing with `DEADLINE_EXCEEDED` if the deadline passes
+    /// first. Bounds the wait for a route config.
+    pub(crate) async fn bound<T, E>(
+        &mut self,
+        fut: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, BoxError>
+    where
+        E: Into<BoxError>,
+    {
+        let mut fut = pin!(fut);
+        poll_fn(|cx| {
+            if let Poll::Ready(result) = fut.as_mut().poll(cx) {
+                return Poll::Ready(result.map_err(Into::into));
+            }
+            match self.sleep.as_mut() {
+                Some(sleep) => {
+                    ready!(sleep.as_mut().poll(cx));
+                    Poll::Ready(Err(deadline_exceeded()))
+                }
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Applies the matched route's xDS max stream duration, counted from the
+    /// start of the call (gRFC A31), and records the resulting deadline on
+    /// `request` as a [`CallDeadline`]. Fails with `DEADLINE_EXCEEDED` if the
+    /// deadline has already passed, e.g. while waiting for the route config.
+    pub(crate) fn apply_route<B>(
+        &mut self,
+        request: &mut Request<B>,
+        max_stream_duration: Option<Duration>,
+    ) -> Result<(), BoxError> {
+        self.tighten(max_stream_duration);
+        let Some(sleep) = &self.sleep else {
+            return Ok(());
+        };
+        let deadline = sleep.deadline();
+        if Instant::now() >= deadline {
+            return Err(deadline_exceeded());
         }
+        request.extensions_mut().insert(CallDeadline(deadline));
+        Ok(())
+    }
+
+    /// Bounds the routed call `inner` by the deadline and, for gRPC, extends
+    /// the deadline over its response stream.
+    pub(crate) fn run<F>(self, inner: F) -> ResponseFuture<F, ResBody> {
         ResponseFuture {
-            inner: self.inner.call(request),
-            sleep: deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
-            body_deadline: self.layer.body_deadline,
+            inner,
+            sleep: self.sleep,
+            body_deadline: self.body_deadline,
         }
     }
 }
 
 pin_project! {
-    /// Response future for [`DeadlineService`].
+    /// A routed call bounded by its deadline; see [`DeadlineTimer::run`].
     pub(crate) struct ResponseFuture<F, ResBody> {
         #[pin]
         inner: F,
@@ -203,8 +230,11 @@ where
             return Poll::Ready(match (result, sleep) {
                 // An attempt cut short by the deadline, by the endpoint's own
                 // `grpc-timeout` timer (an error) or the server's (a CANCELLED
-                // reply), is reported as the deadline it hit. Any other result
-                // that is ready is kept, even if the deadline is too.
+                // reply), is reported as the deadline it hit. tonic's endpoint
+                // stack always runs that timer, but since the advertised
+                // timeout is rounded up it fires on this deadline's tick at the
+                // earliest. Any other result that is ready is kept, even if
+                // the deadline is too.
                 (Err(_), _) if expired => Err(deadline_exceeded()),
                 (Ok(response), _) if expired && is_cancelled(&response) => Err(deadline_exceeded()),
                 (Ok(response), Some(sleep)) => Ok(match *this.body_deadline {
@@ -245,7 +275,7 @@ pub(crate) fn set_grpc_timeout_header<B>(request: &mut Request<B>) {
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if let Ok(value) = HeaderValue::from_str(&encode_grpc_timeout(remaining)) {
-        request.headers_mut().insert(GRPC_TIMEOUT, value);
+        request.headers_mut().insert(GRPC_TIMEOUT_HEADER, value);
     }
 }
 
@@ -309,12 +339,64 @@ mod tests {
     use crate::client::retry::{
         GrpcRetryClassifier, RetryBackoffConfig, RetryConfig, RetryLayer, RetrySharedConfig,
     };
+    use crate::client::route::{
+        AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot, XdsRoutingLayer,
+    };
+    use crate::common::grpc_timeout::parse_grpc_timeout;
+    use crate::xds::routing::RoutingError;
     use shared_http_body::SharedBody;
     use std::sync::{Arc, Mutex};
-    use tower::{ServiceBuilder, ServiceExt, service_fn};
+    use tower::{Service, ServiceBuilder, ServiceExt, service_fn};
 
     /// Which `grpc-timeout` each attempt reached the endpoint with.
     type SeenTimeouts = Arc<Mutex<Vec<Option<String>>>>;
+
+    /// Routes every call to one cluster with the given xDS max stream duration,
+    /// once a route config arrives `config_delay` after the call does.
+    struct TestRouter {
+        max_stream_duration: Option<Duration>,
+        config_delay: Option<Duration>,
+    }
+
+    impl Router for TestRouter {
+        fn acquire(&self) -> AcquiredConfig {
+            match self.config_delay {
+                None => AcquiredConfig::Ready(Arc::default()),
+                Some(delay) => AcquiredConfig::Pending(Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(Arc::default())
+                })),
+            }
+        }
+
+        fn route(
+            &self,
+            _input: &RouteInput<'_>,
+            _config: &RoutingSnapshot,
+        ) -> Result<RouteDecision, RoutingError> {
+            Ok(RouteDecision {
+                cluster: "c".into(),
+                request_hash: None,
+                retry_config: None,
+                max_stream_duration: self.max_stream_duration,
+            })
+        }
+    }
+
+    /// A router whose config is already in effect, matching routes with `msd`.
+    fn router(msd: Option<Duration>) -> TestRouter {
+        TestRouter {
+            max_stream_duration: msd,
+            config_delay: None,
+        }
+    }
+
+    fn routing<ResBody>(
+        router: TestRouter,
+        policy: DeadlinePolicy<ResBody>,
+    ) -> XdsRoutingLayer<ResBody> {
+        XdsRoutingLayer::new(Arc::new(router), None, Arc::from("svc"), policy)
+    }
 
     /// A response body that yields one data frame and then never completes.
     struct StallingBody {
@@ -361,9 +443,11 @@ mod tests {
         req.map(TonicBody::new)
     }
 
-    /// deadline -> retry (UNAVAILABLE, up to 4 retries) -> endpoint mock.
+    /// routing (with the gRPC deadline) -> retry (UNAVAILABLE, up to 4
+    /// retries) -> endpoint mock.
     fn grpc_stack(
         endpoint: Endpoint,
+        router: TestRouter,
     ) -> (
         impl Service<Request<TonicBody>, Response = Response<TonicBody>, Error = BoxError, Future: Send>
         + Clone,
@@ -374,7 +458,7 @@ mod tests {
         let mock = service_fn(move |req: Request<TonicBody>| {
             let timeout = req
                 .headers()
-                .get(GRPC_TIMEOUT)
+                .get(GRPC_TIMEOUT_HEADER)
                 .map(|v| v.to_str().unwrap().to_owned());
             recorder.lock().unwrap().push(timeout.clone());
             async move {
@@ -388,10 +472,8 @@ mod tests {
                         Ok(tonic::Status::unavailable("try again").into_http())
                     }
                     Endpoint::HonorsGrpcTimeout { reply } => {
-                        let timeout = crate::common::grpc_timeout::parse_grpc_timeout(
-                            timeout.as_deref().expect("grpc-timeout"),
-                        )
-                        .unwrap();
+                        let timeout =
+                            parse_grpc_timeout(timeout.as_deref().expect("grpc-timeout")).unwrap();
                         tokio::time::sleep(timeout).await;
                         if reply {
                             Ok(tonic::Status::cancelled("Timeout expired").into_http())
@@ -412,26 +494,20 @@ mod tests {
             Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
         );
         let stack = ServiceBuilder::new()
-            .layer(DeadlineLayer::grpc())
+            .layer(routing(router, DeadlinePolicy::grpc()))
             .layer(RetryLayer::new(Arc::new(retry)))
             .map_request(grpc_endpoint_request)
             .service(mock);
         (stack, seen)
     }
 
-    /// A routed request carrying `msd` and, optionally, an app `grpc-timeout`.
-    fn request(msd: Option<Duration>, app_timeout: Option<&str>) -> Request<TonicBody> {
+    /// A request carrying, optionally, an app `grpc-timeout`.
+    fn request(app_timeout: Option<&str>) -> Request<TonicBody> {
         let mut req = Request::new(TonicBody::empty());
         if let Some(timeout) = app_timeout {
             req.headers_mut()
-                .insert(GRPC_TIMEOUT, HeaderValue::from_str(timeout).unwrap());
+                .insert(GRPC_TIMEOUT_HEADER, HeaderValue::from_str(timeout).unwrap());
         }
-        req.extensions_mut().insert(RouteDecision {
-            cluster: "c".into(),
-            request_hash: None,
-            retry_config: None,
-            max_stream_duration: msd,
-        });
         req
     }
 
@@ -477,8 +553,8 @@ mod tests {
         ];
         for (msd, app, deadline) in cases {
             let case = format!("msd={msd:?} app={app:?}");
-            let (svc, seen) = grpc_stack(Endpoint::OkAfter(secs(DELAY)));
-            let outcome = call(svc, request(msd.map(secs), app)).await;
+            let (svc, seen) = grpc_stack(Endpoint::OkAfter(secs(DELAY)), router(msd.map(secs)));
+            let outcome = call(svc, request(app)).await;
             let want = match deadline.filter(|&d| d < DELAY) {
                 Some(d) => (Err(tonic::Code::DeadlineExceeded), secs(d)),
                 None => (Ok(()), secs(DELAY)),
@@ -490,12 +566,50 @@ mod tests {
         }
     }
 
+    /// The deadline counts from the start of the call, so time spent waiting
+    /// for the first route config uses it up too.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_counts_from_call_start() {
+        const CONFIG_DELAY: u64 = 4;
+        // (xDS msd, app `grpc-timeout`, when the call fails, timeout the
+        // endpoint is sent if it is called); durations in seconds.
+        let cases = [
+            // The app deadline cuts the wait for a route config short.
+            (None, Some("1S"), 1, None),
+            // The xDS limit is only known once a route is matched; if it has
+            // passed by then, the endpoint is never called.
+            (Some(3), None, CONFIG_DELAY, None),
+            // Otherwise only what is left of it is sent on.
+            (Some(10), None, 10, Some(6)),
+            (Some(10), Some("8S"), 8, Some(4)),
+        ];
+        for (msd, app, fails_at, sent) in cases {
+            let case = format!("msd={msd:?} app={app:?}");
+            let router = TestRouter {
+                max_stream_duration: msd.map(secs),
+                config_delay: Some(secs(CONFIG_DELAY)),
+            };
+            let (svc, seen) = grpc_stack(Endpoint::OkAfter(secs(30)), router);
+            let outcome = call(svc, request(app)).await;
+            assert_eq!(
+                outcome,
+                (Err(tonic::Code::DeadlineExceeded), secs(fails_at)),
+                "{case}"
+            );
+            let want_sent: Vec<_> = sent
+                .map(|t| Some(encode_grpc_timeout(secs(t))))
+                .into_iter()
+                .collect();
+            assert_eq!(*seen.lock().unwrap(), want_sent, "{case}");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn deadline_spans_retries() {
         // Each attempt takes 4s, so the 10s deadline lands in the third attempt
         // rather than restarting with each one.
-        let (svc, seen) = grpc_stack(Endpoint::UnavailableAfter(secs(4)));
-        let (result, elapsed) = call(svc, request(Some(secs(10)), None)).await;
+        let (svc, seen) = grpc_stack(Endpoint::UnavailableAfter(secs(4)), router(Some(secs(10))));
+        let (result, elapsed) = call(svc, request(None)).await;
         assert_eq!(result, Err(tonic::Code::DeadlineExceeded));
         assert_eq!(elapsed, secs(10));
 
@@ -504,9 +618,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|t| {
-                crate::common::grpc_timeout::parse_grpc_timeout(t.as_deref().unwrap()).unwrap()
-            })
+            .map(|t| parse_grpc_timeout(t.as_deref().unwrap()).unwrap())
             .collect();
         assert_eq!(seen.len(), 3, "{seen:?}");
         assert_eq!(seen[0], secs(10));
@@ -517,8 +629,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn endpoint_timeout_at_deadline_reports_deadline_exceeded() {
         for reply in [false, true] {
-            let (svc, _) = grpc_stack(Endpoint::HonorsGrpcTimeout { reply });
-            let (result, elapsed) = call(svc, request(Some(secs(3)), None)).await;
+            let (svc, _) = grpc_stack(Endpoint::HonorsGrpcTimeout { reply }, router(Some(secs(3))));
+            let (result, elapsed) = call(svc, request(None)).await;
             assert_eq!(result, Err(tonic::Code::DeadlineExceeded), "reply={reply}");
             assert_eq!(elapsed, secs(3), "reply={reply}");
         }
@@ -526,9 +638,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn deadline_applies_to_response_stream() {
-        let (svc, _) = grpc_stack(Endpoint::StallingStream);
+        let (svc, _) = grpc_stack(Endpoint::StallingStream, router(Some(secs(5))));
         let start = Instant::now();
-        let response = svc.oneshot(request(Some(secs(5)), None)).await.unwrap();
+        let response = svc.oneshot(request(None)).await.unwrap();
         let mut body = response.into_body();
 
         let first = next_frame(&mut body).await.unwrap().unwrap();
@@ -573,21 +685,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn headers_only_layer_ignores_grpc_timeout_and_body() {
-        let svc = ServiceBuilder::new()
-            .layer(DeadlineLayer::<TonicBody>::headers_only())
-            .service(service_fn(|_req: Request<TonicBody>| async {
-                tokio::time::sleep(secs(5)).await;
-                Ok::<_, BoxError>(Response::new(TonicBody::empty()))
-            }));
+    async fn headers_only_policy_ignores_grpc_timeout_and_body() {
+        let svc = |msd| {
+            ServiceBuilder::new()
+                .layer(routing(router(msd), DeadlinePolicy::headers_only()))
+                .service(service_fn(|_req: Request<TonicBody>| async {
+                    tokio::time::sleep(secs(5)).await;
+                    Ok::<_, BoxError>(Response::new(TonicBody::empty()))
+                }))
+        };
 
         // The app `grpc-timeout` is not consulted on a transport-generic channel.
-        let (result, elapsed) = call(svc.clone(), request(None, Some("1S"))).await;
+        let (result, elapsed) = call(svc(None), request(Some("1S"))).await;
         assert_eq!(result, Ok(()));
         assert_eq!(elapsed, secs(5));
 
         // The xDS max stream duration still bounds the wait for response headers.
-        let (result, elapsed) = call(svc, request(Some(secs(2)), None)).await;
+        let (result, elapsed) = call(svc(Some(secs(2))), request(None)).await;
         assert_eq!(result, Err(tonic::Code::DeadlineExceeded));
         assert_eq!(elapsed, secs(2));
     }

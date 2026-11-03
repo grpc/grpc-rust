@@ -154,7 +154,7 @@ struct RawChannelCredentialConfig {
     #[serde(rename = "type")]
     cred_type: String,
     #[serde(default)]
-    config: Option<serde_json::Value>,
+    config: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Default, Deserialize)]

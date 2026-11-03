@@ -25,8 +25,8 @@
 //! Happy Eyeballs connector for endpoints with multiple addresses (gRFC A61).
 //!
 //! An xDS endpoint may have several addresses, typically one IPv4 and one
-//! IPv6. [`HappyEyeballsConnector`] races connections to them as described in
-//! gRFC A61 and [RFC 8305]:
+//! IPv6. [`HappyEyeballsConnector`] connects to them with staggered,
+//! overlapping attempts as described in gRFC A61 and [RFC 8305]:
 //!
 //! - Addresses are de-duplicated, then interleaved by address family starting
 //!   with the family of the first address (RFC 8305 §4, with a First Address
@@ -85,7 +85,8 @@ pub(crate) enum HappyEyeballsError {
     },
 }
 
-/// A [`Service<Uri>`] that connects to one endpoint by racing its addresses.
+/// A [`Service<Uri>`] that connects to one endpoint by trying its addresses in
+/// staggered, overlapping attempts.
 ///
 /// The `Uri` passed to [`Service::call`] is ignored: each attempt dials
 /// `http://{addr}` through the inner connector. It is meant to be used with
@@ -94,7 +95,7 @@ pub(crate) enum HappyEyeballsError {
 /// for the authority and SNI.
 #[derive(Clone, Debug)]
 pub(crate) struct HappyEyeballsConnector<C = HttpConnector> {
-    /// De-duplicated and interleaved; see [`sort_addresses`].
+    /// De-duplicated and interleaved; see [`interleave_addresses`].
     addrs: Arc<[EndpointAddress]>,
     inner: C,
 }
@@ -103,22 +104,23 @@ impl HappyEyeballsConnector {
     /// Creates a connector that dials `addrs` over TCP.
     pub(crate) fn new(addrs: impl IntoIterator<Item = EndpointAddress>) -> Self {
         // Same as tonic's default connector. No per-attempt timeout: tonic's
-        // `connect_timeout` bounds the whole race.
+        // `connect_timeout` bounds the whole pass.
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         http.set_nodelay(true);
-        Self::with_connector(addrs, http)
+        Self::new_with_connector(addrs, http)
     }
 }
 
 impl<C> HappyEyeballsConnector<C> {
-    /// Creates a connector that dials each of `addrs` through `inner`.
-    pub(crate) fn with_connector(
+    /// Like [`HappyEyeballsConnector::new`], but dials each of `addrs`
+    /// through `inner` instead of a default [`HttpConnector`].
+    pub(crate) fn new_with_connector(
         addrs: impl IntoIterator<Item = EndpointAddress>,
         inner: C,
     ) -> Self {
         Self {
-            addrs: sort_addresses(addrs).into(),
+            addrs: interleave_addresses(addrs).into(),
             inner,
         }
     }
@@ -144,16 +146,16 @@ where
         let inner = self.inner.clone();
         let addrs = self.addrs.clone();
         Box::pin(async move {
-            let mut race = Race::new(inner, addrs);
-            poll_fn(|cx| race.poll_connect(cx)).await
+            let mut pass = ConnectPass::new(inner, addrs);
+            poll_fn(|cx| pass.poll_connect(cx)).await
         })
     }
 }
 
 type Attempt<T> = BoxFuture<(usize, Result<T, BoxError>)>;
 
-/// One pass over an endpoint's addresses.
-struct Race<C: Service<Uri>> {
+/// One Happy Eyeballs pass over an endpoint's addresses.
+struct ConnectPass<C: Service<Uri>> {
     inner: C,
     addrs: Arc<[EndpointAddress]>,
     /// Index of the next address to try. Attempts `0..next` have started.
@@ -165,7 +167,7 @@ struct Race<C: Service<Uri>> {
     last_error: Option<(usize, BoxError)>,
 }
 
-impl<C> Race<C>
+impl<C> ConnectPass<C>
 where
     C: Service<Uri> + Clone + Send + 'static,
     C::Response: Send + 'static,
@@ -173,7 +175,7 @@ where
     C::Future: Send + 'static,
 {
     fn new(inner: C, addrs: Arc<[EndpointAddress]>) -> Self {
-        let mut race = Self {
+        let mut pass = Self {
             inner,
             addrs,
             next: 0,
@@ -181,10 +183,10 @@ where
             timer: Box::pin(tokio::time::sleep(CONNECTION_ATTEMPT_DELAY)),
             last_error: None,
         };
-        if !race.addrs.is_empty() {
-            race.start_next_attempt();
+        if !pass.addrs.is_empty() {
+            pass.start_next_attempt();
         }
-        race
+        pass
     }
 
     fn start_next_attempt(&mut self) {
@@ -274,7 +276,14 @@ fn family(addr: &EndpointAddress) -> Family {
 
 /// De-duplicates `addrs`, keeping first occurrences, and interleaves them by
 /// address family. Families take turns in order of first appearance.
-fn sort_addresses(addrs: impl IntoIterator<Item = EndpointAddress>) -> Vec<EndpointAddress> {
+///
+/// RFC 8305 §4 sorts addresses by RFC 6724 Destination Address Selection
+/// before interleaving. Like pick_first in gRFC A61, this skips that sort and
+/// keeps the given order within each family: resolvers already sort their
+/// results, and EDS addresses keep the control plane's order.
+// TODO: consider local RFC 6724-style heuristics, e.g. moving addresses of a
+// family the host has no source address or route for to the back.
+fn interleave_addresses(addrs: impl IntoIterator<Item = EndpointAddress>) -> Vec<EndpointAddress> {
     let mut seen = HashSet::new();
     let mut groups: Vec<(Family, Vec<EndpointAddress>)> = Vec::new();
     for addr in addrs.into_iter().filter(|addr| seen.insert(addr.clone())) {
@@ -309,8 +318,8 @@ mod tests {
         s.parse::<SocketAddr>().unwrap().into()
     }
 
-    fn sorted(addrs: &[EndpointAddress]) -> Vec<String> {
-        sort_addresses(addrs.iter().cloned())
+    fn interleaved(addrs: &[EndpointAddress]) -> Vec<String> {
+        interleave_addresses(addrs.iter().cloned())
             .iter()
             .map(ToString::to_string)
             .collect()
@@ -326,7 +335,7 @@ mod tests {
             addr("10.0.0.2:80"),
         ];
         assert_eq!(
-            sorted(&addrs),
+            interleaved(&addrs),
             [
                 "[2001:db8::1]:80",
                 "10.0.0.1:80",
@@ -345,7 +354,7 @@ mod tests {
             addr("10.0.0.3:80"),
         ];
         assert_eq!(
-            sorted(&addrs),
+            interleaved(&addrs),
             ["10.0.0.2:80", "10.0.0.1:80", "10.0.0.3:80"]
         );
     }
@@ -360,7 +369,7 @@ mod tests {
             addr("[2001:db8::1]:80"),
         ];
         assert_eq!(
-            sorted(&addrs),
+            interleaved(&addrs),
             [
                 "a.example.com:80",
                 "10.0.0.1:80",
@@ -379,7 +388,7 @@ mod tests {
             addr("[2001:db8::1]:80"),
         ];
         assert_eq!(
-            sorted(&addrs),
+            interleaved(&addrs),
             ["10.0.0.1:80", "[2001:db8::1]:80", "[::ffff:10.0.0.2]:80"]
         );
     }
@@ -394,7 +403,7 @@ mod tests {
             addr("[2001:db8::1]:80"),
         ];
         assert_eq!(
-            sorted(&addrs),
+            interleaved(&addrs),
             ["10.0.0.1:80", "[2001:db8::1]:80", "10.0.0.2:80"]
         );
     }
@@ -433,10 +442,10 @@ mod tests {
             }
         }
 
-        /// Races the scripted addresses, in script order.
-        async fn race(&self) -> Result<&'static str, BoxError> {
+        /// Runs one pass over the scripted addresses, in script order.
+        async fn connect(&self) -> Result<&'static str, BoxError> {
             let addrs = self.script.iter().map(|(a, _)| addr(a));
-            HappyEyeballsConnector::with_connector(addrs, self.clone())
+            HappyEyeballsConnector::new_with_connector(addrs, self.clone())
                 .call(Uri::from_static("http://ignored"))
                 .await
         }
@@ -498,7 +507,7 @@ mod tests {
         let mock =
             MockConnector::new(&[("10.0.0.1:80", Connect(200)), ("10.0.0.2:80", Connect(0))]);
 
-        assert_eq!(mock.race().await.unwrap(), "10.0.0.1:80");
+        assert_eq!(mock.connect().await.unwrap(), "10.0.0.1:80");
         assert_eq!(mock.started(), [("10.0.0.1:80", 0)]);
     }
 
@@ -506,7 +515,7 @@ mod tests {
     async fn starts_next_attempt_after_delay_and_drops_losers() {
         let mock = MockConnector::new(&[("10.0.0.1:80", Hang), ("10.0.0.2:80", Connect(10))]);
 
-        assert_eq!(mock.race().await.unwrap(), "10.0.0.2:80");
+        assert_eq!(mock.connect().await.unwrap(), "10.0.0.2:80");
         assert_eq!(mock.started(), [("10.0.0.1:80", 0), ("10.0.0.2:80", 250)]);
         assert_eq!(mock.in_flight(), 0, "losing attempt must be cancelled");
     }
@@ -521,7 +530,7 @@ mod tests {
             ("10.0.0.5:80", Connect(0)),
         ]);
 
-        assert_eq!(mock.race().await.unwrap(), "10.0.0.5:80");
+        assert_eq!(mock.connect().await.unwrap(), "10.0.0.5:80");
         // .3 fails at 360 and starts .4 at once, which restarts the delay
         // timer for .5.
         assert_eq!(
@@ -545,7 +554,7 @@ mod tests {
             ("10.0.0.3:80", Connect(0)),
         ]);
 
-        assert_eq!(mock.race().await.unwrap(), "10.0.0.3:80");
+        assert_eq!(mock.connect().await.unwrap(), "10.0.0.3:80");
         assert_eq!(
             mock.started(),
             [
@@ -564,7 +573,7 @@ mod tests {
             ("10.0.0.3:80", Hang),
         ]);
 
-        assert_eq!(mock.race().await.unwrap(), "10.0.0.1:80");
+        assert_eq!(mock.connect().await.unwrap(), "10.0.0.1:80");
         assert_eq!(mock.started(), [("10.0.0.1:80", 0), ("10.0.0.2:80", 250)]);
         assert_eq!(mock.in_flight(), 0);
     }
@@ -577,7 +586,7 @@ mod tests {
             ("10.0.0.1:80", Fail(0)),
         ]);
 
-        assert_eq!(mock.race().await.unwrap(), "[2001:db8::2]:80");
+        assert_eq!(mock.connect().await.unwrap(), "[2001:db8::2]:80");
         assert_eq!(
             mock.started(),
             [
@@ -592,7 +601,7 @@ mod tests {
     async fn all_attempts_failing_reports_most_recent_failure() {
         let mock = MockConnector::new(&[("10.0.0.1:80", Fail(300)), ("10.0.0.2:80", Fail(10))]);
 
-        let err = mock.race().await.unwrap_err();
+        let err = mock.connect().await.unwrap_err();
         // .2 fails at 260, .1 at 300.
         assert_eq!(
             err.to_string(),
@@ -605,7 +614,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn no_addresses_fails() {
-        let err = HappyEyeballsConnector::with_connector([], MockConnector::new(&[]))
+        let err = HappyEyeballsConnector::new_with_connector([], MockConnector::new(&[]))
             .call(Uri::from_static("http://ignored"))
             .await
             .unwrap_err();
@@ -666,7 +675,7 @@ mod tests {
     }
 
     /// Attempts dial `http://{addr}`, but TLS is decided by the `Endpoint`:
-    /// tonic runs the handshake on whichever stream wins the race.
+    /// tonic runs the handshake on the winning attempt's stream.
     #[cfg(feature = "_tls-any")]
     #[tokio::test]
     async fn channel_runs_tls_over_winning_stream() {

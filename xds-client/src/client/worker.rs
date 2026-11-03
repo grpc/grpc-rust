@@ -1034,11 +1034,11 @@ where
         };
 
         // An empty initial request could accidentally establish a wildcard subscription.
-        if type_state.watchers.is_empty() && !stream.types.contains_key(type_url) {
+        if type_state.watchers.is_empty() && !stream.requested_types.contains_key(type_url) {
             return Ok(());
         }
         let nonce = stream
-            .types
+            .requested_types
             .get(type_url)
             .map_or("", |state| state.nonce.as_str());
         let resource_names = type_state.resource_names_for_request();
@@ -1053,7 +1053,10 @@ where
 
         let bytes = self.codec.encode_request(&request)?;
         stream.writes.send(bytes).map_err(|_| Error::StreamClosed)?;
-        stream.types.entry(type_url.to_owned()).or_default();
+        stream
+            .requested_types
+            .entry(type_url.to_owned())
+            .or_default();
         self.start_pending_resource_timers(type_url);
         Ok(())
     }
@@ -1106,7 +1109,7 @@ where
     ) -> Result<()> {
         let type_url = response.type_url.clone();
         // Only types requested on this stream have protocol state to advance.
-        let Some(stream_type) = stream.types.get_mut(&type_url) else {
+        let Some(stream_type) = stream.requested_types.get_mut(&type_url) else {
             return Ok(());
         };
         stream_type.nonce.clone_from(&response.nonce);
@@ -1606,8 +1609,8 @@ struct ActiveStream {
     writes: mpsc::UnboundedSender<Bytes>,
     cancel: Option<oneshot::Sender<()>>,
     saw_response: bool,
-    /// Presence records a subscription queued on this stream, even after unwatch.
-    types: HashMap<String, StreamTypeState>,
+    /// Types requested on this stream, retained after unsubscribe to preserve their nonces.
+    requested_types: HashMap<String, StreamTypeState>,
 }
 
 #[derive(Default)]
@@ -1622,7 +1625,7 @@ impl ActiveStream {
             writes,
             cancel: Some(cancel),
             saw_response: false,
-            types: HashMap::new(),
+            requested_types: HashMap::new(),
         }
     }
 }
@@ -2145,7 +2148,7 @@ mod tests {
         let (cancel, _cancel_rx) = oneshot::channel();
         let mut stream = ActiveStream::new(writes, cancel);
         stream
-            .types
+            .requested_types
             .insert(TEST_TYPE_URL.to_string(), StreamTypeState::default());
         let response = FakeCodec
             .decode_response(response("late", "latest-nonce", &["res-0"]))
@@ -2153,7 +2156,7 @@ mod tests {
         worker
             .handle_response(&mut stream, response, ProcessingDone::detached())
             .unwrap();
-        assert_eq!(stream.types[TEST_TYPE_URL].nonce, "latest-nonce");
+        assert_eq!(stream.requested_types[TEST_TYPE_URL].nonce, "latest-nonce");
         assert!(worker.type_states[TEST_TYPE_URL].version_info.is_empty());
         assert!(worker.type_states[TEST_TYPE_URL].cache.is_empty());
         assert!(recorder.take().is_empty());

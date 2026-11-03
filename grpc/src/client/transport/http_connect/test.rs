@@ -71,7 +71,7 @@ async fn perform_handshake(
             Box::new(endpoint),
             &info,
             &runtime,
-            private::Internal,
+            private::UnstableToken,
         )
         .await
 }

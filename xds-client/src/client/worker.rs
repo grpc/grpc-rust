@@ -32,26 +32,46 @@
 //! and writes the ADS stream concurrently. Network waits and watcher processing
 //! do not block the worker from registering watchers or replaying cached resources.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
-use crate::client::config::{ClientConfig, ServerConfig};
-use crate::client::retry::{Backoff, RetryPolicy};
-use crate::client::snapshot::{AcceptedResource, RejectedUpdate, ResourceSnapshot, ResourceStatus};
-use crate::client::watch::{ProcessingDone, ResourceEvent};
+use crate::client::config::ClientConfig;
+use crate::client::config::ServerConfig;
+use crate::client::retry::Backoff;
+use crate::client::retry::RetryPolicy;
+use crate::client::snapshot::AcceptedResource;
+use crate::client::snapshot::RejectedUpdate;
+use crate::client::snapshot::ResourceSnapshot;
+use crate::client::snapshot::ResourceStatus;
+use crate::client::watch::ProcessingDone;
+use crate::client::watch::ResourceEvent;
 use crate::codec::XdsCodec;
-use crate::error::{Error, Result};
-use crate::message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Node};
-use crate::metrics::{self, KeyValue, MetricsRecorder};
-use crate::resource::{DecodedResource, DecoderFn};
+use crate::error::Error;
+use crate::error::Result;
+use crate::message::DiscoveryRequest;
+use crate::message::DiscoveryResponse;
+use crate::message::ErrorDetail;
+use crate::message::Node;
+use crate::metrics::KeyValue;
+use crate::metrics::MetricsRecorder;
+use crate::metrics::{self};
+use crate::resource::DecodedResource;
+use crate::resource::DecoderFn;
 use crate::runtime::Runtime;
-use crate::transport::{Transport, TransportBuilder, TransportReceiver, TransportSender};
+use crate::transport::Transport;
+use crate::transport::TransportBuilder;
+use crate::transport::TransportReceiver;
+use crate::transport::TransportSender;
 
 /// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
 ///
@@ -1499,10 +1519,7 @@ impl<R: Runtime, TB: TransportBuilder> TransportContext<R, TB> {
             if saw_response {
                 backoff.reset();
             }
-            let Some(delay) = backoff.next_backoff() else {
-                return;
-            };
-            self.runtime.sleep(delay).await;
+            self.runtime.sleep(backoff.next_backoff()).await;
         }
     }
 
@@ -1619,16 +1636,25 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::client::config::{ClientConfig, ServerConfig};
-    use crate::client::watch::{ResourceEvent, ResourceWatcher};
+    use crate::Error;
+    use crate::XdsClient;
+    use crate::client::config::ClientConfig;
+    use crate::client::config::ServerConfig;
+    use crate::client::watch::ResourceEvent;
+    use crate::client::watch::ResourceWatcher;
     use crate::codec::XdsCodec;
     use crate::error::Result;
-    use crate::message::{DiscoveryRequest, DiscoveryResponse, Node, ResourceAny};
-    use crate::resource::{Resource, TypeUrl};
+    use crate::message::DiscoveryRequest;
+    use crate::message::DiscoveryResponse;
+    use crate::message::Node;
+    use crate::message::ResourceAny;
+    use crate::resource::Resource;
+    use crate::resource::TypeUrl;
     use crate::runtime::tokio::TokioRuntime;
     use crate::transport::TransportBuilder;
-    use crate::transport::mock::{MockServer, MockTransport, mock_transport};
-    use crate::{Error, XdsClient};
+    use crate::transport::mock::MockServer;
+    use crate::transport::mock::MockTransport;
+    use crate::transport::mock::mock_transport;
 
     /// Captures every measurement so tests can assert on the call sequence.
     #[derive(Default)]
@@ -1974,7 +2000,7 @@ mod tests {
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
 
-        let watcher = client.watch::<T>("res-0").await;
+        let watcher = client.watch::<T>("res-0");
         let mut server = tokio::time::timeout(Duration::from_secs(5), servers.recv())
             .await
             .expect("timed out waiting for stream")
@@ -2003,7 +2029,7 @@ mod tests {
             .unwrap();
         // Enqueue both inputs before yielding to the actor. The response must
         // populate the cache before this watch is registered.
-        let mut watcher_b = client.watch::<TestResource>("res-0").await;
+        let mut watcher_b = client.watch::<TestResource>("res-0");
         let (cached, cached_done) = next_changed(&mut watcher_b).await;
         let (original, original_done) = next_changed(&mut watcher_a).await;
         assert!(Arc::ptr_eq(&cached.unwrap(), &original.unwrap()));
@@ -2120,7 +2146,8 @@ mod tests {
     async fn cached_eds_during_reconnect(phase: ReconnectPhase) {
         use envoy_types::pb::envoy::config::core::v3 as core;
         use envoy_types::pb::envoy::service::discovery::v3 as discovery;
-        use envoy_types::pb::google::protobuf::{Any, UInt32Value};
+        use envoy_types::pb::google::protobuf::Any;
+        use envoy_types::pb::google::protobuf::UInt32Value;
         use prost::Message;
 
         let (inner, mut servers) = mock_transport();
@@ -2141,7 +2168,7 @@ mod tests {
         )
         .build();
 
-        let mut a = client.watch::<EdsResource>("cached-eds").await;
+        let mut a = client.watch::<EdsResource>("cached-eds");
         gates.recv().await.unwrap().send(()).unwrap();
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
@@ -2189,7 +2216,7 @@ mod tests {
         };
         let replay_started = tokio::time::Instant::now();
         // A stays alive, so the last-watcher cache eviction cannot occur.
-        let mut b = client.watch::<EdsResource>("cached-eds").await;
+        let mut b = client.watch::<EdsResource>("cached-eds");
         let (result, done) = tokio::time::timeout(Duration::from_millis(100), next_changed(&mut b))
             .await
             .expect("cached replay blocked on reconnect");
@@ -2217,11 +2244,11 @@ mod tests {
         };
 
         // Register and remove another subscription while setup is pending.
-        let removed = client.watch::<EdsResource>("removed-eds").await;
+        let removed = client.watch::<EdsResource>("removed-eds");
         drop(removed);
-        let _added = client.watch::<EdsResource>("added-eds").await;
+        let _added = client.watch::<EdsResource>("added-eds");
         // A cached replay is a barrier for the preceding commands.
-        let mut barrier = client.watch::<EdsResource>("cached-eds").await;
+        let mut barrier = client.watch::<EdsResource>("cached-eds");
         drop(next_changed(&mut barrier).await);
         gate.send(()).unwrap();
         let mut replacement = servers.recv().await.unwrap();
@@ -2284,7 +2311,7 @@ mod tests {
                 TokioRuntime,
             )
             .build();
-            let mut watcher = client.watch::<TestResource>("res-0").await;
+            let mut watcher = client.watch::<TestResource>("res-0");
             let gate = gates.recv().await.unwrap();
             tokio::time::advance(timeout * 2).await;
             assert_no_event(
@@ -2321,14 +2348,14 @@ mod tests {
             ObservedRuntime { sleeps: sleeps_tx },
         )
         .build();
-        let mut first = client.watch::<TestResource>("res-0").await;
+        let mut first = client.watch::<TestResource>("res-0");
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
         assert_eq!(sleeps.recv().await.unwrap(), timeout);
         tokio::time::advance(Duration::from_secs(10)).await;
-        let mut second = client.watch::<TestResource>("res-0").await;
+        let mut second = client.watch::<TestResource>("res-0");
         // Changing another subscription exercises the shared send/timer path too.
-        let _other = client.watch::<TestResource>("res-1").await;
+        let _other = client.watch::<TestResource>("res-1");
         server.requests.recv().await.unwrap();
         tokio::time::advance(Duration::from_secs(5)).await;
         for watcher in [&mut first, &mut second] {
@@ -2354,10 +2381,10 @@ mod tests {
             ObservedRuntime { sleeps: sleeps_tx },
         )
         .build();
-        let _wildcard = client.watch::<TestResource>("").await;
+        let _wildcard = client.watch::<TestResource>("");
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
-        let mut named = client.watch::<TestResource>("res-0").await;
+        let mut named = client.watch::<TestResource>("res-0");
         assert_eq!(
             tokio::time::timeout(Duration::from_millis(100), sleeps.recv())
                 .await
@@ -2388,7 +2415,7 @@ mod tests {
             ObservedRuntime { sleeps: sleeps_tx },
         )
         .build();
-        let mut first = client.watch::<TestResource>("res-0").await;
+        let mut first = client.watch::<TestResource>("res-0");
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
         assert_eq!(sleeps.recv().await.unwrap(), timeout);
@@ -2399,12 +2426,12 @@ mod tests {
         let (original, done) = next_changed(&mut first).await;
         drop(done);
         server.requests.recv().await.unwrap();
-        let mut cached = client.watch::<TestResource>("res-0").await;
+        let mut cached = client.watch::<TestResource>("res-0");
         let (replayed, done) = next_changed(&mut cached).await;
         assert!(Arc::ptr_eq(&original.unwrap(), &replayed.unwrap()));
         drop(done);
         // A new unresolved name should be the only new timer on this request.
-        let _other = client.watch::<TestResource>("res-1").await;
+        let _other = client.watch::<TestResource>("res-1");
         server.requests.recv().await.unwrap();
         assert_eq!(sleeps.recv().await.unwrap(), timeout);
         tokio::time::advance(timeout * 2).await;
@@ -2439,13 +2466,13 @@ mod tests {
             ObservedRuntime { sleeps: sleeps_tx },
         )
         .build();
-        let mut first = client.watch::<TestResource>("res-0").await;
+        let mut first = client.watch::<TestResource>("res-0");
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
         assert_eq!(sleeps.recv().await.unwrap(), timeout);
         server.responses.send(Ok(None)).unwrap();
         assert_eq!(sleeps.recv().await.unwrap(), backoff);
-        let mut second = client.watch::<TestResource>("res-1").await;
+        let mut second = client.watch::<TestResource>("res-1");
         tokio::time::advance(timeout * 2).await;
         assert_no_event(&mut first, "existing resource expired during backoff").await;
         assert_no_event(&mut second, "new resource expired during backoff").await;
@@ -2480,7 +2507,7 @@ mod tests {
             TokioRuntime,
         )
         .build();
-        let mut cached = client.watch::<TestResource>("res-0").await;
+        let mut cached = client.watch::<TestResource>("res-0");
         gates.recv().await.unwrap().send(()).unwrap();
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
@@ -2495,9 +2522,9 @@ mod tests {
         server.responses.send(Ok(None)).unwrap();
         let gate = gates.recv().await.unwrap();
 
-        let mut unresolved = client.watch::<TestResource>("res-1").await;
+        let mut unresolved = client.watch::<TestResource>("res-1");
         // Cached replay confirms the preceding registration was processed.
-        let mut barrier = client.watch::<TestResource>("res-0").await;
+        let mut barrier = client.watch::<TestResource>("res-0");
         assert!(next_changed(&mut barrier).await.0.is_ok());
 
         tokio::time::advance(timeout).await;
@@ -2528,7 +2555,7 @@ mod tests {
             TokioRuntime,
         )
         .build();
-        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut watcher = client.watch::<TestResource>("res-0");
         gates.recv().await.unwrap().send(()).unwrap();
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
@@ -2590,7 +2617,7 @@ mod tests {
                 TokioRuntime,
             )
             .build();
-            let watcher = client.watch::<TestResource>("res-0").await;
+            let watcher = client.watch::<TestResource>("res-0");
             let mut gate = gates.recv().await.unwrap();
             drop(client);
             // A watcher alone keeps the actor and its pending connection alive.
@@ -2616,7 +2643,7 @@ mod tests {
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
             .with_resource_initial_timeout(None);
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
-        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut watcher = client.watch::<TestResource>("res-0");
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
         server
@@ -2631,7 +2658,7 @@ mod tests {
         // Keep the committed event queued. Fail a write while the reader waits
         // for its completion token, forcing disposal of that entire session.
         drop(server.requests);
-        let _extra = client.watch::<TestResource>("res-1").await;
+        let _extra = client.watch::<TestResource>("res-1");
         let mut replacement = tokio::time::timeout(Duration::from_secs(5), servers.recv())
             .await
             .expect("held token blocked reconnect")
@@ -2668,7 +2695,7 @@ mod tests {
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
             .with_metrics_recorder(recorder.clone())
             .build();
-        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut watcher = client.watch::<TestResource>("res-0");
         let mut old = servers.recv().await.unwrap();
         old.requests.recv().await.unwrap();
         old.responses
@@ -2730,7 +2757,7 @@ mod tests {
                 .is_err(),
             "connected without a subscription"
         );
-        let watcher = client.watch::<TestResource>("res-0").await;
+        let watcher = client.watch::<TestResource>("res-0");
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
         drop(watcher);
@@ -2745,7 +2772,7 @@ mod tests {
                 .is_err(),
             "sent a request without subscriptions"
         );
-        let _watcher = client.watch::<TestResource>("res-2").await;
+        let _watcher = client.watch::<TestResource>("res-2");
         let request = replacement.requests.recv().await.unwrap();
         assert!(
             String::from_utf8(request.to_vec())
@@ -2754,23 +2781,26 @@ mod tests {
         );
     }
 
+    /// Backoff resets only after a stream delivers a decoded response, so an
+    /// undecodable response keeps growing the delay (100ms -> 200ms) while a
+    /// decoded one restarts it at the initial backoff (100ms).
     #[tokio::test(start_paused = true)]
-    async fn transport_resets_retry_limit_only_after_a_decoded_response() {
+    async fn transport_resets_backoff_only_after_a_decoded_response() {
         for valid_response in [false, true] {
             let (builder, mut servers) = mock_transport();
             let policy = crate::RetryPolicy::default()
                 .with_initial_backoff(Duration::from_millis(100))
                 .unwrap()
                 .with_jitter(0.0)
-                .unwrap()
-                .with_max_attempts(Some(1));
+                .unwrap();
             let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
                 .with_resource_initial_timeout(None)
                 .with_retry_policy(policy);
             let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
-            let mut watcher = client.watch::<TestResource>("res-0").await;
+            let mut watcher = client.watch::<TestResource>("res-0");
             let mut first = servers.recv().await.unwrap();
             first.requests.recv().await.unwrap();
+            // First failure without a response: wait the initial 100ms.
             first.responses.send(Ok(None)).unwrap();
             let mut second = servers.recv().await.unwrap();
             second.requests.recv().await.unwrap();
@@ -2784,24 +2814,50 @@ mod tests {
                 drop(done);
                 second.requests.recv().await.unwrap();
                 second.responses.send(Ok(None)).unwrap();
-                let mut third = tokio::time::timeout(Duration::from_secs(1), servers.recv())
-                    .await
-                    .expect("decoded response did not reset retry limit")
-                    .unwrap();
-                third.requests.recv().await.unwrap();
             } else {
                 second
                     .responses
                     .send(Ok(Some(Bytes::from_static(&[0xff]))))
                     .unwrap();
+            }
+            let failed_at = tokio::time::Instant::now();
+            let mut third = tokio::time::timeout(Duration::from_secs(1), servers.recv())
+                .await
+                .expect("transport stopped reconnecting")
+                .unwrap();
+            let delay = failed_at.elapsed();
+            if valid_response {
                 assert!(
-                    tokio::time::timeout(Duration::from_secs(1), servers.recv())
-                        .await
-                        .expect("retry limit did not stop the transport")
-                        .is_none(),
-                    "undecodable response reset retry limit"
+                    delay < Duration::from_millis(200),
+                    "decoded response did not reset backoff: {delay:?}"
+                );
+            } else {
+                assert!(
+                    delay >= Duration::from_millis(200),
+                    "undecodable response reset backoff: {delay:?}"
                 );
             }
+            third.requests.recv().await.unwrap();
+        }
+    }
+
+    /// The transport never gives up: it keeps reconnecting through a long run
+    /// of consecutive failures, well past the point where an uncapped
+    /// exponential delay would overflow `Duration`.
+    #[tokio::test(start_paused = true)]
+    async fn transport_keeps_retrying_after_many_failures() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(None);
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let _watcher = client.watch::<TestResource>("res-0");
+        for attempt in 0..200 {
+            let mut server = tokio::time::timeout(Duration::from_secs(60), servers.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no reconnect for attempt {attempt}"))
+                .expect("transport stopped reconnecting");
+            server.requests.recv().await.unwrap();
+            server.responses.send(Ok(None)).unwrap();
         }
     }
 
@@ -2812,7 +2868,7 @@ mod tests {
         server: &mut MockServer,
         name: &str,
     ) -> ResourceWatcher<TestResource> {
-        let watcher = client.watch::<TestResource>(name).await;
+        let watcher = client.watch::<TestResource>(name);
         let _request = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
             .await
             .expect("timed out waiting for subscription request")
@@ -2857,7 +2913,7 @@ mod tests {
             .build();
 
         // Initial state: connected = 1 is recorded for the server URI
-        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut watcher = client.watch::<TestResource>("res-0");
         let mut server1 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
             .await
             .expect("timed out waiting for stream 1")
@@ -2986,7 +3042,7 @@ mod tests {
             .with_metrics_recorder(recorder.clone())
             .build();
 
-        let _watcher = client.watch::<TestResource>("res-0").await;
+        let _watcher = client.watch::<TestResource>("res-0");
 
         tokio::time::timeout(Duration::from_secs(5), attempt_rx)
             .await
@@ -3004,12 +3060,8 @@ mod tests {
         ));
     }
 
-    /// A watcher that issues more commands than the command channel buffers
-    /// while holding its `ProcessingDone` token must not deadlock the worker.
-    ///
-    /// Before the flow-control fix the worker awaited the token inside
-    /// `handle_response`, so it stopped draining commands; once the channel
-    /// filled, watcher and worker waited on each other forever.
+    /// Watch commands must be processed while a watcher holds `ProcessingDone`,
+    /// and response delivery must resume after the token is dropped.
     #[tokio::test]
     async fn commands_drain_while_processing_done_is_held() {
         let (client, mut watcher, server) = connected_client().await;
@@ -3030,15 +3082,16 @@ mod tests {
             panic!("expected ResourceChanged(Ok)");
         };
 
-        // More commands than the previous bounded queue could hold.
+        // Register a batch of cascading watches while response delivery is paused.
         let mut extra = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            for i in 1..=100 {
-                extra.push(client.watch::<TestResource>(format!("res-{i}")).await);
-            }
-        })
-        .await
-        .expect("deadlock: commands not drained while ProcessingDone was held");
+        for i in 1..=100 {
+            extra.push(client.watch::<TestResource>(format!("res-{i}")));
+        }
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), client.resource_snapshot())
+            .await
+            .expect("watch commands stalled while ProcessingDone was held");
+        assert_eq!(snapshot.len(), 101);
 
         // The worker is still healthy end-to-end: it reads the next response
         // and delivers it.
@@ -3239,17 +3292,15 @@ mod tests {
         assert!(next_changed(&mut w1).await.0.is_ok());
     }
 
-    /// A wildcard watcher receiving a response with more resources than
-    /// the previous watcher buffer size (16) must not deadlock the worker even
-    /// before the watcher reads any events, and ADS flow control must remain
-    /// gated until all delivered tokens are dropped.
+    /// An unread wildcard response must not prevent new watches or cached
+    /// replay. The next response remains gated until all delivered tokens drop.
     #[tokio::test]
     async fn wildcard_watcher_many_resources_does_not_deadlock() {
         let (builder, mut servers) = mock_transport();
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
 
-        let mut watcher = client.watch::<TestResource>("").await;
+        let mut watcher = client.watch::<TestResource>("");
         let mut server = tokio::time::timeout(Duration::from_secs(5), servers.recv())
             .await
             .expect("timed out waiting for stream")
@@ -3275,16 +3326,11 @@ mod tests {
 
         // Worker is not deadlocked even though 50 events were produced and none
         // have been read from `watcher` yet: issuing a command succeeds.
-        let mut extra = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.watch::<TestResource>("extra"),
-        )
-        .await
-        .expect("worker deadlocked on full wildcard channel");
+        let mut extra = client.watch::<TestResource>("extra");
 
         // The wildcard watcher has consumed nothing. A second watcher must
         // still reach the actor and receive the cached resource.
-        let mut cached = client.watch::<TestResource>("res-0").await;
+        let mut cached = client.watch::<TestResource>("res-0");
         assert!(next_changed(&mut cached).await.0.is_ok());
 
         let mut dones = Vec::new();
@@ -3317,7 +3363,7 @@ mod tests {
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
 
-        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut watcher = client.watch::<TestResource>("res-0");
         let mut server1 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
             .await
             .expect("timed out waiting for stream")
@@ -3373,8 +3419,8 @@ mod tests {
         assert_eq!(parse_request(&ack), ("1".to_string(), "n1".to_string()));
 
         // While `done` is held, add two more watches.
-        let _w1 = client.watch::<TestResource>("res-1").await;
-        let _w2 = client.watch::<TestResource>("res-2").await;
+        let _w1 = client.watch::<TestResource>("res-1");
+        let _w2 = client.watch::<TestResource>("res-2");
 
         // Both requests should arrive on the stream in order.
         let req1 = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
@@ -3499,7 +3545,7 @@ mod tests {
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
         let mut watchers = Vec::new();
         for name in ["res-0", "res-1", "res-2"] {
-            watchers.push(client.watch::<VersionedResource>(name).await);
+            watchers.push(client.watch::<VersionedResource>(name));
         }
         let server = servers.recv().await.unwrap();
 
@@ -3565,7 +3611,7 @@ mod tests {
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
             .with_resource_initial_timeout(Some(Duration::from_millis(10)));
         let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
-        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut watcher = client.watch::<TestResource>("res-0");
         let _server = servers.recv().await.unwrap();
 
         let (result, _done) = next_changed(&mut watcher).await;

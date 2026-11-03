@@ -161,7 +161,10 @@ impl ChannelCredentials for HttpConnectHandshaker {
         self.inner.info()
     }
 
-    fn get_call_credentials(&self, token: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+    fn get_call_credentials(
+        &self,
+        token: private::UnstableToken,
+    ) -> Option<&Arc<dyn CallCredentials>> {
         self.inner.get_call_credentials(token)
     }
 
@@ -171,7 +174,7 @@ impl ChannelCredentials for HttpConnectHandshaker {
         source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-        token: private::Internal,
+        token: private::UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         // Perform the HTTP CONNECT handshake.
         let proxied_stream = do_connect_handshake(source, &self.options).await?;

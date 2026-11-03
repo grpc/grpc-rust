@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use rand::RngExt;
 
-use crate::error::{Error, Result};
+use crate::error::Error;
+use crate::error::Result;
 
 /// Retry policy for xDS client connection attempts.
 ///
@@ -68,13 +69,6 @@ pub struct RetryPolicy {
     ///
     /// Default: 2.0 (exponential backoff).
     backoff_multiplier: f64,
-
-    /// Maximum number of retry attempts.
-    ///
-    /// If `None`, retries indefinitely. If `Some(n)`, stops after `n` attempts.
-    ///
-    /// Default: None (infinite retries).
-    max_attempts: Option<usize>,
 
     /// The factor with which backoffs are randomized.
     jitter: f64,
@@ -203,17 +197,10 @@ impl RetryPolicy {
         Ok(self)
     }
 
-    /// Set the maximum number of retry attempts.
-    ///
-    /// If set to `None`, retries indefinitely.
-    pub fn with_max_attempts(mut self, max_attempts: Option<usize>) -> Self {
-        self.max_attempts = max_attempts;
-        self
-    }
-
     /// Calculate the backoff duration for a given attempt number.
     ///
-    /// Returns `None` if `max_attempts` is set and the attempt exceeds it.
+    /// There is no attempt limit: the stream is retried for the lifetime of
+    /// the client.
     ///
     /// # Arguments
     ///
@@ -226,25 +213,19 @@ impl RetryPolicy {
     /// use std::time::Duration;
     ///
     /// let policy = RetryPolicy::default();
-    /// assert_eq!(policy.backoff_duration(0), Some(Duration::from_secs(1)));
-    /// assert_eq!(policy.backoff_duration(1), Some(Duration::from_secs(2)));
-    /// assert_eq!(policy.backoff_duration(2), Some(Duration::from_secs(4)));
+    /// assert_eq!(policy.backoff_duration(0), Duration::from_secs(1));
+    /// assert_eq!(policy.backoff_duration(1), Duration::from_secs(2));
+    /// assert_eq!(policy.backoff_duration(2), Duration::from_secs(4));
     /// ```
-    pub fn backoff_duration(&self, attempt: usize) -> Option<Duration> {
-        // Check if we've exceeded max attempts
-        if let Some(max) = self.max_attempts
-            && attempt >= max
-        {
-            return None;
-        }
-
+    pub fn backoff_duration(&self, attempt: usize) -> Duration {
         // Calculate exponential backoff (saturate to i32::MAX to avoid overflow in powi)
         let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
         let multiplier = self.backoff_multiplier.powi(exponent);
-        let backoff = self.initial_backoff.mul_f64(multiplier);
 
-        // Cap at max_backoff
-        Some(backoff.min(self.max_backoff))
+        // Cap at max_backoff. Compare in f64 first: after enough attempts the
+        // product exceeds `Duration` (or reaches infinity), which would panic.
+        Duration::try_from_secs_f64(self.initial_backoff.as_secs_f64() * multiplier)
+            .map_or(self.max_backoff, |backoff| backoff.min(self.max_backoff))
     }
 }
 
@@ -255,14 +236,12 @@ impl Default for RetryPolicy {
     /// - `initial_backoff`: 1 second
     /// - `max_backoff`: 30 seconds
     /// - `backoff_multiplier`: 2.0
-    /// - `max_attempts`: None (infinite retries)
     /// - `jitter`: 0.2
     fn default() -> Self {
         Self {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             backoff_multiplier: 2.0,
-            max_attempts: None,
             jitter: 0.2,
         }
     }
@@ -283,16 +262,16 @@ impl Default for RetryPolicy {
 ///
 /// // Each backoff is the exponential base (1s, 2s, ...) randomized by ±20%
 /// // jitter, so it lands within [0.8x, 1.2x) of the base.
-/// let first = backoff.next_backoff().unwrap();
+/// let first = backoff.next_backoff();
 /// assert!(first >= Duration::from_millis(800) && first < Duration::from_millis(1200));
 ///
 /// // Second failure: the base doubles to 2s (again jittered ±20%).
-/// let second = backoff.next_backoff().unwrap();
+/// let second = backoff.next_backoff();
 /// assert!(second >= Duration::from_millis(1600) && second < Duration::from_millis(2400));
 ///
 /// // Success: reset for the next failure sequence (base returns to 1s).
 /// backoff.reset();
-/// let after_reset = backoff.next_backoff().unwrap();
+/// let after_reset = backoff.next_backoff();
 /// assert!(after_reset >= Duration::from_millis(800) && after_reset < Duration::from_millis(1200));
 /// ```
 #[derive(Debug, Clone)]
@@ -308,13 +287,12 @@ impl Backoff {
     }
 
     /// Get the next backoff duration and advance the attempt counter.
-    ///
-    /// Returns `None` if `max_attempts` is set and has been exceeded.
-    pub fn next_backoff(&mut self) -> Option<Duration> {
-        let base = self.policy.backoff_duration(self.attempt)?;
-        self.attempt += 1;
+    pub fn next_backoff(&mut self) -> Duration {
+        let base = self.policy.backoff_duration(self.attempt);
+        self.attempt = self.attempt.saturating_add(1);
         let factor = 1.0 + self.policy.jitter * rand::rng().random_range(-1.0..1.0);
-        Some(base.mul_f64(factor))
+        // Saturate rather than panic if jitter pushes a huge max_backoff past Duration::MAX.
+        Duration::try_from_secs_f64(base.as_secs_f64() * factor).unwrap_or(Duration::MAX)
     }
 
     /// Reset the backoff after a successful operation.
@@ -338,18 +316,17 @@ mod tests {
     #[test]
     fn next_backoff_applies_bounded_jitter() {
         let mut backoff = Backoff::new(RetryPolicy::default()); // jitter 0.2, base 1s, mult 2
-        let msg = "next_backoff is Some while max_attempts is None";
 
         // base 1s -> [0.8s, 1.2s]
-        let d = backoff.next_backoff().expect(msg);
+        let d = backoff.next_backoff();
         assert!(d > Duration::from_secs_f64(0.8 - EPSILON));
         assert!(d < Duration::from_secs_f64(1.2 + EPSILON));
         // base 2s -> [1.6s, 2.4s]
-        let d = backoff.next_backoff().expect(msg);
+        let d = backoff.next_backoff();
         assert!(d > Duration::from_secs_f64(1.6 - EPSILON));
         assert!(d < Duration::from_secs_f64(2.4 + EPSILON));
         // base 4s -> [3.2s, 4.8s]
-        let d = backoff.next_backoff().expect(msg);
+        let d = backoff.next_backoff();
         assert!(d > Duration::from_secs_f64(3.2 - EPSILON));
         assert!(d < Duration::from_secs_f64(4.8 + EPSILON));
     }
@@ -361,20 +338,28 @@ mod tests {
         let policy = RetryPolicy::default()
             .with_jitter(0.0)
             .expect("0.0 should disabled jitter on retry policy");
-        let msg = "next_backoff is Some while max_attempts is None";
         let mut backoff = Backoff::new(policy);
 
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(1));
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(2));
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(4));
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(8));
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(16));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(1));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(2));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(4));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(8));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(16));
         // Capped at max_backoff (32s -> 30s).
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(30));
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(30));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(30));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(30));
 
         backoff.reset();
-        assert_eq!(backoff.next_backoff().expect(msg), Duration::from_secs(1));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(1));
+    }
+
+    /// Attempt counts far beyond any realistic outage still yield the capped
+    /// delay rather than overflowing or stopping.
+    #[test]
+    fn backoff_duration_never_stops() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.backoff_duration(10_000), Duration::from_secs(30));
+        assert_eq!(policy.backoff_duration(usize::MAX), Duration::from_secs(30));
     }
 
     /// Jitter must be in `[0.0, 1.0]`; out-of-range values are rejected and a

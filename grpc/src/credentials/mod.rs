@@ -68,7 +68,10 @@ pub trait ChannelCredentials: Send + Sync + 'static {
 
     /// Returns call credentials to be used for all RPCs made on a connection.
     #[doc(hidden)]
-    fn get_call_credentials(&self, token: private::Internal) -> Option<&Arc<dyn CallCredentials>>;
+    fn get_call_credentials(
+        &self,
+        token: private::UnstableToken,
+    ) -> Option<&Arc<dyn CallCredentials>>;
 
     /// Performs the client-side authentication handshake on a raw endpoint.
     ///
@@ -91,7 +94,7 @@ pub trait ChannelCredentials: Send + Sync + 'static {
         source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-        token: private::Internal,
+        token: private::UnstableToken,
     ) -> Result<HandshakeOutput, String>;
 }
 
@@ -111,7 +114,7 @@ pub trait ServerCredentials: Send + Sync + 'static {
         &self,
         source: BoxEndpoint,
         runtime: GrpcRuntime,
-        token: private::Internal,
+        token: private::UnstableToken,
     ) -> Result<server::HandshakeOutput, String>;
 }
 

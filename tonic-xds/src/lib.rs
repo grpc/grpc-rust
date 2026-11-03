@@ -249,6 +249,32 @@
 //! [`XdsChannelBuilder::build_transport_channel`] honour it, and the channel
 //! types are unchanged, so switching needs no other code change.
 //!
+//! ## Sharing an xDS client
+//!
+//! Every channel takes its xDS client, and ADS stream, from an
+//! [`XdsClientPool`]. A channel built without one gets a pool of its own, so
+//! its client is not shared. Channels using the same pool share one client
+//! per key. The key defaults to the channel's target URI, as in
+//! [gRFC A71]; give every channel the same key to share one client across the
+//! process. The pool holds the bootstrap and ADS settings for its clients.
+//!
+//! ```rust,no_run
+//! use tonic_xds::{XdsChannelBuilder, XdsChannelConfig, XdsClientPool, XdsUri};
+//!
+//! // Loads the bootstrap from the environment.
+//! let pool = XdsClientPool::builder().build().unwrap();
+//!
+//! let build = |target: &str| {
+//!     XdsChannelBuilder::new(XdsChannelConfig::new(XdsUri::parse(target).unwrap()))
+//!         .with_xds_client_pool(pool.clone())
+//!         .with_xds_client_key("my-app")
+//!         .build_grpc_channel()
+//!         .unwrap()
+//! };
+//! let foo = build("xds:///foo:50051");
+//! let bar = build("xds:///bar:50051"); // Shares `foo`'s ADS stream.
+//! ```
+//!
 //! [A27]: https://github.com/grpc/proposal/blob/master/A27-xds-global-load-balancing.md
 //! [A28]: https://github.com/grpc/proposal/blob/master/A28-xds-traffic-splitting-and-routing.md
 //! [A29]: https://github.com/grpc/proposal/blob/master/A29-xds-tls-security.md
@@ -256,6 +282,7 @@
 //! [A61]: https://github.com/grpc/proposal/blob/master/A61-IPv4-IPv6-dualstack-backends.md
 //! [A63]: https://github.com/grpc/proposal/blob/master/A63-xds-string-matcher-ignore-case.md
 //! [A65]: https://github.com/grpc/proposal/blob/master/A65-xds-mtls-creds-in-bootstrap.md
+//! [gRFC A71]: https://github.com/grpc/proposal/blob/master/A71-xds-fallback.md
 
 pub(crate) mod client;
 pub(crate) mod common;
@@ -268,6 +295,7 @@ pub use client::channel::{
 pub use client::endpoint::{
     ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
 };
+pub use client::pool::{XdsClientPool, XdsClientPoolBuilder};
 pub use client::retry::{
     GrpcRetryClassifierFactory, RetryClassifier, RetryClassifierFactory, RetryOutcome,
     is_retryable_connection_error,

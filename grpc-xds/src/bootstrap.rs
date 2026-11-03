@@ -58,8 +58,9 @@ pub struct BootstrapConfig {
 
 impl BootstrapConfig {
     /// Creates a new bootstrap configuration with the given priority-ordered xDS servers
-    /// and a default [`Node`].
+    /// and a default [`Node`]. The servers must not be empty.
     pub fn new(xds_servers: Vec<XdsServerConfig>) -> Self {
+        assert!(!xds_servers.is_empty());
         Self {
             xds_servers,
             node: default_node(),
@@ -117,10 +118,14 @@ impl XdsServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grpc::credentials::LocalChannelCredentials;
 
     #[test]
     fn bootstrap_config_new_uses_default_node() {
-        let config = BootstrapConfig::new(vec![]);
+        let config = BootstrapConfig::new(vec![XdsServerConfig::new(
+            "example.com".to_string(),
+            LocalChannelCredentials::new_arc(),
+        )]);
         let default = default_node();
         assert_eq!(config.node.user_agent_name, default.user_agent_name);
         assert_eq!(config.node.user_agent_version, default.user_agent_version);

@@ -59,8 +59,6 @@ pub(crate) enum RouteSource {
 /// client implementation.
 #[derive(Debug, Clone)]
 pub(crate) struct ListenerResource {
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) name: String,
     pub(crate) route_source: RouteSource,
 }
@@ -153,8 +151,6 @@ impl Resource for ListenerResource {
 impl ListenerResource {
     /// Returns the RDS route config name for cascading subscriptions, or
     /// `None` when the route configuration was embedded inline.
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn route_config_name(&self) -> Option<&str> {
         match &self.route_source {
             RouteSource::Rds(name) => Some(name),

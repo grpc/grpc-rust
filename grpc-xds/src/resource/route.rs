@@ -60,8 +60,6 @@ pub(crate) struct RouteConfigResource {
 /// Validated virtual host with domain matching and routes.
 #[derive(Debug, Clone)]
 pub(crate) struct VirtualHost {
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) name: String,
     pub(crate) domains: Vec<DomainMatcher>,
     pub(crate) routes: Vec<Route>,
@@ -111,8 +109,6 @@ impl TryFrom<&str> for DomainMatcher {
 /// A validated route with match criteria and action.
 #[derive(Debug, Clone)]
 pub(crate) struct Route {
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) route_match: RouteMatch,
     pub(crate) action: RouteAction,
 }
@@ -178,8 +174,6 @@ pub(crate) enum RouteAction {
 #[derive(Debug, Clone)]
 pub(crate) struct WeightedCluster {
     pub(crate) name: String,
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) weight: u32,
 }
 
@@ -498,6 +492,7 @@ impl VirtualHost {
     /// Returns cluster names referenced by this virtual host, for cascading
     /// CDS subscriptions after the dependency manager selects the host that
     /// matches the channel authority.
+    #[allow(dead_code)] // TODO: remove once dependency manager calls this.
     pub(crate) fn cluster_names(&self) -> HashSet<String> {
         let mut clusters = HashSet::new();
         for route in &self.routes {

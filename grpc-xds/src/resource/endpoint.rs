@@ -39,25 +39,15 @@ use crate::generated::envoy::config::endpoint::v3::lb_endpoint::HostIdentifierOn
 /// Validated ClusterLoadAssignment (EDS resource).
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointsResource {
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) cluster_name: String,
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) localities: Vec<LocalityLbEndpoints>,
 }
 
 /// Endpoints within a single locality.
 #[derive(Debug, Clone)]
 pub(crate) struct LocalityLbEndpoints {
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) locality: Locality,
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) endpoints: Vec<LbEndpoint>,
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[expect(dead_code)]
     pub(crate) load_balancing_weight: u32,
     pub(crate) priority: u32,
 }
@@ -78,8 +68,6 @@ pub(crate) struct Locality {
 #[derive(Debug, Clone)]
 pub(crate) struct LbEndpoint {
     pub(crate) address: EndpointAddress,
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) health_status: HealthStatus,
     pub(crate) load_balancing_weight: u32,
 }
@@ -312,8 +300,6 @@ fn validate_lb_endpoint(
 impl EndpointsResource {
     /// Returns all healthy endpoints (`Unknown` and `Healthy` status), per
     /// gRFC A27's definition of usable endpoints.
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn healthy_endpoints(&self) -> impl Iterator<Item = &LbEndpoint> {
         self.localities
             .iter()

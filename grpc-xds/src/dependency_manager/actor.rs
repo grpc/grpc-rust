@@ -54,7 +54,7 @@ use crate::routing::find_virtual_host_index;
 use crate::xds_config::XdsConfig;
 
 /// Runs a dependency manager until the XdsClient stops.
-pub(crate) async fn run(options: DependencyManagerOptions) {
+pub(super) async fn run(options: DependencyManagerOptions) {
     Actor::new(options).await.run().await;
 }
 

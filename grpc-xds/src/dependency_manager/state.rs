@@ -35,7 +35,7 @@ use xds_client::ResourceEvent;
 /// the cached value, while an *ambient error* (such as a broken stream) keeps
 /// it and only adds a note.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WatchState<T> {
+pub(super) enum WatchState<T> {
     /// The watch has started but nothing has been received yet.
     Pending,
     /// A usable value. `note` holds the latest ambient error, if any; the next
@@ -72,7 +72,7 @@ impl<T> WatchState<Arc<T>> {
     /// Applies an XdsClient event, and returns its flow-control token.
     ///
     /// `describe` turns the event's error into the reason or note to store.
-    pub(crate) fn apply(
+    pub(super) fn apply(
         &mut self,
         event: ResourceEvent<T>,
         describe: impl FnOnce(xds_client::Error) -> Arc<str>,

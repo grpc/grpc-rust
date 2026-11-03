@@ -54,7 +54,7 @@ const DNS_UNSUPPORTED: &str = "LogicalDNS clusters are not supported yet";
 /// Each watcher has a cached state under the same name, and vice versa. Only
 /// [`Self::reconcile`] adds or removes watches, and it changes both together.
 #[derive(Debug, Default)]
-pub(crate) struct Watches {
+pub(super) struct Watches {
     cache: CachedResources,
     clusters: HashMap<String, ResourceWatcher<ClusterResource>>,
     endpoints: HashMap<String, ResourceWatcher<EndpointsResource>>,
@@ -67,7 +67,7 @@ pub(crate) struct Watches {
 
 /// An event for one of the [`Watches`].
 #[derive(Debug)]
-pub(crate) enum Update {
+pub(super) enum Update {
     Cluster(String, ResourceEvent<ClusterResource>),
     Endpoints(String, ResourceEvent<EndpointsResource>),
     /// A LogicalDNS target has been resolved.
@@ -75,7 +75,7 @@ pub(crate) enum Update {
 }
 
 impl Watches {
-    pub(crate) fn cache(&self) -> &CachedResources {
+    pub(super) fn cache(&self) -> &CachedResources {
         &self.cache
     }
 
@@ -87,7 +87,7 @@ impl Watches {
     ///
     /// The caller must have taken every update from [`Self::poll_next`]
     /// first, so that no update is left for a watch that this drops.
-    pub(crate) async fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
+    pub(super) async fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
         reconcile(
             client,
             &mut self.clusters,
@@ -118,7 +118,7 @@ impl Watches {
     /// When no polled updates are left, this polls every watcher and keeps
     /// all the updates that are ready, so that a response for many resources
     /// costs one pass over the watchers rather than one pass per resource.
-    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Update>> {
+    pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Update>> {
         if self.ready.is_empty() {
             self.poll_watchers(cx);
         }
@@ -147,7 +147,7 @@ impl Watches {
 
     /// Applies `update` to its cached state, and returns its flow-control
     /// token, if it has one.
-    pub(crate) fn apply(&mut self, update: Update) -> Option<ProcessingDone> {
+    pub(super) fn apply(&mut self, update: Update) -> Option<ProcessingDone> {
         const WATCHED: &str = "an update's watch is dropped only once its updates are taken";
         match update {
             Update::Cluster(name, event) => {

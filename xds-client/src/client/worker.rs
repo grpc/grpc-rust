@@ -395,22 +395,40 @@ impl CachedResource {
     }
 }
 
+#[derive(Debug)]
+struct ResourceSubscriber {
+    watchers: HashMap<WatcherId, mpsc::UnboundedSender<ResourceEvent<DecodedResource>>>,
+    cached: CachedResource,
+    /// Dropping the sender cancels the pending resource timeout.
+    timer: Option<(u64, oneshot::Sender<()>)>,
+}
+
+impl Default for ResourceSubscriber {
+    fn default() -> Self {
+        Self {
+            watchers: HashMap::new(),
+            cached: CachedResource::requested(),
+            timer: None,
+        }
+    }
+}
+
 /// Per-type_url state tracking.
 /// Retained for stream bookkeeping; resource state and version expire when idle.
 struct TypeState {
     /// Reference-counted type URL, shared with metric attribute slots so
     /// per-emission attribute construction is a cheap.
     type_url: Arc<str>,
-    /// Decoder for the current watch cycle.
+    /// Decoder for this resource type.
     decoder: DecoderFn,
     /// Last accepted version, retained across stream restarts while watched.
     version_info: String,
-    /// Active watchers for this type.
-    watchers: HashMap<WatcherId, WatcherEntry>,
+    /// Watchers interested in every resource of this type.
+    wildcard_watchers: HashMap<WatcherId, mpsc::UnboundedSender<ResourceEvent<DecodedResource>>>,
     /// Current subscription mode (wildcard or named resources).
     subscription: SubscriptionMode,
-    /// Resource cache: name -> cached resource.
-    cache: HashMap<String, CachedResource>,
+    /// Named watchers, cached data, and timeout owned by each resource.
+    resources: HashMap<String, ResourceSubscriber>,
     /// Whether missing resources in SotW should be treated as deleted (per A53).
     all_resources_required_in_sotw: bool,
 }
@@ -421,9 +439,9 @@ impl std::fmt::Debug for TypeState {
             .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
             .field("version_info", &self.version_info)
-            .field("watchers", &self.watchers)
+            .field("wildcard_watchers", &self.wildcard_watchers)
             .field("subscription", &self.subscription)
-            .field("cache", &format!("<{} entries>", self.cache.len()))
+            .field("resources", &format!("<{} entries>", self.resources.len()))
             .field(
                 "all_resources_required_in_sotw",
                 &self.all_resources_required_in_sotw,
@@ -438,33 +456,34 @@ impl TypeState {
             type_url,
             decoder,
             version_info: String::new(),
-            watchers: HashMap::new(),
+            wildcard_watchers: HashMap::new(),
             subscription: SubscriptionMode::Named(HashSet::new()),
-            cache: HashMap::new(),
+            resources: HashMap::new(),
             all_resources_required_in_sotw,
         }
     }
 
     /// Recalculate subscription mode from watchers.
     fn recalculate_subscriptions(&mut self) {
-        let has_wildcard = self
-            .watchers
-            .values()
-            .any(|entry| entry.subscription.is_wildcard());
-
-        if has_wildcard {
-            self.subscription = SubscriptionMode::Wildcard;
+        self.subscription = if self.wildcard_watchers.is_empty() {
+            SubscriptionMode::Named(
+                self.resources
+                    .iter()
+                    .filter(|(_, resource)| !resource.watchers.is_empty())
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            )
         } else {
-            let names: HashSet<String> = self
-                .watchers
+            SubscriptionMode::Wildcard
+        };
+    }
+
+    fn has_watchers(&self) -> bool {
+        !self.wildcard_watchers.is_empty()
+            || self
+                .resources
                 .values()
-                .filter_map(|entry| match &entry.subscription {
-                    WatcherSubscription::Named(name) => Some(name.clone()),
-                    WatcherSubscription::Wildcard => None,
-                })
-                .collect();
-            self.subscription = SubscriptionMode::Named(names);
-        }
+                .any(|resource| !resource.watchers.is_empty())
     }
 
     /// Get resource names to send in DiscoveryRequest.
@@ -477,23 +496,24 @@ impl TypeState {
         &self,
         name: &str,
     ) -> impl Iterator<Item = &mpsc::UnboundedSender<ResourceEvent<DecodedResource>>> {
-        self.watchers
-            .values()
-            .filter(move |e| e.subscription.matches(name))
-            .map(|e| &e.event_tx)
+        self.resources
+            .get(name)
+            .into_iter()
+            .flat_map(|resource| resource.watchers.values())
+            .chain(self.wildcard_watchers.values())
     }
 
     /// Snapshots of the subscribed resources in the cache.
     fn snapshot(&self) -> impl Iterator<Item = ResourceSnapshot> + '_ {
-        self.cache
+        self.resources
             .iter()
             .filter(|(name, _)| self.subscription.includes(name))
-            .map(|(name, cached)| ResourceSnapshot {
+            .map(|(name, resource)| ResourceSnapshot {
                 type_url: self.type_url.to_string(),
                 name: name.clone(),
-                status: cached.state.status(),
-                accepted: cached.accepted.clone(),
-                rejected: match &cached.state {
+                status: resource.cached.state.status(),
+                accepted: resource.cached.accepted.clone(),
+                rejected: match &resource.cached.state {
                     ResourceState::NACKed(rejected) => Some(rejected.clone()),
                     _ => None,
                 },
@@ -505,8 +525,10 @@ impl TypeState {
     /// is the authoritative snapshot for the `grpc.xds_client.resources` gauge.
     fn resource_state_counts(&self) -> HashMap<&'static str, i64> {
         let mut counts: HashMap<&'static str, i64> = HashMap::new();
-        for cached in self.cache.values() {
-            *counts.entry(cached.state.cache_state_label()).or_insert(0) += 1;
+        for resource in self.resources.values() {
+            *counts
+                .entry(resource.cached.state.cache_state_label())
+                .or_insert(0) += 1;
         }
         counts
     }
@@ -531,28 +553,6 @@ impl WatcherSubscription {
             Self::Named(name)
         }
     }
-
-    /// Check if this subscription matches a resource name.
-    fn matches(&self, resource_name: &str) -> bool {
-        match self {
-            Self::Wildcard => true,
-            Self::Named(name) => name == resource_name,
-        }
-    }
-
-    /// Returns true if this is a wildcard subscription.
-    fn is_wildcard(&self) -> bool {
-        matches!(self, Self::Wildcard)
-    }
-}
-
-/// Per-watcher state.
-#[derive(Debug)]
-struct WatcherEntry {
-    /// Channel to send events to this watcher.
-    event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
-    /// What resources this watcher is subscribed to.
-    subscription: WatcherSubscription,
 }
 
 /// All inputs to the state actor share one FIFO message queue.
@@ -637,9 +637,8 @@ pub(crate) struct AdsWorker<C, R> {
     command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
-    /// Cancellation handles for resource timers (gRFC A57).
-    /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
-    resource_timers: HashMap<(String, String), (u64, oneshot::Sender<()>)>,
+    /// Locate a watch's owner without scanning resource subscriber collections.
+    watcher_index: HashMap<WatcherId, (String, WatcherSubscription)>,
     /// IDs continue across reconnects and subscription removal, wrapping at u64::MAX.
     next_resource_timer_id: u64,
     /// Optional backend + per-client A78 metric attributes
@@ -670,7 +669,7 @@ where
             command_tx: command_tx.downgrade(),
             command_rx,
             type_states: HashMap::new(),
-            resource_timers: HashMap::new(),
+            watcher_index: HashMap::new(),
             next_resource_timer_id: 0,
             recorder: RecorderHandle::new(recorder, target),
         }
@@ -741,7 +740,7 @@ where
                 && let Some(active) = &mut context.session
             {
                 drop(active.cancel.take());
-                self.resource_timers.clear();
+                self.cancel_resource_timers();
             }
         }
         if context.healthy {
@@ -775,7 +774,7 @@ where
             }
             TransportEvent::Failed { saw_response_tx } => {
                 // Dropping the handles cancels timers while the stream is unavailable.
-                self.resource_timers.clear();
+                self.cancel_resource_timers();
                 let saw_response = context.session.take().is_some_and(|s| s.saw_response);
                 if !saw_response {
                     self.record_unhealthy(&mut context.healthy);
@@ -815,7 +814,7 @@ where
         let type_urls: Vec<_> = self
             .type_states
             .iter()
-            .filter(|(_, state)| !state.watchers.is_empty())
+            .filter(|(_, state)| state.has_watchers())
             .map(|(type_url, _)| type_url.clone())
             .collect();
         for type_url in type_urls {
@@ -868,7 +867,7 @@ where
                     };
                     // Send the unsubscribe with the old version, then forget the evicted data.
                     if let Some(state) = self.type_states.get_mut(&type_url)
-                        && state.watchers.is_empty()
+                        && !state.has_watchers()
                     {
                         state.version_info.clear();
                     }
@@ -911,106 +910,98 @@ where
         decoder: DecoderFn,
         all_resources_required_in_sotw: bool,
     ) -> bool {
-        let type_url_string = type_url.to_string();
-        let type_state = self.type_states.entry(type_url_string).or_insert_with(|| {
-            TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
-        });
-
+        self.watcher_index.insert(
+            watcher_id,
+            (
+                type_url.to_string(),
+                WatcherSubscription::from_name(name.clone()),
+            ),
+        );
+        let type_state = self
+            .type_states
+            .entry(type_url.to_string())
+            .or_insert_with(|| {
+                TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
+            });
         let old_subscription = type_state.subscription.clone();
-        let watcher_subscription = WatcherSubscription::from_name(name.clone());
-
-        // Track newly-inserted cache entry for the resources gauge (None -> Requested).
         let mut was_new = false;
-
-        // For named subscriptions, check cache and send cached state to new watcher.
-        // For wildcard subscriptions, watchers receive updates as they come in.
-        if let WatcherSubscription::Named(ref resource_name) = watcher_subscription {
-            let cached = match type_state.cache.entry(resource_name.clone()) {
-                Entry::Vacant(v) => {
+        if name.is_empty() {
+            type_state.wildcard_watchers.insert(watcher_id, event_tx);
+        } else {
+            let resource = match type_state.resources.entry(name) {
+                Entry::Vacant(entry) => {
                     was_new = true;
-                    v.insert(CachedResource::requested())
+                    entry.insert(ResourceSubscriber::default())
                 }
-                Entry::Occupied(o) => o.into_mut(),
+                Entry::Occupied(entry) => entry.into_mut(),
             };
-
-            if let Some(event) = cached.to_event() {
-                // Enqueue cached state without waiting for the watcher.
+            if let Some(event) = resource.cached.to_event() {
                 let _ = event_tx.send(event);
             }
+            resource.watchers.insert(watcher_id, event_tx);
         }
-
-        type_state.watchers.insert(
-            watcher_id,
-            WatcherEntry {
-                event_tx,
-                subscription: watcher_subscription,
-            },
-        );
         type_state.recalculate_subscriptions();
-
-        let subscriptions_changed = type_state.subscription != old_subscription;
-
-        // Reconcile the resources gauge from the updated cache.
         if was_new {
             let counts = type_state.resource_state_counts();
             self.recorder
                 .sync_resource_counts(&type_state.type_url, &counts);
         }
-
-        subscriptions_changed
+        type_state.subscription != old_subscription
     }
 
-    /// Remove a watcher from the state.
-    /// Returns the type_url and whether subscriptions changed.
+    /// Remove a watcher and report whether the server subscription changed.
     fn remove_watcher(&mut self, watcher_id: WatcherId) -> Option<(String, bool)> {
-        let type_url = self
+        let (type_url, subscription) = self.watcher_index.remove(&watcher_id)?;
+        let type_state = self
             .type_states
-            .iter()
-            .find(|(_, state)| state.watchers.contains_key(&watcher_id))
-            .map(|(url, _)| url.clone())?;
-
-        let type_state = self.type_states.get_mut(&type_url)?;
-
-        let removed = type_state.watchers.remove(&watcher_id)?;
-        if type_state
-            .watchers
-            .values()
-            .any(|watcher| watcher.subscription == removed.subscription)
-        {
-            return Some((type_url, false));
-        }
-
-        let old_subscription = type_state.subscription.clone();
-        type_state.recalculate_subscriptions();
-        let subscriptions_changed = type_state.subscription != old_subscription;
-
-        let old_cache_len = type_state.cache.len();
-        match removed.subscription {
+            .get_mut(&type_url)
+            .expect("indexed watcher must have a type state");
+        let old_cache_len = type_state.resources.len();
+        match subscription {
             WatcherSubscription::Named(name) => {
-                self.resource_timers
-                    .remove(&(type_url.clone(), name.clone()));
-                // A remaining wildcard still needs this resource's data.
-                if !type_state.subscription.includes(&name) {
-                    type_state.cache.remove(&name);
+                let resource = type_state
+                    .resources
+                    .get_mut(&name)
+                    .expect("indexed named watcher must have a resource subscriber");
+                resource.watchers.remove(&watcher_id);
+                if !resource.watchers.is_empty() {
+                    return Some((type_url, false));
+                }
+                resource.timer = None;
+                if type_state.wildcard_watchers.is_empty() {
+                    type_state.resources.remove(&name);
                 }
             }
             WatcherSubscription::Wildcard => {
+                type_state.wildcard_watchers.remove(&watcher_id);
+                if !type_state.wildcard_watchers.is_empty() {
+                    return Some((type_url, false));
+                }
                 type_state
-                    .cache
-                    .retain(|name, _| type_state.subscription.includes(name));
+                    .resources
+                    .retain(|_, resource| !resource.watchers.is_empty());
             }
         }
-        if type_state.watchers.is_empty() {
-            type_state.cache = HashMap::new();
-            type_state.watchers = HashMap::new();
+        let old_subscription = type_state.subscription.clone();
+        type_state.recalculate_subscriptions();
+        if !type_state.has_watchers() {
+            type_state.resources = HashMap::new();
+            type_state.wildcard_watchers = HashMap::new();
         }
-        if type_state.cache.len() != old_cache_len {
+        if type_state.resources.len() != old_cache_len {
             let counts = type_state.resource_state_counts();
             self.recorder
                 .sync_resource_counts(&type_state.type_url, &counts);
         }
+        Some((type_url, type_state.subscription != old_subscription))
+    }
 
-        Some((type_url, subscriptions_changed))
+    fn cancel_resource_timers(&mut self) {
+        for state in self.type_states.values_mut() {
+            for resource in state.resources.values_mut() {
+                resource.timer = None;
+            }
+        }
     }
 
     /// Send a DiscoveryRequest for a type to the unbounded write channel.
@@ -1021,7 +1012,7 @@ where
         };
 
         // An empty initial request could accidentally establish a wildcard subscription.
-        if type_state.watchers.is_empty() && !stream.requested_types.contains_key(type_url) {
+        if !type_state.has_watchers() && !stream.requested_types.contains_key(type_url) {
             return Ok(());
         }
         let nonce = stream
@@ -1059,16 +1050,10 @@ where
             return;
         };
         let pending: Vec<_> = type_state
-            .watchers
-            .values()
-            .filter_map(|watcher| match &watcher.subscription {
-                WatcherSubscription::Named(name)
-                    if type_state.cache.get(name).is_some_and(|c| c.is_requested()) =>
-                {
-                    Some(name.clone())
-                }
-                _ => None,
-            })
+            .resources
+            .iter()
+            .filter(|(_, resource)| !resource.watchers.is_empty() && resource.cached.is_requested())
+            .map(|(name, _)| name.clone())
             .collect();
         for name in pending {
             self.start_resource_timer(type_url, name, timeout);
@@ -1102,7 +1087,7 @@ where
         stream_type.nonce.clone_from(&response.nonce);
 
         let (type_url_arc, decoder) = match self.type_states.get(&type_url) {
-            Some(s) if !s.watchers.is_empty() => (Arc::clone(&s.type_url), &s.decoder),
+            Some(s) if s.has_watchers() => (Arc::clone(&s.type_url), &s.decoder),
             Some(_) => {
                 // Retry a possibly stale unsubscribe, without retaining the idle version or data.
                 return self.send_ack(&stream.writes, &response);
@@ -1202,13 +1187,12 @@ where
                 continue;
             }
             let resource = Arc::new(resource);
-            type_state.cache.insert(
-                resource_name.clone(),
-                CachedResource::received(Arc::clone(&resource), accepted),
-            );
-            // Cancel the initial resource timer (gRFC A57).
-            self.resource_timers
-                .remove(&(type_url.to_string(), resource_name.clone()));
+            let subscriber = type_state
+                .resources
+                .entry(resource_name.clone())
+                .or_default();
+            subscriber.cached = CachedResource::received(Arc::clone(&resource), accepted);
+            subscriber.timer = None;
 
             for event_tx in type_state.matching_watchers(&resource_name) {
                 let _ = event_tx.send(ResourceEvent::ResourceChanged {
@@ -1243,21 +1227,16 @@ where
         }
 
         let error = rejected.details.clone();
-        let accepted = type_state
-            .cache
-            .remove(resource_name)
-            .and_then(|c| c.accepted);
-        type_state.cache.insert(
-            resource_name.to_string(),
-            CachedResource::nacked(rejected, accepted),
-        );
+        let subscriber = type_state
+            .resources
+            .entry(resource_name.to_string())
+            .or_default();
+        let accepted = subscriber.cached.accepted.take();
+        subscriber.cached = CachedResource::nacked(rejected, accepted);
+        subscriber.timer = None;
         let counts = type_state.resource_state_counts();
         self.recorder
             .sync_resource_counts(&type_state.type_url, &counts);
-
-        // Cancel the resource timer (gRFC A57).
-        self.resource_timers
-            .remove(&(type_url.to_string(), resource_name.to_string()));
 
         for event_tx in type_state.matching_watchers(resource_name) {
             let event = ResourceEvent::ResourceChanged {
@@ -1290,19 +1269,22 @@ where
         }
 
         let deleted_names: Vec<String> = type_state
-            .cache
+            .resources
             .iter()
-            .filter(|(name, cached)| {
-                matches!(cached.state, ResourceState::Received) && !received_names.contains(*name)
+            .filter(|(name, resource)| {
+                matches!(resource.cached.state, ResourceState::Received)
+                    && !received_names.contains(*name)
             })
             .map(|(name, _)| name.clone())
             .collect();
 
         for name in deleted_names {
-            let accepted = type_state.cache.remove(&name).and_then(|c| c.accepted);
-            type_state
-                .cache
-                .insert(name.clone(), CachedResource::does_not_exist(accepted));
+            let subscriber = type_state
+                .resources
+                .get_mut(&name)
+                .expect("resource collected from this map must still exist");
+            let accepted = subscriber.cached.accepted.take();
+            subscriber.cached = CachedResource::does_not_exist(accepted);
 
             for event_tx in type_state.matching_watchers(&name) {
                 let event = ResourceEvent::ResourceChanged {
@@ -1383,10 +1365,15 @@ where
     /// When the timer fires, it sends a `ResourceTimerExpired` command.
     /// The handler checks if the resource is still in Requested state before acting.
     fn start_resource_timer(&mut self, type_url: &str, name: String, timeout: Duration) {
-        let key = (type_url.to_string(), name.clone());
-
-        // Don't reset an existing timer — A57 says timeout starts on first request.
-        if self.resource_timers.contains_key(&key) {
+        let Some(resource) = self
+            .type_states
+            .get_mut(type_url)
+            .and_then(|state| state.resources.get_mut(&name))
+        else {
+            return;
+        };
+        // Preserve the first named watch's deadline.
+        if resource.timer.is_some() || resource.watchers.is_empty() {
             return;
         }
 
@@ -1413,7 +1400,7 @@ where
             }
         });
 
-        self.resource_timers.insert(key, (timer_id, cancel_tx));
+        resource.timer = Some((timer_id, cancel_tx));
     }
 
     /// Handle a resource timer expiration (gRFC A57).
@@ -1421,34 +1408,21 @@ where
     /// If the resource is still in Requested state, marks it as DoesNotExist
     /// and notifies all watchers interested in this resource.
     fn handle_resource_timeout(&mut self, type_url: &str, name: &str, timer_id: u64) {
+        let Some(type_state) = self.type_states.get_mut(type_url) else {
+            return;
+        };
+        let Some(resource) = type_state.resources.get_mut(name) else {
+            return;
+        };
         // Cancellation cannot retract an expiration already in the command queue.
-        let key = (type_url.to_string(), name.to_string());
-        let Entry::Occupied(timer) = self.resource_timers.entry(key) else {
-            return;
-        };
-        if timer.get().0 != timer_id {
+        if resource.timer.as_ref().map(|(id, _)| *id) != Some(timer_id) {
             return;
         }
-        timer.remove();
-
-        let type_state = match self.type_states.get_mut(type_url) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let is_pending = type_state
-            .cache
-            .get(name)
-            .map(|c| c.is_requested())
-            .unwrap_or(true);
-
-        if !is_pending {
+        resource.timer = None;
+        if !resource.cached.is_requested() {
             return;
         }
-
-        type_state
-            .cache
-            .insert(name.to_string(), CachedResource::does_not_exist(None));
+        resource.cached = CachedResource::does_not_exist(None);
         let counts = type_state.resource_state_counts();
         self.recorder
             .sync_resource_counts(&type_state.type_url, &counts);
@@ -2145,7 +2119,7 @@ mod tests {
             .unwrap();
         assert_eq!(stream.requested_types[TEST_TYPE_URL].nonce, "latest-nonce");
         assert!(worker.type_states[TEST_TYPE_URL].version_info.is_empty());
-        assert!(worker.type_states[TEST_TYPE_URL].cache.is_empty());
+        assert!(worker.type_states[TEST_TYPE_URL].resources.is_empty());
         assert!(recorder.take().is_empty());
         assert_eq!(
             requests.try_recv().unwrap(),
@@ -2405,6 +2379,38 @@ mod tests {
             .unwrap();
         assert!(next_changed(&mut rewatch).await.0.is_err());
         expect_request(&mut server, versioned_response("1", "n3", &["*"])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_one_wildcard_preserves_other_wildcard_resources() {
+        let (client, named, mut server) = connected_client().await;
+        let first = watch_synced(&client, &mut server, "").await;
+        let mut second = client.watch::<TestResource>("").await;
+        drop(named);
+        drop(first);
+        take_snapshot(&client).await;
+        assert!(server.requests.try_recv().is_err());
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut second).await.0.is_ok());
+        expect_request(&mut server, response("1", "n1", &["*"])).await;
+        let mut named = client.watch::<TestResource>("res-1").await;
+        assert!(next_changed(&mut named).await.0.is_ok());
+
+        drop(second);
+        expect_request(&mut server, response("1", "n1", &["res-1"])).await;
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut named).await.0.is_ok());
+        expect_request(&mut server, response("2", "n2", &["res-1"])).await;
+        drop(named);
+        expect_request(&mut server, response("2", "n2", &[])).await;
+        assert!(take_snapshot(&client).await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

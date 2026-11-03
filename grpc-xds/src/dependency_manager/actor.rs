@@ -27,7 +27,6 @@
 
 use std::collections::HashSet;
 use std::future::poll_fn;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
@@ -125,8 +124,6 @@ enum Input {
     Listener(ResourceEvent<ListenerResource>),
     RouteConfig(ResourceEvent<RouteConfigResource>),
     Watches(Update),
-    /// A watch has closed, which means that the XdsClient has stopped.
-    Closed,
 }
 
 /// The virtual host selected for the channel's data-plane authority.
@@ -216,13 +213,15 @@ impl Actor {
     async fn run_loop(mut self) {
         loop {
             let mut done = Vec::new();
-            let mut input = poll_fn(|cx| self.poll_input(cx)).await;
+            let mut next = poll_fn(|cx| self.poll_input(cx)).await;
             loop {
-                if self.handle(input, &mut done).is_break() {
+                let Some(input) = next else {
+                    self.publisher.error(XdsConfigErrorKind::XdsClientClosed);
                     return;
-                }
+                };
+                done.extend(self.handle(input));
                 match poll_fn(|cx| Poll::Ready(self.poll_input(cx))).await {
-                    Poll::Ready(next) => input = next,
+                    Poll::Ready(input) => next = input,
                     Poll::Pending => break,
                 }
             }
@@ -230,40 +229,37 @@ impl Actor {
         }
     }
 
-    /// Polls the watches, from the top of the resource tree down.
-    fn poll_input(&mut self, cx: &mut Context<'_>) -> Poll<Input> {
+    /// Polls the watches, from the top of the resource tree down. Returns
+    /// `None` once a watch has closed, which means that the XdsClient has
+    /// stopped.
+    fn poll_input(&mut self, cx: &mut Context<'_>) -> Poll<Option<Input>> {
         if let Poll::Ready(event) = self.listener.watcher.poll_next(cx) {
-            return Poll::Ready(event.map_or(Input::Closed, Input::Listener));
+            return Poll::Ready(event.map(Input::Listener));
         }
         if let Some(route_config) = &mut self.route_config
             && let Poll::Ready(event) = route_config.watcher.poll_next(cx)
         {
-            return Poll::Ready(event.map_or(Input::Closed, Input::RouteConfig));
+            return Poll::Ready(event.map(Input::RouteConfig));
         }
         self.watches
             .poll_next(cx)
-            .map(|update| update.map_or(Input::Closed, Input::Watches))
+            .map(|update| update.map(Input::Watches))
     }
 
-    /// Applies `input` to the cached states. Breaks once the XdsClient has
-    /// stopped.
-    fn handle(&mut self, input: Input, done: &mut Vec<ProcessingDone>) -> ControlFlow<()> {
+    /// Applies `input` to the cached states, and returns its flow-control
+    /// token, if it has one.
+    fn handle(&mut self, input: Input) -> Option<ProcessingDone> {
         match input {
-            Input::Listener(event) => done.push(self.listener.apply(event)),
+            Input::Listener(event) => Some(self.listener.apply(event)),
             Input::RouteConfig(event) => {
                 let route_config = self
                     .route_config
                     .as_mut()
                     .expect("RouteConfiguration events come from the RouteConfiguration watch");
-                done.push(route_config.apply(event));
+                Some(route_config.apply(event))
             }
-            Input::Watches(update) => done.extend(self.watches.apply(update)),
-            Input::Closed => {
-                self.publisher.error(XdsConfigErrorKind::XdsClientClosed);
-                return ControlFlow::Break(());
-            }
+            Input::Watches(update) => self.watches.apply(update),
         }
-        ControlFlow::Continue(())
     }
 
     /// Updates the watches to match the cached states, and publishes the
@@ -434,10 +430,10 @@ mod tests {
 
         /// Handles `inputs` as one batch, and returns what it published.
         async fn batch(&mut self, inputs: impl IntoIterator<Item = Input>) -> Vec<XdsConfigUpdate> {
-            let mut done = Vec::new();
-            for input in inputs {
-                assert!(self.actor.handle(input, &mut done).is_continue());
-            }
+            let done = inputs
+                .into_iter()
+                .filter_map(|input| self.actor.handle(input))
+                .collect();
             self.actor.finish_batch(done).await;
             std::mem::take(&mut *self.recorder.0.lock().unwrap())
         }

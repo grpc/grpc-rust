@@ -126,19 +126,10 @@ impl Watches {
     }
 
     fn poll_watchers(&mut self, cx: &mut Context<'_>) {
-        let ready = &mut self.ready;
-        for (name, watcher) in &mut self.clusters {
-            poll_ready(watcher, cx, |event| {
-                ready.push_back(event.map(|event| Update::Cluster(name.clone(), event)));
-            });
-        }
-        for (name, watcher) in &mut self.endpoints {
-            poll_ready(watcher, cx, |event| {
-                ready.push_back(event.map(|event| Update::Endpoints(name.clone(), event)));
-            });
-        }
+        poll_ready(&mut self.clusters, cx, Update::Cluster, &mut self.ready);
+        poll_ready(&mut self.endpoints, cx, Update::Endpoints, &mut self.ready);
         // Resolution always fails for now, so it is reported straight away.
-        ready.extend(
+        self.ready.extend(
             self.unresolved_dns
                 .drain(..)
                 .map(|target| Some(Update::Dns(target))),
@@ -184,18 +175,21 @@ async fn reconcile<T: Resource>(
     }
 }
 
-/// Passes each event that is ready on `watcher` to `push`, followed by `None`
-/// if the watcher has closed.
+/// Adds each event that is ready on `watchers` to `ready` as an [`Update`]
+/// made by `update`, followed by `None` for each watcher that has closed.
 fn poll_ready<T: Resource>(
-    watcher: &mut ResourceWatcher<T>,
+    watchers: &mut HashMap<String, ResourceWatcher<T>>,
     cx: &mut Context<'_>,
-    mut push: impl FnMut(Option<ResourceEvent<T>>),
+    update: fn(String, ResourceEvent<T>) -> Update,
+    ready: &mut VecDeque<Option<Update>>,
 ) {
-    while let Poll::Ready(event) = watcher.poll_next(cx) {
-        let closed = event.is_none();
-        push(event);
-        if closed {
-            return;
+    for (name, watcher) in watchers {
+        while let Poll::Ready(event) = watcher.poll_next(cx) {
+            let closed = event.is_none();
+            ready.push_back(event.map(|event| update(name.clone(), event)));
+            if closed {
+                break;
+            }
         }
     }
 }

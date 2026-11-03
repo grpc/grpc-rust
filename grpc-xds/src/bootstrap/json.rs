@@ -114,12 +114,10 @@ impl BootstrapConfig {
         }
 
         match std::env::var(ENV_BOOTSTRAP_CONFIG) {
-            Ok(json) => return Self::from_json(&json),
-            Err(VarError::NotUnicode(_)) => return Err(BootstrapError::EnvNotUnicode),
-            Err(VarError::NotPresent) => (),
+            Ok(json) => Self::from_json(&json),
+            Err(VarError::NotUnicode(_)) => Err(BootstrapError::EnvNotUnicode),
+            Err(VarError::NotPresent) => Err(BootstrapError::NotConfigured),
         }
-
-        Err(BootstrapError::NotConfigured)
     }
 
     /// Loads bootstrap configuration from a file path.

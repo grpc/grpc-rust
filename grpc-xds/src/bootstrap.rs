@@ -108,7 +108,7 @@ impl XdsServerConfig {
     /// Creates a new server configuration for the given URI and channel credentials.
     pub fn new(server_uri: String, channel_credentials: Arc<dyn ChannelCredentials>) -> Self {
         Self {
-            server_uri: server_uri,
+            server_uri,
             channel_credentials,
         }
     }

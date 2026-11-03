@@ -396,14 +396,14 @@ impl CachedResource {
 }
 
 #[derive(Debug)]
-struct ResourceSubscriber {
+struct ResourceWatchState {
     watchers: HashMap<WatcherId, mpsc::UnboundedSender<ResourceEvent<DecodedResource>>>,
     cached: CachedResource,
     /// Dropping the sender cancels the pending resource timeout.
     timer: Option<(u64, oneshot::Sender<()>)>,
 }
 
-impl Default for ResourceSubscriber {
+impl Default for ResourceWatchState {
     fn default() -> Self {
         Self {
             watchers: HashMap::new(),
@@ -428,7 +428,7 @@ struct TypeState {
     /// Current subscription mode (wildcard or named resources).
     subscription: SubscriptionMode,
     /// Named watchers, cached data, and timeout owned by each resource.
-    resources: HashMap<String, ResourceSubscriber>,
+    resources: HashMap<String, ResourceWatchState>,
     /// Whether missing resources in SotW should be treated as deleted (per A53).
     all_resources_required_in_sotw: bool,
 }
@@ -637,7 +637,7 @@ pub(crate) struct AdsWorker<C, R> {
     command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
-    /// Locate a watch's owner without scanning resource subscriber collections.
+    /// Maps watcher IDs to their type URL and subscription.
     watcher_index: HashMap<WatcherId, (String, WatcherSubscription)>,
     /// IDs continue across reconnects and subscription removal, wrapping at u64::MAX.
     next_resource_timer_id: u64,
@@ -931,7 +931,7 @@ where
             let resource = match type_state.resources.entry(name) {
                 Entry::Vacant(entry) => {
                     was_new = true;
-                    entry.insert(ResourceSubscriber::default())
+                    entry.insert(ResourceWatchState::default())
                 }
                 Entry::Occupied(entry) => entry.into_mut(),
             };
@@ -962,7 +962,7 @@ where
                 let resource = type_state
                     .resources
                     .get_mut(&name)
-                    .expect("indexed named watcher must have a resource subscriber");
+                    .expect("indexed named watcher must have resource watch state");
                 resource.watchers.remove(&watcher_id);
                 if !resource.watchers.is_empty() {
                     return Some((type_url, false));

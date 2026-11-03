@@ -271,6 +271,7 @@ impl TonicRecvStream {
         status: crate::Result<()>,
         md: Option<&TonicMeta>,
     ) -> ResponseStreamItem {
+        self.state = StreamState::Closed;
         if let Some(cancel_tx) = self.cancel_tx.take() {
             cancel_tx.cancel();
         }
@@ -298,14 +299,17 @@ enum StreamState {
 
 impl RecvStream for TonicRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
-        // Take the current state, leaving `Closed` in its place temporarily
-        let state = std::mem::replace(&mut self.state, StreamState::Closed);
-
-        match state {
+        match &mut self.state {
             // Closed is terminal.
             StreamState::Closed => ResponseStreamItem::StreamClosed,
-            // Stay closed after sending trailers (do not set self.state).
-            StreamState::LocalError(error) => self.trailers_from_grpc_result(Err(error), None),
+            StreamState::LocalError(_) => {
+                let StreamState::LocalError(error) =
+                    std::mem::replace(&mut self.state, StreamState::Closed)
+                else {
+                    unreachable!()
+                };
+                self.trailers_from_grpc_result(Err(error), None)
+            }
             StreamState::AwaitingHeaders(rx) => match rx.await {
                 Ok(Ok(response)) => {
                     let (metadata, stream, _extensions) = response.into_parts();
@@ -341,29 +345,20 @@ impl RecvStream for TonicRecvStream {
                         ),
                     }
                 }
-                Err(_) => {
-                    // Stay closed after sending trailers (do not set self.state).
-                    self.trailers_from_grpc_result(
-                        Err(StatusError::new(StatusCodeError::Unknown, "Task cancelled")),
-                        None,
-                    )
-                }
+                Err(_) => self.trailers_from_grpc_result(
+                    Err(StatusError::new(StatusCodeError::Unknown, "Task cancelled")),
+                    None,
+                ),
                 Ok(Err(mut status)) => {
                     // In a Trailers-only response, the tonic status contains
                     // the metadata.
-                    // Stay closed after sending trailers (do not set self.state).
                     let md = std::mem::take(status.metadata_mut());
                     self.trailers_from_tonic_status(&status, md)
                 }
             },
-            StreamState::Streaming(mut stream) => match stream.message().await {
+            StreamState::Streaming(stream) => match stream.message().await {
                 Ok(Some(mut buf)) => match msg.decode(&mut buf) {
-                    Ok(()) => {
-                        // More messages may remain in the stream; set receiver
-                        // again.
-                        self.state = StreamState::Streaming(stream);
-                        ResponseStreamItem::Message
-                    }
+                    Ok(()) => ResponseStreamItem::Message,
                     Err(e) => self.trailers_from_grpc_result(
                         Err(StatusError::new(
                             StatusCodeError::Internal,
@@ -373,12 +368,10 @@ impl RecvStream for TonicRecvStream {
                     ),
                 },
                 Err(mut status) => {
-                    // Stay closed after sending trailers (do not set self.state).
                     let md = std::mem::take(status.metadata_mut());
                     self.trailers_from_tonic_status(&status, md)
                 }
                 Ok(None) => {
-                    // Stay closed after sending trailers (do not set self.state).
                     let trailers = stream.trailers().await;
                     let md = trailers.unwrap_or_default().unwrap_or_default();
                     self.trailers_from_grpc_result(Ok(()), Some(&md))

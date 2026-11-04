@@ -37,6 +37,7 @@ use rustls_pki_types::CertificateDer;
 use tokio::sync::watch;
 use tokio_rustls::TlsStream;
 
+use grpc::__unstable::credentials::protocol_info_new;
 use grpc::__unstable::rt::EndpointIoStream;
 use grpc::__unstable::rt::GrpcEndpoint;
 use grpc::__unstable::rt::StreamEndpoint;
@@ -145,7 +146,7 @@ pub type StaticRootCertificatesProvider = StaticProvider<RootCertificates>;
 /// A provider for a single, fixed identity.
 pub type StaticIdentityProvider = StaticProvider<Identity>;
 
-static TLS_PROTO_INFO: ProtocolInfo = ProtocolInfo::unstable_new("tls");
+static TLS_PROTO_INFO: ProtocolInfo = protocol_info_new("tls");
 
 /// A [`GrpcEndpoint`] that carries TLS over an underlying transport endpoint.
 type TlsEndpoint<T> = StreamEndpoint<TlsStream<EndpointIoStream<T>>>;

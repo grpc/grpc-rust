@@ -267,7 +267,7 @@ impl<'a> ClusterConfig<'a> {
     }
 
     /// The cluster name.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'a str {
         self.name
     }
 

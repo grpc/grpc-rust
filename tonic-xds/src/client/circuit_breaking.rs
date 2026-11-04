@@ -37,11 +37,13 @@
 //! [gRFC A32]: https://github.com/grpc/proposal/blob/master/A32-xds-circuit-breaking.md
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
@@ -100,15 +102,13 @@ impl ClusterCircuitBreakerRegistry {
 
     pub(crate) fn set_cluster_config(
         &self,
-        cluster: impl Into<String>,
-        eds_service_name: impl Into<String>,
+        cluster: &str,
+        eds_service_name: &str,
         config: CircuitBreakingConfig,
     ) {
-        let cluster = cluster.into();
-        let eds_service_name = eds_service_name.into();
-        let counter_key = CounterKey::new(cluster.as_str(), eds_service_name.as_str());
+        let counter_key = CounterKey::new(cluster, eds_service_name);
         let counter = self.inner.counters.counter(&counter_key);
-        let state = self.ensure_state(&cluster);
+        let state = self.ensure_state(cluster);
         self.update_state_config(
             &state,
             CircuitBreakerRuntimeConfig {
@@ -320,28 +320,18 @@ impl ClusterCircuitBreaker {
             return Ok(None);
         };
 
-        self.acquire_with_config(
-            config.counter_key.clone(),
-            config.counter.clone(),
-            config.max_requests,
-        )
-        .map(Some)
-    }
-
-    fn acquire_with_config(
-        &self,
-        counter_key: CounterKey,
-        counter: Arc<InFlightCounter>,
-        max_requests: u32,
-    ) -> Result<CircuitBreakerPermit, CircuitBreakerLimit> {
-        let limit = CircuitBreakerLimit { max_requests };
-        match self.counters.acquire(counter_key, counter, max_requests) {
-            Some(permit) => Ok(permit),
-            None => {
-                self.state.record_drop();
-                Err(limit)
-            }
+        if config.counter.try_acquire(config.max_requests) {
+            return Ok(Some(CircuitBreakerPermit {
+                config: Some(config),
+                counters: self.counters.clone(),
+            }));
         }
+        let limit = CircuitBreakerLimit {
+            max_requests: config.max_requests,
+        };
+        self.counters.drop_config(config);
+        self.state.record_drop();
+        Err(limit)
     }
 }
 
@@ -371,25 +361,21 @@ impl ClusterRequestCounters {
         }
     }
 
-    fn acquire(
-        &self,
-        counter_key: CounterKey,
-        counter: Arc<InFlightCounter>,
-        limit: u32,
-    ) -> Option<CircuitBreakerPermit> {
-        if counter.try_acquire(limit) {
-            Some(CircuitBreakerPermit {
-                counter: Some(counter),
-                counter_key,
-                counters: self.clone(),
-            })
-        } else {
-            let should_cleanup = counter.is_unused();
-            drop(counter);
-            if should_cleanup {
-                self.cleanup_if_unused(&counter_key);
-            }
-            None
+    /// Drops a reference to `config`. Dropping the last one also removes its
+    /// counter if no request or other config still uses it.
+    fn drop_config(&self, config: Arc<CircuitBreakerRuntimeConfig>) {
+        let Some(CircuitBreakerRuntimeConfig {
+            counter_key,
+            counter,
+            ..
+        }) = Arc::into_inner(config)
+        else {
+            return;
+        };
+        let should_cleanup = counter.is_unused();
+        drop(counter);
+        if should_cleanup {
+            self.cleanup_if_unused(&counter_key);
         }
     }
 
@@ -483,20 +469,17 @@ impl InFlightCounter {
 
 #[derive(Debug)]
 struct CircuitBreakerPermit {
-    counter: Option<Arc<InFlightCounter>>,
-    counter_key: CounterKey,
+    /// The config the slot was taken under. Holding it keeps the counter and
+    /// its key without cloning them on every call.
+    config: Option<Arc<CircuitBreakerRuntimeConfig>>,
     counters: ClusterRequestCounters,
 }
 
 impl Drop for CircuitBreakerPermit {
     fn drop(&mut self) {
-        if let Some(counter) = self.counter.take() {
-            counter.release();
-            let should_cleanup = counter.is_unused();
-            drop(counter);
-            if should_cleanup {
-                self.counters.cleanup_if_unused(&self.counter_key);
-            }
+        if let Some(config) = self.config.take() {
+            config.counter.release();
+            self.counters.drop_config(config);
         }
     }
 }
@@ -532,15 +515,15 @@ impl<MC: MakeConnector> MakeConnector for CircuitBreakingMakeConnector<MC> {
         &self,
         cluster: ClusterConfig<'_>,
     ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError> {
-        let cluster_name = cluster.name().to_owned();
+        let cluster_name = cluster.name();
         let eds_service_name = cluster.eds_service_name;
         let config = cluster.circuit_breaking;
         let inner = self.inner.make_connector(cluster)?;
         self.circuit_breakers
-            .set_cluster_config(cluster_name.as_str(), eds_service_name, config);
+            .set_cluster_config(cluster_name, eds_service_name, config);
         Ok(Arc::new(CircuitBreakingConnector {
             inner,
-            breaker: self.circuit_breakers.cluster_breaker(&cluster_name),
+            breaker: self.circuit_breakers.cluster_breaker(cluster_name),
         }))
     }
 }
@@ -590,36 +573,72 @@ impl<S: fmt::Debug> fmt::Debug for CircuitBreakingEndpointService<S> {
 impl<S, B> Service<Request<B>> for CircuitBreakingEndpointService<S>
 where
     S: Service<Request<B>, Response = Response<TonicBody>, Error: Into<BoxError>>,
-    S::Future: Send + 'static,
 {
     type Response = Response<TonicBody>;
     type Error = BoxError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+    type Future = ResponseFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let permit = match self.breaker.acquire() {
-            Ok(permit) => permit,
-            Err(limit) => {
-                return Box::pin(std::future::ready(Ok(limit_exceeded_response(
-                    &self.breaker.cluster,
-                    limit,
-                ))));
+        match self.breaker.acquire() {
+            Ok(permit) => ResponseFuture::Called {
+                response: self.inner.call(request),
+                permit,
+            },
+            Err(limit) => ResponseFuture::Dropped {
+                response: Some(limit_exceeded_response(&self.breaker.cluster, limit)),
+            },
+        }
+    }
+}
+
+pin_project! {
+    /// The response future of a [`CircuitBreakingEndpointService`].
+    #[project = ResponseFutureProj]
+    pub(crate) enum ResponseFuture<F> {
+        /// The call reached the endpoint, holding a slot if its cluster has a
+        /// limit.
+        Called {
+            #[pin]
+            response: F,
+            permit: Option<CircuitBreakerPermit>,
+        },
+        /// The call was dropped by the circuit breaker.
+        Dropped {
+            response: Option<Response<TonicBody>>,
+        },
+    }
+}
+
+impl<F, E> Future for ResponseFuture<F>
+where
+    F: Future<Output = Result<Response<TonicBody>, E>>,
+    E: Into<BoxError>,
+{
+    type Output = Result<Response<TonicBody>, BoxError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            ResponseFutureProj::Called { response, permit } => {
+                let result = ready!(response.poll(cx));
+                // Taken before the error check, so a failed call frees its slot
+                // as soon as it completes.
+                let permit = permit.take();
+                let response = result.map_err(Into::into)?;
+                Poll::Ready(Ok(match permit {
+                    Some(permit) => {
+                        response.map(|body| TonicBody::new(PermitBody::new(body, permit)))
+                    }
+                    None => response,
+                }))
             }
-        };
-        let response = self.inner.call(request);
-        Box::pin(async move {
-            let response = response.await.map_err(Into::into)?;
-            match permit {
-                Some(permit) => {
-                    Ok(response.map(|body| TonicBody::new(PermitBody::new(body, permit))))
-                }
-                None => Ok(response),
-            }
-        })
+            ResponseFutureProj::Dropped { response } => Poll::Ready(Ok(response
+                .take()
+                .expect("ResponseFuture polled after completion"))),
+        }
     }
 }
 
@@ -945,8 +964,8 @@ mod tests {
         });
         let mut service = endpoint(&breakers, service);
 
-        let mut future = service.ready().await.unwrap().call(request());
-        std::future::poll_fn(|cx| match Future::poll(Pin::new(&mut future), cx) {
+        let mut future = Box::pin(service.ready().await.unwrap().call(request()));
+        std::future::poll_fn(|cx| match Future::poll(future.as_mut(), cx) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(_) => panic!("inner service should remain pending"),
         })

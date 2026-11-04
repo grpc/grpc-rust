@@ -480,17 +480,21 @@ struct LbInvoker {
     lb_watcher: Arc<Watcher<LbState>>,
 }
 
-impl Invoke for LbInvoker {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
-
+// Note: `LbInvoker` implements `DynInvoke` directly, rather than `Invoke`, as
+// its streams are already boxed; the blanket `DynInvoke` implementation for
+// `Invoke` would box them a second time when it is passed to the config
+// selector's interceptor.
+impl LbInvoker {
     /// Starts an RPC on a subchannel picked by the current LB picker, waiting
     /// for a new picker while picks are queued.
+    ///
+    /// Unlike [`DynInvoke::dyn_invoke`], this doesn't box the returned future,
+    /// so callers that don't need dynamic dispatch avoid an allocation.
     async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Self::SendStream, Self::RecvStream) {
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
         // Fast path: snapshot the latest LB state without locking and pick
         // with its picker.
         let mut snapshot = self.lb_watcher.snapshot();
@@ -521,6 +525,17 @@ impl Invoke for LbInvoker {
             // pick with the newest state.
             snapshot = snapshot.next().await;
         }
+    }
+}
+
+#[crate::async_trait]
+impl DynInvoke for LbInvoker {
+    async fn dyn_invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        self.invoke(headers, options).await
     }
 }
 

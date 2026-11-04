@@ -51,6 +51,9 @@ pub mod pick_first;
 pub mod priority;
 pub mod registry;
 pub mod round_robin;
+// TODO: Export this module from __internal instead of __unstable once
+// https://github.com/grpc/grpc-rust/pull/2968 is merged.
+pub mod sampling;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
 

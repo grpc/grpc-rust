@@ -36,9 +36,6 @@ use crate::resource::RouteMatch;
 impl RouteMatch {
     /// Returns whether an RPC for `path` (e.g. "/pkg.Service/Method") with
     /// `metadata` matches this route.
-    // TODO: remove once the resolver builds config selectors from `XdsConfig`
-    // updates.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn is_match(&self, path: &str, metadata: &MetadataMap) -> bool {
         self.path_matches(path)
             && self.headers.iter().all(|h| h.is_match(metadata))

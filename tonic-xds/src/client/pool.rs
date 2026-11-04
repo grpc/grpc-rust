@@ -37,6 +37,7 @@ use xds_client::{
 
 use crate::TonicCallCredentials;
 use crate::client::channel::BuildError;
+use crate::csds::CsdsRegistry;
 use crate::xds::bootstrap::BootstrapConfig;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{
@@ -68,6 +69,9 @@ use crate::xds::cert_provider_config::FileWatcherConfig;
 /// The pool's bootstrap and ADS settings apply to every client it starts.
 /// Cloning the pool is cheap and shares its clients.
 ///
+/// [`CsdsService`](crate::CsdsService) reports each client the pool starts,
+/// with its key as the `client_scope`.
+///
 /// [`XdsChannelBuilder::with_xds_client_pool`]: crate::XdsChannelBuilder::with_xds_client_pool
 /// [`XdsChannelBuilder::with_xds_client_key`]: crate::XdsChannelBuilder::with_xds_client_key
 /// [gRFC A71]: https://github.com/grpc/proposal/blob/master/A71-xds-fallback.md
@@ -80,13 +84,15 @@ struct Inner {
     bootstrap: BootstrapConfig,
     ads: AdsClientSettings,
     recorder: Option<Arc<dyn MetricsRecorder>>,
+    csds_registry: Arc<CsdsRegistry>,
     clients: Mutex<HashMap<String, Weak<XdsClient>>>,
 }
 
 impl Inner {
-    /// Starts an xDS client for the bootstrap's server. `key` becomes the
-    /// gRFC A78 `grpc.target` metric label.
-    fn start_client(&self, key: &str) -> Result<XdsClient, BuildError> {
+    /// Starts an xDS client for the bootstrap's server and reports it through
+    /// CSDS while it runs. `key` becomes the gRFC A78 `grpc.target` metric
+    /// label and the gRFC A71 CSDS `client_scope`.
+    fn start_client(&self, key: &str) -> Result<Arc<XdsClient>, BuildError> {
         let bootstrap = &self.bootstrap;
         #[allow(unused_mut)]
         let mut transport_builder = TonicTransportBuilder::new();
@@ -122,13 +128,16 @@ impl Inner {
         }
 
         let node = Node::try_from(bootstrap.node.clone())?;
-        let client_config = ClientConfig::new(node, bootstrap.server_uri()).with_target(key);
+        let client_config =
+            ClientConfig::new(node.clone(), bootstrap.server_uri()).with_target(key);
         let mut client_builder =
             XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
         if let Some(recorder) = self.recorder.clone() {
             client_builder = client_builder.with_metrics_recorder(recorder);
         }
-        Ok(client_builder.build())
+        let client = Arc::new(client_builder.build());
+        self.csds_registry.register(key.to_owned(), &node, &client);
+        Ok(client)
     }
 }
 
@@ -215,7 +224,7 @@ impl XdsClientPool {
         if let Some(client) = clients.get(key).and_then(Weak::upgrade) {
             return Ok(client);
         }
-        let client = Arc::new(self.inner.start_client(key)?);
+        let client = self.inner.start_client(key)?;
         clients.retain(|_, client| client.strong_count() > 0);
         clients.insert(key.to_owned(), Arc::downgrade(&client));
         Ok(client)
@@ -228,6 +237,9 @@ pub struct XdsClientPoolBuilder {
     bootstrap: Option<BootstrapConfig>,
     ads: AdsClientSettings,
     recorder: Option<Arc<dyn MetricsRecorder>>,
+    /// Where started clients are reported through CSDS. The process-wide
+    /// registry unless set.
+    csds_registry: Option<Arc<CsdsRegistry>>,
 }
 
 impl Debug for XdsClientPoolBuilder {
@@ -300,6 +312,15 @@ impl XdsClientPoolBuilder {
         ))
     }
 
+    /// Reports the pool's clients in `registry` instead of the process-wide
+    /// one, so a test sees only its own clients.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_csds_registry(mut self, registry: Arc<CsdsRegistry>) -> Self {
+        self.csds_registry = Some(registry);
+        self
+    }
+
     /// Builds the pool. Clients are started on demand, when channels are built.
     pub fn build(self) -> Result<XdsClientPool, BuildError> {
         let bootstrap = match self.bootstrap {
@@ -311,6 +332,7 @@ impl XdsClientPoolBuilder {
                 bootstrap,
                 ads: self.ads,
                 recorder: self.recorder,
+                csds_registry: self.csds_registry.unwrap_or_else(CsdsRegistry::global),
                 clients: Mutex::default(),
             }),
         })
@@ -325,16 +347,47 @@ fn recorder_name(recorder: Option<&dyn MetricsRecorder>) -> &'static str {
 mod tests {
     use super::*;
 
-    /// A pool whose clients point at a port nothing listens on.
-    fn test_pool() -> XdsClientPool {
+    /// A pool builder whose clients point at a port nothing listens on.
+    fn test_pool_builder() -> XdsClientPoolBuilder {
         let bootstrap = BootstrapConfig::from_json(
             r#"{"xds_servers":[{"server_uri":"http://127.0.0.1:1","channel_creds":[{"type":"insecure"}]}],"node":{"id":"test"}}"#,
         )
         .unwrap();
-        XdsClientPool::builder()
-            .with_bootstrap(bootstrap)
+        XdsClientPool::builder().with_bootstrap(bootstrap)
+    }
+
+    fn test_pool() -> XdsClientPool {
+        test_pool_builder().build().unwrap()
+    }
+
+    #[test]
+    fn clients_are_reported_in_the_global_csds_registry_by_default() {
+        assert!(Arc::ptr_eq(
+            &test_pool().inner.csds_registry,
+            &CsdsRegistry::global()
+        ));
+    }
+
+    /// A client shared under one key is reported once, until the last
+    /// channel using it drops it.
+    #[tokio::test]
+    async fn csds_reports_each_client_once_while_it_is_used() {
+        let registry = Arc::new(CsdsRegistry::default());
+        let pool = test_pool_builder()
+            .with_csds_registry(Arc::clone(&registry))
             .build()
-            .unwrap()
+            .unwrap();
+
+        let a = pool.get_or_create("a").unwrap();
+        let shared_a = pool.get_or_create("a").unwrap();
+        let b = pool.get_or_create("b").unwrap();
+        assert_eq!(registry.scopes(), ["a", "b"]);
+
+        drop(a);
+        assert_eq!(registry.scopes(), ["a", "b"]);
+        drop(shared_a);
+        assert_eq!(registry.scopes(), ["b"]);
+        drop(b);
     }
 
     #[tokio::test]

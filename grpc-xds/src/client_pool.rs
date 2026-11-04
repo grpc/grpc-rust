@@ -245,7 +245,7 @@ mod tests {
             "same-client-probe-{}",
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let _watcher = a.watch::<ListenerResource>(name.clone()).await;
+        let _watcher = a.watch::<ListenerResource>(name.clone());
         b.resource_snapshot()
             .await
             .iter()

@@ -111,6 +111,35 @@ mod test {
         BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap")
     }
 
+    fn configure_route(
+        control_plane: &XdsTestControlPlaneService,
+        name: &str,
+        backend_addr: SocketAddr,
+    ) {
+        let cluster = format!("{name}-cluster");
+        control_plane.set_xds_config(
+            &config::AdsTypeUrl::Lds,
+            HashMap::from([(
+                name.to_string(),
+                config::build_inline_listener(name, &cluster),
+            )]),
+        );
+        control_plane.set_xds_config(
+            &config::AdsTypeUrl::Cds,
+            HashMap::from([(cluster.clone(), config::build_cluster(&cluster))]),
+        );
+        control_plane.set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([(
+                cluster.clone(),
+                config::build_cla(
+                    &cluster,
+                    &[(backend_addr.ip().to_string(), backend_addr.port())],
+                ),
+            )]),
+        );
+    }
+
     /// Sends `say_hello` in a loop until a reply starting with `want_prefix` is
     /// observed (xDS resolution and config updates are asynchronous), returning
     /// that reply. Panics if it never arrives.
@@ -194,6 +223,63 @@ mod test {
         assert_eq!(counts.get(&config::AdsTypeUrl::Cds), Some(&1), "{lb:?}");
         assert_eq!(counts.get(&config::AdsTypeUrl::Eds), Some(&1), "{lb:?}");
 
+        let _ = backend.shutdown.send(());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xds_channel_e2e_uds_control_plane_routes_to_backend() {
+        use crate::common::async_util::AbortOnDrop;
+        use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
+        use tokio_stream::wrappers::UnixListenerStream;
+
+        const LISTENER: &str = "my-service";
+
+        let backend = spawn_greeter_server("backend", None, None)
+            .await
+            .expect("spawn greeter backend");
+        let control_plane = XdsTestControlPlaneService::new();
+        configure_route(&control_plane, LISTENER, backend.addr);
+
+        let directory = tempfile::tempdir().expect("create socket directory");
+        let path = directory.path().join("ads.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind control-plane socket");
+        let service = control_plane.clone();
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(AggregatedDiscoveryServiceServer::new(service))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await
+                .expect("serve UDS control plane");
+        }));
+
+        let bootstrap = BootstrapConfig::builder(format!("unix://{}", path.display()))
+            .channel_creds([crate::ChannelCredentialType::Insecure])
+            .node_id("test")
+            .build()
+            .expect("build UDS bootstrap");
+        let target = XdsUri::parse(&format!("xds:///{LISTENER}")).expect("parse target");
+        let channel =
+            XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap))
+                .build_grpc_channel()
+                .expect("build xds channel");
+        let mut client = GreeterClient::new(channel);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            say_hello_until_prefix(&mut client, "backend:"),
+        )
+        .await
+        .expect("route RPC through the UDS control plane");
+        assert_eq!(reply, "backend: world");
+
+        let counts = control_plane.get_subscriber_counts();
+        for resource_type in [
+            config::AdsTypeUrl::Lds,
+            config::AdsTypeUrl::Cds,
+            config::AdsTypeUrl::Eds,
+        ] {
+            assert_eq!(counts.get(&resource_type), Some(&1), "{resource_type:?}");
+        }
         let _ = backend.shutdown.send(());
     }
 
@@ -441,6 +527,162 @@ mod test {
         assert_eq!(reply, "backend: world");
 
         let _ = backend.shutdown.send(());
+    }
+
+    mod user_transport {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+
+        type TestService = tower::util::BoxCloneService<
+            http::Request<tonic::body::Body>,
+            http::Response<tonic::body::Body>,
+            tonic::transport::Error,
+        >;
+
+        struct TestMakeControlPlaneConnector {
+            addr: SocketAddr,
+            expected_uri: String,
+            keep_alive: Option<(Option<Duration>, Duration)>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl crate::MakeControlPlaneConnector for TestMakeControlPlaneConnector {
+            type Service = TestService;
+
+            fn make_connector(
+                &self,
+                config: crate::ControlPlaneConfig<'_>,
+            ) -> xds_client::Result<Arc<dyn crate::ControlPlaneConnector<Service = Self::Service>>>
+            {
+                assert_eq!(config.server().uri(), self.expected_uri);
+                assert_eq!(config.keep_alive(), self.keep_alive);
+                Ok(Arc::new(TestControlPlaneConnector {
+                    addr: self.addr,
+                    keep_alive: config.keep_alive(),
+                    calls: self.calls.clone(),
+                }))
+            }
+        }
+
+        struct TestControlPlaneConnector {
+            addr: SocketAddr,
+            keep_alive: Option<(Option<Duration>, Duration)>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl crate::ControlPlaneConnector for TestControlPlaneConnector {
+            type Service = TestService;
+
+            fn is_secure(&self) -> bool {
+                false
+            }
+
+            fn connect(&self) -> crate::BoxFuture<xds_client::Result<Self::Service>> {
+                let addr = self.addr;
+                let keep_alive = self.keep_alive;
+                let calls = self.calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let mut builder = xds_client::TonicTransportBuilder::new();
+                    if let Some((interval, timeout)) = keep_alive {
+                        builder = builder.with_keep_alive(interval, timeout);
+                    }
+                    let server = crate::ServerConfig::new(format!("http://{addr}"));
+                    let channel = builder.connect_channel(&server).await?;
+                    let service =
+                        tower::service_fn(move |request: http::Request<tonic::body::Body>| {
+                            assert_eq!(
+                                request.headers().get("authorization").unwrap(),
+                                "Bearer custom"
+                            );
+                            channel.clone().oneshot(request)
+                        });
+                    Ok(tower::util::BoxCloneService::new(service))
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestCallCredentials;
+
+        #[tonic::async_trait]
+        impl crate::TonicCallCredentials for TestCallCredentials {
+            async fn get_request_metadata(
+                &self,
+                metadata: &mut tonic::metadata::MetadataMap,
+            ) -> Result<(), tonic::Status> {
+                metadata.insert("authorization", "Bearer custom".parse().unwrap());
+                Ok(())
+            }
+
+            fn requires_secure_transport(&self) -> bool {
+                false
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn custom_control_plane_connector_owns_transport() {
+            routes_through_custom_control_plane_connector(false).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn pooled_custom_control_plane_connector_owns_transport() {
+            routes_through_custom_control_plane_connector(true).await;
+        }
+
+        async fn routes_through_custom_control_plane_connector(use_pool: bool) {
+            const LISTENER: &str = "my-service";
+
+            let backend = spawn_greeter_server("backend", None, None)
+                .await
+                .expect("spawn greeter backend");
+            let (control_plane, cp_addr) = start_control_plane().await;
+            configure_route(control_plane.get_service(), LISTENER, backend.addr);
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let connector = TestMakeControlPlaneConnector {
+                addr: cp_addr,
+                expected_uri: cp_addr.to_string(),
+                keep_alive: Some((None, Duration::from_secs(1))),
+                calls: calls.clone(),
+            };
+            let bootstrap = BootstrapConfig::from_json(&format!(
+                r#"{{"xds_servers":[{{"server_uri":"{cp_addr}","channel_creds":[{{"type":"insecure"}}]}}],"node":{{"id":"test"}}}}"#
+            ))
+            .unwrap();
+            let target = XdsUri::parse(&format!("xds:///{LISTENER}")).expect("parse target");
+
+            let builder = if use_pool {
+                let pool = XdsClientPool::builder()
+                    .with_bootstrap(bootstrap)
+                    .with_call_credentials(Arc::new(TestCallCredentials))
+                    .with_control_plane_connector(connector)
+                    .with_ads_keep_alive(None, Duration::from_secs(1))
+                    .build()
+                    .expect("build pool");
+                XdsChannelBuilder::new(XdsChannelConfig::new(target)).with_xds_client_pool(pool)
+            } else {
+                XdsChannelBuilder::new(
+                    XdsChannelConfig::new(target)
+                        .with_bootstrap(bootstrap)
+                        .with_call_credentials(Arc::new(TestCallCredentials))
+                        .with_ads_keep_alive(None, Duration::from_secs(1)),
+                )
+                .with_control_plane_connector(connector)
+            };
+            let channel = builder.build_grpc_channel().expect("build xds channel");
+
+            let mut client = GreeterClient::new(channel);
+            assert_eq!(
+                say_hello_until_prefix(&mut client, "backend:").await,
+                "backend: world"
+            );
+            assert!(calls.load(Ordering::SeqCst) > 0, "connector was not used");
+
+            let _ = backend.shutdown.send(());
+        }
     }
 
     /// Forwards TCP connections to `upstream` until `blackhole` is cancelled,

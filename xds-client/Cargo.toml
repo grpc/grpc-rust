@@ -68,4 +68,6 @@ allowed_external_types = [
     # Re-exported in the public API behind the transport-tonic / codegen-prost features.
     "tonic::*",
     "prost::*",
+    # Bounds on generic tonic service response bodies.
+    "http_body::*",
 ]

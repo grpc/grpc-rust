@@ -35,10 +35,10 @@ use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tonic::client::Grpc;
+use tonic::client::{Grpc, GrpcService};
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
@@ -146,8 +146,8 @@ impl Decoder for BytesDecoder {
 
 /// Factory for creating ADS streams using tonic.
 #[derive(Clone, Debug)]
-pub struct TonicTransport {
-    channel: Channel,
+pub struct TonicTransport<S = Channel> {
+    service: Arc<Mutex<S>>,
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
@@ -178,7 +178,7 @@ impl TonicTransport {
     /// ```
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            channel,
+            service: Arc::new(Mutex::new(channel)),
             call_creds: None,
             max_decoding_message_size: None,
             max_encoding_message_size: None,
@@ -316,10 +316,12 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Construct the TLS configuration each time a connection is created.
+    /// Construct the TLS configuration when preparing a new channel.
     ///
-    /// The factory is called from [`build`](TransportBuilder::build), including
-    /// every reconnect, so callers can supply refreshed certificate material.
+    /// The factory is evaluated by [`connect_channel`](Self::connect_channel),
+    /// including calls from [`build`](TransportBuilder::build), after URI/security
+    /// validation. It is not re-evaluated for tonic's internal reconnects on an
+    /// existing channel.
     #[cfg(feature = "_tonic-tls-any")]
     pub fn with_tls_config_factory<F>(mut self, factory: F) -> Self
     where
@@ -356,6 +358,48 @@ impl TonicTransportBuilder {
         self
     }
 
+    /// Create an ADS transport from a custom service connection future.
+    ///
+    /// `secure = true` declares that the service guarantees server authentication,
+    /// confidentiality, and integrity. The declaration is trusted, not verified.
+    /// Call-credential requirements are checked against this declaration before
+    /// the connection future is polled.
+    ///
+    /// The connection future owns URI handling, TLS, timeouts, and keepalives.
+    /// This builder applies call credentials and ADS message-size limits.
+    pub async fn build_with_service<S, F>(
+        &self,
+        connect: F,
+        secure: bool,
+    ) -> Result<TonicTransport<S>>
+    where
+        F: Future<Output = Result<S>> + Send,
+    {
+        self.validate_call_credentials_security(secure)?;
+        Ok(self.transport_from_service(connect.await?))
+    }
+
+    fn validate_call_credentials_security(&self, secure: bool) -> Result<()> {
+        if let Some(creds) = &self.call_creds
+            && creds.requires_secure_transport()
+            && !secure
+        {
+            return Err(Error::CallCredentials(
+                "call credentials require a secure transport".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn transport_from_service<S>(&self, service: S) -> TonicTransport<S> {
+        TonicTransport {
+            service: Arc::new(Mutex::new(service)),
+            call_creds: self.call_creds.clone(),
+            max_decoding_message_size: self.max_decoding_message_size,
+            max_encoding_message_size: self.max_encoding_message_size,
+        }
+    }
+
     /// Prepend `https://` to a scheme-less `server_uri` on the secure path.
     ///
     /// Bootstrap URIs like `trafficdirector.googleapis.com:443` parse with no scheme,
@@ -370,12 +414,14 @@ impl TonicTransportBuilder {
         }
         raw.to_string()
     }
-}
 
-impl TransportBuilder for TonicTransportBuilder {
-    type Transport = TonicTransport;
-
-    async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
+    /// Establish a channel to an xDS management server.
+    ///
+    /// Applies this builder's URI/TLS validation, connection timeout, and
+    /// HTTP/2 keepalive settings. A configured TLS factory is evaluated while
+    /// preparing the channel. Call-credential security requirements are checked,
+    /// but no ADS stream is created and no call credentials are sent.
+    pub async fn connect_channel(&self, server: &ServerConfig) -> Result<Channel> {
         // With no TLS backend compiled in, `tls_configured` stays false.
         #[cfg(feature = "_tonic-tls-any")]
         let tls_configured = self.tls_config_factory.is_some();
@@ -406,14 +452,7 @@ impl TransportBuilder for TonicTransportBuilder {
         }
 
         // Fail before connecting, so credentials stay off an insecure channel.
-        if let Some(creds) = &self.call_creds
-            && creds.requires_secure_transport()
-            && !secure
-        {
-            return Err(Error::CallCredentials(
-                "call credentials require a secure transport".into(),
-            ));
-        }
+        self.validate_call_credentials_security(secure)?;
 
         // `Endpoint::from_shared` routes `unix://` URIs to tonic's UDS connector.
         // Required for control planes like Istio's grpc-agent that ship `unix:///etc/istio/proxy/XDS`.
@@ -435,29 +474,44 @@ impl TransportBuilder for TonicTransportBuilder {
             None => endpoint,
         };
 
-        let channel = endpoint
+        endpoint
             .connect()
             .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+            .map_err(|e| Error::Connection(e.to_string()))
+    }
+}
 
-        Ok(TonicTransport {
-            channel,
-            call_creds: self.call_creds.clone(),
-            max_decoding_message_size: self.max_decoding_message_size,
-            max_encoding_message_size: self.max_encoding_message_size,
-        })
+impl TransportBuilder for TonicTransportBuilder {
+    type Transport = TonicTransport;
+
+    async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
+        let channel = self.connect_channel(server).await?;
+
+        Ok(self.transport_from_service(channel))
     }
 }
 
 type StreamingFuture =
     Box<dyn Future<Output = std::result::Result<Streaming<Bytes>, Status>> + Send>;
 
-impl Transport for TonicTransport {
+impl<S> Transport for TonicTransport<S>
+where
+    S: GrpcService<tonic::body::Body> + Clone + Send + 'static,
+    S::Future: Send,
+    S::ResponseBody: Send + 'static,
+    <S::ResponseBody as tonic::codegen::Body>::Error:
+        Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     type Sender = TonicAdsSender;
     type Receiver = TonicAdsReceiver;
 
     async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
-        let mut grpc = Grpc::new(self.channel.clone());
+        let service = self
+            .service
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut grpc = Grpc::new(service);
 
         if let Some(limit) = self.max_decoding_message_size {
             grpc = grpc.max_decoding_message_size(limit);
@@ -469,9 +523,10 @@ impl Transport for TonicTransport {
         // The worker uses new_stream() completion as its resource-timer readiness
         // fallback. This checks service capacity, not channel connectivity or ADS
         // stream dispatch; the streaming RPC is started when the receiver is polled.
-        grpc.ready()
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        grpc.ready().await.map_err(|error| {
+            let error: Box<dyn std::error::Error + Send + Sync> = error.into();
+            Error::Connection(error.to_string())
+        })?;
 
         let (tx, rx) = mpsc::channel::<Bytes>(ADS_CHANNEL_BUFFER_SIZE);
         let channel_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -876,6 +931,53 @@ mod tests {
             err.to_string()
                 .contains("requires TLS but no TLS config is set")
         );
+    }
+
+    #[tokio::test]
+    async fn custom_service_carries_ads_stream_with_call_credentials() {
+        let addr = start_mock_server(Some("******")).await;
+
+        let builder = TonicTransportBuilder::new().with_call_credentials(Arc::new(MockCreds {
+            pairs: vec![("authorization".into(), "******".into())],
+            requires_secure: false,
+        }));
+        let server = ServerConfig::new(format!("http://{addr}"));
+        let connection_builder = TonicTransportBuilder::new();
+
+        for attempt in 0..2 {
+            let transport = builder
+                .build_with_service(connection_builder.connect_channel(&server), false)
+                .await
+                .unwrap_or_else(|e| panic!("build {attempt} failed: {e:?}"));
+
+            let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+            tx.send(discovery_request()).await.unwrap();
+            let response = rx.recv().await.unwrap().unwrap();
+            let response = DiscoveryResponse::decode(response).unwrap();
+            assert_eq!(response.version_info, "1");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_service_checks_security_before_connecting() {
+        let strict = Arc::new(MockCreds {
+            pairs: vec![],
+            requires_secure: true,
+        });
+
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let result = TonicTransportBuilder::new()
+            .with_call_credentials(strict)
+            .build_with_service(
+                async {
+                    polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Channel::from_static("http://127.0.0.1:1").connect_lazy())
+                },
+                false,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::CallCredentials(_))));
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

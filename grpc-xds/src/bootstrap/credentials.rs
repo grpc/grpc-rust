@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use grpc::__unstable::UnstableToken;
+use grpc::__unstable::credentials::protocol_info_new;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::client::HandshakeOutput;
 use grpc::__unstable::credentials::client::ValidateAuthority;
@@ -41,7 +42,7 @@ use grpc::credentials::SecurityLevel;
 use grpc::credentials::call::CallCredentials;
 
 const INSECURE_PROTOCOL_NAME: &str = "insecure";
-static INSECURE_PROTO_INFO: ProtocolInfo = ProtocolInfo::unstable_new(INSECURE_PROTOCOL_NAME);
+static INSECURE_PROTO_INFO: ProtocolInfo = protocol_info_new(INSECURE_PROTOCOL_NAME);
 
 /// [`ChannelCredentials`] that perform no encryption or authentication, using
 /// plaintext over the raw transport, regardless of whether the peer is local.

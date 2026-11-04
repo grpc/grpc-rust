@@ -35,16 +35,27 @@ use xds_client::resource::TypeUrl;
 use crate::generated::envoy::config::core::v3::HealthStatus as EnvoyHealthStatus;
 use crate::generated::envoy::config::endpoint::v3::ClusterLoadAssignment;
 use crate::generated::envoy::config::endpoint::v3::lb_endpoint::HostIdentifierOneof;
+use crate::generated::envoy::r#type::v3::FractionalPercentView;
+use crate::generated::envoy::r#type::v3::fractional_percent::DenominatorType;
 
 /// Validated ClusterLoadAssignment (EDS resource).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EndpointsResource {
     pub(crate) cluster_name: String,
     pub(crate) localities: Vec<LocalityLbEndpoints>,
+    pub(crate) drop_overloads: Vec<DropOverload>,
+}
+
+/// An EDS drop overload category and rate (gRFC A27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DropOverload {
+    pub(crate) category: String,
+    /// Number of requests to drop per million (`0..=1_000_000`).
+    pub(crate) requests_per_million: u32,
 }
 
 /// Endpoints within a single locality.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalityLbEndpoints {
     pub(crate) locality: Locality,
     pub(crate) endpoints: Vec<LbEndpoint>,
@@ -65,7 +76,7 @@ pub(crate) struct Locality {
 }
 
 /// A single validated endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LbEndpoint {
     pub(crate) address: EndpointAddress,
     pub(crate) health_status: HealthStatus,
@@ -226,11 +237,67 @@ impl Resource for EndpointsResource {
             }
         }
 
+        let drop_overloads = validate_drop_overloads(&message)?;
+
         Ok(EndpointsResource {
             cluster_name,
             localities,
+            drop_overloads,
         })
     }
+}
+
+/// Extracts `ClusterLoadAssignment.policy.drop_overloads` (gRFC A27),
+/// normalizing each `drop_percentage` to requests per million. Empty or
+/// non-UTF-8 categories, missing `drop_percentage` fields, and unknown
+/// denominators are rejected, matching gRPC C-core.
+fn validate_drop_overloads(
+    message: &ClusterLoadAssignment,
+) -> xds_client::Result<Vec<DropOverload>> {
+    if !message.has_policy() {
+        return Ok(Vec::new());
+    }
+    message
+        .policy()
+        .drop_overloads()
+        .iter()
+        .map(|d| -> xds_client::Result<DropOverload> {
+            let category = d
+                .category()
+                .to_str()
+                .map_err(|e| {
+                    Error::Validation(format!("drop_overloads category is not valid UTF-8: {e}"))
+                })?
+                .to_string();
+            if category.is_empty() {
+                return Err(Error::Validation(
+                    "drop_overloads category must be non-empty".to_string(),
+                ));
+            }
+            let frac = d.drop_percentage_opt().ok_or_else(|| {
+                Error::Validation(format!(
+                    "drop_overloads category {category:?}: drop_percentage not present"
+                ))
+            })?;
+            let requests_per_million = fractional_percent_to_million(frac).map_err(|e| {
+                Error::Validation(format!("drop_overloads category {category:?}: {e}"))
+            })?;
+            Ok(DropOverload {
+                category,
+                requests_per_million,
+            })
+        })
+        .collect()
+}
+
+fn fractional_percent_to_million(frac: FractionalPercentView<'_>) -> Result<u32, String> {
+    let scale = match frac.denominator() {
+        DenominatorType::Hundred => 10_000,
+        DenominatorType::TenThousand => 100,
+        DenominatorType::Million => 1,
+        other => return Err(format!("unknown drop_percentage denominator: {other:?}")),
+    };
+    Ok(frac.numerator().saturating_mul(scale).min(1_000_000))
 }
 
 fn validate_lb_endpoint(
@@ -653,5 +720,134 @@ mod tests {
         let bytes = cla.serialize().expect("serialize");
         let deserialized = EndpointsResource::deserialize(bytes::Bytes::from(bytes)).unwrap();
         assert_eq!(EndpointsResource::name(&deserialized), "test");
+    }
+
+    #[test]
+    fn validate_drop_overloads() {
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy::r#type::v3::FractionalPercent;
+
+        let make_drop = |category: &str, num: u32, denom: DenominatorType| {
+            let mut frac = FractionalPercent::new();
+            frac.set_numerator(num);
+            frac.set_denominator(denom);
+            let mut drop_overload = EnvoyDropOverload::new();
+            drop_overload.set_category(category);
+            drop_overload.set_drop_percentage(frac);
+            drop_overload
+        };
+
+        let mut policy = Policy::new();
+        policy
+            .drop_overloads_mut()
+            .push(make_drop("hundred", 25, DenominatorType::Hundred));
+        policy.drop_overloads_mut().push(make_drop(
+            "ten_thousand",
+            500,
+            DenominatorType::TenThousand,
+        ));
+        policy
+            .drop_overloads_mut()
+            .push(make_drop("million", 123_456, DenominatorType::Million));
+        policy
+            .drop_overloads_mut()
+            .push(make_drop("capped", 150, DenominatorType::Hundred));
+
+        let mut cla = make_cla("my-cluster");
+        cla.set_policy(policy);
+
+        let validated = EndpointsResource::validate(cla).unwrap();
+        assert_eq!(
+            validated.drop_overloads,
+            vec![
+                DropOverload {
+                    category: "hundred".to_string(),
+                    requests_per_million: 250_000,
+                },
+                DropOverload {
+                    category: "ten_thousand".to_string(),
+                    requests_per_million: 50_000,
+                },
+                DropOverload {
+                    category: "million".to_string(),
+                    requests_per_million: 123_456,
+                },
+                DropOverload {
+                    category: "capped".to_string(),
+                    requests_per_million: 1_000_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_drop_percentage() {
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+
+        let mut drop_overload = EnvoyDropOverload::new();
+        drop_overload.set_category("unset_pct");
+        let mut policy = Policy::new();
+        policy.drop_overloads_mut().push(drop_overload);
+
+        let mut cla = make_cla("my-cluster");
+        cla.set_policy(policy);
+
+        let err = EndpointsResource::validate(cla).unwrap_err();
+        assert!(
+            err.to_string().contains("drop_percentage not present"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_drop_category() {
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy::r#type::v3::FractionalPercent;
+
+        let mut frac = FractionalPercent::new();
+        frac.set_numerator(10);
+        frac.set_denominator(DenominatorType::Hundred);
+        let mut drop_overload = EnvoyDropOverload::new();
+        drop_overload.set_drop_percentage(frac);
+        let mut policy = Policy::new();
+        policy.drop_overloads_mut().push(drop_overload);
+
+        let mut cla = make_cla("my-cluster");
+        cla.set_policy(policy);
+
+        let err = EndpointsResource::validate(cla).unwrap_err();
+        assert!(
+            err.to_string().contains("category must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_drop_denominator() {
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
+        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy::r#type::v3::FractionalPercent;
+
+        let mut frac = FractionalPercent::new();
+        frac.set_numerator(10);
+        frac.set_denominator(DenominatorType::from(99));
+        let mut drop_overload = EnvoyDropOverload::new();
+        drop_overload.set_category("bad_denominator");
+        drop_overload.set_drop_percentage(frac);
+        let mut policy = Policy::new();
+        policy.drop_overloads_mut().push(drop_overload);
+
+        let mut cla = make_cla("my-cluster");
+        cla.set_policy(policy);
+
+        let err = EndpointsResource::validate(cla).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown drop_percentage denominator"),
+            "got: {err}"
+        );
     }
 }

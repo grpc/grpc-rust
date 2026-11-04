@@ -32,22 +32,30 @@ use xds_client::resource::TypeUrl;
 use crate::generated::envoy::config::cluster::v3::Cluster;
 use crate::generated::envoy::config::cluster::v3::cluster::ClusterDiscoveryTypeOneof;
 use crate::generated::envoy::config::cluster::v3::cluster::DiscoveryType;
+use crate::generated::envoy::config::core::v3::RoutingPriority;
 use crate::generated::envoy::extensions::clusters::aggregate::v3::ClusterConfig as AggregateClusterConfig;
+
+/// Default limit on concurrent in-flight requests per cluster (gRFC A32).
+pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: u32 = 1024;
 
 /// Extension name and `typed_config` type for gRFC A37 aggregate clusters.
 const AGGREGATE_CLUSTER_NAME: &str = "envoy.clusters.aggregate";
 const AGGREGATE_CLUSTER_CONFIG_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig";
 
-// TODO: model `transport_socket` (security) and load-balancing-policy
-// config once the dependency manager and LB policies exist to consume them.
+// TODO: model `transport_socket` (security, consumed by `xds_cluster_impl`
+// once `XdsCredentials` exists), LRS config (`lrs_server`,
+// `lrs_report_endpoint_metrics`), and the cluster's xDS LB policy config.
 /// Validated Cluster resource.
 ///
-/// Only the discovery mechanism is modeled for now (gRFC A27/A37).
-#[derive(Debug, Clone)]
+/// Models the discovery mechanism (gRFC A27/A37) and circuit-breaking
+/// limits (gRFC A32).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClusterResource {
     pub(crate) name: String,
     pub(crate) discovery: ClusterDiscovery,
+    /// Circuit-breaking limit on concurrent in-flight requests (gRFC A32).
+    pub(crate) max_concurrent_requests: u32,
 }
 
 /// How a cluster's endpoints are discovered, mirroring the
@@ -56,11 +64,19 @@ pub(crate) struct ClusterResource {
 ///
 /// `STATIC`, `STRICT_DNS`, and `ORIGINAL_DST` are not supported: they have no
 /// gRPC xDS use case.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClusterDiscovery {
-    /// Endpoints are discovered via EDS. When CDS resource left `eds_service_name` unset,
-    /// it is resolved to the cluster name.
-    Eds { eds_service_name: String },
+    /// Endpoints are discovered via EDS.
+    Eds {
+        /// The EDS resource name to watch. When the CDS resource left
+        /// `eds_service_name` unset, it is resolved to the cluster name.
+        eds_service_name: String,
+        /// `eds_service_name` exactly as set in the CDS resource (empty if
+        /// unset). Used where gRPC must match other implementations' keys:
+        /// the circuit-breaker counter key (gRFC A32) and the LRS
+        /// `cluster_service_name`.
+        raw_eds_service_name: String,
+    },
     /// Endpoints are discovered via DNS resolution of a single target.
     LogicalDns { hostname: String, port: u16 },
     /// This is an aggregate cluster (gRFC A37): traffic falls over across
@@ -86,7 +102,7 @@ impl Resource for ClusterResource {
     }
 
     fn validate(message: Self::Message) -> xds_client::Result<Self> {
-        let name = message.name().to_str().unwrap_or_default().to_string();
+        let name: String = message.name().to_str().unwrap_or_default().to_string();
         if name.is_empty() {
             return Err(Error::Validation("cluster name is empty".into()));
         }
@@ -110,8 +126,30 @@ impl Resource for ClusterResource {
             }
         };
 
-        Ok(ClusterResource { name, discovery })
+        let max_concurrent_requests = extract_max_concurrent_requests(&message);
+
+        Ok(ClusterResource {
+            name,
+            discovery,
+            max_concurrent_requests,
+        })
     }
+}
+
+/// Extracts `max_concurrent_requests` from `Cluster.circuit_breakers` per gRFC A32:
+/// uses `max_requests` from the first `Thresholds` entry with `DEFAULT`
+/// priority, or [`DEFAULT_MAX_CONCURRENT_REQUESTS`] if absent or unset.
+fn extract_max_concurrent_requests(message: &Cluster) -> u32 {
+    if !message.has_circuit_breakers() {
+        return DEFAULT_MAX_CONCURRENT_REQUESTS;
+    }
+    message
+        .circuit_breakers()
+        .thresholds()
+        .iter()
+        .find(|t| t.priority() == RoutingPriority::Default)
+        .and_then(|t| t.max_requests_opt().map(|v| v.value()))
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
 }
 
 fn validate_eds_discovery(
@@ -133,11 +171,11 @@ fn validate_eds_discovery(
         ));
     }
 
-    let eds_service_name = eds_cluster_config
+    let raw_eds_service_name = eds_cluster_config
         .service_name()
         .to_str()
         .unwrap_or_default();
-    let eds_service_name = if eds_service_name.is_empty() {
+    let eds_service_name = if raw_eds_service_name.is_empty() {
         // Per gRFC A47, `xdstp:`-scheme (federation) cluster names must set an
         // explicit EDS service name rather than relying on the cluster-name fallback.
         if cluster_name.starts_with("xdstp:") {
@@ -147,10 +185,13 @@ fn validate_eds_discovery(
         }
         cluster_name.to_string()
     } else {
-        eds_service_name.to_string()
+        raw_eds_service_name.to_string()
     };
 
-    Ok(ClusterDiscovery::Eds { eds_service_name })
+    Ok(ClusterDiscovery::Eds {
+        eds_service_name,
+        raw_eds_service_name: raw_eds_service_name.to_string(),
+    })
 }
 
 fn validate_logical_dns_discovery(message: &Cluster) -> xds_client::Result<ClusterDiscovery> {
@@ -321,8 +362,12 @@ mod tests {
         let validated = ClusterResource::validate(cluster).expect("should validate");
         assert_eq!(validated.name, "my-cluster");
         match validated.discovery {
-            ClusterDiscovery::Eds { eds_service_name } => {
+            ClusterDiscovery::Eds {
+                eds_service_name,
+                raw_eds_service_name,
+            } => {
                 assert_eq!(eds_service_name, "my-cluster");
+                assert_eq!(raw_eds_service_name, "");
             }
             other => panic!("expected Eds, got {other:?}"),
         }
@@ -336,7 +381,13 @@ mod tests {
         cluster.set_eds_cluster_config(eds_cfg);
         let validated = ClusterResource::validate(cluster).unwrap();
         match validated.discovery {
-            ClusterDiscovery::Eds { eds_service_name } => assert_eq!(eds_service_name, "eds-svc"),
+            ClusterDiscovery::Eds {
+                eds_service_name,
+                raw_eds_service_name,
+            } => {
+                assert_eq!(eds_service_name, "eds-svc");
+                assert_eq!(raw_eds_service_name, "eds-svc");
+            }
             other => panic!("expected Eds, got {other:?}"),
         }
     }
@@ -506,5 +557,76 @@ mod tests {
         let bytes = cluster.serialize().expect("serialize");
         let deserialized = ClusterResource::deserialize(bytes::Bytes::from(bytes)).unwrap();
         assert_eq!(ClusterResource::name(&deserialized), "test");
+    }
+
+    #[test]
+    fn validate_circuit_breakers_default_when_absent() {
+        let cluster = make_cluster("my-cluster");
+        let validated = ClusterResource::validate(cluster).unwrap();
+        assert_eq!(
+            validated.max_concurrent_requests,
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        );
+    }
+
+    #[test]
+    fn validate_circuit_breakers_custom_max_requests() {
+        use crate::generated::envoy::config::cluster::v3::CircuitBreakers;
+        use crate::generated::envoy::config::cluster::v3::circuit_breakers::Thresholds;
+        use protobuf_well_known_types::UInt32Value;
+
+        let mut max_req = UInt32Value::new();
+        max_req.set_value(256);
+
+        let mut default_thresh = Thresholds::new();
+        default_thresh.set_priority(RoutingPriority::Default);
+        default_thresh.set_max_requests(max_req);
+
+        let mut second_default = Thresholds::new();
+        second_default.set_priority(RoutingPriority::Default);
+        let mut second_max = UInt32Value::new();
+        second_max.set_value(999);
+        second_default.set_max_requests(second_max);
+
+        let mut cb = CircuitBreakers::new();
+        cb.thresholds_mut().push(default_thresh);
+        cb.thresholds_mut().push(second_default);
+
+        let mut cluster = make_cluster("my-cluster");
+        cluster.set_circuit_breakers(cb);
+
+        let validated = ClusterResource::validate(cluster).unwrap();
+        // Per gRFC A32, the first DEFAULT threshold entry wins.
+        assert_eq!(validated.max_concurrent_requests, 256);
+    }
+
+    #[test]
+    fn validate_circuit_breakers_ignores_non_default_priority_and_unset_max_requests() {
+        use crate::generated::envoy::config::cluster::v3::CircuitBreakers;
+        use crate::generated::envoy::config::cluster::v3::circuit_breakers::Thresholds;
+        use protobuf_well_known_types::UInt32Value;
+
+        let mut high_thresh = Thresholds::new();
+        high_thresh.set_priority(RoutingPriority::High);
+        let mut high_max = UInt32Value::new();
+        high_max.set_value(42);
+        high_thresh.set_max_requests(high_max);
+
+        // DEFAULT priority present, but max_requests is unset.
+        let mut default_unset = Thresholds::new();
+        default_unset.set_priority(RoutingPriority::Default);
+
+        let mut cb = CircuitBreakers::new();
+        cb.thresholds_mut().push(high_thresh);
+        cb.thresholds_mut().push(default_unset);
+
+        let mut cluster = make_cluster("my-cluster");
+        cluster.set_circuit_breakers(cb);
+
+        let validated = ClusterResource::validate(cluster).unwrap();
+        assert_eq!(
+            validated.max_concurrent_requests,
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        );
     }
 }

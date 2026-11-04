@@ -37,6 +37,8 @@ use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::client::Trailers;
 use crate::client::interceptor::Intercept;
+use crate::client::load_balancing::CallOutcome;
+use crate::client::load_balancing::CompletionCallback;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
@@ -213,6 +215,77 @@ impl FailingRecvStream {
                 connection_info,
             }),
         )
+    }
+}
+
+/// Wraps a client's [`RecvStream`] and invokes an LB policy's
+/// [`CompletionCallback`] (from [`Pick::on_complete`]) exactly once when the
+/// RPC completes.
+///
+/// The RPC is considered complete when trailers are received, in which case
+/// the callback receives the trailers' status and metadata. If the stream is
+/// closed without trailers, or dropped before completing (e.g. the RPC was
+/// cancelled or abandoned by the application), the callback receives an error
+/// status and no trailing metadata.
+///
+/// Note that an application that drops the stream after reading its last
+/// message but before reading trailers is reported as `CANCELLED`, so LB
+/// policies (e.g. for LRS load reports) count such RPCs as failed. This
+/// matches gRPC C-core, where the call is likewise cancelled if the
+/// application stops before receiving the status.
+///
+/// [`Pick::on_complete`]: crate::client::load_balancing::Pick::on_complete
+pub(crate) struct CompletionRecvStream<R> {
+    recv_stream: R,
+    on_complete: Option<CompletionCallback>,
+}
+
+impl<R> CompletionRecvStream<R> {
+    pub(crate) fn new(recv_stream: R, on_complete: CompletionCallback) -> Self {
+        Self {
+            recv_stream,
+            on_complete: Some(on_complete),
+        }
+    }
+
+    fn complete(&mut self, outcome: CallOutcome<'_>) {
+        if let Some(on_complete) = self.on_complete.take() {
+            on_complete(&outcome);
+        }
+    }
+
+    fn complete_with_error(&mut self, code: StatusCodeError, message: &str) {
+        if self.on_complete.is_some() {
+            let status = Err(StatusError::new(code, message));
+            self.complete(CallOutcome::new(&status));
+        }
+    }
+}
+
+impl<R> RecvStream for CompletionRecvStream<R>
+where
+    R: RecvStream,
+{
+    async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        let item = self.recv_stream.recv(msg).await;
+        match &item {
+            ResponseStreamItem::Trailers(trailers) => self.complete(
+                CallOutcome::new(trailers.status()).with_trailing_metadata(trailers.metadata()),
+            ),
+            ResponseStreamItem::StreamClosed => self
+                .complete_with_error(StatusCodeError::Internal, "stream closed without trailers"),
+            ResponseStreamItem::Headers(_) | ResponseStreamItem::Message => {}
+        }
+        item
+    }
+}
+
+impl<R> Drop for CompletionRecvStream<R> {
+    fn drop(&mut self) {
+        self.complete_with_error(
+            StatusCodeError::Cancelled,
+            "RPC abandoned before completion",
+        );
     }
 }
 
@@ -512,5 +585,66 @@ mod test {
                 );
             }
         }
+    }
+
+    /// What a completion callback observed: the error code (`None` for OK)
+    /// and whether trailing metadata was provided.
+    type Observed = std::sync::Arc<std::sync::Mutex<Vec<(Option<StatusCodeError>, bool)>>>;
+
+    fn recording_callback() -> (CompletionCallback, Observed) {
+        let observed = Observed::default();
+        let observed_clone = observed.clone();
+        let cb: CompletionCallback = Box::new(move |outcome| {
+            let code = outcome.status().as_ref().err().map(|e| e.code());
+            observed_clone
+                .lock()
+                .unwrap()
+                .push((code, outcome.trailing_metadata().is_some()));
+        });
+        (cb, observed)
+    }
+
+    // Tests that the completion callback runs exactly once with the trailers'
+    // status and metadata when trailers are received, and not again on later
+    // reads or when the stream is dropped.
+    #[tokio::test]
+    async fn test_completion_recv_stream_completes_on_trailers() {
+        let (cb, observed) = recording_callback();
+        let (_, rx) = FailingRecvStream::new_stream_pair(
+            StatusError::new(StatusCodeError::Unavailable, "fail"),
+            None,
+        );
+        let mut stream = CompletionRecvStream::new(rx, cb);
+        assert!(observed.lock().unwrap().is_empty());
+
+        let item = stream.recv(&mut NopRecvMessage).await;
+        assert!(matches!(item, ResponseStreamItem::Trailers(_)));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(Some(StatusCodeError::Unavailable), true)]
+        );
+
+        let item = stream.recv(&mut NopRecvMessage).await;
+        assert!(matches!(item, ResponseStreamItem::StreamClosed));
+        drop(stream);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+    }
+
+    // Tests that the completion callback runs with CANCELLED and no trailing
+    // metadata when the stream is dropped before the RPC completes.
+    #[tokio::test]
+    async fn test_completion_recv_stream_completes_on_drop() {
+        let (cb, observed) = recording_callback();
+        let (_, rx) = FailingRecvStream::new_stream_pair(
+            StatusError::new(StatusCodeError::Unavailable, "fail"),
+            None,
+        );
+        let stream = CompletionRecvStream::new(rx, cb);
+        assert!(observed.lock().unwrap().is_empty());
+        drop(stream);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(Some(StatusCodeError::Cancelled), false)]
+        );
     }
 }

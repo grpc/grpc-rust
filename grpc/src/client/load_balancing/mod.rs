@@ -480,8 +480,52 @@ impl LbState {
     }
 }
 
-/// Type alias for the completion callback function.
-pub type CompletionCallback = Box<dyn Fn() + Send + Sync>;
+/// Information about a finished RPC, passed to a [`CompletionCallback`].
+#[derive(Debug, Clone, Copy)]
+pub struct CallOutcome<'a> {
+    status: &'a crate::Result<()>,
+    trailing_metadata: Option<&'a MetadataMap>,
+}
+
+impl<'a> CallOutcome<'a> {
+    /// Creates a [`CallOutcome`] with the RPC's final status and no trailing
+    /// metadata.
+    pub fn new(status: &'a crate::Result<()>) -> Self {
+        Self {
+            status,
+            trailing_metadata: None,
+        }
+    }
+
+    /// Sets the trailing metadata received from the server.
+    pub fn with_trailing_metadata(mut self, trailing_metadata: &'a MetadataMap) -> Self {
+        self.trailing_metadata = Some(trailing_metadata);
+        self
+    }
+
+    /// Returns the RPC's final status.
+    ///
+    /// If the RPC was abandoned before completing (e.g. the application
+    /// dropped the stream), this is a `CANCELLED` error.
+    pub fn status(&self) -> &'a crate::Result<()> {
+        self.status
+    }
+
+    /// Returns the trailing metadata received from the server, if any. This
+    /// is `None` if the RPC did not receive trailers from the server (e.g. it
+    /// was abandoned).
+    ///
+    /// LB policies can use this to read per-call backend metrics (e.g. ORCA
+    /// load reports).
+    pub fn trailing_metadata(&self) -> Option<&'a MetadataMap> {
+        self.trailing_metadata
+    }
+}
+
+/// Callback invoked when an RPC that used a [`Pick`] completes.
+///
+/// See [`Pick::on_complete`] for when it is invoked.
+pub type CompletionCallback = Box<dyn for<'a> FnOnce(&CallOutcome<'a>) + Send + Sync>;
 
 /// A collection of data used by the channel for routing a request.
 pub struct Pick {
@@ -489,7 +533,16 @@ pub struct Pick {
     pub subchannel: Arc<dyn Subchannel>,
     // Metadata to be added to existing outgoing metadata.
     pub metadata: MetadataMap,
-    // Callback to be invoked once the RPC completes.
+    /// Callback to be invoked once the RPC completes.
+    ///
+    /// The channel invokes the callback when the RPC finishes (trailers are
+    /// received) or when it is abandoned before finishing (e.g. cancelled),
+    /// passing the RPC's [`CallOutcome`]. If the RPC never starts on the
+    /// subchannel, the callback is dropped without being invoked. This
+    /// includes the case where a parent LB policy discards this `Pick` (e.g.
+    /// a circuit breaker rejects it), so any per-call state acquired at pick
+    /// time must be released when the callback is dropped, not only when it
+    /// is invoked.
     pub on_complete: Option<CompletionCallback>,
 }
 

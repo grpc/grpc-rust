@@ -33,7 +33,7 @@ fn main() {
         .collect();
 
     grpc_protobuf_build::CodeGen::new()
-        .include("proto")
+        .include("third_party/grpc-proto")
         .inputs([
             "grpc/testing/benchmark_service.proto",
             "grpc/testing/messages.proto",
@@ -66,7 +66,7 @@ fn main() {
                 "grpc/testing/benchmark_service.proto",
                 "grpc/testing/worker_service.proto",
             ],
-            &["proto"],
+            &["third_party/grpc-proto"],
         )
         .unwrap();
 }

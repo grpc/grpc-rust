@@ -63,8 +63,6 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
-use crate::client::load_balancing::pick_first;
-use crate::client::load_balancing::round_robin;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel_sharing::SubchannelSharing;
@@ -165,8 +163,7 @@ impl Channel {
     /// Always available. When the `_runtime-tokio` feature is enabled,
     /// [`builder()`](Channel::builder) can be used instead to use the default
     /// Tokio runtime.
-    #[doc(hidden)]
-    pub fn builder_with_runtime(
+    pub(crate) fn builder_with_runtime(
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
         runtime: GrpcRuntime,
@@ -864,8 +861,7 @@ fn sanitize_config_selector_status(status: StatusError) -> StatusError {
 // Sets up the default registries for transports, name resolvers, and load
 // balancers.
 fn setup_registeries() {
-    pick_first::reg();
-    round_robin::reg();
+    load_balancing::register();
     dns::reg();
     #[cfg(unix)]
     name_resolution::unix::reg();

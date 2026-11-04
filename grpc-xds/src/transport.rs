@@ -27,13 +27,11 @@
 //! This transport uses the `grpc` crate's [`Channel`] and low-level streams
 //! to send and receive raw bytes.
 
-// TODO: remove once XdsClient is wired up in grpc-xds.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
+use grpc::__unstable::client::channel_builder_with_runtime;
 use grpc::__unstable::rt::GrpcRuntime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
@@ -94,7 +92,7 @@ impl TransportBuilder for GrpcTransportBuilder {
     type Transport = GrpcTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        let channel = Channel::builder_with_runtime(
+        let channel = channel_builder_with_runtime(
             server.uri(),
             self.credentials.clone(),
             self.runtime.clone(),
@@ -301,7 +299,7 @@ mod tests {
         )
         .build();
 
-        let mut watcher = client.watch::<ListenerResource>("listener-1").await;
+        let mut watcher = client.watch::<ListenerResource>("listener-1");
         let event = watcher.next().await.expect("watcher event");
         let ResourceEvent::ResourceChanged {
             result: Ok(listener),

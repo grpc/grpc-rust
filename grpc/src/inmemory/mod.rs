@@ -74,7 +74,6 @@ use crate::core::StreamEnded;
 use crate::core::StreamError;
 use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
-use crate::private::Internal;
 use crate::rt::GrpcRuntime;
 use crate::server::DynHandle;
 use crate::server::GracefulConnection;
@@ -191,7 +190,7 @@ impl InMemoryListener {
 impl Listener for InMemoryListener {
     type Transport = InMemoryServerCall;
 
-    async fn accept(&self, _token: Internal) -> Result<Self::Transport, String> {
+    async fn accept(&self, _token: crate::private::SealedToken) -> Result<Self::Transport, String> {
         let mut r = self.inner.r.lock().await;
         tokio::select! {
             call = r.recv() => call.ok_or_else(|| "listener closed".to_string()),
@@ -220,7 +219,7 @@ impl Future for InMemoryServingConnection {
 }
 
 impl GracefulConnection for InMemoryServingConnection {
-    fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+    fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::SealedToken) {
         // No-op: each in-memory "connection" is a single RPC.
     }
 }
@@ -232,7 +231,7 @@ impl ServerTransport for InMemoryServerCall {
         self,
         handler: Arc<dyn DynHandle>,
         _runtime: GrpcRuntime,
-        _token: crate::private::Internal,
+        _token: crate::private::SealedToken,
     ) -> InMemoryServingConnection {
         let mut send = InMemoryServerSendStream { tx: self.resp_tx };
         let recv = Box::new(InMemoryServerRecvStream { rx: self.req_rx });
@@ -649,7 +648,7 @@ mod tests {
         let mut serving_conn = transport.serve(
             Arc::new(HangingHandler(hs, hf)),
             crate::rt::default_runtime(),
-            crate::private::Internal,
+            crate::private::SealedToken,
         );
 
         // Poll the serving connection briefly to start the handler.

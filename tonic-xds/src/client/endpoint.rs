@@ -27,7 +27,7 @@ use crate::common::async_util::BoxFuture;
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
 use crate::xds::resource::cluster::ClusterResource;
 use crate::xds::resource::security::ClusterSecurityConfig;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use std::task::{Context, Poll};
 use tower::{BoxError, Service, load::Load};
@@ -69,6 +69,15 @@ impl EndpointAddress {
         Self {
             host: EndpointHost::from(host.into()),
             port,
+        }
+    }
+
+    /// Returns the IP address, or `None` if the host is a hostname.
+    pub(crate) fn ip(&self) -> Option<IpAddr> {
+        match self.host {
+            EndpointHost::Ipv4(ip) => Some(IpAddr::V4(ip)),
+            EndpointHost::Ipv6(ip) => Some(IpAddr::V6(ip)),
+            EndpointHost::Hostname(_) => None,
         }
     }
 }

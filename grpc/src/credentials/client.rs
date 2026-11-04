@@ -104,7 +104,7 @@ impl<T: ChannelCredentials> CompositeChannelCredentials<T> {
     /// so that both can be provided to a [`Channel`](crate::client::Channel).
     pub fn new(channel_creds: T, call_creds: Arc<dyn CallCredentials>) -> Self {
         let combined_call_creds =
-            if let Some(existing) = channel_creds.get_call_credentials(private::Internal) {
+            if let Some(existing) = channel_creds.get_call_credentials(private::UnstableToken) {
                 let composite_creds = CompositeCallCredentials::new(existing.clone(), call_creds);
                 Arc::new(composite_creds)
             } else {
@@ -126,7 +126,7 @@ impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T
         source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-        token: private::Internal,
+        token: private::UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         self.channel_creds
             .connect(authority, source, info, runtime, token)
@@ -137,7 +137,7 @@ impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T
         self.channel_creds.info()
     }
 
-    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+    fn get_call_credentials(&self, _: private::UnstableToken) -> Option<&Arc<dyn CallCredentials>> {
         Some(&self.call_creds)
     }
 }
@@ -208,7 +208,9 @@ mod tests {
         let composite2 = CompositeChannelCredentials::new(composite1, call_creds2);
 
         // Verify call credentials
-        let combined_call_creds = composite2.get_call_credentials(private::Internal).unwrap();
+        let combined_call_creds = composite2
+            .get_call_credentials(private::UnstableToken)
+            .unwrap();
         let call_details = CallDetails::new("service".to_string(), "method".to_string());
         let auth_info = ClientConnectionSecurityInfo::new(
             "local",
@@ -248,7 +250,7 @@ mod tests {
                 endpoint,
                 &ClientHandshakeInfo::default(),
                 &runtime,
-                private::Internal,
+                private::UnstableToken,
             )
             .await
             .unwrap();

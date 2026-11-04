@@ -120,7 +120,7 @@ impl ChannelCredentials for LocalChannelCredentials {
         source: BoxEndpoint,
         _info: &ClientHandshakeInfo,
         _runtime: &GrpcRuntime,
-        _token: private::Internal,
+        _token: private::UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
@@ -136,7 +136,7 @@ impl ChannelCredentials for LocalChannelCredentials {
         &INFO
     }
 
-    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+    fn get_call_credentials(&self, _: private::UnstableToken) -> Option<&Arc<dyn CallCredentials>> {
         None
     }
 }
@@ -161,7 +161,7 @@ impl ServerCredentials for LocalServerCredentials {
         &self,
         source: BoxEndpoint,
         _runtime: GrpcRuntime,
-        _token: private::Internal,
+        _token: private::UnstableToken,
     ) -> Result<server::HandshakeOutput, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
@@ -247,7 +247,7 @@ mod test {
                 endpoint,
                 &handshake_info,
                 &runtime,
-                private::Internal,
+                private::UnstableToken,
             )
             .await
             .unwrap();
@@ -306,7 +306,7 @@ mod test {
         let server_stream = StreamEndpoint::new_from_tcp(stream).unwrap();
 
         let output = creds
-            .accept(Box::new(server_stream), runtime, private::Internal)
+            .accept(Box::new(server_stream), runtime, private::UnstableToken)
             .await
             .unwrap();
         let endpoint = output.endpoint;
@@ -355,7 +355,7 @@ mod test {
             .accept(
                 Box::new(server_stream) as BoxEndpoint,
                 runtime,
-                private::Internal,
+                private::UnstableToken,
             )
             .await;
 

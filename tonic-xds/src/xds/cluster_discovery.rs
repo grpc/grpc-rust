@@ -300,6 +300,7 @@ impl Connector for TlsConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::cluster::{ClusterResource, LbPolicy};
 
     #[cfg(feature = "_tls-any")]
@@ -315,6 +316,7 @@ mod tests {
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: None,
+            circuit_breaking: CircuitBreakingConfig::default(),
         }
     }
 
@@ -325,6 +327,7 @@ mod tests {
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: Some(security),
+            circuit_breaking: CircuitBreakingConfig::default(),
         }
     }
 

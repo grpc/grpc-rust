@@ -46,6 +46,7 @@ _runtime-tokio = [
 # to be able to do its checks.
 tower = ["_runtime-tokio"]
 __unstable = []
+__internal = []
 gzip = ["dep:flate2"]
 
 [dependencies]
@@ -86,7 +87,7 @@ url = "2.5.0"
 
 [dev-dependencies]
 h2 = "0.4"
-tokio = { version = "1.37.0", features = ["test-util"] }
+tokio = { version = "1.47.0", features = ["test-util"] }
 async-stream = "0.3.6"
 criterion = "0.8"
 hickory-server = "0.26.1"

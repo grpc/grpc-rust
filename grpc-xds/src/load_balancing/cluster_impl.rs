@@ -50,7 +50,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::Once;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -86,7 +85,6 @@ use crate::xds_config::LeafEndpointSource;
 use crate::xds_config::XdsConfig;
 
 static POLICY_NAME: &str = "xds_cluster_impl_experimental";
-static START: Once = Once::new();
 
 const MILLION: u32 = 1_000_000;
 
@@ -565,9 +563,7 @@ impl Picker for FailurePicker {
 
 /// Registers `xds_cluster_impl_experimental` in the global LB policy registry.
 pub(crate) fn reg() {
-    START.call_once(|| {
-        GLOBAL_LB_REGISTRY.add_builder(ClusterImplBuilder);
-    });
+    GLOBAL_LB_REGISTRY.add_builder(ClusterImplBuilder);
 }
 
 #[cfg(test)]

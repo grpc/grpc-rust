@@ -15,12 +15,12 @@ base="$tmpdir/grpc-proto-master"
 # Copy protos in 'proto' from grpc-proto for these projects
 for project in interop grpc-benchmark; do
   while read -r proto; do
-    [ -f "$base/$proto" ] && cp "$base/$proto" "$project/proto/$proto"
+    [ -f "$base/$proto" ] && cp "$base/$proto" "$project/third_party/grpc-proto/$proto"
     echo "$proto"
-  done < <(cd "$project/proto" && find . -name "*.proto")
+  done < <(cd "$project/third_party/grpc-proto" && find . -name "*.proto" && echo ./LICENSE)
 done | sort -u > "$tmpdir/grpc-rust.lst"
 
-(cd "$base" && find . -name "*.proto") | sort > "$tmpdir/base.lst"
+(cd "$base" && find . -name "*.proto" && echo ./LICENSE) | sort > "$tmpdir/base.lst"
 echo "Files synced:"
 comm -12 "$tmpdir/grpc-rust.lst" "$tmpdir/base.lst"
 

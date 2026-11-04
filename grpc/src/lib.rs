@@ -74,7 +74,8 @@ pub use tonic::async_trait;
 #[cfg(feature = "__unstable")]
 #[doc(hidden)]
 pub mod __unstable {
-    pub use crate::private::Internal;
+    pub use crate::private::UnstableToken;
+    pub use crate::private::UnstableTrait;
 
     pub mod rt {
         pub use crate::rt::*;
@@ -89,6 +90,14 @@ pub mod __unstable {
         pub mod service_config {
             pub use crate::client::service_config::*;
         }
+
+        pub fn channel_builder_with_runtime(
+            target: impl Into<String>,
+            credentials: std::sync::Arc<dyn crate::credentials::ChannelCredentials>,
+            runtime: crate::rt::GrpcRuntime,
+        ) -> crate::client::ChannelBuilder {
+            crate::client::Channel::builder_with_runtime(target, credentials, runtime)
+        }
     }
     pub mod credentials {
         pub mod client {
@@ -100,16 +109,73 @@ pub mod __unstable {
         pub mod common {
             pub use crate::credentials::common::*;
         }
+
+        pub const fn protocol_info_new(
+            security_protocol: &'static str,
+        ) -> crate::credentials::ProtocolInfo {
+            crate::credentials::ProtocolInfo::new(security_protocol)
+        }
     }
 }
 
+#[cfg(feature = "__internal")]
+#[doc(hidden)]
+pub mod __internal {
+    pub use crate::private::InternalToken;
+    pub use crate::private::InternalTrait;
+}
+
+/// These private types are only intended to be used in exported traits, where
+/// the trait must be exposed for direct use, but we need to put some
+/// restrictions on the trait. Prefer to use 'pub use' in __unstable or
+/// __internal instead of using this.
+///
+/// For functions and struct methods, instead of using this, forwarding
+/// functions are added to __unstable or __internal.
+///
+/// For structs and enums, instead of using this, 'pub use' is added to
+/// __unstable or __internal.
 mod private {
-    /// A zero-sized type used to seal methods on a public trait.
+    /// A zero-sized type used on an exported trait so only the grpc crate can
+    /// call or implement methods with this argument. These methods may be
+    /// modified or deleted. The type is private to this crate.
+    pub struct SealedToken;
+    /// A trait used as a supertrait of an exported trait so only the grpc crate
+    /// can implement the trait and methods may be added. The type is private
+    /// to this crate. The traits are unrestricted for consumers.
     ///
-    /// Because this type is private to this crate, it cannot be constructed or
-    /// named by external crates. As a result, any method requiring an `Internal`
-    /// argument becomes uncallable from outside the crate.
-    pub struct Internal;
+    /// This trait does not imply that methods may be modified or deleted.
+    /// [`SealedToken`] must be used in addition to this trait to denote sealed
+    /// methods.
+    pub trait SealedTrait {}
+
+    /// A zero-sized type used on an exported trait where only grpc-authored
+    /// crates should call or implement methods with this argument. These
+    /// methods may be modified or deleted.
+    pub struct InternalToken;
+    /// A trait used as a supertrait of an exported trait where only
+    /// grpc-authored crates should implement the trait and methods may be
+    /// added. The traits are unrestricted for consumers.
+    ///
+    /// This trait does not imply that methods may be modified or deleted.
+    /// [`InternalToken`] must be used in addition to this trait to denote
+    /// internal methods.
+    pub trait InternalTrait {}
+
+    /// A zero-sized type used on an exported trait for methods which may be
+    /// modified or deleted. Unstable methods are generally not safe to use from
+    /// libraries since libraries should not require a specific version of the
+    /// grpc crate.
+    pub struct UnstableToken;
+    /// A trait used as a supertrait of an exported trait where methods may be
+    /// added. The traits are unrestricted for consumers. Unstable traits are
+    /// generally not safe to implement from libraries since libraries should
+    /// not require a specific version of the grpc crate.
+    ///
+    /// This trait does not imply that methods may be modified or deleted.
+    /// [`UnstableToken`] must be used in addition to this trait to denote
+    /// unstable methods.
+    pub trait UnstableTrait {}
 }
 
 #[cfg(test)]
@@ -119,3 +185,6 @@ mod echo_pb {
         "/src/generated/grpc_examples_echo.rs"
     ));
 }
+
+#[cfg(test)]
+mod stub_server;

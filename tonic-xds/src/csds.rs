@@ -63,19 +63,23 @@ pub(crate) struct CsdsRegistry {
 }
 
 struct RegisteredClient {
-    /// The key that channels look the client up by in their pool, reported
-    /// as the gRFC A71 `client_scope`.
-    scope: String,
-    node: NodeProto,
+    info: Arc<ClientInfo>,
     /// Weak, so that reporting a client does not keep it running.
     client: Weak<XdsClient>,
 }
 
 /// A registered client that is still running.
 struct LiveClient {
+    info: Arc<ClientInfo>,
+    client: Arc<XdsClient>,
+}
+
+/// How a registered client is identified in its `ClientConfig`.
+struct ClientInfo {
+    /// The key that channels look the client up by in their pool, reported
+    /// as the gRFC A71 `client_scope`.
     scope: String,
     node: NodeProto,
-    client: Arc<XdsClient>,
 }
 
 impl CsdsRegistry {
@@ -94,8 +98,7 @@ impl CsdsRegistry {
         let mut clients = self.lock();
         clients.retain(|registered| registered.client.strong_count() > 0);
         clients.push(RegisteredClient {
-            scope,
-            node,
+            info: Arc::new(ClientInfo { scope, node }),
             client: Arc::downgrade(client),
         });
     }
@@ -105,10 +108,10 @@ impl CsdsRegistry {
         self.lock()
             .iter()
             .filter_map(|registered| {
+                let client = registered.client.upgrade()?;
                 Some(LiveClient {
-                    scope: registered.scope.clone(),
-                    node: registered.node.clone(),
-                    client: registered.client.upgrade()?,
+                    info: Arc::clone(&registered.info),
+                    client,
                 })
             })
             .collect()
@@ -117,7 +120,10 @@ impl CsdsRegistry {
     /// The scopes of the registered clients that are still running.
     #[cfg(test)]
     pub(crate) fn scopes(&self) -> Vec<String> {
-        self.clients().into_iter().map(|live| live.scope).collect()
+        self.clients()
+            .into_iter()
+            .map(|live| live.info.scope.clone())
+            .collect()
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<RegisteredClient>> {
@@ -234,22 +240,22 @@ impl CsdsHandler {
             .registry
             .clients()
             .into_iter()
-            .map(|client| self.client_config(client, include_contents));
+            .map(|client| client_config(client, include_contents));
         let config = futures_util::future::join_all(configs).await;
         Ok(ClientStatusResponse { config })
     }
+}
 
-    async fn client_config(&self, live: LiveClient, include_contents: bool) -> ClientConfig {
-        let snapshot = live.client.resource_snapshot().await;
-        ClientConfig {
-            node: Some(live.node),
-            generic_xds_configs: snapshot
-                .into_iter()
-                .map(|resource| generic_xds_config(resource, include_contents))
-                .collect(),
-            client_scope: live.scope,
-            ..Default::default()
-        }
+async fn client_config(live: LiveClient, include_contents: bool) -> ClientConfig {
+    let snapshot = live.client.resource_snapshot().await;
+    ClientConfig {
+        node: Some(live.info.node.clone()),
+        generic_xds_configs: snapshot
+            .into_iter()
+            .map(|resource| generic_xds_config(resource, include_contents))
+            .collect(),
+        client_scope: live.info.scope.clone(),
+        ..Default::default()
     }
 }
 

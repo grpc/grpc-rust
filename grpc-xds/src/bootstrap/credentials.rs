@@ -27,11 +27,11 @@
 use std::sync::Arc;
 
 use grpc::__unstable::UnstableToken;
-use grpc::__unstable::credentials::protocol_info_new;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::client::HandshakeOutput;
 use grpc::__unstable::credentials::client::ValidateAuthority;
 use grpc::__unstable::credentials::common::Authority;
+use grpc::__unstable::credentials::protocol_info_new;
 use grpc::__unstable::rt::BoxEndpoint;
 use grpc::__unstable::rt::GrpcRuntime;
 use grpc::async_trait;

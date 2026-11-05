@@ -47,6 +47,7 @@ _runtime-tokio = [
 tower = ["_runtime-tokio"]
 __unstable = []
 __internal = []
+test-utils = []
 gzip = ["dep:flate2"]
 
 [dependencies]

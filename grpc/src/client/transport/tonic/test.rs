@@ -23,6 +23,7 @@
  */
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::result::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,8 @@ use http::HeaderName;
 use http::HeaderValue;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status as TonicStatus;
 use tonic::metadata::MetadataMap as TonicMetadata;
@@ -47,6 +50,7 @@ use crate::async_trait;
 use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::Channel;
+use crate::client::DynInvoke;
 use crate::client::Invoke as _;
 use crate::client::RecvStream as _;
 use crate::client::RequestHeaders;
@@ -1029,4 +1033,379 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     // Verify the send stream has ended.
     let req = WrappedEchoRequest(EchoRequest::default());
     assert!(tx.send(&req, SendOptions::default()).await.is_err());
+}
+
+struct FailingEncodeRequest;
+
+impl SendMessage for FailingEncodeRequest {
+    fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String> {
+        Err("intentional encode failure".to_string())
+    }
+}
+
+// Starts a raw h2 server that accepts one stream and asserts the client resets
+// it with CANCEL.  The server never sends a status, so the client can only
+// learn it from its own encode failure.
+async fn spawn_cancel_expecting_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (request, _respond) = connection.accept().await.unwrap().unwrap();
+
+        // Drive the connection so the RST_STREAM frame is processed.
+        tokio::spawn(async move { while connection.accept().await.is_some() {} });
+
+        match request.into_body().data().await {
+            Some(Ok(_)) => panic!("Expected RST_STREAM, got data"),
+            Some(Err(err)) => assert_eq!(err.reason(), Some(Reason::CANCEL)),
+            None => panic!("Expected RST_STREAM, got clean close (EOS)"),
+        }
+    });
+    (addr, handle)
+}
+
+// Starts a raw h2 server that accepts one stream, optionally responds with
+// headers, and then holds the stream open without sending a status.
+async fn spawn_stream_holding_server(send_headers: bool) -> SocketAddr {
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+        let _response_stream = send_headers.then(|| {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            respond.send_response(response, false).unwrap()
+        });
+        while connection.accept().await.is_some() {}
+    });
+    addr
+}
+
+// Connects to addr, returning the connection and its disconnection listener.
+async fn connect_tonic_transport(
+    addr: SocketAddr,
+) -> (Box<dyn DynInvoke>, oneshot::Receiver<Result<(), String>>) {
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let config = Arc::new(TransportOptions::default());
+    let security_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+    let (conn, _sec_info, disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &security_opts,
+            &config,
+        )
+        .await
+        .unwrap();
+    (conn, disconnection_listener)
+}
+
+fn assert_encode_error_trailers(item: ResponseStreamItem) {
+    let ResponseStreamItem::Trailers(trailers) = item else {
+        panic!("Expected Trailers after encode failure, got {item:?}");
+    };
+    let status_err = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status_err.code(), StatusCodeError::Internal);
+    assert!(
+        status_err.message().contains("intentional encode failure"),
+        "unexpected status message: {}",
+        status_err.message()
+    );
+}
+
+const ENCODE_ERROR_METHOD: &str = "/grpc.examples.echo.Echo/BidirectionalStreamingEcho";
+
+#[tokio::test]
+async fn tonic_transport_send_encode_error_cancels_stream() {
+    super::reg();
+    let (addr, server_handle) = spawn_cancel_expecting_server().await;
+    let (conn, _disconnection_listener) = connect_tonic_transport(addr).await;
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(ENCODE_ERROR_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+
+    assert!(
+        tx.send(&FailingEncodeRequest, SendOptions::default())
+            .await
+            .is_err()
+    );
+
+    // The send stream has ended, so a message that encodes fine is rejected.
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err());
+
+    // The send failure alone cancels the stream, before the application reads
+    // the status.
+    GrpcRuntime::default()
+        .timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("Test timed out waiting for server to observe RST_STREAM")
+        .unwrap();
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = GrpcRuntime::default()
+        .timeout(Duration::from_secs(5), rx.recv(&mut resp))
+        .await
+        .expect("Test timed out waiting for trailers after encode failure");
+    assert_encode_error_trailers(item);
+    assert!(matches!(
+        rx.recv(&mut resp).await,
+        ResponseStreamItem::StreamClosed
+    ));
+}
+
+#[tokio::test]
+async fn tonic_transport_send_encode_error_fails_recv_awaiting_headers() {
+    super::reg();
+    let addr = spawn_stream_holding_server(false).await;
+    let (conn, _disconnection_listener) = connect_tonic_transport(addr).await;
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(ENCODE_ERROR_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+
+    // join! polls recv first, so it is already waiting for the response
+    // headers when send fails.
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let runtime = GrpcRuntime::default();
+    let (item, send_result) = tokio::join!(
+        runtime.timeout(Duration::from_secs(5), rx.recv(&mut resp)),
+        tx.send(&FailingEncodeRequest, SendOptions::default()),
+    );
+    assert!(send_result.is_err());
+    assert_encode_error_trailers(
+        item.expect("Test timed out waiting for trailers after encode failure"),
+    );
+}
+
+#[tokio::test]
+async fn tonic_transport_send_encode_error_fails_recv_awaiting_message() {
+    super::reg();
+    let addr = spawn_stream_holding_server(true).await;
+    let (conn, _disconnection_listener) = connect_tonic_transport(addr).await;
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(ENCODE_ERROR_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let runtime = GrpcRuntime::default();
+    let item = runtime
+        .timeout(Duration::from_secs(5), rx.recv(&mut resp))
+        .await
+        .expect("Test timed out waiting for response headers");
+    assert!(matches!(item, ResponseStreamItem::Headers(_)));
+
+    // join! polls recv first, so it is already waiting for a message when send
+    // fails.
+    let (item, send_result) = tokio::join!(
+        runtime.timeout(Duration::from_secs(5), rx.recv(&mut resp)),
+        tx.send(&FailingEncodeRequest, SendOptions::default()),
+    );
+    assert!(send_result.is_err());
+    assert_encode_error_trailers(
+        item.expect("Test timed out waiting for trailers after encode failure"),
+    );
+}
+
+// While the stream cannot be opened, tonic cannot act on the cancellation, so
+// a pending recv must not depend on it.
+#[tokio::test]
+async fn tonic_transport_send_encode_error_fails_recv_while_waiting_for_stream_slot() {
+    super::reg();
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake::<_, Bytes>(socket)
+            .await
+            .unwrap();
+        // Hold every stream open, and respond with headers so the client can
+        // tell when its first stream is established.
+        let mut streams = Vec::new();
+        while let Some(Ok((request, mut respond))) = connection.accept().await {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            let response_stream = respond.send_response(response, false).unwrap();
+            streams.push((request, response_stream));
+        }
+    });
+    let (conn, _disconnection_listener) = connect_tonic_transport(addr).await;
+    let runtime = GrpcRuntime::default();
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+
+    // The first call occupies the server's only stream slot.
+    let (_tx1, mut rx1) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(ENCODE_ERROR_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+    let item = runtime
+        .timeout(Duration::from_secs(5), rx1.recv(&mut resp))
+        .await
+        .expect("Test timed out waiting for response headers");
+    assert!(matches!(item, ResponseStreamItem::Headers(_)));
+
+    // The second call's stream cannot be opened until the first one ends.
+    let (mut tx2, mut rx2) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(ENCODE_ERROR_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+    // join! polls recv first, so it is already waiting when send fails.
+    let (item, send_result) = tokio::join!(
+        runtime.timeout(Duration::from_secs(5), rx2.recv(&mut resp)),
+        tx2.send(&FailingEncodeRequest, SendOptions::default()),
+    );
+    assert!(send_result.is_err());
+    assert_encode_error_trailers(
+        item.expect("Test timed out waiting for trailers after encode failure"),
+    );
+}
+
+// Builds a recv stream whose tonic call has already finished with `result`,
+// after the call's send stream failed.  The status must already be received
+// when the send fails, which cannot be arranged deterministically over a real
+// connection, so the stream is built directly.
+fn recv_stream_after_send_failure(
+    result: Result<tonic::Response<tonic::Streaming<Bytes>>, TonicStatus>,
+) -> super::TonicRecvStream {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    resp_tx.send(result).unwrap();
+    let call = Arc::new(super::CallState {
+        cancel_tx: tonic::Request::new(()).cancellation_handle(),
+        send_failure: Arc::default(),
+    });
+    call.fail_send(StatusError::new(
+        StatusCodeError::Internal,
+        "error encoding request: intentional encode failure",
+    ));
+    super::TonicRecvStream {
+        state: super::StreamState::AwaitingHeaders(resp_rx),
+        call: Some(call),
+        connection_info: Some(crate::core::test_connection_info()),
+    }
+}
+
+// As in gRPC-Go, a status the client already received from the server is
+// reported even if the send stream fails before the application reads it.
+#[tokio::test]
+async fn tonic_recv_stream_reports_received_status_after_send_failure() {
+    for code in [tonic::Code::NotFound, tonic::Code::Cancelled] {
+        let mut rx = recv_stream_after_send_failure(Err(TonicStatus::new(code, "server status")));
+        let mut resp = WrappedEchoResponse(EchoResponse::default());
+        let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut resp).await else {
+            panic!("Expected Trailers");
+        };
+        let status_err = trailers.status().as_ref().unwrap_err();
+        assert_eq!(status_err.code(), StatusCodeError::from(code as i32));
+        assert_eq!(status_err.message(), "server status");
+    }
+}
+
+// Records, each time the request body is woken, whether the send failure was
+// already recorded.
+struct SendFailureProbe {
+    send_failure: Arc<super::SendFailure>,
+    recorded_at_wake: std::sync::Mutex<Vec<bool>>,
+}
+
+impl std::task::Wake for SendFailureProbe {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let recorded = self.send_failure.get().is_some();
+        self.recorded_at_wake.lock().unwrap().push(recorded);
+    }
+}
+
+// A request body that ends normally lets the server treat a cut-short request
+// as complete, so after a send failure the body must only end by cancellation.
+// The race this guards against needs a concurrent poll of the body, so the
+// test observes the body directly: the request channel wakes it when it
+// closes, and the failure must be recorded by then.
+#[tokio::test]
+async fn tonic_send_encode_error_never_ends_request_body() {
+    let new_streams = || {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let send_failure = Arc::new(super::SendFailure::default());
+        let body = super::RequestStream {
+            rx: ReceiverStream::new(rx),
+            send_failure: send_failure.clone(),
+        };
+        let call = Arc::new(super::CallState {
+            cancel_tx: tonic::Request::new(()).cancellation_handle(),
+            send_failure: send_failure.clone(),
+        });
+        let send = super::TonicSendStream {
+            state: super::SendState::Open { tx, call },
+        };
+        (send, body, send_failure)
+    };
+
+    // Without a send failure, the final message ends the body.
+    let (mut send, mut body, _) = new_streams();
+    let req = WrappedEchoRequest(EchoRequest::default());
+    send.send(&req, SendOptions::default().with_final_msg(true))
+        .await
+        .unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        Pin::new(&mut body).poll_next(&mut cx),
+        std::task::Poll::Ready(Some(_))
+    ));
+    assert!(matches!(
+        Pin::new(&mut body).poll_next(&mut cx),
+        std::task::Poll::Ready(None)
+    ));
+
+    let (mut send, mut body, send_failure) = new_streams();
+    let probe = Arc::new(SendFailureProbe {
+        send_failure,
+        recorded_at_wake: Default::default(),
+    });
+    let waker = std::task::Waker::from(probe.clone());
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(Pin::new(&mut body).poll_next(&mut cx).is_pending());
+    assert!(
+        send.send(&FailingEncodeRequest, SendOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(*probe.recorded_at_wake.lock().unwrap(), vec![true]);
+    assert!(Pin::new(&mut body).poll_next(&mut cx).is_pending());
 }

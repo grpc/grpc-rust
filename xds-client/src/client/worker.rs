@@ -270,7 +270,7 @@ impl Default for WatcherId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SubscriptionMode {
     /// Wildcard subscription - receive all resources of this type.
-    /// In xDS protocol, this is represented by an empty resource_names list.
+    /// Uses an explicit `*` so an empty resource_names list can unsubscribe.
     Wildcard,
     /// Named subscription - receive only specific resources.
     /// Contains the set of resource names to subscribe to.
@@ -279,10 +279,10 @@ enum SubscriptionMode {
 
 impl SubscriptionMode {
     /// Get resource names for DiscoveryRequest.
-    /// Returns empty vec for wildcard (xDS spec: empty = all resources).
+    /// Uses `*` for wildcard and an empty list for no subscriptions.
     fn resource_names_for_request(&self) -> Vec<String> {
         match self {
-            Self::Wildcard => Vec::new(),
+            Self::Wildcard => vec!["*".to_string()],
             Self::Named(names) => names.iter().cloned().collect(),
         }
     }
@@ -415,23 +415,40 @@ impl CachedResource {
     }
 }
 
+#[derive(Debug)]
+struct ResourceWatchState {
+    watchers: HashMap<WatcherId, mpsc::UnboundedSender<ResourceEvent<DecodedResource>>>,
+    cached: CachedResource,
+    /// Dropping the sender cancels the pending resource timeout.
+    timer: Option<(u64, oneshot::Sender<()>)>,
+}
+
+impl Default for ResourceWatchState {
+    fn default() -> Self {
+        Self {
+            watchers: HashMap::new(),
+            cached: CachedResource::requested(),
+            timer: None,
+        }
+    }
+}
+
 /// Per-type_url state tracking.
+/// Retained for stream bookkeeping; resource state and version expire when idle.
 struct TypeState {
     /// Reference-counted type URL, shared with metric attribute slots so
     /// per-emission attribute construction is a cheap.
     type_url: Arc<str>,
-    /// Decoder function for this resource type.
+    /// Decoder for this resource type.
     decoder: DecoderFn,
-    /// Version from last successful response.
+    /// Last accepted version, retained across stream restarts while watched.
     version_info: String,
-    /// Nonce from last response (for ACK/NACK).
-    nonce: String,
-    /// Active watchers for this type.
-    watchers: HashMap<WatcherId, WatcherEntry>,
+    /// Watchers interested in every resource of this type.
+    wildcard_watchers: HashMap<WatcherId, mpsc::UnboundedSender<ResourceEvent<DecodedResource>>>,
     /// Current subscription mode (wildcard or named resources).
     subscription: SubscriptionMode,
-    /// Resource cache: name -> cached resource.
-    cache: HashMap<String, CachedResource>,
+    /// Named watchers, cached data, and timeout owned by each resource.
+    resources: HashMap<String, ResourceWatchState>,
     /// Whether missing resources in SotW should be treated as deleted (per A53).
     all_resources_required_in_sotw: bool,
 }
@@ -442,10 +459,9 @@ impl std::fmt::Debug for TypeState {
             .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
             .field("version_info", &self.version_info)
-            .field("nonce", &self.nonce)
-            .field("watchers", &self.watchers)
+            .field("wildcard_watchers", &self.wildcard_watchers)
             .field("subscription", &self.subscription)
-            .field("cache", &format!("<{} entries>", self.cache.len()))
+            .field("resources", &format!("<{} entries>", self.resources.len()))
             .field(
                 "all_resources_required_in_sotw",
                 &self.all_resources_required_in_sotw,
@@ -460,34 +476,34 @@ impl TypeState {
             type_url,
             decoder,
             version_info: String::new(),
-            nonce: String::new(),
-            watchers: HashMap::new(),
+            wildcard_watchers: HashMap::new(),
             subscription: SubscriptionMode::Named(HashSet::new()),
-            cache: HashMap::new(),
+            resources: HashMap::new(),
             all_resources_required_in_sotw,
         }
     }
 
     /// Recalculate subscription mode from watchers.
     fn recalculate_subscriptions(&mut self) {
-        let has_wildcard = self
-            .watchers
-            .values()
-            .any(|entry| entry.subscription.is_wildcard());
-
-        if has_wildcard {
-            self.subscription = SubscriptionMode::Wildcard;
+        self.subscription = if self.wildcard_watchers.is_empty() {
+            SubscriptionMode::Named(
+                self.resources
+                    .iter()
+                    .filter(|(_, resource)| !resource.watchers.is_empty())
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            )
         } else {
-            let names: HashSet<String> = self
-                .watchers
+            SubscriptionMode::Wildcard
+        };
+    }
+
+    fn has_watchers(&self) -> bool {
+        !self.wildcard_watchers.is_empty()
+            || self
+                .resources
                 .values()
-                .filter_map(|entry| match &entry.subscription {
-                    WatcherSubscription::Named(name) => Some(name.clone()),
-                    WatcherSubscription::Wildcard => None,
-                })
-                .collect();
-            self.subscription = SubscriptionMode::Named(names);
-        }
+                .any(|resource| !resource.watchers.is_empty())
     }
 
     /// Get resource names to send in DiscoveryRequest.
@@ -500,23 +516,24 @@ impl TypeState {
         &self,
         name: &str,
     ) -> impl Iterator<Item = &mpsc::UnboundedSender<ResourceEvent<DecodedResource>>> {
-        self.watchers
-            .values()
-            .filter(move |e| e.subscription.matches(name))
-            .map(|e| &e.event_tx)
+        self.resources
+            .get(name)
+            .into_iter()
+            .flat_map(|resource| resource.watchers.values())
+            .chain(self.wildcard_watchers.values())
     }
 
     /// Snapshots of the subscribed resources in the cache.
     fn snapshot(&self) -> impl Iterator<Item = ResourceSnapshot> + '_ {
-        self.cache
+        self.resources
             .iter()
             .filter(|(name, _)| self.subscription.includes(name))
-            .map(|(name, cached)| ResourceSnapshot {
+            .map(|(name, resource)| ResourceSnapshot {
                 type_url: self.type_url.to_string(),
                 name: name.clone(),
-                status: cached.state.status(),
-                accepted: cached.accepted.clone(),
-                rejected: match &cached.state {
+                status: resource.cached.state.status(),
+                accepted: resource.cached.accepted.clone(),
+                rejected: match &resource.cached.state {
                     ResourceState::NACKed(rejected) => Some(rejected.clone()),
                     _ => None,
                 },
@@ -528,8 +545,10 @@ impl TypeState {
     /// is the authoritative snapshot for the `grpc.xds_client.resources` gauge.
     fn resource_state_counts(&self) -> HashMap<&'static str, i64> {
         let mut counts: HashMap<&'static str, i64> = HashMap::new();
-        for cached in self.cache.values() {
-            *counts.entry(cached.state.cache_state_label()).or_insert(0) += 1;
+        for resource in self.resources.values() {
+            *counts
+                .entry(resource.cached.state.cache_state_label())
+                .or_insert(0) += 1;
         }
         counts
     }
@@ -554,28 +573,6 @@ impl WatcherSubscription {
             Self::Named(name)
         }
     }
-
-    /// Check if this subscription matches a resource name.
-    fn matches(&self, resource_name: &str) -> bool {
-        match self {
-            Self::Wildcard => true,
-            Self::Named(name) => name == resource_name,
-        }
-    }
-
-    /// Returns true if this is a wildcard subscription.
-    fn is_wildcard(&self) -> bool {
-        matches!(self, Self::Wildcard)
-    }
-}
-
-/// Per-watcher state.
-#[derive(Debug)]
-struct WatcherEntry {
-    /// Channel to send events to this watcher.
-    event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
-    /// What resources this watcher is subscribed to.
-    subscription: WatcherSubscription,
 }
 
 /// All inputs to the state actor share one FIFO message queue.
@@ -660,9 +657,8 @@ pub(crate) struct AdsWorker<C, R> {
     command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
-    /// Cancellation handles for resource timers (gRFC A57).
-    /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
-    resource_timers: HashMap<(String, String), (u64, oneshot::Sender<()>)>,
+    /// Maps watcher IDs to their type URL and subscription.
+    watcher_index: HashMap<WatcherId, (String, WatcherSubscription)>,
     /// IDs continue across reconnects and subscription removal, wrapping at u64::MAX.
     next_resource_timer_id: u64,
     /// Optional backend + per-client A78 metric attributes
@@ -693,7 +689,7 @@ where
             command_tx: command_tx.downgrade(),
             command_rx,
             type_states: HashMap::new(),
-            resource_timers: HashMap::new(),
+            watcher_index: HashMap::new(),
             next_resource_timer_id: 0,
             recorder: RecorderHandle::new(recorder, target),
         }
@@ -743,12 +739,8 @@ where
         while let Some(message) = self.command_rx.recv().await {
             let result = match message {
                 WorkerCommand::Watcher(cmd) => {
-                    let sender = context
-                        .session
-                        .as_ref()
-                        .filter(|s| s.cancel.is_some())
-                        .map(|s| &s.writes);
-                    let result = self.handle_command(sender, cmd);
+                    let stream = context.session.as_mut().filter(|s| s.cancel.is_some());
+                    let result = self.handle_command(stream, cmd);
                     if !self.type_states.is_empty()
                         && let Some(task) = transport_task.take()
                     {
@@ -768,7 +760,7 @@ where
                 && let Some(active) = &mut context.session
             {
                 drop(active.cancel.take());
-                self.resource_timers.clear();
+                self.cancel_resource_timers();
             }
         }
         if context.healthy {
@@ -784,12 +776,9 @@ where
     ) -> Result<()> {
         match event {
             TransportEvent::Ready { writes, cancel } => {
-                for state in self.type_states.values_mut() {
-                    state.nonce.clear();
-                }
-                let active = ActiveStream::new(writes, cancel);
+                let mut active = ActiveStream::new(writes, cancel);
                 // Reconcile subscriptions from current actor state after setup.
-                let result = self.send_initial_requests(&active.writes);
+                let result = self.send_initial_requests(&mut active);
                 context.session = Some(active);
                 result
             }
@@ -801,11 +790,11 @@ where
                 let response = self.codec.decode_response(bytes)?;
                 active.saw_response = true;
                 self.record_healthy(&mut context.healthy);
-                self.handle_response(&active.writes, response, done)
+                self.handle_response(active, response, done)
             }
             TransportEvent::Failed { saw_response_tx } => {
                 // Dropping the handles cancels timers while the stream is unavailable.
-                self.resource_timers.clear();
+                self.cancel_resource_timers();
                 let saw_response = context.session.take().is_some_and(|s| s.saw_response);
                 if !saw_response {
                     self.record_unhealthy(&mut context.healthy);
@@ -841,15 +830,15 @@ where
     }
 
     /// Send initial DiscoveryRequests for all active subscriptions.
-    fn send_initial_requests(&mut self, sender: &mpsc::UnboundedSender<Bytes>) -> Result<()> {
+    fn send_initial_requests(&mut self, stream: &mut ActiveStream) -> Result<()> {
         let type_urls: Vec<_> = self
             .type_states
             .iter()
-            .filter(|(_, state)| !state.watchers.is_empty())
+            .filter(|(_, state)| state.has_watchers())
             .map(|(type_url, _)| type_url.clone())
             .collect();
         for type_url in type_urls {
-            self.send_request(sender, &type_url)?;
+            self.send_request(stream, &type_url)?;
         }
 
         Ok(())
@@ -857,14 +846,10 @@ where
 
     /// Handle a command, optionally sending network requests if connected.
     ///
-    /// When `sender` is `None`, only state updates are performed (disconnected mode).
-    /// When `sender` is `Some`, subscription changes trigger network requests via
+    /// When `stream` is `None`, only state updates are performed (disconnected mode).
+    /// When `stream` is `Some`, subscription changes trigger network requests via
     /// the unbounded write channel.
-    fn handle_command(
-        &mut self,
-        sender: Option<&mpsc::UnboundedSender<Bytes>>,
-        cmd: WatchEvent,
-    ) -> Result<()> {
+    fn handle_command(&mut self, stream: Option<&mut ActiveStream>, cmd: WatchEvent) -> Result<()> {
         match cmd {
             WatchEvent::Watch {
                 type_url,
@@ -882,9 +867,9 @@ where
                     decoder,
                     all_resources_required_in_sotw,
                 );
-                if let Some(sender) = sender {
+                if let Some(stream) = stream {
                     if subscriptions_changed {
-                        self.send_request(sender, type_url)?;
+                        self.send_request(stream, type_url)?;
                     } else {
                         // The current subscription already covers this watch,
                         // including a named watch added under a wildcard.
@@ -893,10 +878,20 @@ where
                 }
             }
             WatchEvent::Unwatch { watcher_id } => {
-                if let Some((type_url, true)) = self.remove_watcher(watcher_id)
-                    && let Some(sender) = sender
-                {
-                    self.send_request(sender, &type_url)?;
+                if let Some((type_url, subscriptions_changed)) = self.remove_watcher(watcher_id) {
+                    let result = match stream {
+                        Some(stream) if subscriptions_changed => {
+                            self.send_request(stream, &type_url)
+                        }
+                        _ => Ok(()),
+                    };
+                    // Send the unsubscribe with the old version, then forget the evicted data.
+                    if let Some(state) = self.type_states.get_mut(&type_url)
+                        && !state.has_watchers()
+                    {
+                        state.version_info.clear();
+                    }
+                    result?;
                 }
             }
             WatchEvent::ResourceTimerExpired {
@@ -935,112 +930,131 @@ where
         decoder: DecoderFn,
         all_resources_required_in_sotw: bool,
     ) -> bool {
-        let type_url_string = type_url.to_string();
+        self.watcher_index.insert(
+            watcher_id,
+            (
+                type_url.to_string(),
+                WatcherSubscription::from_name(name.clone()),
+            ),
+        );
         let type_state = self
             .type_states
-            .entry(type_url_string.clone())
+            .entry(type_url.to_string())
             .or_insert_with(|| {
                 TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
             });
-
         let old_subscription = type_state.subscription.clone();
-        let watcher_subscription = WatcherSubscription::from_name(name.clone());
-
-        // Track newly-inserted cache entry for the resources gauge (None -> Requested).
         let mut was_new = false;
-
-        // For named subscriptions, check cache and send cached state to new watcher.
-        // For wildcard subscriptions, watchers receive updates as they come in.
-        if let WatcherSubscription::Named(ref resource_name) = watcher_subscription {
-            let cached = match type_state.cache.entry(resource_name.clone()) {
-                Entry::Vacant(v) => {
+        if name.is_empty() {
+            type_state.wildcard_watchers.insert(watcher_id, event_tx);
+        } else {
+            let resource = match type_state.resources.entry(name) {
+                Entry::Vacant(entry) => {
                     was_new = true;
-                    v.insert(CachedResource::requested())
+                    entry.insert(ResourceWatchState::default())
                 }
-                Entry::Occupied(o) => o.into_mut(),
+                Entry::Occupied(entry) => entry.into_mut(),
             };
-
-            if let Some(event) = cached.to_event() {
-                // Enqueue cached state without waiting for the watcher.
+            if let Some(event) = resource.cached.to_event() {
                 let _ = event_tx.send(event);
             }
+            resource.watchers.insert(watcher_id, event_tx);
         }
-
-        type_state.watchers.insert(
-            watcher_id,
-            WatcherEntry {
-                event_tx,
-                subscription: watcher_subscription,
-            },
-        );
         type_state.recalculate_subscriptions();
-
-        let subscriptions_changed = type_state.subscription != old_subscription;
-
-        // Reconcile the resources gauge from the updated cache.
         if was_new {
             let counts = type_state.resource_state_counts();
             self.recorder
                 .sync_resource_counts(&type_state.type_url, &counts);
         }
-
-        subscriptions_changed
+        type_state.subscription != old_subscription
     }
 
-    /// Remove a watcher from the state.
-    /// Returns the type_url and whether subscriptions changed.
+    /// Remove a watcher and report whether the server subscription changed.
     fn remove_watcher(&mut self, watcher_id: WatcherId) -> Option<(String, bool)> {
-        let type_url = self
+        let (type_url, subscription) = self.watcher_index.remove(&watcher_id)?;
+        let type_state = self
             .type_states
-            .iter()
-            .find(|(_, state)| state.watchers.contains_key(&watcher_id))
-            .map(|(url, _)| url.clone())?;
-
-        let type_state = self.type_states.get_mut(&type_url)?;
-
-        let old_subscription = type_state.subscription.clone();
-
-        type_state.watchers.remove(&watcher_id);
-        type_state.recalculate_subscriptions();
-
-        let subscriptions_changed = type_state.subscription != old_subscription;
-
-        if type_state.watchers.is_empty() {
-            let type_url_arc = Arc::clone(&type_state.type_url);
-            self.type_states.remove(&type_url);
-            // The type is gone — reset all of its resource buckets to zero.
-            self.recorder
-                .sync_resource_counts(&type_url_arc, &HashMap::new());
-            // Cancel all pending resource timers for this type.
-            self.resource_timers.retain(|key, _| key.0 != type_url);
+            .get_mut(&type_url)
+            .expect("indexed watcher must have a type state");
+        let old_cache_len = type_state.resources.len();
+        match subscription {
+            WatcherSubscription::Named(name) => {
+                let resource = type_state
+                    .resources
+                    .get_mut(&name)
+                    .expect("indexed named watcher must have resource watch state");
+                resource.watchers.remove(&watcher_id);
+                if !resource.watchers.is_empty() {
+                    return Some((type_url, false));
+                }
+                resource.timer = None;
+                if type_state.wildcard_watchers.is_empty() {
+                    type_state.resources.remove(&name);
+                }
+            }
+            WatcherSubscription::Wildcard => {
+                type_state.wildcard_watchers.remove(&watcher_id);
+                if !type_state.wildcard_watchers.is_empty() {
+                    return Some((type_url, false));
+                }
+                type_state
+                    .resources
+                    .retain(|_, resource| !resource.watchers.is_empty());
+            }
         }
+        let old_subscription = type_state.subscription.clone();
+        type_state.recalculate_subscriptions();
+        if !type_state.has_watchers() {
+            type_state.resources = HashMap::new();
+            type_state.wildcard_watchers = HashMap::new();
+        }
+        if type_state.resources.len() != old_cache_len {
+            let counts = type_state.resource_state_counts();
+            self.recorder
+                .sync_resource_counts(&type_state.type_url, &counts);
+        }
+        Some((type_url, type_state.subscription != old_subscription))
+    }
 
-        Some((type_url, subscriptions_changed))
+    fn cancel_resource_timers(&mut self) {
+        for state in self.type_states.values_mut() {
+            for resource in state.resources.values_mut() {
+                resource.timer = None;
+            }
+        }
     }
 
     /// Send a DiscoveryRequest for a type to the unbounded write channel.
-    fn send_request(
-        &mut self,
-        sender: &mpsc::UnboundedSender<Bytes>,
-        type_url: &str,
-    ) -> Result<()> {
+    fn send_request(&mut self, stream: &mut ActiveStream, type_url: &str) -> Result<()> {
         let type_state = match self.type_states.get(type_url) {
             Some(s) => s,
             None => return Ok(()),
         };
 
+        // An empty initial request could accidentally establish a wildcard subscription.
+        if !type_state.has_watchers() && !stream.requested_types.contains_key(type_url) {
+            return Ok(());
+        }
+        let nonce = stream
+            .requested_types
+            .get(type_url)
+            .map_or("", |state| state.nonce.as_str());
         let resource_names = type_state.resource_names_for_request();
         let request = DiscoveryRequest {
             node: &self.node,
             type_url,
             resource_names: &resource_names,
             version_info: &type_state.version_info,
-            response_nonce: &type_state.nonce,
+            response_nonce: nonce,
             error_detail: None,
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+        stream.writes.send(bytes).map_err(|_| Error::StreamClosed)?;
+        stream
+            .requested_types
+            .entry(type_url.to_owned())
+            .or_default();
         self.start_pending_resource_timers(type_url);
         Ok(())
     }
@@ -1056,16 +1070,10 @@ where
             return;
         };
         let pending: Vec<_> = type_state
-            .watchers
-            .values()
-            .filter_map(|watcher| match &watcher.subscription {
-                WatcherSubscription::Named(name)
-                    if type_state.cache.get(name).is_some_and(|c| c.is_requested()) =>
-                {
-                    Some(name.clone())
-                }
-                _ => None,
-            })
+            .resources
+            .iter()
+            .filter(|(_, resource)| !resource.watchers.is_empty() && resource.cached.is_requested())
+            .map(|(name, _)| name.clone())
             .collect();
         for name in pending {
             self.start_resource_timer(type_url, name, timeout);
@@ -1087,17 +1095,24 @@ where
     /// cannot suspend this turn. `ProcessingDone` gates only the next stream read.
     fn handle_response(
         &mut self,
-        sender: &mpsc::UnboundedSender<Bytes>,
+        stream: &mut ActiveStream,
         response: DiscoveryResponse,
         done: ProcessingDone,
     ) -> Result<()> {
         let type_url = response.type_url.clone();
+        // Only types requested on this stream have protocol state to advance.
+        let Some(stream_type) = stream.requested_types.get_mut(&type_url) else {
+            return Ok(());
+        };
+        stream_type.nonce.clone_from(&response.nonce);
 
         let (type_url_arc, decoder) = match self.type_states.get(&type_url) {
-            Some(s) => (Arc::clone(&s.type_url), &s.decoder),
-            None => {
-                return Ok(());
+            Some(s) if s.has_watchers() => (Arc::clone(&s.type_url), &s.decoder),
+            Some(_) => {
+                // Retry a possibly stale unsubscribe, without retaining the idle version or data.
+                return self.send_ack(&stream.writes, &response);
             }
+            None => return Ok(()),
         };
 
         // Decode all resources, tracking valid and invalid separately.
@@ -1136,16 +1151,12 @@ where
         self.recorder
             .record_resource_updates(&type_url_arc, valid_count, invalid_count);
 
-        if let Some(type_state) = self.type_states.get_mut(&type_url) {
-            type_state.nonce = response.nonce.clone();
-        }
+        let nack_error = nack_error_message(&top_level_errors, &per_resource_errors);
 
         let received_names: HashSet<String> = valid_resources
             .iter()
             .map(|(r, _)| r.name().to_string())
             .collect();
-
-        let nack_error = nack_error_message(&top_level_errors, &per_resource_errors);
 
         self.dispatch_resources(&type_url, valid_resources, &done);
 
@@ -1168,9 +1179,9 @@ where
                 if let Some(ts) = self.type_states.get_mut(&type_url) {
                     ts.version_info = response.version_info.clone();
                 }
-                self.send_ack(sender, &response)?;
+                self.send_ack(&stream.writes, &response)?;
             }
-            Some(error) => self.send_nack(sender, &response, error)?,
+            Some(error) => self.send_nack(&stream.writes, &response, error)?,
         }
 
         Ok(())
@@ -1192,14 +1203,16 @@ where
 
         for (resource, accepted) in resources {
             let resource_name = resource.name().to_string();
+            if !type_state.subscription.includes(&resource_name) {
+                continue;
+            }
             let resource = Arc::new(resource);
-            type_state.cache.insert(
-                resource_name.clone(),
-                CachedResource::received(Arc::clone(&resource), accepted),
-            );
-            // Cancel the initial resource timer (gRFC A57).
-            self.resource_timers
-                .remove(&(type_url.to_string(), resource_name.clone()));
+            let subscriber = type_state
+                .resources
+                .entry(resource_name.clone())
+                .or_default();
+            subscriber.cached = CachedResource::received(Arc::clone(&resource), accepted);
+            subscriber.timer = None;
 
             for event_tx in type_state.matching_watchers(&resource_name) {
                 let _ = event_tx.send(ResourceEvent::ResourceChanged {
@@ -1229,22 +1242,21 @@ where
             None => return,
         };
 
+        if !type_state.subscription.includes(resource_name) {
+            return;
+        }
+
         let error = rejected.details.clone();
-        let accepted = type_state
-            .cache
-            .remove(resource_name)
-            .and_then(|c| c.accepted);
-        type_state.cache.insert(
-            resource_name.to_string(),
-            CachedResource::nacked(rejected, accepted),
-        );
+        let subscriber = type_state
+            .resources
+            .entry(resource_name.to_string())
+            .or_default();
+        let accepted = subscriber.cached.accepted.take();
+        subscriber.cached = CachedResource::nacked(rejected, accepted);
+        subscriber.timer = None;
         let counts = type_state.resource_state_counts();
         self.recorder
             .sync_resource_counts(&type_state.type_url, &counts);
-
-        // Cancel the resource timer (gRFC A57).
-        self.resource_timers
-            .remove(&(type_url.to_string(), resource_name.to_string()));
 
         for event_tx in type_state.matching_watchers(resource_name) {
             let event = ResourceEvent::ResourceChanged {
@@ -1277,19 +1289,22 @@ where
         }
 
         let deleted_names: Vec<String> = type_state
-            .cache
+            .resources
             .iter()
-            .filter(|(name, cached)| {
-                matches!(cached.state, ResourceState::Received) && !received_names.contains(*name)
+            .filter(|(name, resource)| {
+                matches!(resource.cached.state, ResourceState::Received)
+                    && !received_names.contains(*name)
             })
             .map(|(name, _)| name.clone())
             .collect();
 
         for name in deleted_names {
-            let accepted = type_state.cache.remove(&name).and_then(|c| c.accepted);
-            type_state
-                .cache
-                .insert(name.clone(), CachedResource::does_not_exist(accepted));
+            let subscriber = type_state
+                .resources
+                .get_mut(&name)
+                .expect("resource collected from this map must still exist");
+            let accepted = subscriber.cached.accepted.take();
+            subscriber.cached = CachedResource::does_not_exist(accepted);
 
             for event_tx in type_state.matching_watchers(&name) {
                 let event = ResourceEvent::ResourceChanged {
@@ -1370,10 +1385,15 @@ where
     /// When the timer fires, it sends a `ResourceTimerExpired` command.
     /// The handler checks if the resource is still in Requested state before acting.
     fn start_resource_timer(&mut self, type_url: &str, name: String, timeout: Duration) {
-        let key = (type_url.to_string(), name.clone());
-
-        // Don't reset an existing timer — A57 says timeout starts on first request.
-        if self.resource_timers.contains_key(&key) {
+        let Some(resource) = self
+            .type_states
+            .get_mut(type_url)
+            .and_then(|state| state.resources.get_mut(&name))
+        else {
+            return;
+        };
+        // Preserve the first named watch's deadline.
+        if resource.timer.is_some() || resource.watchers.is_empty() {
             return;
         }
 
@@ -1400,7 +1420,7 @@ where
             }
         });
 
-        self.resource_timers.insert(key, (timer_id, cancel_tx));
+        resource.timer = Some((timer_id, cancel_tx));
     }
 
     /// Handle a resource timer expiration (gRFC A57).
@@ -1408,34 +1428,21 @@ where
     /// If the resource is still in Requested state, marks it as DoesNotExist
     /// and notifies all watchers interested in this resource.
     fn handle_resource_timeout(&mut self, type_url: &str, name: &str, timer_id: u64) {
+        let Some(type_state) = self.type_states.get_mut(type_url) else {
+            return;
+        };
+        let Some(resource) = type_state.resources.get_mut(name) else {
+            return;
+        };
         // Cancellation cannot retract an expiration already in the command queue.
-        let key = (type_url.to_string(), name.to_string());
-        let Entry::Occupied(timer) = self.resource_timers.entry(key) else {
-            return;
-        };
-        if timer.get().0 != timer_id {
+        if resource.timer.as_ref().map(|(id, _)| *id) != Some(timer_id) {
             return;
         }
-        timer.remove();
-
-        let type_state = match self.type_states.get_mut(type_url) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let is_pending = type_state
-            .cache
-            .get(name)
-            .map(|c| c.is_requested())
-            .unwrap_or(true);
-
-        if !is_pending {
+        resource.timer = None;
+        if !resource.cached.is_requested() {
             return;
         }
-
-        type_state
-            .cache
-            .insert(name.to_string(), CachedResource::does_not_exist(None));
+        resource.cached = CachedResource::does_not_exist(None);
         let counts = type_state.resource_state_counts();
         self.recorder
             .sync_resource_counts(&type_state.type_url, &counts);
@@ -1580,6 +1587,14 @@ struct ActiveStream {
     writes: mpsc::UnboundedSender<Bytes>,
     cancel: Option<oneshot::Sender<()>>,
     saw_response: bool,
+    /// Types requested on this stream, retained after unsubscribe to preserve their nonces.
+    requested_types: HashMap<String, StreamTypeState>,
+}
+
+#[derive(Default)]
+struct StreamTypeState {
+    /// Latest response nonce, including rejected responses.
+    nonce: String,
 }
 
 impl ActiveStream {
@@ -1588,6 +1603,7 @@ impl ActiveStream {
             writes,
             cancel: Some(cancel),
             saw_response: false,
+            requested_types: HashMap::new(),
         }
     }
 }
@@ -2016,6 +2032,537 @@ mod tests {
         connected_client_for::<TestResource>().await
     }
 
+    async fn expect_request(server: &mut MockServer, expected: Bytes) {
+        let request = tokio::time::timeout(Duration::from_secs(1), server.requests.recv())
+            .await
+            .expect("timed out waiting for request")
+            .expect("stream closed");
+        assert_eq!(request, expected);
+    }
+
+    /// Deliver `res-0` and verify both watcher delivery and the ACK.
+    async fn accept_resource<T: Resource>(
+        server: &mut MockServer,
+        watcher: &mut ResourceWatcher<T>,
+        version: &str,
+        nonce: &str,
+    ) {
+        let bytes = response_for(T::TYPE_URL.as_str(), version, nonce, &["res-0"]);
+        server.responses.send(Ok(Some(bytes.clone()))).unwrap();
+        assert!(next_changed(watcher).await.0.is_ok());
+        expect_request(server, bytes).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_unsubscribe_retries_after_in_flight_response_changes_nonce() {
+        let (client, mut watcher, mut server) = connected_client().await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+
+        // The server has issued n2, but delivery to the client is delayed.
+        let server_nonce = "n2";
+        let in_flight = response("2", server_nonce, &["res-0"]);
+        drop(watcher);
+        let stale_unsubscribe =
+            tokio::time::timeout(Duration::from_secs(1), server.requests.recv())
+                .await
+                .expect("missing initial unsubscribe")
+                .unwrap();
+        assert_eq!(stale_unsubscribe, response("1", "n1", &[]));
+        assert_ne!(parse_request(&stale_unsubscribe).1, server_nonce);
+        // Reject the stale unsubscribe without changing the server subscription,
+        // matching Go Control Plane's SotW nonce check.
+
+        server.responses.send(Ok(Some(in_flight))).unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(1), server.requests.recv())
+            .await
+            .expect("server remains subscribed: idle response did not retry unsubscribe with n2")
+            .expect("stream closed before unsubscribe retry");
+        let retry = FakeCodec.decode_response(retry).unwrap();
+        assert_eq!(retry.type_url, TEST_TYPE_URL);
+        assert_eq!(retry.nonce, server_nonce);
+        assert_eq!(
+            retry.version_info, "2",
+            "idle ACK must echo the response version"
+        );
+        assert!(
+            retry.resources.is_empty(),
+            "retry must unsubscribe all resources"
+        );
+        assert!(
+            take_snapshot(&client).await.is_empty(),
+            "idle response refilled cache"
+        );
+
+        // A server may answer the unsubscribe with an empty SotW response.
+        server
+            .responses
+            .send(Ok(Some(response("2", "n3", &[]))))
+            .unwrap();
+        expect_request(&mut server, response("2", "n3", &[])).await;
+        // A same-version ACK needs no further response; the client must go quiet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.requests.recv())
+                .await
+                .is_err()
+        );
+        assert!(take_snapshot(&client).await.is_empty());
+        let _rewatch = client.watch::<TestResource>("res-0").await;
+        expect_request(&mut server, response("", "n3", &["res-0"])).await;
+    }
+
+    #[test]
+    fn idle_response_acknowledges_without_retaining_version_or_decoding_resources() {
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let recorder = Arc::new(CapturingRecorder::default());
+        let mut worker = AdsWorker::new(
+            FakeCodec,
+            TokioRuntime,
+            &config,
+            commands,
+            command_rx,
+            Some(recorder.clone()),
+        );
+        worker.type_states.insert(
+            TEST_TYPE_URL.to_string(),
+            TypeState::new(
+                Arc::from(TEST_TYPE_URL),
+                Box::new(|_| panic!("idle resource was decoded")),
+                false,
+            ),
+        );
+        let (writes, mut requests) = mpsc::unbounded_channel();
+        let (cancel, _cancel_rx) = oneshot::channel();
+        let mut stream = ActiveStream::new(writes, cancel);
+        stream
+            .requested_types
+            .insert(TEST_TYPE_URL.to_string(), StreamTypeState::default());
+        let response = FakeCodec
+            .decode_response(response("late", "latest-nonce", &["res-0"]))
+            .unwrap();
+        worker
+            .handle_response(&mut stream, response, ProcessingDone::detached())
+            .unwrap();
+        assert_eq!(stream.requested_types[TEST_TYPE_URL].nonce, "latest-nonce");
+        assert!(worker.type_states[TEST_TYPE_URL].version_info.is_empty());
+        assert!(worker.type_states[TEST_TYPE_URL].resources.is_empty());
+        assert!(recorder.take().is_empty());
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            response_for(TEST_TYPE_URL, "late", "latest-nonce", &[])
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_watcher_removed_while_disconnected_clears_version() {
+        let (inner, mut servers) = mock_transport();
+        let (gates_tx, mut gates) = mpsc::unbounded_channel();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(
+            config,
+            GatedBuilder {
+                inner,
+                phase: ReconnectPhase::Stream,
+                gates: gates_tx,
+            },
+            FakeCodec,
+            TokioRuntime,
+        )
+        .build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        gates.recv().await.unwrap().send(()).unwrap();
+        let mut server = servers.recv().await.unwrap();
+        expect_request(&mut server, response("", "", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+        server.responses.send(Ok(None)).unwrap();
+        let gate = gates.recv().await.unwrap();
+        drop(watcher);
+        assert!(take_snapshot(&client).await.is_empty());
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        take_snapshot(&client).await;
+        gate.send(()).unwrap();
+        let mut replacement = servers.recv().await.unwrap();
+        expect_request(&mut replacement, response("", "", &["res-0"])).await;
+        accept_resource(&mut replacement, &mut rewatch, "1", "n2").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_watcher_drop_unsubscribes_and_rewatch_retains_nonce() {
+        let (client, mut watcher, mut server) = connected_client().await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+
+        drop(watcher);
+        // Queue the rewatch without waiting for the worker to process Unwatch.
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        expect_request(&mut server, response("1", "n1", &[])).await;
+        expect_request(&mut server, response("", "n1", &["res-0"])).await;
+        assert_no_event(&mut rewatch, "last watcher removal retained the cache").await;
+        accept_resource(&mut server, &mut rewatch, "1", "n2").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_watcher_drop_before_response_cancels_resource_timer() {
+        let (client, watcher, mut server) = connected_client().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(watcher);
+        expect_request(&mut server, response("", "", &[])).await;
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        expect_request(&mut server, response("", "", &["res-0"])).await;
+        // A queued expiration from the removed watch cannot consume the new timer.
+        client
+            .command_tx
+            .send(WorkerCommand::Watcher(WatchEvent::ResourceTimerExpired {
+                type_url: TEST_TYPE_URL.to_string(),
+                name: "res-0".to_string(),
+                timer_id: 0,
+            }))
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_no_event(&mut rewatch, "removed watch shortened the new deadline").await;
+        let event = tokio::time::timeout(Duration::from_secs(10), rewatch.next())
+            .await
+            .expect("rewatch did not start a fresh timer")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_response_after_unsubscribe_keeps_subscription_empty() {
+        let (client, watcher, mut server) = connected_client().await;
+        drop(watcher);
+        expect_request(&mut server, response("", "", &[])).await;
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        expect_request(&mut server, response("1", "n1", &[])).await;
+        assert!(take_snapshot(&client).await.is_empty());
+
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        expect_request(&mut server, response("", "n1", &["res-0"])).await;
+        assert_no_event(
+            &mut rewatch,
+            "late first response repopulated the idle cache",
+        )
+        .await;
+        accept_resource(&mut server, &mut rewatch, "1", "n2").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_one_watcher_preserves_shared_resource_state() {
+        let (client, mut first, mut server) = connected_client().await;
+        let mut second = client.watch::<TestResource>("res-0").await;
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut first).await.0.is_ok());
+        let (resource, done) = next_changed(&mut second).await;
+        let resource = resource.unwrap();
+        drop(done);
+        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        drop(first);
+        assert_eq!(take_snapshot(&client).await.len(), 1);
+        assert!(
+            server.requests.try_recv().is_err(),
+            "remaining watcher was unsubscribed"
+        );
+        let mut third = client.watch::<TestResource>("res-0").await;
+        let (cached, done) = next_changed(&mut third).await;
+        assert!(Arc::ptr_eq(&resource, &cached.unwrap()));
+        drop(done);
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut second).await.0.is_ok());
+        assert!(next_changed(&mut third).await.0.is_ok());
+        expect_request(&mut server, response("2", "n2", &["res-0"])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_unsubscribe_evicts_resource_cache() {
+        let (client, mut first, mut server) = connected_client().await;
+        let mut other = watch_synced(&client, &mut server, "res-1").await;
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut first).await.0.is_ok());
+        assert!(next_changed(&mut other).await.0.is_ok());
+        server.requests.recv().await.unwrap(); // ACK names have no defined order.
+
+        drop(first);
+        expect_request(&mut server, response("1", "n1", &["res-1"])).await;
+        let mut rewatch = watch_synced(&client, &mut server, "res-0").await;
+        assert_no_event(&mut rewatch, "partial unsubscribe retained stale cache").await;
+
+        // The resource that remained watched still has its cached value.
+        let mut other_rewatch = client.watch::<TestResource>("res-1").await;
+        assert!(next_changed(&mut other_rewatch).await.0.is_ok());
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatch).await.0.is_ok());
+        assert!(next_changed(&mut other).await.0.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_unsubscribe_cancels_resource_timer() {
+        let (client, first, mut server) = connected_client().await;
+        let mut other = watch_synced(&client, &mut server, "res-1").await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(first);
+        expect_request(&mut server, response("", "", &["res-1"])).await;
+        let mut rewatch = watch_synced(&client, &mut server, "res-0").await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        // B keeps its original deadline; A must get a fresh fifteen seconds.
+        assert!(matches!(
+            next_changed(&mut other).await.0,
+            Err(Error::ResourceDoesNotExist)
+        ));
+        assert_no_event(&mut rewatch, "partial unsubscribe retained the old timer").await;
+        let event = tokio::time::timeout(Duration::from_secs(10), rewatch.next())
+            .await
+            .expect("rewatch did not start a fresh timer")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_unsubscribe_ignores_late_resource_updates() {
+        let (client, first, mut server) = connected_client_for::<VersionedResource>().await;
+        let _other = client.watch::<VersionedResource>("res-1").await;
+        server.requests.recv().await.unwrap();
+        drop(first);
+        expect_request(&mut server, versioned_response("", "", &["res-1"])).await;
+        for (version, nonce, name, accepted) in
+            [("1", "n1", "res-0", "1"), ("2", "n2", "res-0#bad", "1")]
+        {
+            server
+                .responses
+                .send(Ok(Some(versioned_response(version, nonce, &[name]))))
+                .unwrap();
+            expect_request(&mut server, versioned_response(accepted, nonce, &["res-1"])).await;
+            let mut rewatch = client.watch::<VersionedResource>("res-0").await;
+            server.requests.recv().await.unwrap();
+            assert_no_event(&mut rewatch, "late update restored unsubscribed resource").await;
+            let snapshot = take_snapshot(&client).await;
+            let resource = snapshot.iter().find(|r| r.name == "res-0").unwrap();
+            assert!(resource.accepted.is_none());
+            assert!(resource.rejected.is_none());
+            drop(rewatch);
+            expect_request(&mut server, versioned_response(accepted, nonce, &["res-1"])).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_wildcard_drop_unsubscribes_and_rewatch_requests_all_resources() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let mut watcher = client.watch::<VersionedResource>("").await;
+        let mut server = servers.recv().await.unwrap();
+        expect_request(&mut server, versioned_response("", "", &["*"])).await;
+
+        server
+            .responses
+            .send(Ok(Some(versioned_response("1", "n1", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+        expect_request(&mut server, versioned_response("1", "n1", &["*"])).await;
+        drop(watcher);
+        expect_request(&mut server, versioned_response("1", "n1", &[])).await;
+        assert!(take_snapshot(&client).await.is_empty());
+
+        let mut rewatch = client.watch::<VersionedResource>("").await;
+        expect_request(&mut server, versioned_response("", "n1", &["*"])).await;
+        server
+            .responses
+            .send(Ok(Some(versioned_response("1", "n2", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatch).await.0.is_ok());
+        expect_request(&mut server, versioned_response("1", "n2", &["*"])).await;
+
+        server
+            .responses
+            .send(Ok(Some(versioned_response("2", "n3", &["res-0#bad"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatch).await.0.is_err());
+        expect_request(&mut server, versioned_response("1", "n3", &["*"])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_one_wildcard_preserves_other_wildcard_resources() {
+        let (client, named, mut server) = connected_client().await;
+        let first = watch_synced(&client, &mut server, "").await;
+        let mut second = client.watch::<TestResource>("").await;
+        drop(named);
+        drop(first);
+        take_snapshot(&client).await;
+        assert!(server.requests.try_recv().is_err());
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut second).await.0.is_ok());
+        expect_request(&mut server, response("1", "n1", &["*"])).await;
+        let mut named = client.watch::<TestResource>("res-1").await;
+        assert!(next_changed(&mut named).await.0.is_ok());
+
+        drop(second);
+        expect_request(&mut server, response("1", "n1", &["res-1"])).await;
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut named).await.0.is_ok());
+        expect_request(&mut server, response("2", "n2", &["res-1"])).await;
+        drop(named);
+        expect_request(&mut server, response("2", "n2", &[])).await;
+        assert!(take_snapshot(&client).await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wildcard_interest_retains_cache_until_named_transition() {
+        let (client, first, mut server) = connected_client().await;
+        let mut wildcard = watch_synced(&client, &mut server, "").await;
+        drop(first);
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut wildcard).await.0.is_ok());
+        assert!(next_changed(&mut wildcard).await.0.is_ok());
+        expect_request(&mut server, response("1", "n1", &["*"])).await;
+        let mut first = client.watch::<TestResource>("res-0").await;
+        assert!(next_changed(&mut first).await.0.is_ok());
+        let mut other = client.watch::<TestResource>("res-1").await;
+        assert!(next_changed(&mut other).await.0.is_ok());
+        drop(other);
+        drop(wildcard);
+        expect_request(&mut server, response("1", "n1", &["res-0"])).await;
+        let mut other = watch_synced(&client, &mut server, "res-1").await;
+        assert_no_event(
+            &mut other,
+            "wildcard removal retained an unsubscribed resource",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rewatch_preserves_decoder_and_resource_rules() {
+        let (client, mut watcher, mut server) = connected_client_for::<SotwResource>().await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+        drop(watcher);
+        let mut rewatch = client.watch::<SotwResource>("res-0").await;
+        expect_request(&mut server, sotw_response("1", "n1", &[])).await;
+        expect_request(&mut server, sotw_response("", "n1", &["res-0"])).await;
+        accept_resource(&mut server, &mut rewatch, "2", "n2").await;
+        server
+            .responses
+            .send(Ok(Some(sotw_response("3", "n3", &[]))))
+            .unwrap();
+        assert!(matches!(
+            next_changed(&mut rewatch).await.0,
+            Err(Error::ResourceDoesNotExist)
+        ));
+        expect_request(&mut server, sotw_response("3", "n3", &["res-0"])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_responses_after_unsubscribe_do_not_repopulate_cache() {
+        let (client, mut watcher, mut server) = connected_client_for::<VersionedResource>().await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+        drop(watcher);
+        expect_request(&mut server, versioned_response("1", "n1", &[])).await;
+
+        for (version, nonce, resources) in [
+            ("2", "n2", vec!["res-0"]),
+            ("3", "n3", vec!["res-0#bad"]),
+            ("4", "n4", vec!["res-0", "other#bad"]),
+        ] {
+            server
+                .responses
+                .send(Ok(Some(versioned_response(version, nonce, &resources))))
+                .unwrap();
+            expect_request(&mut server, versioned_response(version, nonce, &[])).await;
+            let mut rewatch = client.watch::<VersionedResource>("res-0").await;
+            expect_request(&mut server, versioned_response("", nonce, &["res-0"])).await;
+            assert_no_event(&mut rewatch, "late response repopulated the idle cache").await;
+            let snapshot = take_snapshot(&client).await;
+            assert_eq!(snapshot.len(), 1);
+            assert!(snapshot[0].accepted.is_none());
+            assert!(snapshot[0].rejected.is_none());
+            drop(rewatch);
+            expect_request(&mut server, versioned_response("", nonce, &[])).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_while_unwatched_resets_version_and_nonce() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut server = servers.recv().await.unwrap();
+        expect_request(&mut server, response("", "", &["res-0"])).await;
+        accept_resource(&mut server, &mut watcher, "1", "n1").await;
+        drop(watcher);
+        expect_request(&mut server, response("1", "n1", &[])).await;
+        server.responses.send(Ok(None)).unwrap();
+        let mut replacement = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Synchronize on another type to prove the new stream is ready.
+        let _other = client.watch::<SotwResource>("other").await;
+        expect_request(&mut replacement, sotw_response("", "", &["other"])).await;
+        assert!(
+            replacement.requests.try_recv().is_err(),
+            "idle type resubscribed on reconnect"
+        );
+        // A retained type was never requested on this stream. Ignore unsolicited
+        // responses without ACKing or changing the version/nonce used by rewatch.
+        let (done, processed) = ProcessingDone::channel();
+        client
+            .command_tx
+            .send(WorkerCommand::Transport(TransportEvent::Response {
+                bytes: response("unsolicited", "unsolicited", &["res-0"]),
+                done,
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), processed)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(replacement.requests.try_recv().is_err());
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        expect_request(&mut replacement, response("", "", &["res-0"])).await;
+        assert_no_event(
+            &mut rewatch,
+            "rewatch replayed evicted cache after reconnect",
+        )
+        .await;
+        accept_resource(&mut replacement, &mut rewatch, "1", "new-nonce").await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn response_before_watch_is_replayed_from_cache() {
         let (client, mut watcher_a, _server) = connected_client().await;
@@ -2365,6 +2912,64 @@ mod tests {
                     .expect("additional watcher reset the original deadline");
             assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_shared_named_watch_under_wildcard_keeps_original_timer() {
+        let (client, first, mut server) = connected_client().await;
+        let _wildcard = watch_synced(&client, &mut server, "").await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let mut second = client.watch::<TestResource>("res-0").await;
+        drop(first);
+        take_snapshot(&client).await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let event = tokio::time::timeout(Duration::from_millis(100), second.next())
+            .await
+            .expect("remaining named watcher lost its original deadline")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_last_named_watch_under_wildcard_cancels_its_timer() {
+        let (client, first, mut server) = connected_client().await;
+        let mut wildcard = watch_synced(&client, &mut server, "").await;
+        let second = client.watch::<TestResource>("res-0").await;
+        drop(first);
+        take_snapshot(&client).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(second);
+        take_snapshot(&client).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_no_event(
+            &mut wildcard,
+            "removed named watch timed out under wildcard",
+        )
+        .await;
+        assert!(server.requests.try_recv().is_err());
+
+        let mut rewatch = client.watch::<TestResource>("res-0").await;
+        take_snapshot(&client).await;
+        assert_no_event(&mut rewatch, "removed named watch left a cached timeout").await;
+        let event = tokio::time::timeout(Duration::from_secs(15), rewatch.next())
+            .await
+            .expect("rewatch did not start a fresh timer")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged {
+                result: Err(Error::ResourceDoesNotExist),
+                ..
+            }
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3633,8 +4238,7 @@ mod tests {
         assert!(next_changed(&mut watcher).await.0.is_ok());
         let _ack = server.requests.recv().await.unwrap();
 
-        // The cache keeps res-1 after its last watcher goes away, but the
-        // client no longer subscribes to it.
+        // Removing the last watcher for res-1 also removes its cached state.
         drop(other);
         let _unsubscribe = server.requests.recv().await.unwrap();
 

@@ -209,6 +209,7 @@ mod tests {
                     },
                     action: RouteConfigAction::Cluster("cluster-1".to_string()),
                     retry_config: None,
+                    max_stream_duration: None,
                 }],
             }],
             metadata: Default::default(),
@@ -216,11 +217,14 @@ mod tests {
     }
 
     fn make_cluster(name: &str, lb: LbPolicy) -> Arc<ClusterResource> {
+        use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
+
         Arc::new(ClusterResource {
             name: name.to_string(),
             eds_service_name: None,
             lb_policy: lb,
             security: None,
+            circuit_breaking: CircuitBreakingConfig::default(),
         })
     }
 

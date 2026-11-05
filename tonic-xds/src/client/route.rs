@@ -22,17 +22,19 @@
  *
  */
 
+use crate::client::deadline::DeadlinePolicy;
 use crate::client::retry::{RetryClassifierFactory, RetrySharedConfig};
 use crate::common::async_util::BoxFuture;
 use crate::xds::resource::route_config::{
     RouteConfigMetadata, RouteConfigResource, RouteRetryConfig,
 };
 use crate::xds::routing::RoutingError;
-use http::Request;
+use http::{Request, Response};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tower::{BoxError, Layer, Service};
 
 /// Represents the input for routing decisions.
@@ -62,6 +64,9 @@ pub(crate) struct RouteDecision {
     /// this decision was made on, so the retry layer applies the config for exactly
     /// the route the request took.
     pub retry_config: Option<Arc<RetrySharedConfig>>,
+    /// The matched route's xDS max stream duration (gRFC A31), with the
+    /// listener's default already applied. `None` when there is no limit.
+    pub max_stream_duration: Option<Duration>,
 }
 
 /// A hook that runs before xDS route selection.
@@ -175,8 +180,11 @@ pub(crate) trait Router: Send + Sync + 'static {
 /// Attaches routing decision as [`RouteDecision`] to the request extensions.
 /// The [`RouteDecision`] will be used by the `XdsLbService` to identify the
 /// cluster to which the request should be routed.
-#[derive(Clone)]
-pub(crate) struct XdsRoutingService<S> {
+///
+/// It also enforces the call deadline (gRFC A31) from the moment the call
+/// enters, through the wait for a route config and everything below it; see
+/// [`crate::client::deadline`].
+pub(crate) struct XdsRoutingService<S, ResBody> {
     /// The inner Tower service to which the request will be forwarded after routing decision is made.
     inner: S,
     /// The router used to make routing decisions based on the request.
@@ -185,15 +193,34 @@ pub(crate) struct XdsRoutingService<S> {
     interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     /// Channel-level authority used as the routing key.
     authority: Arc<str>,
+    /// How the call deadline is enforced.
+    deadline: DeadlinePolicy<ResBody>,
 }
 
-impl<S, B> Service<Request<B>> for XdsRoutingService<S>
+// Not derived: that would needlessly require `ResBody: Clone`.
+impl<S: Clone, ResBody> Clone for XdsRoutingService<S, ResBody> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            router: self.router.clone(),
+            interceptor: self.interceptor.clone(),
+            authority: self.authority.clone(),
+            deadline: self.deadline,
+        }
+    }
+}
+
+impl<S, B, ResBody> Service<Request<B>> for XdsRoutingService<S, ResBody>
 where
-    S: Service<Request<B>, Error: Into<BoxError>> + Clone + Send + 'static,
-    B: Send + 'static,
+    S: Service<Request<B>, Response = Response<ResBody>, Error: Into<BoxError>>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send + 'static,
+    B: Send + 'static,
+    ResBody: Send + 'static,
 {
-    type Response = S::Response;
+    type Response = Response<ResBody>;
     type Error = BoxError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
@@ -206,11 +233,12 @@ where
         let interceptor = self.interceptor.clone();
         let authority = self.authority.clone();
         let mut inner_service = self.inner.clone();
+        let mut deadline = self.deadline.start(&request);
         Box::pin(async move {
             // Scoped so the config `Arc` is dropped before the inner call:
             // to avoid holding that config version for the life of a long-running stream.
             let route_decision = {
-                let config = router.acquire().get().await?;
+                let config = deadline.bound(router.acquire().get()).await?;
                 if let Some(interceptor) = interceptor.as_ref() {
                     interceptor.on_request(request.headers_mut(), &config.metadata);
                 }
@@ -221,24 +249,37 @@ where
                 };
                 router.route(&route_input, &config)?
             };
+            deadline.apply_route(&mut request, route_decision.max_stream_duration)?;
             request.extensions_mut().insert(route_decision);
-            inner_service.call(request).await.map_err(Into::into)
+            deadline.run(inner_service.call(request)).await
         })
     }
 }
 
 /// Tower layer for routing requests to the appropriate cluster.
-#[derive(Clone)]
 #[allow(dead_code)]
-pub(crate) struct XdsRoutingLayer {
+pub(crate) struct XdsRoutingLayer<ResBody> {
     router: Arc<dyn Router>,
     interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     authority: Arc<str>,
+    deadline: DeadlinePolicy<ResBody>,
 }
 
-impl XdsRoutingLayer {
+// Not derived: that would needlessly require `ResBody: Clone`.
+impl<ResBody> Clone for XdsRoutingLayer<ResBody> {
+    fn clone(&self) -> Self {
+        Self {
+            router: self.router.clone(),
+            interceptor: self.interceptor.clone(),
+            authority: self.authority.clone(),
+            deadline: self.deadline,
+        }
+    }
+}
+
+impl<ResBody> XdsRoutingLayer<ResBody> {
     /// Creates a new `XdsRoutingLayer` with the given [`Router`], optional
-    /// pre-route interceptor, and authority.
+    /// pre-route interceptor, authority, and call deadline policy.
     ///
     /// `authority` is the routing key matched against `VirtualHost.domains`
     /// in RDS. It should be the endpoint portion of the xDS target.
@@ -247,17 +288,19 @@ impl XdsRoutingLayer {
         router: Arc<dyn Router>,
         interceptor: Option<Arc<dyn PreRouteInterceptor>>,
         authority: Arc<str>,
+        deadline: DeadlinePolicy<ResBody>,
     ) -> Self {
         Self {
             router,
             interceptor,
             authority,
+            deadline,
         }
     }
 }
 
-impl<S> Layer<S> for XdsRoutingLayer {
-    type Service = XdsRoutingService<S>;
+impl<S, ResBody> Layer<S> for XdsRoutingLayer<ResBody> {
+    type Service = XdsRoutingService<S, ResBody>;
 
     fn layer(&self, service: S) -> Self::Service {
         XdsRoutingService {
@@ -265,6 +308,7 @@ impl<S> Layer<S> for XdsRoutingLayer {
             router: self.router.clone(),
             interceptor: self.interceptor.clone(),
             authority: self.authority.clone(),
+            deadline: self.deadline,
         }
     }
 }
@@ -296,6 +340,7 @@ mod tests {
                 cluster: "test-cluster".to_string(),
                 request_hash: None,
                 retry_config: None,
+                max_stream_duration: None,
             })
         }
     }
@@ -319,6 +364,7 @@ mod tests {
                 },
                 action: RouteConfigAction::Cluster(cluster.into()),
                 retry_config: None,
+                max_stream_duration: None,
             }
         }
 
@@ -355,7 +401,13 @@ mod tests {
                 Ok::<_, BoxError>(http::Response::new(()))
             }
         });
-        let svc = XdsRoutingLayer::new(router, None, Arc::from("greeter.svc:50051")).layer(inner);
+        let svc = XdsRoutingLayer::new(
+            router,
+            None,
+            Arc::from("greeter.svc:50051"),
+            DeadlinePolicy::headers_only(),
+        )
+        .layer(inner);
 
         // The URI a tonic-generated client produces.
         let req = Request::builder()
@@ -415,8 +467,13 @@ mod tests {
                 Ok::<_, BoxError>(http::Response::new(()))
             }
         });
-        let svc = XdsRoutingLayer::new(router, Some(Arc::new(MarkPartition)), Arc::from("svc"))
-            .layer(inner);
+        let svc = XdsRoutingLayer::new(
+            router,
+            Some(Arc::new(MarkPartition)),
+            Arc::from("svc"),
+            DeadlinePolicy::headers_only(),
+        )
+        .layer(inner);
 
         let call = tokio::spawn(svc.oneshot(Request::builder().uri("/pkg.S/M").body(()).unwrap()));
 
@@ -442,6 +499,7 @@ mod tests {
                     },
                     action: RouteConfigAction::Cluster("c".into()),
                     retry_config: None,
+                    max_stream_duration: None,
                 }],
             }],
             metadata: RouteConfigMetadata::from_encoded(
@@ -480,6 +538,7 @@ mod tests {
                     cluster: "c".to_string(),
                     request_hash: None,
                     retry_config: None,
+                    max_stream_duration: None,
                 })
             }
         }
@@ -502,7 +561,13 @@ mod tests {
                 Ok::<_, BoxError>(http::Response::new(()))
             }
         });
-        let svc = XdsRoutingLayer::new(router, None, Arc::from("svc")).layer(inner);
+        let svc = XdsRoutingLayer::new(
+            router,
+            None,
+            Arc::from("svc"),
+            DeadlinePolicy::headers_only(),
+        )
+        .layer(inner);
 
         svc.oneshot(Request::builder().uri("/pkg.S/M").body(()).unwrap())
             .await
@@ -521,7 +586,12 @@ mod tests {
         let router: Arc<dyn Router> = Arc::new(CaptureAuthorityRouter {
             captured: captured.clone(),
         });
-        let layer = XdsRoutingLayer::new(router, None, Arc::from("greeter.svc:50051"));
+        let layer = XdsRoutingLayer::new(
+            router,
+            None,
+            Arc::from("greeter.svc:50051"),
+            DeadlinePolicy::headers_only(),
+        );
 
         let inner =
             service_fn(
@@ -585,6 +655,7 @@ mod tests {
                 },
                 action: RouteConfigAction::Cluster(cluster.into()),
                 retry_config: None,
+                max_stream_duration: None,
             }
         }
 
@@ -659,7 +730,13 @@ mod tests {
         };
 
         let interceptor: Arc<dyn PreRouteInterceptor> = Arc::new(PartitionInterceptor);
-        let svc = XdsRoutingLayer::new(router, Some(interceptor), Arc::from("svc")).layer(terminal);
+        let svc = XdsRoutingLayer::new(
+            router,
+            Some(interceptor),
+            Arc::from("svc"),
+            DeadlinePolicy::headers_only(),
+        )
+        .layer(terminal);
 
         // hint "a" -> partition 1 -> cluster-p1
         let req = Request::builder().header("hint", "a").body(()).unwrap();

@@ -52,10 +52,11 @@ use crate::resource::{DecodedResource, Resource};
 /// # Example
 ///
 /// ```ignore
+/// // Keep route_watcher in the caller's state so it outlives this event.
 /// match event {
 ///     ResourceEvent::ResourceChanged { result: Ok(resource), done } => {
 ///         // Process the new resource, possibly add cascading watches.
-///         client.watch::<RouteConfiguration>(&resource.route_name()).await;
+///         route_watcher = Some(client.watch::<RouteConfiguration>(&resource.route_name()));
 ///         // Signal is sent automatically when done is dropped
 ///     }
 ///     ResourceEvent::ResourceChanged { result: Err(error), done } => {
@@ -148,6 +149,7 @@ pub enum ResourceEvent<T> {
 /// Call [`next()`](Self::next) to receive resource events.
 /// Dropping the watcher unsubscribes from the resource.
 #[derive(Debug)]
+#[must_use = "dropping the watcher unsubscribes from the resource"]
 pub struct ResourceWatcher<T: Resource> {
     /// Channel to receive events from the worker.
     event_rx: mpsc::UnboundedReceiver<ResourceEvent<DecodedResource>>,
@@ -181,11 +183,13 @@ impl<T: Resource> ResourceWatcher<T> {
     /// # Example
     ///
     /// ```ignore
+    /// // Keep the cascading watcher alive across listener updates.
+    /// let mut route_watcher = None;
     /// while let Some(event) = watcher.next().await {
     ///     match event {
     ///         ResourceEvent::ResourceChanged { result: Ok(resource), done } => {
     ///             // Process the new resource, possibly add cascading watches.
-    ///             client.watch::<RouteConfiguration>(&resource.route_name()).await;
+    ///             route_watcher = Some(client.watch::<RouteConfiguration>(&resource.route_name()));
     ///             // Signal is sent automatically when done is dropped
     ///         }
     ///         ResourceEvent::ResourceChanged { result: Err(error), done } => {

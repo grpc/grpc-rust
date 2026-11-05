@@ -58,7 +58,7 @@ pub mod round_robin;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, feature = "__internal-test-utils"))]
 pub mod test_utils;
 
 static START: Once = Once::new();

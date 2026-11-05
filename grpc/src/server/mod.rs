@@ -47,6 +47,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::watch;
 
@@ -56,17 +57,23 @@ use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::core::StreamEnded;
 use crate::core::StreamError;
+use crate::metadata::AsciiMetadataValue;
 use crate::metadata::MetadataMap;
+use crate::private::SealedToken;
 use crate::rt::GrpcRuntime;
+use crate::rt::address::ListenerAddress;
 use crate::send_future::SendFuture;
 
 pub mod builder;
 pub mod descriptor;
+pub(crate) mod http2_config;
 pub mod interceptor;
 pub(crate) mod router;
 pub mod service;
+pub(crate) mod transport;
 
 use builder::ServerBuilder;
+pub use http2_config::Http2Config;
 use interceptor::Identity;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
@@ -99,11 +106,12 @@ impl CallOptions {
 /// times on the same connection MUST be safe and act as a no-op after the
 /// initial shutdown signal is sent.
 #[doc(hidden)]
-pub trait GracefulConnection: Future<Output = ()> + Send + 'static {
+pub trait GracefulConnection: Future<Output = Result<(), String>> + Send + 'static {
     /// Initiate graceful shutdown.
-    fn graceful_shutdown(self: Pin<&mut Self>, token: crate::private::Internal);
+    fn graceful_shutdown(self: Pin<&mut Self>, token: SealedToken);
 }
 
+#[derive(Default)]
 pub struct Server {
     handler: Option<Arc<dyn DynHandle>>,
     runtime: GrpcRuntime,
@@ -112,6 +120,7 @@ pub struct Server {
 mod sealed {
     pub trait Sealed {}
     impl Sealed for crate::inmemory::InMemoryListener {}
+    impl Sealed for crate::server::transport::hyper::HyperListener {}
 }
 
 /// A bound listening socket that yields incoming connections.
@@ -131,11 +140,15 @@ pub trait Listener: sealed::Sealed {
     type Transport: Transport + 'static;
 
     /// Accepts the next incoming connection.
+    ///
+    /// Returns an error once the listener can't produce any more connections,
+    /// because it was closed or because accepting failed. The server then stops
+    /// accepting and returns that error.
     #[doc(hidden)]
-    async fn accept(&self, token: crate::private::Internal) -> Option<Self::Transport>;
+    async fn accept(&self, token: SealedToken) -> Result<Self::Transport, String>;
 
     /// Returns the address this listener is bound to.
-    fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress>;
+    fn local_addr(&self) -> Box<dyn ListenerAddress>;
 }
 
 /// A connection accepted by a [`Listener`] that can serve RPCs.
@@ -150,7 +163,7 @@ pub trait Transport: Send + 'static {
         self,
         handler: Arc<dyn DynHandle>,
         runtime: GrpcRuntime,
-        token: crate::private::Internal,
+        token: SealedToken,
     ) -> Self::Connection;
 }
 
@@ -168,22 +181,25 @@ impl GracefulCoordinator {
         Self { tx }
     }
 
-    fn watch<C: GracefulConnection>(&self, conn: C) -> impl Future<Output = ()> + Send + 'static {
+    fn watch<C: GracefulConnection>(
+        &self,
+        conn: C,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
         let mut rx = self.tx.subscribe();
         async move {
             let mut conn = std::pin::pin!(conn);
             loop {
                 tokio::select! {
-                    _ = &mut conn => { break; }
+                    res = &mut conn => { return res; }
                     res = rx.changed() => {
                         match res {
                             // Operator graceful signal: begin GOAWAY drain,
                             // keep polling the connection to completion.
-                            Ok(()) => conn.as_mut().graceful_shutdown(crate::private::Internal),
+                            Ok(()) => conn.as_mut().graceful_shutdown(SealedToken),
                             // Sender dropped == serve future dropped (force
                             // shutdown): stop now. Dropping `conn` closes the
                             // socket and cancels in-flight work.
-                            Err(_) => break,
+                            Err(_) => return Ok(()),
                         }
                     }
                 }
@@ -203,6 +219,24 @@ impl Server {
         ServerBuilder::new()
     }
 
+    /// Binds a TCP listener to `addr` with the given server credentials and HTTP/2 configuration.
+    // TODO: Consider making this a builder to allow adding additional listener
+    // configuration without breaking changes.
+    #[cfg(feature = "_runtime-tokio")]
+    pub async fn tcp_listener(
+        addr: std::net::SocketAddr,
+        creds: Arc<dyn crate::credentials::ServerCredentials>,
+        config: Http2Config,
+    ) -> Result<impl Listener, String> {
+        let listener = transport::hyper::HyperListener::new_tcp_listener(
+            addr,
+            creds,
+            &crate::rt::default_runtime(),
+        )
+        .await?;
+        Ok(listener.with_config(config))
+    }
+
     /// Creates a new server with the given handler and runtime.
     pub(crate) fn new(handler: impl Handle + 'static, runtime: GrpcRuntime) -> Self {
         Self {
@@ -216,22 +250,24 @@ impl Server {
         &self.runtime
     }
 
-    /// Serves on the given listener until it stops producing connections.
+    /// Serves on the given listener until accepting fails.
     ///
-    /// After the accept loop ends, the listener is dropped and the server waits
-    /// for all in-flight connections to drain before returning. Connections are
-    /// not notified to shut down gracefully; they run until completion or client
-    /// disconnect.
-    // TODO: Consider returning a `ServeOutcome` enum (e.g.
-    // ShutdownSignal / ListenerClosed) so callers can distinguish
-    // why the server stopped.
-    pub async fn serve(&self, listener: impl Listener) {
+    /// After the accept loop ends, the listener is dropped, all open HTTP/2
+    /// connections receive a GOAWAY frame, and the server waits for in-flight
+    /// RPCs to finish before returning.
+    ///
+    /// # Errors
+    ///
+    /// This only returns once the listener fails to accept: the server drains as
+    /// above and then returns the listener's error. Draining has no time limit.
+    // TODO: Revisit the serve and accept error API, especially the error type, before GA.
+    pub async fn serve(&self, listener: impl Listener) -> Result<(), String> {
         self.serve_with_shutdown(listener, std::future::pending())
-            .await;
+            .await
     }
 
-    /// Serves on the given listener until `signal` resolves, then drains
-    /// all in-flight connections before returning.
+    /// Serves on the given listener until `signal` resolves or the listener
+    /// fails, then drains all in-flight connections before returning.
     ///
     /// When `signal` completes:
     /// 1. The server stops accepting new connections and drops the listener,
@@ -239,24 +275,33 @@ impl Server {
     /// 2. All open HTTP/2 connections receive a GOAWAY frame.
     /// 3. In-flight RPCs continue to completion.
     /// 4. This method returns once all connections are closed.
-    // TODO(sauravz): The shutdown signal is currently per-listener like tonic
-    // Other implementations have signal on the server level.
-    // We need to evaluate what's the correct behavior here.
-    // Per Listener is more flexible and easy to implement, but
-    // doesn't allign with other implementations.
+    ///
+    /// If the listener fails to accept, the server drains the same way and
+    /// then returns the listener's error.
+    ///
+    /// Draining has no time limit. To bound it, drop the returned future, for
+    /// example by racing it against a timer; dropping it closes all remaining
+    /// connections.
     pub(crate) async fn serve_with_shutdown(
         &self,
         listener: impl Listener,
         signal: impl Future<Output = ()>,
-    ) {
+    ) -> Result<(), String> {
         let graceful = GracefulCoordinator::new();
+        let mut exit_err: Option<String> = None;
 
         tokio::pin!(signal);
 
         loop {
             tokio::select! {
-                conn = listener.accept(crate::private::Internal) => {
-                    let Some(connection) = conn else { break };
+                conn = listener.accept(SealedToken) => {
+                    let connection = match conn {
+                        Ok(c) => c,
+                        Err(err) => {
+                            exit_err = Some(err);
+                            break;
+                        }
+                    };
                     let handler = match self.handler.as_ref() {
                         Some(h) => h.clone(),
                         None => continue,
@@ -264,10 +309,14 @@ impl Server {
                     let serving = connection.serve(
                         handler,
                         self.runtime.clone(),
-                        crate::private::Internal,
+                        SealedToken,
                     );
                     let fut = graceful.watch(serving);
-                    self.runtime.spawn(Box::pin(fut));
+                    self.runtime.spawn(Box::pin(async move {
+                        if let Err(_err) = fut.await {
+                            // TODO: Perform logging or some sort of connection error signal for connection errors.
+                        }
+                    }));
                 }
                 _ = &mut signal => {
                     break;
@@ -278,14 +327,10 @@ impl Server {
         drop(listener);
 
         graceful.shutdown().await;
-    }
-}
 
-impl Default for Server {
-    fn default() -> Self {
-        Self {
-            handler: None,
-            runtime: crate::rt::default_runtime(),
+        match exit_err {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 }
@@ -506,6 +551,8 @@ impl ResponseHeaders {
 }
 
 /// Contains all information transmitted in the request headers of an RPC.
+// TODO: Revisit symmetry with `client::CallOptions` (whether timeout/deadline
+// and compression encodings should live on `server::RequestHeaders` or `server::CallOptions`).
 #[derive(Debug, Clone)]
 pub struct RequestHeaders {
     /// The full (e.g. "/Service/Method") method name specified for the call.
@@ -514,6 +561,13 @@ pub struct RequestHeaders {
     metadata: MetadataMap,
     /// Information about the client.
     connection_info: ConnectionInfo,
+    /// The deadline for the call, derived from the client's `grpc-timeout`
+    /// when the call started.
+    deadline: Option<Instant>,
+    /// The message compression encoding (`grpc-encoding`) specified by the client.
+    encoding: Option<AsciiMetadataValue>,
+    /// The accepted response compression encodings (`grpc-accept-encoding`) specified by the client.
+    accept_encoding: Option<AsciiMetadataValue>,
 }
 
 impl RequestHeaders {
@@ -523,6 +577,9 @@ impl RequestHeaders {
             method_name: method_name.into(),
             connection_info,
             metadata: MetadataMap::default(),
+            deadline: None,
+            encoding: None,
+            accept_encoding: None,
         }
     }
 
@@ -564,10 +621,37 @@ impl RequestHeaders {
         &self.connection_info
     }
 
-    /// Returns the owned fields in the RequestHeaders.
-    // TODO: make public once fields are fixed.
-    pub(crate) fn into_parts(self) -> (String, MetadataMap) {
-        (self.method_name, self.metadata)
+    /// Sets the deadline for the call on these headers.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Returns the deadline for the call, if the client sent a `grpc-timeout`.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Sets the `grpc-encoding` value on these headers.
+    pub fn with_encoding(mut self, encoding: AsciiMetadataValue) -> Self {
+        self.encoding = Some(encoding);
+        self
+    }
+
+    /// Returns the `grpc-encoding` header value sent by the client, if present.
+    pub fn encoding(&self) -> Option<&str> {
+        self.encoding.as_ref().map(|v| v.to_str())
+    }
+
+    /// Sets the `grpc-accept-encoding` value on these headers.
+    pub fn with_accept_encoding(mut self, accept_encoding: AsciiMetadataValue) -> Self {
+        self.accept_encoding = Some(accept_encoding);
+        self
+    }
+
+    /// Returns the `grpc-accept-encoding` header value sent by the client, if present.
+    pub fn accept_encoding(&self) -> Option<&str> {
+        self.accept_encoding.as_ref().map(|v| v.to_str())
     }
 }
 
@@ -627,69 +711,80 @@ impl Trailers {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
+    use std::time::Duration;
 
-    use tokio::sync::Notify;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::core::test_connection_info;
-    /// A mock connection whose completion is controlled by a [`Notify`],
-    /// and which records whether [`graceful_shutdown`] was called.
+    use crate::credentials::LocalServerCredentials;
+    use crate::credentials::ServerCredentials;
+    use crate::rt::address::TcpAddress;
+    /// A mock connection with one RPC in flight. It finishes only when the test
+    /// sends on its finish sender, even after [`graceful_shutdown`], which it
+    /// reports on its shutdown receiver.
     struct MockConnection {
-        shutdown_called: Arc<AtomicBool>,
-        finish: Arc<Notify>,
+        shutdown_called: Option<oneshot::Sender<()>>,
+        finish: oneshot::Receiver<()>,
     }
 
     impl MockConnection {
-        fn new() -> (Self, Arc<AtomicBool>, Arc<Notify>) {
-            let shutdown_called = Arc::new(AtomicBool::new(false));
-            let finish = Arc::new(Notify::new());
+        /// Returns the connection, a receiver that resolves when
+        /// `graceful_shutdown` is called, and a sender that finishes the
+        /// connection.
+        fn new() -> (Self, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (finish_tx, finish_rx) = oneshot::channel();
             (
                 Self {
-                    shutdown_called: shutdown_called.clone(),
-                    finish: finish.clone(),
+                    shutdown_called: Some(shutdown_tx),
+                    finish: finish_rx,
                 },
-                shutdown_called,
-                finish,
+                shutdown_rx,
+                finish_tx,
             )
         }
     }
 
     impl Future for MockConnection {
-        type Output = ();
+        type Output = Result<(), String>;
 
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            let notified = self.finish.notified();
-            tokio::pin!(notified);
-            notified.poll(cx)
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), String>> {
+            Pin::new(&mut self.finish).poll(cx).map(|_| Ok(()))
         }
     }
 
     impl GracefulConnection for MockConnection {
-        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
-            self.shutdown_called.store(true, Ordering::SeqCst);
-            self.finish.notify_one();
+        fn graceful_shutdown(mut self: Pin<&mut Self>, _token: SealedToken) {
+            if let Some(shutdown_called) = self.shutdown_called.take() {
+                let _ = shutdown_called.send(());
+            }
         }
     }
 
     #[tokio::test]
     async fn shutdown_signals_watched_connection() {
         let coordinator = GracefulCoordinator::new();
-        let (conn, shutdown_called, _finish) = MockConnection::new();
+        let (conn, shutdown_called, finish) = MockConnection::new();
 
         let watched = coordinator.watch(conn);
         let handle = tokio::spawn(watched);
 
         tokio::task::yield_now().await;
 
-        coordinator.shutdown().await;
+        let shutdown = tokio::spawn(coordinator.shutdown());
+        shutdown_called.await.unwrap();
+        assert!(!shutdown.is_finished());
+        finish.send(()).unwrap();
 
-        handle.await.unwrap();
-        assert!(shutdown_called.load(Ordering::SeqCst));
+        handle.await.unwrap().unwrap();
+        shutdown.await.unwrap();
     }
 
     #[tokio::test]
@@ -699,13 +794,14 @@ mod tests {
 
         let watched = coordinator.watch(conn);
         let handle = tokio::spawn(watched);
+        tokio::task::yield_now().await;
 
         // Connection finishes on its own (e.g. client disconnected).
-        finish.notify_one();
-        handle.await.unwrap();
+        finish.send(()).unwrap();
+        handle.await.unwrap().unwrap();
 
         // graceful_shutdown was never called.
-        assert!(!shutdown_called.load(Ordering::SeqCst));
+        assert!(shutdown_called.await.is_err());
 
         // Shutdown still returns promptly (no connections to drain).
         coordinator.shutdown().await;
@@ -715,19 +811,22 @@ mod tests {
     async fn two_connections_both_drained() {
         let coordinator = GracefulCoordinator::new();
 
-        let (conn_a, shutdown_a, _finish_a) = MockConnection::new();
-        let (conn_b, shutdown_b, _finish_b) = MockConnection::new();
+        let (conn_a, shutdown_a, finish_a) = MockConnection::new();
+        let (conn_b, shutdown_b, finish_b) = MockConnection::new();
 
         let handle_a = tokio::spawn(coordinator.watch(conn_a));
         let handle_b = tokio::spawn(coordinator.watch(conn_b));
 
         tokio::task::yield_now().await;
-        coordinator.shutdown().await;
+        let shutdown = tokio::spawn(coordinator.shutdown());
+        shutdown_a.await.unwrap();
+        shutdown_b.await.unwrap();
+        finish_a.send(()).unwrap();
+        finish_b.send(()).unwrap();
 
-        handle_a.await.unwrap();
-        handle_b.await.unwrap();
-        assert!(shutdown_a.load(Ordering::SeqCst));
-        assert!(shutdown_b.load(Ordering::SeqCst));
+        handle_a.await.unwrap().unwrap();
+        handle_b.await.unwrap().unwrap();
+        shutdown.await.unwrap();
     }
 
     // -- Server + InMemoryListener integration tests --
@@ -745,7 +844,8 @@ mod tests {
                 .serve_with_shutdown(listener_clone, async {
                     let _ = shutdown_rx.await;
                 })
-                .await;
+                .await
+                .unwrap();
         });
 
         // Fire shutdown immediately.
@@ -756,27 +856,6 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down within 2s")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn server_stops_when_listener_closes() {
-        let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::builder().build();
-
-        let listener_for_serve = listener.clone();
-        let server_handle = tokio::spawn(async move {
-            // serve() runs until the listener stops producing connections.
-            server.serve(listener_for_serve).await;
-        });
-
-        // Closing the listener makes accept() return None.
-        listener.close().await;
-
-        GrpcRuntime::default()
-            .timeout(std::time::Duration::from_secs(2), server_handle)
-            .await
-            .expect("server did not exit after listener close")
             .unwrap();
     }
 
@@ -793,16 +872,16 @@ mod tests {
         // Drop the coordinator/Sender explicitly (simulating serve future being dropped).
         drop(coordinator);
 
-        // The watched task should exit promptly because `rx.changed()` returns `Err` -> `break`.
-        // If the old busy-loop bug existed, this `await` would time out / hang forever.
+        // The watched task should exit promptly because `rx.changed()` returns `Err`, so the watcher returns `Ok(())`.
         GrpcRuntime::default()
-            .timeout(std::time::Duration::from_secs(1), handle)
+            .timeout(Duration::from_secs(1), handle)
             .await
             .expect("watched connection did not exit when coordinator was dropped")
+            .unwrap()
             .unwrap();
 
         // `graceful_shutdown` should NOT have been called on the force-close path.
-        assert!(!shutdown_called.load(Ordering::SeqCst));
+        assert!(shutdown_called.await.is_err());
     }
 
     #[tokio::test]
@@ -837,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn infinite_connection_graceful_shutdown_then_drop() {
         let coordinator = GracefulCoordinator::new();
-        // MockConnection never notifies finish on its own or when graceful_shutdown is called.
+        // `_finish` is never sent, so the connection never finishes.
         let (conn, shutdown_called, _finish) = MockConnection::new();
 
         let watched = coordinator.watch(conn);
@@ -846,25 +925,27 @@ mod tests {
         tokio::task::yield_now().await;
 
         // 1. Initiate graceful shutdown. `tx.send(())` wakes `rx.changed()`, triggering `graceful_shutdown()`.
-        // But because `conn` never completes (`_finish` never notified), `coordinator.shutdown()` would hang if awaited.
+        // But because `conn` never completes, `coordinator.shutdown()` would hang if awaited.
         let _ = coordinator.tx.send(());
-        tokio::task::yield_now().await;
-        assert!(shutdown_called.load(Ordering::SeqCst));
+        shutdown_called.await.unwrap();
+        assert!(!handle.is_finished());
 
         // 2. Escalate to forceful shutdown by dropping the coordinator (simulating dropping the serve future).
         drop(coordinator);
 
-        // The watched task MUST self-terminate (`rx.changed()` returns `Err` -> `break`) despite being mid-drain.
-        GrpcRuntime::default().timeout(std::time::Duration::from_secs(1), handle)
+        // The watched task MUST self-terminate (`rx.changed()` returns `Err`, so the watcher returns `Ok(())`) despite being mid-drain.
+        GrpcRuntime::default()
+            .timeout(Duration::from_secs(1), handle)
             .await
             .expect("infinite watched connection did not exit when coordinator was dropped after graceful shutdown")
+            .unwrap()
             .unwrap();
     }
 
     #[derive(Debug)]
     struct MockListenerAddress;
 
-    impl crate::rt::address::ListenerAddress for MockListenerAddress {
+    impl ListenerAddress for MockListenerAddress {
         fn network(&self) -> &str {
             "mock"
         }
@@ -907,11 +988,16 @@ mod tests {
     impl Listener for MockListener {
         type Transport = MockTransport;
 
-        async fn accept(&self, _token: crate::private::Internal) -> Option<Self::Transport> {
-            self.rx.lock().await.recv().await
+        async fn accept(&self, _token: SealedToken) -> Result<Self::Transport, String> {
+            self.rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| "mock listener closed".to_string())
         }
 
-        fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress> {
+        fn local_addr(&self) -> Box<dyn ListenerAddress> {
             Box::new(MockListenerAddress)
         }
     }
@@ -937,19 +1023,19 @@ mod tests {
     }
 
     struct MockServingConnection {
-        inner: Pin<Box<dyn Future<Output = ()> + Send>>,
+        inner: Pin<Box<dyn Future<Output = Result<(), String>> + Send>>,
     }
 
     impl Future for MockServingConnection {
-        type Output = ();
+        type Output = Result<(), String>;
 
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), String>> {
             self.inner.as_mut().poll(cx)
         }
     }
 
     impl GracefulConnection for MockServingConnection {
-        fn graceful_shutdown(self: Pin<&mut Self>, _token: crate::private::Internal) {
+        fn graceful_shutdown(self: Pin<&mut Self>, _token: SealedToken) {
             // No-op for mock connection
         }
     }
@@ -963,7 +1049,7 @@ mod tests {
             self,
             handler: Arc<dyn DynHandle>,
             _runtime: GrpcRuntime,
-            _token: crate::private::Internal,
+            _token: SealedToken,
         ) -> Self::Connection {
             let inner = Box::pin(async move {
                 let mut tx = NopSendStream;
@@ -976,6 +1062,7 @@ mod tests {
                         rx,
                     )
                     .await;
+                Ok(())
             });
             MockServingConnection { inner }
         }
@@ -993,7 +1080,8 @@ mod tests {
                 .serve_with_shutdown(listener, async {
                     let _ = shutdown_rx.await;
                 })
-                .await;
+                .await
+                .unwrap();
         });
 
         tokio::task::yield_now().await;
@@ -1090,7 +1178,8 @@ mod tests {
                 .serve_with_shutdown(listener, async {
                     let _ = shutdown_rx.await;
                 })
-                .await;
+                .await
+                .unwrap();
         });
 
         // Send a MockTransport to the listener so the server accepts a connection.
@@ -1150,5 +1239,48 @@ mod tests {
             .await
             .expect("server did not shut down after connection drained")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_serve_propagates_accept_error() {
+        struct FailingListener;
+
+        impl sealed::Sealed for FailingListener {}
+
+        impl Listener for FailingListener {
+            type Transport = MockTransport;
+
+            async fn accept(&self, _token: SealedToken) -> Result<Self::Transport, String> {
+                Err("simulated listener accept error".to_string())
+            }
+
+            fn local_addr(&self) -> Box<dyn ListenerAddress> {
+                Box::new(MockListenerAddress)
+            }
+        }
+
+        let server = Server::builder().build();
+        let result = server.serve(FailingListener).await;
+        assert_eq!(
+            result,
+            Err("simulated listener accept error".to_string()),
+            "server::serve must propagate accept error to the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_binds_and_returns_local_tcp_address() {
+        let creds: Arc<dyn ServerCredentials> = Arc::new(LocalServerCredentials::new());
+        let config = Http2Config::new().with_max_recv_message_size(1024);
+
+        let listener = Server::tcp_listener("127.0.0.1:0".parse().unwrap(), creds, config)
+            .await
+            .unwrap();
+
+        let local_addr = listener.local_addr();
+        let tcp_addr = (&*local_addr as &dyn Any)
+            .downcast_ref::<TcpAddress>()
+            .expect("expected TcpAddress");
+        assert!(tcp_addr.0.port() > 0);
     }
 }

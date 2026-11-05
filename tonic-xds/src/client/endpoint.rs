@@ -25,12 +25,15 @@
 use crate::common::async_util::BoxFuture;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
+use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
 use crate::xds::resource::cluster::ClusterResource;
 use crate::xds::resource::security::ClusterSecurityConfig;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tower::{BoxError, Service, load::Load};
+use xds_client::ServerConfig;
 
 /// Represents the host part of an endpoint address
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -69,6 +72,15 @@ impl EndpointAddress {
         Self {
             host: EndpointHost::from(host.into()),
             port,
+        }
+    }
+
+    /// Returns the IP address, or `None` if the host is a hostname.
+    pub(crate) fn ip(&self) -> Option<IpAddr> {
+        match self.host {
+            EndpointHost::Ipv4(ip) => Some(IpAddr::V4(ip)),
+            EndpointHost::Ipv6(ip) => Some(IpAddr::V6(ip)),
+            EndpointHost::Hostname(_) => None,
         }
     }
 }
@@ -205,6 +217,74 @@ pub trait Connector {
     ) -> crate::common::async_util::BoxFuture<Self::Service>;
 }
 
+/// A read-only view of the server and connection options passed to
+/// [`ControlPlaneConnector::connect`].
+///
+/// The server configuration preserves the original URI, including Unix socket
+/// paths and scheme-less addresses, before any transport-specific normalization.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlPlaneConfig<'a> {
+    server: &'a ServerConfig,
+    keep_alive: Option<(Option<Duration>, Duration)>,
+}
+
+impl<'a> ControlPlaneConfig<'a> {
+    pub(crate) fn new(
+        server: &'a ServerConfig,
+        keep_alive: Option<(Option<Duration>, Duration)>,
+    ) -> Self {
+        Self { server, keep_alive }
+    }
+
+    /// The original management-server configuration.
+    pub fn server(&self) -> &'a ServerConfig {
+        self.server
+    }
+
+    /// The explicit HTTP/2 keepalive override, if one was configured.
+    ///
+    /// `None` leaves the connector's defaults unchanged. `Some((None, timeout))`
+    /// disables keepalives. `Some((Some(interval), timeout))` sets the PING
+    /// interval and acknowledgement timeout.
+    pub fn keep_alive(&self) -> Option<(Option<Duration>, Duration)> {
+        self.keep_alive
+    }
+}
+
+/// Creates tonic channels to xDS management servers.
+///
+/// Implementations capture shared transport configuration at construction time
+/// and own endpoint creation. [`ControlPlaneConfig`] provides the original
+/// server URI and connection overrides for each connection attempt, including
+/// retries and reconnects.
+///
+/// Implementations must honor explicit connection overrides or return an error
+/// when an override cannot be supported.
+///
+/// The boxed future makes this trait object-safe, so connectors can be shared
+/// as `Arc<dyn ControlPlaneConnector>` without requiring implementations to
+/// be cloneable.
+pub trait ControlPlaneConnector: Send + Sync + 'static {
+    /// Declares whether every channel returned by [`connect`](Self::connect) provides
+    /// server authentication, confidentiality, and integrity.
+    ///
+    /// This is a guarantee about the transport, not the URI scheme or enabled
+    /// TLS features. It applies to every connection, including reconnects.
+    /// When returning `true`, implementations must fail rather than fall back
+    /// to an insecure transport.
+    fn is_secure(&self) -> bool;
+
+    /// Create a channel for the management server and connection options.
+    ///
+    /// The channel may connect lazily. Returns an error if the configuration or
+    /// requested overrides cannot be supported. The future must own any state
+    /// it needs from `self` and `config`, so it can outlive both references.
+    fn connect(
+        &self,
+        config: ControlPlaneConfig<'_>,
+    ) -> BoxFuture<xds_client::Result<tonic::transport::Channel>>;
+}
+
 /// A read-only view of a cluster's parsed xDS configuration, handed to
 /// [`MakeConnector::make_connector`] so a factory can build a connector
 /// tailored to the cluster.
@@ -217,6 +297,11 @@ pub struct ClusterConfig<'a> {
     /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal;
     /// read publicly through `ClusterConfig::tls`.
     pub(crate) security: Option<&'a ClusterSecurityConfig>,
+    /// EDS service name of the cluster's endpoints. Crate-internal; keys the
+    /// cluster's A32 request counter together with the cluster name.
+    pub(crate) eds_service_name: &'a str,
+    /// A32 circuit-breaking thresholds. Crate-internal.
+    pub(crate) circuit_breaking: CircuitBreakingConfig,
     /// Cert-provider registry. Ambient here so [`ClusterTlsConfig`] can resolve
     /// provider instance names without the caller handling the registry.
     #[cfg(feature = "_tls-any")]
@@ -234,6 +319,8 @@ impl<'a> ClusterConfig<'a> {
         Self {
             name: &cluster.name,
             security: cluster.security.as_ref(),
+            eds_service_name: cluster.eds_service_name(),
+            circuit_breaking: cluster.circuit_breaking,
             registry,
         }
     }
@@ -244,11 +331,13 @@ impl<'a> ClusterConfig<'a> {
         Self {
             name: &cluster.name,
             security: cluster.security.as_ref(),
+            eds_service_name: cluster.eds_service_name(),
+            circuit_breaking: cluster.circuit_breaking,
         }
     }
 
     /// The cluster name.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'a str {
         self.name
     }
 

@@ -63,7 +63,10 @@ pub use call_options::CallOptions;
 mod channel;
 pub use channel::Channel;
 pub use channel::ChannelBuilder;
+pub use channel::ChannelRecvStream;
+pub use channel::ChannelSendStream;
 
+mod deadline;
 mod subchannel;
 
 pub mod interceptor;

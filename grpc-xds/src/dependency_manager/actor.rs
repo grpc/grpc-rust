@@ -67,7 +67,7 @@ struct Watched<T: Resource> {
 impl<T: Resource> Watched<T> {
     async fn start(client: &XdsClient, name: String) -> Self {
         Self {
-            watcher: client.watch(name.clone()).await,
+            watcher: client.watch(name.clone()),
             name,
             state: WatchState::Pending,
         }

@@ -43,7 +43,7 @@ use crate::StaticProvider;
 use crate::server::RustlsServerCredentials;
 use crate::server::ServerTlsConfig;
 use crate::server::TlsClientCertificateRequestType;
-use grpc::__unstable::Internal;
+use grpc::__unstable::UnstableToken;
 use grpc::__unstable::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use grpc::__unstable::rt;
 use grpc::__unstable::rt::EndpointIoStream;
@@ -87,7 +87,7 @@ async fn test_tls_server_handshake() {
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
-        let result = creds.accept(Box::new(stream), runtime, Internal).await;
+        let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
         assert!(
             result.is_ok(),
             "Server handshake failed: {:?}",
@@ -143,7 +143,7 @@ async fn test_tls_server_handshake_no_alpn() {
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
-        let result = creds.accept(Box::new(stream), runtime, Internal).await;
+        let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
         assert!(result.is_err(), "Server handshake should have failed");
     });
 
@@ -186,7 +186,7 @@ async fn test_tls_server_handshake_bad_alpn() {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
         let runtime = rt::default_runtime();
-        let result = creds.accept(Box::new(stream), runtime, Internal).await;
+        let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
         assert!(result.is_err(), "Server handshake should have failed");
     });
 
@@ -223,7 +223,7 @@ async fn test_tls_handshake_alpn_h1_and_h2() {
         let stream = endpoint_from_tcp(stream).unwrap();
         let runtime = rt::default_runtime();
         creds
-            .accept(Box::new(stream), runtime, Internal)
+            .accept(Box::new(stream), runtime, UnstableToken)
             .await
             .unwrap();
     });
@@ -268,7 +268,7 @@ async fn test_tls_server_mtls_require_fail() {
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
-        let result = creds.accept(Box::new(stream), runtime, Internal).await;
+        let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
         assert!(result.is_err(), "Handshake should fail without client cert");
     });
 
@@ -320,7 +320,7 @@ async fn test_tls_server_mtls_success() {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
         let result = creds
-            .accept(Box::new(stream), runtime, Internal)
+            .accept(Box::new(stream), runtime, UnstableToken)
             .await
             .expect("Server handshake failed");
         let mut stream = EndpointIoStream::new(result.endpoint);
@@ -380,7 +380,7 @@ async fn test_tls_server_mtls_optional() {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
         let result = creds
-            .accept(Box::new(stream), runtime, Internal)
+            .accept(Box::new(stream), runtime, UnstableToken)
             .await
             .expect("Server handshake failed");
         let mut stream = EndpointIoStream::new(result.endpoint);
@@ -430,7 +430,7 @@ async fn test_tls_server_key_log() {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
         let result = creds
-            .accept(Box::new(stream), runtime, Internal)
+            .accept(Box::new(stream), runtime, UnstableToken)
             .await
             .expect("Server handshake failed");
         let mut stream = EndpointIoStream::new(result.endpoint);
@@ -483,7 +483,7 @@ async fn check_resumption_disabled(versions: Vec<&'static rustls::SupportedProto
             let (stream, _) = listener.accept().await.unwrap();
             let stream = endpoint_from_tcp(stream).unwrap();
             let runtime = rt::default_runtime();
-            let result = creds.accept(Box::new(stream), runtime, Internal).await;
+            let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
             assert!(result.is_ok());
             let stream = result.unwrap().endpoint;
             EndpointIoStream::new(stream)
@@ -558,7 +558,7 @@ async fn test_tls_server_sni() {
             let (stream, _) = listener.accept().await.unwrap();
             let stream = endpoint_from_tcp(stream).unwrap();
             let runtime = rt::default_runtime();
-            let result = creds.accept(Box::new(stream), runtime, Internal).await;
+            let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
             assert!(
                 result.is_ok(),
                 "Server handshake failed: {:?}",

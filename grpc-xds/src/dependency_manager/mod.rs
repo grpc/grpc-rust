@@ -363,10 +363,10 @@ mod tests {
         // The XdsClient sends no request for a type once it has no watches, so
         // keep one of each type to see the dependency manager's watches end.
         let _other_watches = (
-            xds_client.watch::<ListenerResource>("other").await,
-            xds_client.watch::<RouteConfigResource>("other").await,
-            xds_client.watch::<ClusterResource>("other").await,
-            xds_client.watch::<EndpointsResource>("other").await,
+            xds_client.watch::<ListenerResource>("other"),
+            xds_client.watch::<RouteConfigResource>("other"),
+            xds_client.watch::<ClusterResource>("other"),
+            xds_client.watch::<EndpointsResource>("other"),
         );
         let (dependency_manager, mut rx) = start(xds_client.clone());
         snapshot(&mut rx, &["a"]).await;

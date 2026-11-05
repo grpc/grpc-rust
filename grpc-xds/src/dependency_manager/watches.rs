@@ -205,7 +205,7 @@ async fn reconcile<T: Resource>(
     for name in required {
         if !watches.contains_key(name) {
             let watch = Watch {
-                watcher: client.watch(name.clone()).await,
+                watcher: client.watch(name.clone()),
                 state: WatchState::Pending,
             };
             watches.insert(name.clone(), watch);

@@ -34,15 +34,25 @@ use arc_swap::ArcSwap;
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::SetOnce;
 use tokio::sync::mpsc;
 
+use crate::StatusCodeError;
+use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::RecvStream;
 use crate::client::RequestHeaders;
+use crate::client::ResponseStreamItem;
+use crate::client::SendOptions;
+use crate::client::SendStream;
+use crate::client::deadline::DeadlineInvoker;
+use crate::client::deadline::DeadlineRecvStream;
+use crate::client::deadline::DeadlineSendStream;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
@@ -53,8 +63,6 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
-use crate::client::load_balancing::pick_first;
-use crate::client::load_balancing::round_robin;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel_sharing::SubchannelSharing;
@@ -62,6 +70,10 @@ use crate::client::load_balancing::{self};
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
+use crate::client::name_resolution::config_selector::ConfigSelector;
+use crate::client::name_resolution::config_selector::DefaultConfigSelector;
+use crate::client::name_resolution::config_selector::RpcConfig;
+use crate::client::name_resolution::config_selector::SelectConfigOptions;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::proxy_resolver;
@@ -77,6 +89,9 @@ use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
+use crate::core::RecvMessage;
+use crate::core::SendMessage;
+use crate::core::StreamEnded;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
@@ -93,7 +108,13 @@ use crate::rt::default_runtime;
 /// To perform RPCs, use the [`Invoke`] trait implemented by `Channel`.
 #[derive(Clone)]
 pub struct Channel {
-    inner: Arc<PersistentChannel>,
+    /// The layers that RPCs pass through, outermost first:
+    ///
+    /// 1. [`DeadlineInvoker`]: enforces the call's deadline.
+    /// 2. [`PersistentChannel`]: starts RPCs on the current [`ActiveChannel`].
+    /// 3. [`ActiveChannel`]: applies the config chosen by its config selector.
+    /// 4. [`LbInvoker`]: picks a subchannel using the LB policy's picker.
+    inner: Arc<DeadlineInvoker<PersistentChannel>>,
 }
 
 impl Channel {
@@ -142,8 +163,7 @@ impl Channel {
     /// Always available. When the `_runtime-tokio` feature is enabled,
     /// [`builder()`](Channel::builder) can be used instead to use the default
     /// Tokio runtime.
-    #[doc(hidden)]
-    pub fn builder_with_runtime(
+    pub(crate) fn builder_with_runtime(
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
         runtime: GrpcRuntime,
@@ -160,7 +180,7 @@ impl Channel {
     /// state was [`Idle`](ConnectivityState::Idle), the channel will attempt to
     /// create connections.
     pub fn get_state(&mut self, connect: bool) -> ConnectivityState {
-        self.inner.get_state(connect)
+        self.persistent().get_state(connect)
     }
 
     /// Waits for the state of the channel to change from source.  Times out and
@@ -174,17 +194,45 @@ impl Channel {
     }
 }
 
+impl Channel {
+    fn persistent(&self) -> &PersistentChannel {
+        self.inner.next()
+    }
+}
+
 impl Invoke for Channel {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
+    type SendStream = ChannelSendStream;
+    type RecvStream = ChannelRecvStream;
 
     async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
-        let ac = self.inner.get_active_channel();
-        ac.invoke(headers, options).await
+        let (tx, rx) = self.inner.invoke(headers, options).await;
+        (ChannelSendStream(tx), ChannelRecvStream(rx))
+    }
+}
+
+/// The [`SendStream`] of an RPC started on a [`Channel`].
+pub struct ChannelSendStream(DeadlineSendStream<Box<dyn DynSendStream>>);
+
+impl SendStream for ChannelSendStream {
+    async fn send(
+        &mut self,
+        msg: &dyn SendMessage,
+        options: SendOptions,
+    ) -> Result<(), StreamEnded> {
+        self.0.send(msg, options).await
+    }
+}
+
+/// The [`RecvStream`] of an RPC started on a [`Channel`].
+pub struct ChannelRecvStream(DeadlineRecvStream<Box<dyn DynSendStream>, Box<dyn DynRecvStream>>);
+
+impl RecvStream for ChannelRecvStream {
+    async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        self.0.recv(msg).await
     }
 }
 
@@ -233,15 +281,16 @@ impl ChannelBuilder {
             authority: Authority::from_host_port_str(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
+        let persistent = PersistentChannel {
+            active_channel: ArcSwapOption::empty(),
+            active_channel_init: Mutex::new(()),
+            target,
+            security_opts,
+            runtime: self.runtime.clone(),
+            resolver_builder,
+        };
         Channel {
-            inner: Arc::new(PersistentChannel {
-                active_channel: ArcSwapOption::empty(),
-                active_channel_init: Mutex::new(()),
-                target,
-                security_opts,
-                runtime: self.runtime,
-                resolver_builder,
-            }),
+            inner: Arc::new(DeadlineInvoker::new(self.runtime, persistent)),
         }
     }
 
@@ -305,12 +354,26 @@ impl PersistentChannel {
     }
 }
 
+/// Starts RPCs on the current [`ActiveChannel`], creating it if necessary.
+impl Invoke for PersistentChannel {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        self.get_active_channel().invoke(headers, options).await
+    }
+}
+
 // A channel that is not idle (connecting, ready, or erroring).
 struct ActiveChannel {
-    abort_handle: Box<dyn rt::TaskHandle>, /* Work scheduler task killed when ActiveChannel is
-                                            * dropped. */
-    lb_watcher: Arc<Watcher<LbState>>, /* For getting the channel connectivity state and pickers
-                                        * for RPCs. */
+    /// Starts RPCs on subchannels picked by the LB policy.  In an `Arc` so
+    /// that it can be passed to the interceptors chosen by the config selector.
+    lb: Arc<LbInvoker>,
+    config_selector: SharedConfigSelector,
 }
 
 impl ActiveChannel {
@@ -323,11 +386,13 @@ impl ActiveChannel {
         }));
 
         let (wqtx, mut wqrx) = mpsc::unbounded_channel::<WorkQueueItem>();
+        let config_selector = SharedConfigSelector::new();
         let mut resolver_channel_controller = ResolverChannelController::new(
             wqtx.clone(),
             runtime.clone(),
             lb_watcher.clone(),
             persistent_channel.security_opts.clone(),
+            config_selector.clone(),
         );
 
         let work_scheduler = Arc::new(ResolverWorkScheduler { wqtx });
@@ -360,17 +425,21 @@ impl ActiveChannel {
         }));
 
         Arc::new(Self {
-            abort_handle,
-            lb_watcher,
+            lb: Arc::new(LbInvoker {
+                abort_handle,
+                lb_watcher,
+            }),
+            config_selector,
         })
     }
 
     fn connectivity_state(&self) -> ConnectivityState {
-        self.lb_watcher.snapshot().value().connectivity_state
+        self.lb.lb_watcher.snapshot().value().connectivity_state
     }
 }
 
-impl Invoke for Arc<ActiveChannel> {
+/// Applies the config chosen by the config selector to each RPC.
+impl Invoke for ActiveChannel {
     type SendStream = Box<dyn DynSendStream>;
     type RecvStream = Box<dyn DynRecvStream>;
 
@@ -379,6 +448,50 @@ impl Invoke for Arc<ActiveChannel> {
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
+        let selected = self
+            .config_selector
+            .select_config(SelectConfigOptions::default())
+            .await;
+        let config = match selected {
+            Ok(config) => config,
+            Err(status) => return FailingRecvStream::new_stream_pair(status, None),
+        };
+        match config.interceptor {
+            Some(interceptor) => {
+                interceptor
+                    .dyn_intercept(headers, options, self.lb.clone())
+                    .await
+            }
+            // Avoid heap allocations and dynamic dispatch.
+            None => self.lb.invoke(headers, options).await,
+        }
+    }
+}
+
+/// Starts RPCs on subchannels picked by the LB policy's current picker.
+struct LbInvoker {
+    /// The task running the resolver and LB policy, which update `lb_watcher`.
+    /// Aborted when this is dropped.
+    abort_handle: Box<dyn rt::TaskHandle>,
+    /// For getting the channel connectivity state and pickers for RPCs.
+    lb_watcher: Arc<Watcher<LbState>>,
+}
+
+// Note: `LbInvoker` implements `DynInvoke` directly, rather than `Invoke`, as
+// its streams are already boxed; the blanket `DynInvoke` implementation for
+// `Invoke` would box them a second time when it is passed to the config
+// selector's interceptor.
+impl LbInvoker {
+    /// Starts an RPC on a subchannel picked by the current LB picker, waiting
+    /// for a new picker while picks are queued.
+    ///
+    /// Unlike [`DynInvoke::dyn_invoke`], this doesn't box the returned future,
+    /// so callers that don't need dynamic dispatch avoid an allocation.
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
         // Fast path: snapshot the latest LB state without locking and pick
         // with its picker.
         let mut snapshot = self.lb_watcher.snapshot();
@@ -412,7 +525,18 @@ impl Invoke for Arc<ActiveChannel> {
     }
 }
 
-impl Drop for ActiveChannel {
+#[crate::async_trait]
+impl DynInvoke for LbInvoker {
+    async fn dyn_invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        self.invoke(headers, options).await
+    }
+}
+
+impl Drop for LbInvoker {
     fn drop(&mut self) {
         self.abort_handle.abort();
     }
@@ -436,6 +560,7 @@ struct ResolverChannelController {
     lb_policy: SubchannelSharing<GracefulSwitchPolicy>,
     lb_work_scheduler: Arc<LbWorkScheduler>,
     lb_channel_controller: LbChannelController,
+    config_selector: SharedConfigSelector,
 }
 
 impl ResolverChannelController {
@@ -444,6 +569,7 @@ impl ResolverChannelController {
         runtime: GrpcRuntime,
         lb_watcher: Arc<Watcher<LbState>>,
         security_opts: SecurityOpts,
+        config_selector: SharedConfigSelector,
     ) -> Self {
         let lb_work_scheduler = Arc::new(LbWorkScheduler { wqtx: wqtx.clone() });
         let lb_channel_controller = LbChannelController {
@@ -462,21 +588,41 @@ impl ResolverChannelController {
             lb_channel_controller,
             wqtx: wqtx.clone(),
             runtime: runtime.clone(),
+            config_selector,
         }
     }
 }
 
 impl name_resolution::ChannelController for ResolverChannelController {
-    fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
+    fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
         let (builder, config) = match update.service_config.as_ref() {
             Ok(Some(sc)) => sc.lb_config(),
             _ => ServiceConfig::default_lb_policy(),
         };
 
+        let cfg_selector = update.take_config_selector();
+
         let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 
-        self.lb_policy
-            .resolver_update(update, &gsb_config, &mut self.lb_channel_controller)
+        let lb_result =
+            self.lb_policy
+                .resolver_update(update, &gsb_config, &mut self.lb_channel_controller);
+        // As per gRFC A31, the LB policy's update must be called and return
+        // before the new config selector is used, since the selector may route
+        // RPCs to destinations that only the LB policy's new picker knows
+        // about. `resolver_update` is synchronous, so any picker produced for
+        // this update has already been published.
+        //
+        // The selector is applied even if the LB policy returned an error: the
+        // policy has still processed the update (and may have published a new
+        // picker); the error only asks the resolver to re-resolve.
+        //
+        // TODO: once service config error handling (gRFC A21) is implemented,
+        // keep the previous selector when the resolver returns an invalid
+        // service config.
+        self.config_selector
+            .update(cfg_selector.unwrap_or_else(|| Arc::new(DefaultConfigSelector)));
+        lb_result
     }
 
     fn parse_service_config(&self, config: &str) -> ParseResult {
@@ -649,11 +795,73 @@ fn parse_authority(host_and_port: &str) -> Authority {
     Authority::new(host_and_port.to_string(), None)
 }
 
+/// Shares an [`ActiveChannel`]'s config selector between the work serializer,
+/// which replaces it on every resolver update, and RPCs, which each read it
+/// once.
+#[derive(Debug, Clone)]
+struct SharedConfigSelector {
+    inner: Arc<SharedConfigSelectorInner>,
+}
+
+#[derive(Debug)]
+struct SharedConfigSelectorInner {
+    /// The current config selector. Until the resolver produces its first
+    /// result, this is a [`DefaultConfigSelector`] that RPCs never use: they
+    /// wait for `resolved` instead.
+    current: ArcSwap<Arc<dyn ConfigSelector>>,
+    /// Set once `current` holds the selector from the resolver's first result.
+    resolved: SetOnce<()>,
+}
+
+impl SharedConfigSelector {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(SharedConfigSelectorInner {
+                current: ArcSwap::from_pointee(Arc::new(DefaultConfigSelector)),
+                resolved: SetOnce::new(),
+            }),
+        }
+    }
+
+    /// Waits for the resolver's first result, then selects the configuration
+    /// for an RPC using `current`.
+    async fn select_config(&self, options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
+        // Returns immediately if `resolved` is already set. `SetOnce` stays
+        // set, so an `update` that races with this call can't be missed.
+        self.inner.resolved.wait().await;
+        self.inner
+            .current
+            .load()
+            .select_config(options)
+            .map_err(sanitize_config_selector_status)
+    }
+
+    fn update(&self, selector: Arc<dyn ConfigSelector>) {
+        self.inner.current.store(Arc::new(selector));
+        // Set `resolved` after the store, so that RPCs that observe it also
+        // observe the new selector. This fails, harmlessly, on every update
+        // after the first.
+        let _ = self.inner.resolved.set(());
+    }
+}
+
+/// Replaces status codes that config selectors may not produce with INTERNAL,
+/// per gRFC A54.
+fn sanitize_config_selector_status(status: StatusError) -> StatusError {
+    if status.is_restricted_control_plane_code() {
+        StatusError::new(
+            StatusCodeError::Internal,
+            format!("config selector returned illegal status: {status}"),
+        )
+    } else {
+        status
+    }
+}
+
 // Sets up the default registries for transports, name resolvers, and load
 // balancers.
 fn setup_registeries() {
-    pick_first::reg();
-    round_robin::reg();
+    load_balancing::register();
     dns::reg();
     #[cfg(unix)]
     name_resolution::unix::reg();
@@ -683,7 +891,7 @@ mod tests {
     async fn get_state_without_connect_stays_idle() {
         let mut channel = new_channel();
         assert_eq!(channel.get_state(false), ConnectivityState::Idle);
-        assert!(channel.inner.active_channel.load().is_none());
+        assert!(channel.persistent().active_channel.load().is_none());
     }
 
     #[tokio::test]
@@ -700,7 +908,7 @@ mod tests {
                         // ActiveChannel creation spawns tasks on the runtime.
                         let _rt = handle.enter();
                         barrier.wait();
-                        channel.inner.get_active_channel()
+                        channel.persistent().get_active_channel()
                     })
                 })
                 .collect();
@@ -713,9 +921,12 @@ mod tests {
         }
         assert!(Arc::ptr_eq(
             first,
-            &channel.inner.active_channel.load_full().unwrap()
+            &channel.persistent().active_channel.load_full().unwrap()
         ));
-        assert_ne!(channel.inner.get_state(false), ConnectivityState::Idle);
+        assert_ne!(
+            channel.persistent().get_state(false),
+            ConnectivityState::Idle
+        );
     }
 
     // Fails the test instead of hanging if next() never resolves.

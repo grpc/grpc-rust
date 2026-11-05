@@ -24,7 +24,9 @@
 //! Helper functions for building xDS configuration resources for testing.
 
 use envoy_types::pb::envoy::config::cluster::v3::Cluster;
-use envoy_types::pb::envoy::config::cluster::v3::cluster::{ClusterDiscoveryType, DiscoveryType};
+use envoy_types::pb::envoy::config::cluster::v3::cluster::{
+    ClusterDiscoveryType, DiscoveryType, EdsClusterConfig,
+};
 use envoy_types::pb::envoy::config::core::v3 as core_v3;
 use envoy_types::pb::envoy::config::endpoint::v3::{
     ClusterLoadAssignment, Endpoint, LbEndpoint, LocalityLbEndpoints, lb_endpoint::HostIdentifier,
@@ -39,7 +41,7 @@ use envoy_types::pb::envoy::config::route::v3::{
 use envoy_types::pb::envoy::extensions::filters::network::http_connection_manager::v3::{
     HttpConnectionManager, Rds, http_connection_manager::RouteSpecifier,
 };
-use envoy_types::pb::google::protobuf::Any;
+use envoy_types::pb::google::protobuf::{Any, UInt32Value};
 use prost::Message;
 use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
@@ -63,6 +65,17 @@ pub enum AdsTypeUrl {
         serialize = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
     )]
     Hcm,
+}
+
+/// A config source that points at the ADS stream, which gRPC clients require
+/// for RDS and EDS (gRFC A27).
+fn ads_config_source() -> core_v3::ConfigSource {
+    core_v3::ConfigSource {
+        config_source_specifier: Some(core_v3::config_source::ConfigSourceSpecifier::Ads(
+            core_v3::AggregatedConfigSource {},
+        )),
+        ..Default::default()
+    }
 }
 
 /// Wraps a `HttpConnectionManager` route specifier in an `ApiListener` listener.
@@ -97,8 +110,8 @@ pub fn build_rds_listener(name: &str, rds_name: &str) -> Listener {
     build_listener(
         name,
         RouteSpecifier::Rds(Rds {
+            config_source: Some(ads_config_source()),
             route_config_name: rds_name.to_string(),
-            ..Default::default()
         }),
     )
 }
@@ -169,25 +182,35 @@ pub fn build_route_config_with_clusters(name: &str, clusters: &[String]) -> Rout
     }
 }
 
-/// Builds an EDS-discovered cluster named `name`.
+/// Builds an EDS-discovered cluster named `name`, whose endpoints come from
+/// ADS under the same name.
 pub fn build_cluster(name: &str) -> Cluster {
     Cluster {
         name: name.to_string(),
         cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds as i32)),
+        eds_cluster_config: Some(EdsClusterConfig {
+            eds_config: Some(ads_config_source()),
+            service_name: String::new(),
+        }),
         ..Default::default()
     }
 }
 
 /// Builds a `ClusterLoadAssignment` for `cluster` with the given endpoints, all
 /// placed in a single locality.
+///
+/// The locality has an ID and a weight, without which gRPC clients reject or
+/// skip it (gRFC A27).
 pub fn build_cla(cluster: &str, endpoints: &[(String, u16)]) -> ClusterLoadAssignment {
     ClusterLoadAssignment {
         cluster_name: cluster.to_string(),
         endpoints: vec![LocalityLbEndpoints {
+            locality: Some(core_v3::Locality::default()),
             lb_endpoints: endpoints
                 .iter()
                 .map(|(host, port)| lb_endpoint(host, *port))
                 .collect(),
+            load_balancing_weight: Some(UInt32Value { value: 1 }),
             ..Default::default()
         }],
         ..Default::default()

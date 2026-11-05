@@ -57,8 +57,6 @@ use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
 use crate::client::load_balancing::PickResult;
-use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
@@ -380,10 +378,7 @@ impl ActiveChannel {
     fn new_arc_for(persistent_channel: &PersistentChannel) -> Arc<Self> {
         let runtime = persistent_channel.runtime.clone();
 
-        let lb_watcher = Arc::new(Watcher::new(LbState {
-            connectivity_state: ConnectivityState::Connecting,
-            picker: Arc::new(QueuingPicker) as Arc<dyn Picker>,
-        }));
+        let lb_watcher = Arc::new(Watcher::new(LbState::initial()));
 
         let (wqtx, mut wqrx) = mpsc::unbounded_channel::<WorkQueueItem>();
         let config_selector = SharedConfigSelector::new();

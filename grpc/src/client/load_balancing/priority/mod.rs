@@ -54,9 +54,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::StatusCodeError;
+use crate::StatusError;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::FailingPicker;
+use crate::client::load_balancing::FixedResultPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
@@ -64,6 +66,7 @@ use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedLbConfig;
+use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::child_manager::Child;
@@ -639,17 +642,18 @@ impl PriorityPolicy {
     /// [gRFC A56 (Section Algorithm for Choosing a Priority)]:
     ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#algorithm-for-choosing-a-priority
     fn choose_priority(&mut self, channel_controller: &mut dyn ChannelController) {
-        // If priority list is empty, report TRANSIENT_FAILURE with
-        // FailingPicker.
+        // If priority list is empty, report TRANSIENT_FAILURE with a failing
+        // FixedResultPicker.
         if self.children.is_empty() {
             self.current_priority = None;
             self.update_picker(
                 channel_controller,
                 LbState {
                     connectivity_state: ConnectivityState::TransientFailure,
-                    picker: Arc::new(FailingPicker {
-                        error: "priority policy has empty priority list".to_owned(),
-                    }),
+                    picker: Arc::new(FixedResultPicker(PickResult::Fail(StatusError::new(
+                        StatusCodeError::Unavailable,
+                        "priority policy has empty priority list",
+                    )))),
                 },
             );
             return;

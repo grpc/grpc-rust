@@ -30,7 +30,6 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::Once;
 
-use crate::StatusCodeError;
 use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
@@ -403,7 +402,7 @@ impl<'a> PickOptions<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PickResult {
     /// Indicates the Subchannel in the Pick should be used for the request.
     Pick(Pick),
@@ -493,15 +492,16 @@ impl LbState {
     pub fn initial() -> Self {
         Self {
             connectivity_state: ConnectivityState::Connecting,
-            picker: Arc::new(QueuingPicker {}),
+            picker: Arc::new(FixedResultPicker(PickResult::Queue)),
         }
     }
 }
 
 /// Type alias for the completion callback function.
-pub type CompletionCallback = Box<dyn Fn() + Send + Sync>;
+pub type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// A collection of data used by the channel for routing a request.
+#[derive(Clone)]
 pub struct Pick {
     /// The Subchannel for the request.
     pub subchannel: Arc<dyn Subchannel>,
@@ -521,28 +521,13 @@ impl Debug for Pick {
     }
 }
 
-/// QueuingPicker always returns Queue.  LB policies that are not actively
-/// Connecting should not use this picker.
-#[derive(Debug)]
-pub struct QueuingPicker;
+/// A [`Picker`] that always returns a clone of the same [`PickResult`].
+#[derive(Clone, Debug)]
+pub struct FixedResultPicker(pub PickResult);
 
-impl Picker for QueuingPicker {
+impl Picker for FixedResultPicker {
     fn pick(&self, _options: PickOptions<'_>) -> PickResult {
-        PickResult::Queue
-    }
-}
-
-#[derive(Debug)]
-pub struct FailingPicker {
-    pub error: String,
-}
-
-impl Picker for FailingPicker {
-    fn pick(&self, _: PickOptions<'_>) -> PickResult {
-        PickResult::Fail(StatusError::new(
-            StatusCodeError::Unavailable,
-            self.error.clone(),
-        ))
+        self.0.clone()
     }
 }
 

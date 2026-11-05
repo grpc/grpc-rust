@@ -258,9 +258,8 @@ mod tests {
     use crate::attributes::Attributes;
     use crate::client::CallOptions;
     use crate::client::ConnectivityState;
-    use crate::client::load_balancing::FailingPicker;
+    use crate::client::load_balancing::FixedResultPicker;
     use crate::client::load_balancing::Pick;
-    use crate::client::load_balancing::QueuingPicker;
     use crate::client::load_balancing::endpoint_filtering::set_path_in_endpoint;
     use crate::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use crate::client::load_balancing::sampling::test_utils::sampler_builder;
@@ -285,10 +284,10 @@ mod tests {
     /// On its first resolver update, the stub creates a subchannel whose
     /// address is the `TargetName` attribute injected by `weighted_target`. On
     /// every subchannel update, it reports that subchannel's connectivity state
-    /// with a state-appropriate picker (`SubchannelPicker` when `Ready`,
-    /// `FailingPicker` when `TransientFailure`, `QueuingPicker` otherwise). When
-    /// `exit_idle` is called while in `Idle`, it calls `connect()` on its
-    /// subchannel and transitions to `Connecting`.
+    /// with a state-appropriate `FixedResultPicker` (`PickResult::Pick` when
+    /// `Ready`, `PickResult::Fail` when `TransientFailure`, `PickResult::Queue`
+    /// otherwise). When `exit_idle` is called while in `Idle`, it calls
+    /// `connect()` on its subchannel and transitions to `Connecting`.
     fn reg_stub(policy_name: &'static str) {
         let funcs = StubPolicyFuncs {
             resolver_update: Some(Arc::new(|data, update, _cfg, controller| {
@@ -322,15 +321,18 @@ mod tests {
                     .expect("stub state should be initialized");
                 let state = update.state.connectivity_state;
                 stub.state = state;
-                let picker: Arc<dyn Picker> = match state {
-                    ConnectivityState::Ready => Arc::new(SubchannelPicker(update.subchannel)),
-                    ConnectivityState::TransientFailure => Arc::new(FailingPicker {
-                        error: update.state.last_connection_error.unwrap_or_default(),
+                let picker: Arc<dyn Picker> = Arc::new(FixedResultPicker(match state {
+                    ConnectivityState::Ready => PickResult::Pick(Pick {
+                        subchannel: update.subchannel,
+                        metadata: MetadataMap::new(),
+                        on_complete: None,
                     }),
-                    ConnectivityState::Connecting | ConnectivityState::Idle => {
-                        Arc::new(QueuingPicker {})
-                    }
-                };
+                    ConnectivityState::TransientFailure => PickResult::Fail(StatusError::new(
+                        StatusCodeError::Unavailable,
+                        update.state.last_connection_error.unwrap_or_default(),
+                    )),
+                    ConnectivityState::Connecting | ConnectivityState::Idle => PickResult::Queue,
+                }));
                 controller.update_picker(LbState {
                     connectivity_state: state,
                     picker,
@@ -472,19 +474,6 @@ mod tests {
             Endpoint::default(),
             path.iter().map(|p| p.to_string()).collect(),
         )
-    }
-
-    #[derive(Debug)]
-    struct SubchannelPicker(Arc<dyn Subchannel>);
-
-    impl Picker for SubchannelPicker {
-        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
-            PickResult::Pick(Pick {
-                subchannel: self.0.clone(),
-                metadata: MetadataMap::new(),
-                on_complete: None,
-            })
-        }
     }
 
     #[test]
@@ -759,9 +748,10 @@ mod tests {
                     }
                     controller.update_picker(LbState {
                         connectivity_state: ConnectivityState::TransientFailure,
-                        picker: Arc::new(FailingPicker {
-                            error: "woken".to_string(),
-                        }),
+                        picker: Arc::new(FixedResultPicker(PickResult::Fail(StatusError::new(
+                            StatusCodeError::Unavailable,
+                            "woken",
+                        )))),
                     });
                 })),
                 ..Default::default()

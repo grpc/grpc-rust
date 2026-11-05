@@ -231,7 +231,7 @@
 //! `Balance`, fed endpoints that discovery has already connected.
 //!
 //! [`LbBackend::XdsLb`] selects this crate's own balancer instead, which
-//! receives bare addresses plus a connector and so owns the connection
+//! receives unconnected endpoints plus a connector and so owns the connection
 //! lifecycle — the prerequisite for ejecting outliers and for pluggable
 //! pickers such as ring-hash. It is still maturing: outlier detection is
 //! compiled in but left disabled, and only the P2C picker is selected, so the
@@ -247,9 +247,10 @@
 //!     .unwrap();
 //! ```
 //!
-//! Both [`XdsChannelBuilder::build_grpc_channel`] and
-//! [`XdsChannelBuilder::build_transport_channel`] honour it, and the channel
-//! types are unchanged, so switching needs no other code change.
+//! [`XdsChannelBuilder::build_grpc_channel`],
+//! [`XdsChannelBuilder::build_grpc_channel_with_connector`] and
+//! [`XdsChannelBuilder::build_transport_channel`] all honour it, and the
+//! channel types are unchanged, so switching needs no other code change.
 //!
 //! ## Sharing an xDS client
 //!
@@ -298,7 +299,7 @@ pub use client::channel::{
     XdsTransportChannel,
 };
 pub use client::endpoint::{
-    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector, XdsEndpoint,
 };
 pub use client::pool::{XdsClientPool, XdsClientPoolBuilder};
 pub use client::retry::{
@@ -313,6 +314,7 @@ pub use xds::bootstrap::{
     BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,
 };
 pub use xds::cert_provider_config::TlsChannelCredentials;
+pub use xds::cluster_discovery::GrpcMakeConnector;
 pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};
 /// Re-export of the error type returned by

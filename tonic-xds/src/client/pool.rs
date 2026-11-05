@@ -34,7 +34,7 @@ use tonic::transport::Channel;
 use xds_client::Error as XdsClientError;
 use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, ServerConfig, TokioRuntime, TonicTransport,
-    TonicTransportBuilder, Transport, TransportBuilder, XdsClient,
+    TonicTransportBuilder, TransportBuilder, XdsClient,
 };
 
 use crate::client::channel::BuildError;
@@ -46,10 +46,7 @@ use crate::xds::cert_provider::{
 };
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider_config::FileWatcherConfig;
-use crate::{
-    BoxFuture, ControlPlaneConfig, ControlPlaneConnector, MakeControlPlaneConnector,
-    TonicCallCredentials,
-};
+use crate::{BoxFuture, ControlPlaneConfig, ControlPlaneConnector, TonicCallCredentials};
 
 /// Shares xDS clients, and their ADS streams, between channels.
 ///
@@ -100,86 +97,10 @@ impl Inner {
     fn start_client(&self, key: &str) -> Result<Arc<XdsClient>, BuildError> {
         let bootstrap = &self.bootstrap;
         let ads = &self.ads;
-        let client_factory: Arc<dyn ControlPlaneClientFactory> = match &ads.client_factory {
-            Some(factory) => factory.clone(),
-            None => Arc::new(ConnectorClientFactory::new(
-                GrpcMakeControlPlaneConnector::new(bootstrap)?,
-            )),
+        let connector: Arc<dyn ControlPlaneConnector> = match &ads.connector {
+            Some(connector) => connector.clone(),
+            None => Arc::new(GrpcControlPlaneConnector::new(bootstrap)?),
         };
-        let node = Node::try_from(bootstrap.node.clone())?;
-        let client_config =
-            ClientConfig::new(node.clone(), bootstrap.server_uri()).with_target(key);
-        let client = Arc::new(client_factory.make(
-            client_config,
-            ads,
-            bootstrap.use_tls(),
-            self.recorder.clone(),
-        ));
-        self.csds_registry.register(key.to_owned(), &node, &client);
-        Ok(client)
-    }
-}
-
-/// Builds ADS clients on first use, hiding connector and service types from the pool.
-trait ControlPlaneClientFactory: Send + Sync + 'static {
-    fn make(
-        &self,
-        config: ClientConfig,
-        ads: &AdsClientSettings,
-        require_secure: bool,
-        recorder: Option<Arc<dyn MetricsRecorder>>,
-    ) -> XdsClient;
-}
-
-/// ADS stream settings shared by every client a pool starts.
-#[derive(Clone, Default)]
-struct AdsClientSettings {
-    client_factory: Option<Arc<dyn ControlPlaneClientFactory>>,
-    call_creds: Option<Arc<dyn TonicCallCredentials>>,
-    max_decoding_message_size: Option<usize>,
-    max_encoding_message_size: Option<usize>,
-    keep_alive: Option<(Option<Duration>, Duration)>,
-}
-
-impl Debug for AdsClientSettings {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AdsClientSettings")
-            .field(
-                "custom_control_plane_connector",
-                &self.client_factory.is_some(),
-            )
-            .field("call_creds", &self.call_creds)
-            .field("max_decoding_message_size", &self.max_decoding_message_size)
-            .field("max_encoding_message_size", &self.max_encoding_message_size)
-            .field("keep_alive", &self.keep_alive)
-            .finish()
-    }
-}
-
-struct ConnectorClientFactory<C> {
-    factory: Arc<C>,
-}
-
-impl<C> ConnectorClientFactory<C> {
-    fn new(factory: C) -> Self {
-        Self {
-            factory: Arc::new(factory),
-        }
-    }
-}
-
-impl<C> ControlPlaneClientFactory for ConnectorClientFactory<C>
-where
-    C: MakeControlPlaneConnector,
-    TonicTransport<C::Service>: Transport,
-{
-    fn make(
-        &self,
-        config: ClientConfig,
-        ads: &AdsClientSettings,
-        require_secure: bool,
-        recorder: Option<Arc<dyn MetricsRecorder>>,
-    ) -> XdsClient {
         let mut options = TonicTransportBuilder::new();
         if let Some(creds) = ads.call_creds.clone() {
             options = options.with_call_credentials(creds);
@@ -191,37 +112,60 @@ where
             options = options.with_max_encoding_message_size(limit);
         }
         let transport_builder = ControlPlaneTransportBuilder {
-            factory: self.factory.clone(),
+            connector,
             options,
             keep_alive: ads.keep_alive,
-            require_secure,
+            require_secure: bootstrap.use_tls(),
         };
-        let mut builder = XdsClient::builder(config, transport_builder, ProstCodec, TokioRuntime);
-        if let Some(recorder) = recorder {
+        let node = Node::try_from(bootstrap.node.clone())?;
+        let client_config =
+            ClientConfig::new(node.clone(), bootstrap.server_uri()).with_target(key);
+        let mut builder =
+            XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
+        if let Some(recorder) = self.recorder.clone() {
             builder = builder.with_metrics_recorder(recorder);
         }
-        builder.build()
+        let client = Arc::new(builder.build());
+        self.csds_registry.register(key.to_owned(), &node, &client);
+        Ok(client)
     }
 }
 
-struct ControlPlaneTransportBuilder<C> {
-    factory: Arc<C>,
+/// ADS stream settings shared by every client a pool starts.
+#[derive(Clone, Default)]
+struct AdsClientSettings {
+    connector: Option<Arc<dyn ControlPlaneConnector>>,
+    call_creds: Option<Arc<dyn TonicCallCredentials>>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
+    keep_alive: Option<(Option<Duration>, Duration)>,
+}
+
+impl Debug for AdsClientSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdsClientSettings")
+            .field("custom_control_plane_connector", &self.connector.is_some())
+            .field("call_creds", &self.call_creds)
+            .field("max_decoding_message_size", &self.max_decoding_message_size)
+            .field("max_encoding_message_size", &self.max_encoding_message_size)
+            .field("keep_alive", &self.keep_alive)
+            .finish()
+    }
+}
+
+struct ControlPlaneTransportBuilder {
+    connector: Arc<dyn ControlPlaneConnector>,
     options: TonicTransportBuilder,
     keep_alive: Option<(Option<Duration>, Duration)>,
     require_secure: bool,
 }
 
-impl<C> TransportBuilder for ControlPlaneTransportBuilder<C>
-where
-    C: MakeControlPlaneConnector,
-    TonicTransport<C::Service>: Transport,
-{
-    type Transport = TonicTransport<C::Service>;
+impl TransportBuilder for ControlPlaneTransportBuilder {
+    type Transport = TonicTransport;
 
     async fn build(&self, server: &ServerConfig) -> xds_client::Result<Self::Transport> {
         let config = ControlPlaneConfig::new(server, self.keep_alive);
-        let connector = self.factory.make_connector(config)?;
-        let secure = connector.is_secure();
+        let secure = self.connector.is_secure();
         let https = server
             .uri()
             .parse::<http::Uri>()
@@ -234,19 +178,19 @@ where
             )));
         }
         self.options
-            .build_with_service(connector.connect(), secure)
+            .build_with_channel(async { self.connector.connect(config).await }, secure)
             .await
     }
 }
 
-/// The default gRPC control-plane connector factory.
+/// The default gRPC control-plane connector.
 #[derive(Debug)]
-pub(crate) struct GrpcMakeControlPlaneConnector {
+pub(crate) struct GrpcControlPlaneConnector {
     transport_builder: TonicTransportBuilder,
     secure: bool,
 }
 
-impl GrpcMakeControlPlaneConnector {
+impl GrpcControlPlaneConnector {
     pub(crate) fn new(bootstrap: &BootstrapConfig) -> Result<Self, BuildError> {
         let (transport_builder, secure) = default_control_plane_transport(bootstrap)?;
         Ok(Self {
@@ -256,42 +200,17 @@ impl GrpcMakeControlPlaneConnector {
     }
 }
 
-impl MakeControlPlaneConnector for GrpcMakeControlPlaneConnector {
-    type Service = Channel;
-
-    fn make_connector(
-        &self,
-        config: ControlPlaneConfig<'_>,
-    ) -> xds_client::Result<Arc<dyn ControlPlaneConnector<Service = Self::Service>>> {
-        let mut transport_builder = self.transport_builder.clone();
-        if let Some((interval, timeout)) = config.keep_alive() {
-            transport_builder = transport_builder.with_keep_alive(interval, timeout);
-        }
-        Ok(Arc::new(GrpcControlPlaneConnector {
-            transport_builder,
-            server: config.server().clone(),
-            secure: self.secure,
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct GrpcControlPlaneConnector {
-    transport_builder: TonicTransportBuilder,
-    server: ServerConfig,
-    secure: bool,
-}
-
 impl ControlPlaneConnector for GrpcControlPlaneConnector {
-    type Service = Channel;
-
     fn is_secure(&self) -> bool {
         self.secure
     }
 
-    fn connect(&self) -> BoxFuture<xds_client::Result<Self::Service>> {
-        let transport_builder = self.transport_builder.clone();
-        let server = self.server.clone();
+    fn connect(&self, config: ControlPlaneConfig<'_>) -> BoxFuture<xds_client::Result<Channel>> {
+        let mut transport_builder = self.transport_builder.clone();
+        if let Some((interval, timeout)) = config.keep_alive() {
+            transport_builder = transport_builder.with_keep_alive(interval, timeout);
+        }
+        let server = config.server().clone();
         Box::pin(async move { transport_builder.connect_channel(&server).await })
     }
 }
@@ -440,16 +359,15 @@ impl XdsClientPoolBuilder {
         self
     }
 
-    /// Uses a custom connector factory for every xDS management server connection.
+    /// Uses a custom connector for every xDS management server connection.
     /// See [`XdsChannelBuilder::with_control_plane_connector`](crate::XdsChannelBuilder::with_control_plane_connector)
     /// for the transport security contract.
     #[must_use]
     pub fn with_control_plane_connector<C>(mut self, connector: C) -> Self
     where
-        C: MakeControlPlaneConnector,
-        TonicTransport<C::Service>: Transport,
+        C: ControlPlaneConnector,
     {
-        self.ads.client_factory = Some(Arc::new(ConnectorClientFactory::new(connector)));
+        self.ads.connector = Some(Arc::new(connector));
         self
     }
 
@@ -471,7 +389,7 @@ impl XdsClientPoolBuilder {
 
     /// Configures HTTP/2 keepalives on the ADS connection. See
     /// [`XdsChannelConfig::with_ads_keep_alive`](crate::XdsChannelConfig::with_ads_keep_alive).
-    /// The override is passed to the connector factory through
+    /// The override is passed to the connector through
     /// [`ControlPlaneConfig::keep_alive`].
     #[must_use]
     pub fn with_ads_keep_alive(mut self, interval: Option<Duration>, timeout: Duration) -> Self {
@@ -537,54 +455,35 @@ mod tests {
     type RecordedConfig = (String, KeepAliveOverride);
 
     #[derive(Default)]
-    struct TestMakeControlPlaneConnector {
+    struct TestControlPlaneConnector {
         secure: bool,
-        connects: Arc<AtomicUsize>,
+        connects: AtomicUsize,
         configs: Mutex<Vec<RecordedConfig>>,
         reject_keep_alive: bool,
     }
 
-    impl MakeControlPlaneConnector for TestMakeControlPlaneConnector {
-        type Service = Channel;
+    impl ControlPlaneConnector for TestControlPlaneConnector {
+        fn is_secure(&self) -> bool {
+            self.secure
+        }
 
-        fn make_connector(
+        fn connect(
             &self,
             config: ControlPlaneConfig<'_>,
-        ) -> xds_client::Result<Arc<dyn ControlPlaneConnector<Service = Self::Service>>> {
+        ) -> BoxFuture<xds_client::Result<Channel>> {
             self.configs
                 .lock()
                 .unwrap()
                 .push((config.server().uri().to_owned(), config.keep_alive()));
             if self.reject_keep_alive && config.keep_alive().is_some() {
-                return Err(xds_client::Error::Connection(
-                    "keepalive override unsupported".into(),
-                ));
+                return Box::pin(async {
+                    Err(xds_client::Error::Connection(
+                        "keepalive override unsupported".into(),
+                    ))
+                });
             }
-            Ok(Arc::new(TestControlPlaneConnector {
-                secure: self.secure,
-                connects: self.connects.clone(),
-            }))
-        }
-    }
-
-    struct TestControlPlaneConnector {
-        secure: bool,
-        connects: Arc<AtomicUsize>,
-    }
-
-    impl ControlPlaneConnector for TestControlPlaneConnector {
-        type Service = Channel;
-
-        fn is_secure(&self) -> bool {
-            self.secure
-        }
-
-        fn connect(&self) -> BoxFuture<xds_client::Result<Self::Service>> {
-            let connects = self.connects.clone();
-            Box::pin(async move {
-                connects.fetch_add(1, Ordering::SeqCst);
-                Ok(Channel::from_static("http://127.0.0.1:1").connect_lazy())
-            })
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(Channel::from_static("http://127.0.0.1:1").connect_lazy()) })
         }
     }
 
@@ -605,21 +504,26 @@ mod tests {
         secure: bool,
         require_secure: bool,
         options: TonicTransportBuilder,
-    ) -> ControlPlaneTransportBuilder<TestMakeControlPlaneConnector> {
-        ControlPlaneTransportBuilder {
-            factory: Arc::new(TestMakeControlPlaneConnector {
-                secure,
-                ..Default::default()
-            }),
-            options,
-            keep_alive: None,
-            require_secure,
-        }
+    ) -> (ControlPlaneTransportBuilder, Arc<TestControlPlaneConnector>) {
+        let connector = Arc::new(TestControlPlaneConnector {
+            secure,
+            ..Default::default()
+        });
+        (
+            ControlPlaneTransportBuilder {
+                connector: connector.clone(),
+                options,
+                keep_alive: None,
+                require_secure,
+            },
+            connector,
+        )
     }
 
     #[tokio::test]
-    async fn factory_receives_config_on_each_connection() {
-        let mut builder = test_transport_builder(false, false, TonicTransportBuilder::new());
+    async fn connector_receives_config_on_each_connection() {
+        let (mut builder, connector) =
+            test_transport_builder(false, false, TonicTransportBuilder::new());
         let uris = [
             "http://127.0.0.1:1",
             "xds.example.com:443",
@@ -640,11 +544,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(*builder.factory.configs.lock().unwrap(), expected);
-        assert_eq!(
-            builder.factory.connects.load(Ordering::SeqCst),
-            expected.len()
-        );
+        assert_eq!(*connector.configs.lock().unwrap(), expected);
+        assert_eq!(connector.connects.load(Ordering::SeqCst), expected.len());
     }
 
     #[tokio::test]
@@ -654,11 +555,12 @@ mod tests {
             (true, "xds.example.com:443"),
             (false, "https://127.0.0.1:1"),
         ] {
-            let builder =
+            let (builder, connector) =
                 test_transport_builder(false, require_secure, TonicTransportBuilder::new());
             let error = builder.build(&ServerConfig::new(uri)).await.unwrap_err();
             assert!(matches!(error, xds_client::Error::Connection(_)));
-            assert_eq!(builder.factory.connects.load(Ordering::SeqCst), 0);
+            assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+            assert!(connector.configs.lock().unwrap().is_empty());
         }
     }
 
@@ -667,38 +569,43 @@ mod tests {
         for secure in [false, true] {
             let options =
                 TonicTransportBuilder::new().with_call_credentials(Arc::new(SecureCallCredentials));
-            let builder = test_transport_builder(secure, false, options);
+            let (builder, connector) = test_transport_builder(secure, false, options);
             let result = builder
                 .build(&ServerConfig::new("http://127.0.0.1:1"))
                 .await;
             if secure {
                 result.unwrap();
-                assert_eq!(builder.factory.connects.load(Ordering::SeqCst), 1);
+                assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
             } else {
                 assert!(matches!(result, Err(xds_client::Error::CallCredentials(_))));
-                assert_eq!(builder.factory.connects.load(Ordering::SeqCst), 0);
+                assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+                assert!(connector.configs.lock().unwrap().is_empty());
             }
         }
     }
 
     #[tokio::test]
     async fn secure_connector_satisfies_bootstrap_and_https_requirements() {
-        let builder = test_transport_builder(true, true, TonicTransportBuilder::new());
+        let (builder, connector) = test_transport_builder(true, true, TonicTransportBuilder::new());
         builder
             .build(&ServerConfig::new("https://xds.example.com:443"))
             .await
             .unwrap();
-        assert_eq!(builder.factory.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn unsupported_keepalive_error_propagates_before_connecting() {
-        let mut builder = test_transport_builder(false, false, TonicTransportBuilder::new());
-        builder.keep_alive = Some((None, Duration::from_secs(1)));
-        builder.factory = Arc::new(TestMakeControlPlaneConnector {
+        let connector = Arc::new(TestControlPlaneConnector {
             reject_keep_alive: true,
             ..Default::default()
         });
+        let builder = ControlPlaneTransportBuilder {
+            connector: connector.clone(),
+            options: TonicTransportBuilder::new(),
+            keep_alive: Some((None, Duration::from_secs(1))),
+            require_secure: false,
+        };
         let error = builder
             .build(&ServerConfig::new("http://127.0.0.1:1"))
             .await
@@ -706,21 +613,17 @@ mod tests {
         assert!(
             matches!(error, xds_client::Error::Connection(message) if message == "keepalive override unsupported")
         );
-        assert_eq!(builder.factory.connects.load(Ordering::SeqCst), 0);
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn default_factory_reports_insecure_bootstrap() {
+    fn default_connector_reports_insecure_bootstrap() {
         for uri in ["http://127.0.0.1:1", "unix:///tmp/control-plane.sock"] {
             let bootstrap = BootstrapConfig::builder(uri)
                 .channel_creds([crate::ChannelCredentialType::Insecure])
                 .build()
                 .unwrap();
-            let factory = GrpcMakeControlPlaneConnector::new(&bootstrap).unwrap();
-            let server = ServerConfig::new(uri);
-            let connector = factory
-                .make_connector(ControlPlaneConfig::new(&server, None))
-                .unwrap();
+            let connector = GrpcControlPlaneConnector::new(&bootstrap).unwrap();
             assert!(!connector.is_secure(), "{uri}");
         }
     }
@@ -755,7 +658,7 @@ mod tests {
             let mut builder = test_pool_builder().with_csds_registry(Arc::clone(&registry));
             if custom_connector {
                 builder =
-                    builder.with_control_plane_connector(TestMakeControlPlaneConnector::default());
+                    builder.with_control_plane_connector(TestControlPlaneConnector::default());
             }
             let pool = builder.build().unwrap();
 

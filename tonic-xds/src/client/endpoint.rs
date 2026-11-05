@@ -218,7 +218,7 @@ pub trait Connector {
 }
 
 /// A read-only view of the server and connection options passed to
-/// [`MakeControlPlaneConnector::make_connector`].
+/// [`ControlPlaneConnector::connect`].
 ///
 /// The server configuration preserves the original URI, including Unix socket
 /// paths and scheme-less addresses, before any transport-specific normalization.
@@ -243,7 +243,7 @@ impl<'a> ControlPlaneConfig<'a> {
 
     /// The explicit HTTP/2 keepalive override, if one was configured.
     ///
-    /// `None` leaves the factory's defaults unchanged. `Some((None, timeout))`
+    /// `None` leaves the connector's defaults unchanged. `Some((None, timeout))`
     /// disables keepalives. `Some((Some(interval), timeout))` sets the PING
     /// interval and acknowledgement timeout.
     pub fn keep_alive(&self) -> Option<(Option<Duration>, Duration)> {
@@ -251,19 +251,21 @@ impl<'a> ControlPlaneConfig<'a> {
     }
 }
 
-/// A configured connector to an xDS management server.
+/// Creates tonic channels to xDS management servers.
 ///
-/// Created by [`MakeControlPlaneConnector`]. Implementations capture the server
-/// address and transport configuration (security, timeouts, HTTP/2 settings)
-/// at construction time and own endpoint creation.
+/// Implementations capture shared transport configuration at construction time
+/// and own endpoint creation. [`ControlPlaneConfig`] provides the original
+/// server URI and connection overrides for each connection attempt, including
+/// retries and reconnects.
+///
+/// Implementations must honor explicit connection overrides or return an error
+/// when an override cannot be supported.
 ///
 /// The boxed future makes this trait object-safe, so connectors can be shared
-/// as `Arc<dyn ControlPlaneConnector<Service = S>>`.
+/// as `Arc<dyn ControlPlaneConnector>` without requiring implementations to
+/// be cloneable.
 pub trait ControlPlaneConnector: Send + Sync + 'static {
-    /// The service type produced by this connector.
-    type Service;
-
-    /// Declares whether every service returned by [`connect`](Self::connect) provides
+    /// Declares whether every channel returned by [`connect`](Self::connect) provides
     /// server authentication, confidentiality, and integrity.
     ///
     /// This is a guarantee about the transport, not the URI scheme or enabled
@@ -272,12 +274,15 @@ pub trait ControlPlaneConnector: Send + Sync + 'static {
     /// to an insecure transport.
     fn is_secure(&self) -> bool;
 
-    /// Create a service for the configured management server.
+    /// Create a channel for the management server and connection options.
     ///
-    /// Resolves to a service or connection error; the service may connect lazily.
-    /// The future must own any state it needs from `self`, so it can outlive the
-    /// connector reference.
-    fn connect(&self) -> BoxFuture<xds_client::Result<Self::Service>>;
+    /// The channel may connect lazily. Returns an error if the configuration or
+    /// requested overrides cannot be supported. The future must own any state
+    /// it needs from `self` and `config`, so it can outlive both references.
+    fn connect(
+        &self,
+        config: ControlPlaneConfig<'_>,
+    ) -> BoxFuture<xds_client::Result<tonic::transport::Channel>>;
 }
 
 /// A read-only view of a cluster's parsed xDS configuration, handed to
@@ -488,35 +493,4 @@ pub trait MakeConnector: Send + Sync + 'static {
         &self,
         cluster: ClusterConfig<'_>,
     ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError>;
-}
-
-/// Factory for creating per-server [`ControlPlaneConnector`]s.
-///
-/// Implementations capture shared transport configuration at construction time
-/// and build a connector tailored to each management server.
-/// [`ControlPlaneConfig`] provides the original [`ServerConfig`] and connection
-/// overrides instead of a prebuilt [`Endpoint`](tonic::transport::Endpoint),
-/// allowing implementations to handle Unix socket paths and scheme-less
-/// addresses before tonic normalizes them.
-///
-/// Factories must honor explicit connection overrides or return an error when
-/// an override cannot be supported.
-///
-/// Connectors are returned type-erased so implementations can use different
-/// connector types for different servers without wrapping them in an enum.
-pub trait MakeControlPlaneConnector: Send + Sync + 'static {
-    /// The service type produced by the connectors.
-    ///
-    /// Must be `Clone` to share a service across ADS streams and
-    /// `Send + 'static` for background connection and stream tasks.
-    type Service: Clone + Send + 'static;
-
-    /// Build a connector for the management server and connection options.
-    ///
-    /// Returns an error if the configuration or requested overrides cannot be
-    /// supported. The connector must own any state it needs from `config`.
-    fn make_connector(
-        &self,
-        config: ControlPlaneConfig<'_>,
-    ) -> xds_client::Result<Arc<dyn ControlPlaneConnector<Service = Self::Service>>>;
 }

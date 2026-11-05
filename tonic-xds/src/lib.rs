@@ -299,7 +299,7 @@ pub use client::channel::{
 };
 pub use client::endpoint::{
     ClusterConfig, Connector, ControlPlaneConfig, ControlPlaneConnector, EndpointAddress,
-    EndpointChannel, MakeConnector, MakeControlPlaneConnector,
+    EndpointChannel, MakeConnector,
 };
 pub use client::pool::{XdsClientPool, XdsClientPoolBuilder};
 pub use client::retry::{

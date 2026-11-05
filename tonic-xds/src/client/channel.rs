@@ -42,7 +42,7 @@ use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, Certifi
 use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
-use crate::{MakeControlPlaneConnector, TonicCallCredentials, XdsUri};
+use crate::{ControlPlaneConnector, TonicCallCredentials, XdsUri};
 use http::{Request, Response};
 use http_body::Body;
 use shared_http_body::SharedBody;
@@ -54,7 +54,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
-use xds_client::{MetricsRecorder, TonicTransport, Transport, XdsClient};
+use xds_client::{MetricsRecorder, XdsClient};
 
 use crate::client::retry::{RetryClassifierFactory, RetryLayer, RetrySharedConfig};
 
@@ -141,9 +141,9 @@ impl XdsChannelConfig {
     /// every 5 minutes with GOAWAY `too_many_pings` (gRFC A8), so keep
     /// `interval` at or above the control plane's minimum.
     ///
-    /// Passed to default and custom factories through
+    /// Passed to default and custom connectors through
     /// [`ControlPlaneConfig::keep_alive`](crate::ControlPlaneConfig::keep_alive).
-    /// A custom factory must apply an explicit override or return an error if
+    /// A custom connector must apply an explicit override or return an error if
     /// it cannot support the requested setting.
     pub fn with_ads_keep_alive(self, interval: Option<Duration>, timeout: Duration) -> Self {
         self.update_xds_client(|settings| settings.with_ads_keep_alive(interval, timeout))
@@ -448,31 +448,30 @@ impl XdsChannelBuilder {
         self
     }
 
-    /// Uses a custom [`MakeControlPlaneConnector`] for the xDS management server.
+    /// Uses a custom [`ControlPlaneConnector`] for the xDS management server.
     ///
-    /// Backend connections are unaffected. The factory receives the original
+    /// Backend connections are unaffected. The connector receives the original
     /// server configuration and owns URI handling, security, and connection
     /// settings, including UDS paths, TLS, timeouts, and keepalives. Custom
-    /// factories work with or without a TLS feature enabled.
+    /// connectors work with or without a TLS feature enabled.
     ///
-    /// The returned connector must declare its security through
+    /// The connector must declare its security through
     /// [`is_secure`](crate::ControlPlaneConnector::is_secure). Connectors declaring
     /// an insecure transport are rejected when bootstrap, an HTTPS URI, or call
     /// credentials require a secure transport. The declaration is trusted, not
     /// independently verified. Call credentials are attached to each ADS stream
-    /// over the connector's service.
+    /// over the connector's channel.
     ///
     /// Connection overrides such as [`XdsChannelConfig::with_ads_keep_alive`]
     /// are provided in [`ControlPlaneConfig`](crate::ControlPlaneConfig).
-    /// The factory must apply requested overrides or return an error.
+    /// The connector must apply requested overrides or return an error.
     ///
     /// With a shared [`XdsClientPool`], set the connector on
     /// [`XdsClientPoolBuilder::with_control_plane_connector`] instead.
     #[must_use]
     pub fn with_control_plane_connector<C>(mut self, connector: C) -> Self
     where
-        C: MakeControlPlaneConnector,
-        TonicTransport<C::Service>: Transport,
+        C: ControlPlaneConnector,
     {
         self.config = Arc::new(
             self.config
@@ -1616,7 +1615,7 @@ mod tests {
                 test_config().with_ads_keep_alive(None, std::time::Duration::from_secs(1)),
             ),
             XdsChannelBuilder::new(test_config()).with_control_plane_connector(
-                crate::client::pool::GrpcMakeControlPlaneConnector::new(&test_bootstrap()).unwrap(),
+                crate::client::pool::GrpcControlPlaneConnector::new(&test_bootstrap()).unwrap(),
             ),
             XdsChannelBuilder::new(test_config()).with_metrics_recorder(Arc::new(NoopRecorder)),
         ];

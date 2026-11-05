@@ -35,10 +35,10 @@ use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tonic::client::{Grpc, GrpcService};
+use tonic::client::Grpc;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
@@ -146,8 +146,8 @@ impl Decoder for BytesDecoder {
 
 /// Factory for creating ADS streams using tonic.
 #[derive(Clone, Debug)]
-pub struct TonicTransport<S = Channel> {
-    service: Arc<Mutex<S>>,
+pub struct TonicTransport {
+    channel: Channel,
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
@@ -178,7 +178,7 @@ impl TonicTransport {
     /// ```
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            service: Arc::new(Mutex::new(channel)),
+            channel,
             call_creds: None,
             max_decoding_message_size: None,
             max_encoding_message_size: None,
@@ -358,25 +358,21 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Create an ADS transport from a custom service connection future.
+    /// Create an ADS transport from a custom channel connection future.
     ///
-    /// `secure = true` declares that the service guarantees server authentication,
+    /// `secure = true` declares that the channel guarantees server authentication,
     /// confidentiality, and integrity. The declaration is trusted, not verified.
     /// Call-credential requirements are checked against this declaration before
     /// the connection future is polled.
     ///
     /// The connection future owns URI handling, TLS, timeouts, and keepalives.
     /// This builder applies call credentials and ADS message-size limits.
-    pub async fn build_with_service<S, F>(
-        &self,
-        connect: F,
-        secure: bool,
-    ) -> Result<TonicTransport<S>>
+    pub async fn build_with_channel<F>(&self, connect: F, secure: bool) -> Result<TonicTransport>
     where
-        F: Future<Output = Result<S>> + Send,
+        F: Future<Output = Result<Channel>> + Send,
     {
         self.validate_call_credentials_security(secure)?;
-        Ok(self.transport_from_service(connect.await?))
+        Ok(self.transport_from_channel(connect.await?))
     }
 
     fn validate_call_credentials_security(&self, secure: bool) -> Result<()> {
@@ -391,9 +387,9 @@ impl TonicTransportBuilder {
         Ok(())
     }
 
-    fn transport_from_service<S>(&self, service: S) -> TonicTransport<S> {
+    fn transport_from_channel(&self, channel: Channel) -> TonicTransport {
         TonicTransport {
-            service: Arc::new(Mutex::new(service)),
+            channel,
             call_creds: self.call_creds.clone(),
             max_decoding_message_size: self.max_decoding_message_size,
             max_encoding_message_size: self.max_encoding_message_size,
@@ -487,31 +483,19 @@ impl TransportBuilder for TonicTransportBuilder {
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
         let channel = self.connect_channel(server).await?;
 
-        Ok(self.transport_from_service(channel))
+        Ok(self.transport_from_channel(channel))
     }
 }
 
 type StreamingFuture =
     Box<dyn Future<Output = std::result::Result<Streaming<Bytes>, Status>> + Send>;
 
-impl<S> Transport for TonicTransport<S>
-where
-    S: GrpcService<tonic::body::Body> + Clone + Send + 'static,
-    S::Future: Send,
-    S::ResponseBody: Send + 'static,
-    <S::ResponseBody as tonic::codegen::Body>::Error:
-        Into<Box<dyn std::error::Error + Send + Sync>>,
-{
+impl Transport for TonicTransport {
     type Sender = TonicAdsSender;
     type Receiver = TonicAdsReceiver;
 
     async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
-        let service = self
-            .service
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let mut grpc = Grpc::new(service);
+        let mut grpc = Grpc::new(self.channel.clone());
 
         if let Some(limit) = self.max_decoding_message_size {
             grpc = grpc.max_decoding_message_size(limit);
@@ -523,10 +507,9 @@ where
         // The worker uses new_stream() completion as its resource-timer readiness
         // fallback. This checks service capacity, not channel connectivity or ADS
         // stream dispatch; the streaming RPC is started when the receiver is polled.
-        grpc.ready().await.map_err(|error| {
-            let error: Box<dyn std::error::Error + Send + Sync> = error.into();
-            Error::Connection(error.to_string())
-        })?;
+        grpc.ready()
+            .await
+            .map_err(|error| Error::Connection(error.to_string()))?;
 
         let (tx, rx) = mpsc::channel::<Bytes>(ADS_CHANNEL_BUFFER_SIZE);
         let channel_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -934,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_service_carries_ads_stream_with_call_credentials() {
+    async fn custom_channel_carries_ads_stream_with_call_credentials() {
         let addr = start_mock_server(Some("******")).await;
 
         let builder = TonicTransportBuilder::new().with_call_credentials(Arc::new(MockCreds {
@@ -946,7 +929,7 @@ mod tests {
 
         for attempt in 0..2 {
             let transport = builder
-                .build_with_service(connection_builder.connect_channel(&server), false)
+                .build_with_channel(connection_builder.connect_channel(&server), false)
                 .await
                 .unwrap_or_else(|e| panic!("build {attempt} failed: {e:?}"));
 
@@ -959,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_service_checks_security_before_connecting() {
+    async fn custom_channel_checks_security_before_connecting() {
         let strict = Arc::new(MockCreds {
             pairs: vec![],
             requires_secure: true,
@@ -968,7 +951,7 @@ mod tests {
         let polled = std::sync::atomic::AtomicBool::new(false);
         let result = TonicTransportBuilder::new()
             .with_call_credentials(strict)
-            .build_with_service(
+            .build_with_channel(
                 async {
                     polled.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(Channel::from_static("http://127.0.0.1:1").connect_lazy())

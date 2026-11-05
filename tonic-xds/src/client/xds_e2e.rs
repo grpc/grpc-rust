@@ -531,57 +531,33 @@ mod test {
 
     mod user_transport {
         use super::*;
+        use crate::common::async_util::AbortOnDrop;
+        use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tower::ServiceExt as _;
+        use tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::Channel;
 
-        type TestService = tower::util::BoxCloneService<
-            http::Request<tonic::body::Body>,
-            http::Response<tonic::body::Body>,
-            tonic::transport::Error,
-        >;
-
-        struct TestMakeControlPlaneConnector {
+        struct TestControlPlaneConnector {
             addr: SocketAddr,
             expected_uri: String,
             keep_alive: Option<(Option<Duration>, Duration)>,
             calls: Arc<AtomicUsize>,
         }
 
-        impl crate::MakeControlPlaneConnector for TestMakeControlPlaneConnector {
-            type Service = TestService;
-
-            fn make_connector(
-                &self,
-                config: crate::ControlPlaneConfig<'_>,
-            ) -> xds_client::Result<Arc<dyn crate::ControlPlaneConnector<Service = Self::Service>>>
-            {
-                assert_eq!(config.server().uri(), self.expected_uri);
-                assert_eq!(config.keep_alive(), self.keep_alive);
-                Ok(Arc::new(TestControlPlaneConnector {
-                    addr: self.addr,
-                    keep_alive: config.keep_alive(),
-                    calls: self.calls.clone(),
-                }))
-            }
-        }
-
-        struct TestControlPlaneConnector {
-            addr: SocketAddr,
-            keep_alive: Option<(Option<Duration>, Duration)>,
-            calls: Arc<AtomicUsize>,
-        }
-
         impl crate::ControlPlaneConnector for TestControlPlaneConnector {
-            type Service = TestService;
-
             fn is_secure(&self) -> bool {
                 false
             }
 
-            fn connect(&self) -> crate::BoxFuture<xds_client::Result<Self::Service>> {
+            fn connect(
+                &self,
+                config: crate::ControlPlaneConfig<'_>,
+            ) -> crate::BoxFuture<xds_client::Result<Channel>> {
+                assert_eq!(config.server().uri(), self.expected_uri);
+                assert_eq!(config.keep_alive(), self.keep_alive);
                 let addr = self.addr;
-                let keep_alive = self.keep_alive;
+                let keep_alive = config.keep_alive();
                 let calls = self.calls.clone();
                 Box::pin(async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -590,16 +566,7 @@ mod test {
                         builder = builder.with_keep_alive(interval, timeout);
                     }
                     let server = crate::ServerConfig::new(format!("http://{addr}"));
-                    let channel = builder.connect_channel(&server).await?;
-                    let service =
-                        tower::service_fn(move |request: http::Request<tonic::body::Body>| {
-                            assert_eq!(
-                                request.headers().get("authorization").unwrap(),
-                                "Bearer custom"
-                            );
-                            channel.clone().oneshot(request)
-                        });
-                    Ok(tower::util::BoxCloneService::new(service))
+                    builder.connect_channel(&server).await
                 })
             }
         }
@@ -638,11 +605,41 @@ mod test {
             let backend = spawn_greeter_server("backend", None, None)
                 .await
                 .expect("spawn greeter backend");
-            let (control_plane, cp_addr) = start_control_plane().await;
-            configure_route(control_plane.get_service(), LISTENER, backend.addr);
+            let control_plane = XdsTestControlPlaneService::new();
+            configure_route(&control_plane, LISTENER, backend.addr);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind control plane");
+            let cp_addr = listener.local_addr().unwrap();
+            let authenticated_requests = Arc::new(AtomicUsize::new(0));
+            let requests = authenticated_requests.clone();
+            let service = AggregatedDiscoveryServiceServer::with_interceptor(
+                control_plane,
+                move |request: tonic::Request<()>| {
+                    if request
+                        .metadata()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer custom")
+                    {
+                        return Err(tonic::Status::unauthenticated(
+                            "missing or unexpected authorization",
+                        ));
+                    }
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Ok(request)
+                },
+            );
+            let _server = AbortOnDrop(tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .expect("serve control plane");
+            }));
 
             let calls = Arc::new(AtomicUsize::new(0));
-            let connector = TestMakeControlPlaneConnector {
+            let connector = TestControlPlaneConnector {
                 addr: cp_addr,
                 expected_uri: cp_addr.to_string(),
                 keep_alive: Some((None, Duration::from_secs(1))),
@@ -680,6 +677,10 @@ mod test {
                 "backend: world"
             );
             assert!(calls.load(Ordering::SeqCst) > 0, "connector was not used");
+            assert!(
+                authenticated_requests.load(Ordering::SeqCst) > 0,
+                "ADS server did not receive call credentials"
+            );
 
             let _ = backend.shutdown.send(());
         }

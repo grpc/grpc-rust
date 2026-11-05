@@ -351,6 +351,7 @@ struct ServiceGenerator {
     generate_default_stubs: bool,
     proto_path: String,
     compile_well_known_types: bool,
+    with_extended_rust_types: bool,
     codec_path: String,
     disable_comments: HashSet<String>,
 }
@@ -368,6 +369,7 @@ impl ServiceGenerator {
         generate_default_stubs: bool,
         proto_path: String,
         compile_well_known_types: bool,
+        with_extended_rust_types: bool,
         codec_path: String,
         disable_comments: HashSet<String>,
     ) -> Self {
@@ -381,6 +383,7 @@ impl ServiceGenerator {
             generate_default_stubs,
             proto_path,
             compile_well_known_types,
+            with_extended_rust_types,
             codec_path,
             disable_comments,
         }
@@ -389,6 +392,23 @@ impl ServiceGenerator {
 
 impl prost_build::ServiceGenerator for ServiceGenerator {
     fn generate(&mut self, service: Service, buf: &mut String) {
+        // Drop guard that will set `NON_PATH_TYPE_ALLOWLIST` back
+        // to its default on exit.
+        struct Defer;
+        impl Drop for Defer {
+            fn drop(&mut self) {
+                NON_PATH_TYPE_ALLOWLIST.set(DEFAULT_NON_PATH_TYPE_ALLOWLIST);
+            }
+        }
+
+        let _defer_guard = Defer;
+
+        if self.with_extended_rust_types {
+            NON_PATH_TYPE_ALLOWLIST.set(EXTENDED_NON_PATH_TYPE_ALLOWLIST);
+        } else {
+            NON_PATH_TYPE_ALLOWLIST.set(DEFAULT_NON_PATH_TYPE_ALLOWLIST);
+        }
+
         let tonic_service = TonicBuildService::new(service, self.codec_path.clone());
 
         let mut builder = CodeGenBuilder::new();
@@ -759,17 +779,6 @@ impl Builder {
     where
         P: AsRef<Path>,
     {
-        /// Drop guard that will set [`NON_PATH_TYPE_ALLOWLIST`] back
-        /// to its default on exit.
-        struct Defer;
-        impl Drop for Defer {
-            fn drop(&mut self) {
-                NON_PATH_TYPE_ALLOWLIST.set(DEFAULT_NON_PATH_TYPE_ALLOWLIST);
-            }
-        }
-
-        let _defer_guard = Defer;
-
         let out_dir = if let Some(out_dir) = self.out_dir.as_ref() {
             out_dir.clone()
         } else {
@@ -823,10 +832,6 @@ impl Builder {
             config.include_file(path);
         }
 
-        if self.with_extended_rust_types {
-            NON_PATH_TYPE_ALLOWLIST.set(EXTENDED_NON_PATH_TYPE_ALLOWLIST);
-        }
-
         // Note: We don't pass self.disable_comments to prost Config here
         // because those are meant for service/method paths which are handled
         // by the ServiceGenerator, not for message paths
@@ -854,6 +859,7 @@ impl Builder {
                 self.generate_default_stubs,
                 self.proto_path,
                 self.compile_well_known_types,
+                self.with_extended_rust_types,
                 self.codec_path.clone(),
                 self.disable_comments,
             );
@@ -956,6 +962,7 @@ impl Builder {
                 self.generate_default_stubs,
                 self.proto_path,
                 self.compile_well_known_types,
+                self.with_extended_rust_types,
                 self.codec_path.clone(),
                 self.disable_comments,
             );
@@ -981,6 +988,7 @@ impl Builder {
             self.generate_default_stubs,
             self.proto_path,
             self.compile_well_known_types,
+            self.with_extended_rust_types,
             self.codec_path.clone(),
             self.disable_comments,
         ))

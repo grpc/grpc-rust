@@ -340,3 +340,90 @@ fn test_edge_cases() {
     assert_eq!(request.to_string(), "mypackage . ()");
     assert_eq!(response.to_string(), "mypackage . ()");
 }
+
+#[test]
+fn test_compile_fds_with_extended_rust_types() {
+    let fds = prost_types::FileDescriptorSet {
+        file: vec![prost_types::FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            service: vec![prost_types::ServiceDescriptorProto {
+                name: Some("TestService".to_string()),
+                method: vec![
+                    prost_types::MethodDescriptorProto {
+                        name: Some("BoolToInt32".to_string()),
+                        input_type: Some(".google.protobuf.BoolValue".to_string()),
+                        output_type: Some(".google.protobuf.Int32Value".to_string()),
+                        ..Default::default()
+                    },
+                    prost_types::MethodDescriptorProto {
+                        name: Some("UInt64ToDouble".to_string()),
+                        input_type: Some(".google.protobuf.UInt64Value".to_string()),
+                        output_type: Some(".google.protobuf.DoubleValue".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let extended_dir = tempfile::tempdir().unwrap();
+    configure()
+        .out_dir(extended_dir.path())
+        .with_extended_rust_types(true)
+        .compile_fds(fds.clone())
+        .unwrap();
+
+    let generated = std::fs::read_to_string(extended_dir.path().join("test.rs")).unwrap();
+    assert!(generated.contains("tonic::Request<bool>"));
+    assert!(generated.contains("tonic::Response<i32>"));
+    assert!(generated.contains("tonic::Request<u64>"));
+    assert!(generated.contains("tonic::Response<f64>"));
+    assert!(!generated.contains("super::bool"));
+
+    // Verify the thread-local allowlist is reset after compile_fds finishes.
+    let default_dir = tempfile::tempdir().unwrap();
+    configure()
+        .out_dir(default_dir.path())
+        .compile_fds(fds)
+        .unwrap();
+
+    let default_generated = std::fs::read_to_string(default_dir.path().join("test.rs")).unwrap();
+    assert!(default_generated.contains("tonic::Request<super::bool>"));
+    assert!(default_generated.contains("tonic::Response<super::i32>"));
+}
+
+#[test]
+fn test_service_generator_with_extended_rust_types() {
+    let method = create_test_method("bool".to_string(), "i32".to_string()).prost_method;
+    let service = Service {
+        name: "TestService".to_string(),
+        proto_name: "TestService".to_string(),
+        package: "test".to_string(),
+        comments: Comments::default(),
+        methods: vec![method],
+        options: prost_types::ServiceOptions::default(),
+    };
+
+    let mut generated = String::new();
+    configure()
+        .with_extended_rust_types(true)
+        .service_generator()
+        .generate(service.clone(), &mut generated);
+
+    assert!(generated.contains("tonic::Request<bool>"));
+    assert!(generated.contains("tonic::Response<i32>"));
+    assert!(!generated.contains("super::bool"));
+
+    // Verify the thread-local allowlist is reset after generate finishes.
+    let mut default_generated = String::new();
+    configure()
+        .service_generator()
+        .generate(service, &mut default_generated);
+
+    assert!(default_generated.contains("tonic::Request<super::bool>"));
+    assert!(default_generated.contains("tonic::Response<super::i32>"));
+}

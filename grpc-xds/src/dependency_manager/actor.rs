@@ -355,7 +355,7 @@ impl Actor {
     /// resolved.
     async fn update_clusters(&mut self, selection: Selection) -> Result<XdsConfig, Blocked> {
         let graph = walk(
-            self.watches.cache(),
+            &self.watches,
             selection.clusters.iter().map(String::as_str),
             &selection.notes,
             self.node_id.as_deref(),
@@ -468,11 +468,11 @@ mod tests {
         }
 
         fn watched_clusters(&self) -> Vec<&str> {
-            sorted(self.actor.watches.cache().clusters.keys())
+            sorted(self.actor.watches.cluster_names())
         }
 
         fn watched_endpoints(&self) -> Vec<&str> {
-            sorted(self.actor.watches.cache().endpoints.keys())
+            sorted(self.actor.watches.endpoint_names())
         }
 
         fn route_config_watch(&self) -> Option<&str> {

@@ -43,6 +43,7 @@ use super::cluster_graph::DnsTarget;
 use super::cluster_graph::RequiredWatches;
 use super::state::WatchState;
 use crate::resource::ClusterResource;
+use crate::resource::EndpointAddress;
 use crate::resource::EndpointsResource;
 
 /// The resolution note of every LogicalDNS cluster, for now.
@@ -51,18 +52,28 @@ const DNS_UNSUPPORTED: &str = "LogicalDNS clusters are not supported yet";
 
 /// The CDS, EDS and DNS watches, and the cached state of each.
 ///
-/// Each watcher has a cached state under the same name, and vice versa. Only
-/// [`Self::reconcile`] adds or removes watches, and it changes both together.
+/// Only [`Self::reconcile`] adds or removes watches. The cluster graph walk
+/// reads the cached states through [`CachedResources`].
 #[derive(Debug, Default)]
 pub(super) struct Watches {
-    cache: CachedResources,
-    clusters: HashMap<String, ResourceWatcher<ClusterResource>>,
-    endpoints: HashMap<String, ResourceWatcher<EndpointsResource>>,
+    /// The CDS watches, by cluster name.
+    clusters: HashMap<String, Watch<ClusterResource>>,
+    /// The EDS watches, by EDS service name.
+    endpoints: HashMap<String, Watch<EndpointsResource>>,
+    /// The state of each DNS resolution, by LogicalDNS cluster target.
+    dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
     /// DNS targets whose resolution hasn't been reported yet.
     unresolved_dns: Vec<DnsTarget>,
     /// Updates that have been polled but not yet returned by
     /// [`Self::poll_next`]. `None` means that a watcher has closed.
     ready: VecDeque<Option<Update>>,
+}
+
+/// An xDS resource watch, and the cached state of its resource.
+#[derive(Debug)]
+struct Watch<T: Resource> {
+    watcher: ResourceWatcher<T>,
+    state: WatchState<Arc<T>>,
 }
 
 /// An event for one of the [`Watches`].
@@ -74,11 +85,23 @@ pub(super) enum Update {
     Dns(DnsTarget),
 }
 
-impl Watches {
-    pub(super) fn cache(&self) -> &CachedResources {
-        &self.cache
+impl CachedResources for Watches {
+    fn cluster(&self, name: &str) -> Option<&WatchState<Arc<ClusterResource>>> {
+        self.clusters.get(name).map(|watch| &watch.state)
     }
 
+    fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<Arc<EndpointsResource>>> {
+        self.endpoints
+            .get(eds_service_name)
+            .map(|watch| &watch.state)
+    }
+
+    fn dns(&self, target: &DnsTarget) -> Option<&WatchState<Arc<[EndpointAddress]>>> {
+        self.dns.get(target)
+    }
+}
+
+impl Watches {
     /// Starts the watches in `required` that don't exist yet, and drops the
     /// ones that aren't in it. Dropping a watcher unsubscribes from its
     /// resource.
@@ -88,22 +111,10 @@ impl Watches {
     /// The caller must have taken every update from [`Self::poll_next`]
     /// first, so that no update is left for a watch that this drops.
     pub(super) async fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
-        reconcile(
-            client,
-            &mut self.clusters,
-            &mut self.cache.clusters,
-            &required.clusters,
-        )
-        .await;
-        reconcile(
-            client,
-            &mut self.endpoints,
-            &mut self.cache.endpoints,
-            &required.eds_services,
-        )
-        .await;
+        reconcile(client, &mut self.clusters, &required.clusters).await;
+        reconcile(client, &mut self.endpoints, &required.eds_services).await;
 
-        let dns = &mut self.cache.dns;
+        let dns = &mut self.dns;
         dns.retain(|target, _| required.dns_targets.contains(target));
         for target in &required.dns_targets {
             if !dns.contains_key(target) {
@@ -142,15 +153,23 @@ impl Watches {
         const WATCHED: &str = "an update's watch is dropped only once its updates are taken";
         match update {
             Update::Cluster(name, event) => {
-                let state = self.cache.clusters.get_mut(&name).expect(WATCHED);
-                Some(state.apply(event, |e| format!("CDS resource {name}: {e}").into()))
+                let watch = self.clusters.get_mut(&name).expect(WATCHED);
+                Some(
+                    watch
+                        .state
+                        .apply(event, |e| format!("CDS resource {name}: {e}").into()),
+                )
             }
             Update::Endpoints(name, event) => {
-                let state = self.cache.endpoints.get_mut(&name).expect(WATCHED);
-                Some(state.apply(event, |e| format!("EDS resource {name}: {e}").into()))
+                let watch = self.endpoints.get_mut(&name).expect(WATCHED);
+                Some(
+                    watch
+                        .state
+                        .apply(event, |e| format!("EDS resource {name}: {e}").into()),
+                )
             }
             Update::Dns(target) => {
-                let state = self.cache.dns.get_mut(&target).expect(WATCHED);
+                let state = self.dns.get_mut(&target).expect(WATCHED);
                 *state = WatchState::Failed(DNS_UNSUPPORTED.into());
                 None
             }
@@ -158,39 +177,53 @@ impl Watches {
     }
 }
 
-/// Makes `watchers` and `states` hold exactly the names in `required`.
+/// Makes `watches` hold exactly the names in `required`.
 async fn reconcile<T: Resource>(
     client: &XdsClient,
-    watchers: &mut HashMap<String, ResourceWatcher<T>>,
-    states: &mut HashMap<String, WatchState<Arc<T>>>,
+    watches: &mut HashMap<String, Watch<T>>,
     required: &HashSet<String>,
 ) {
-    watchers.retain(|name, _| required.contains(name));
-    states.retain(|name, _| required.contains(name));
+    watches.retain(|name, _| required.contains(name));
     for name in required {
-        if !watchers.contains_key(name) {
-            watchers.insert(name.clone(), client.watch(name.clone()).await);
-            states.insert(name.clone(), WatchState::Pending);
+        if !watches.contains_key(name) {
+            let watch = Watch {
+                watcher: client.watch(name.clone()).await,
+                state: WatchState::Pending,
+            };
+            watches.insert(name.clone(), watch);
         }
     }
 }
 
-/// Adds each event that is ready on `watchers` to `ready` as an [`Update`]
+/// Adds each event that is ready on `watches` to `ready` as an [`Update`]
 /// made by `update`, followed by `None` for each watcher that has closed.
 fn poll_ready<T: Resource>(
-    watchers: &mut HashMap<String, ResourceWatcher<T>>,
+    watches: &mut HashMap<String, Watch<T>>,
     cx: &mut Context<'_>,
     update: fn(String, ResourceEvent<T>) -> Update,
     ready: &mut VecDeque<Option<Update>>,
 ) {
-    for (name, watcher) in watchers {
-        while let Poll::Ready(event) = watcher.poll_next(cx) {
+    for (name, watch) in watches {
+        while let Poll::Ready(event) = watch.watcher.poll_next(cx) {
             let closed = event.is_none();
             ready.push_back(event.map(|event| update(name.clone(), event)));
             if closed {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Watches {
+    /// The names of the CDS watches.
+    pub(super) fn cluster_names(&self) -> impl Iterator<Item = &String> {
+        self.clusters.keys()
+    }
+
+    /// The names of the EDS watches.
+    pub(super) fn endpoint_names(&self) -> impl Iterator<Item = &String> {
+        self.endpoints.keys()
     }
 }
 
@@ -214,28 +247,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_keeps_watchers_and_states_in_step() {
+    async fn reconcile_adds_and_drops_watches() {
         let client = XdsClient::disconnected();
         let mut watches = Watches::default();
         watches
             .reconcile(&client, &required_clusters(&["a", "b"]))
             .await;
-        watches
-            .cache
-            .clusters
-            .insert("a".to_owned(), WatchState::Failed("kept".into()));
+        watches.clusters.get_mut("a").unwrap().state = WatchState::Failed("kept".into());
 
         watches
             .reconcile(&client, &required_clusters(&["a", "c"]))
             .await;
 
         assert_eq!(names(&watches.clusters), ["a", "c"]);
-        assert_eq!(names(&watches.cache.clusters), ["a", "c"]);
         // An existing watch keeps its state; a new one starts pending.
         assert!(
-            matches!(&watches.cache.clusters["a"], WatchState::Failed(reason) if &**reason == "kept")
+            matches!(watches.cluster("a"), Some(WatchState::Failed(reason)) if &**reason == "kept")
         );
-        assert!(matches!(watches.cache.clusters["c"], WatchState::Pending));
+        assert!(matches!(watches.cluster("c"), Some(WatchState::Pending)));
+        assert!(watches.cluster("b").is_none());
     }
 
     #[tokio::test]
@@ -252,7 +282,7 @@ mod tests {
         watches
             .reconcile(&XdsClient::disconnected(), &required)
             .await;
-        assert_eq!(watches.cache.dns[&target], WatchState::Pending);
+        assert_eq!(watches.dns[&target], WatchState::Pending);
 
         // The failure arrives as an update, which starts the next batch.
         let mut cx = Context::from_waker(Waker::noop());
@@ -261,7 +291,7 @@ mod tests {
         };
         assert!(watches.apply(update).is_none());
         assert_eq!(
-            watches.cache.dns[&target],
+            watches.dns[&target],
             WatchState::Failed(DNS_UNSUPPORTED.into())
         );
         assert!(watches.poll_next(&mut cx).is_pending());
@@ -269,7 +299,7 @@ mod tests {
         watches
             .reconcile(&XdsClient::disconnected(), &RequiredWatches::default())
             .await;
-        assert!(watches.cache.dns.is_empty());
+        assert!(watches.dns.is_empty());
     }
 
     #[tokio::test]

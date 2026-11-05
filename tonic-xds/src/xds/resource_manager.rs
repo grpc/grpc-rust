@@ -44,6 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_core::Stream;
 use tokio_stream::{StreamExt, StreamMap};
@@ -101,6 +102,12 @@ struct CascadeState {
     rds_watcher: Option<ResourceWatcher<RouteConfigResource>>,
     /// Active RDS name to detect changes across LDS updates.
     rds_name: Option<String>,
+    /// Latest route config received for `rds_name`, as received (without the
+    /// listener's defaults), so a listener-only change can be republished.
+    rds_route_config: Option<Arc<RouteConfigResource>>,
+    /// The current listener's HCM default max stream duration (gRFC A31),
+    /// applied to routes that set none when a route config is published.
+    listener_max_stream_duration: Option<Duration>,
     /// Per-cluster CDS watchers, keyed by cluster name.
     cds_watchers: StreamMap<String, WatcherStream<ClusterResource>>,
     /// Per-cluster EDS watchers, keyed by cluster name.
@@ -114,6 +121,8 @@ impl CascadeState {
         Self {
             rds_watcher: None,
             rds_name: None,
+            rds_route_config: None,
+            listener_max_stream_duration: None,
             cds_watchers: StreamMap::new(),
             eds_watchers: StreamMap::new(),
             eds_names: HashMap::new(),
@@ -126,7 +135,7 @@ impl CascadeState {
     /// lower-level ones (CDS/EDS), avoiding wasted work on clusters
     /// about to be removed.
     async fn run(mut self, xds_client: XdsClient, cache: Arc<XdsCache>, listener_name: String) {
-        let mut lds_watcher = xds_client.watch::<ListenerResource>(&listener_name).await;
+        let mut lds_watcher = xds_client.watch::<ListenerResource>(&listener_name);
 
         loop {
             tokio::select! {
@@ -135,7 +144,7 @@ impl CascadeState {
                 lds_event = lds_watcher.next() => {
                     // None means xds-client shut down; exit the cascade.
                     let Some(event) = lds_event else { break };
-                    self.handle_lds(event, &xds_client, &cache).await;
+                    self.handle_lds(event, &xds_client, &cache);
                 }
 
                 rds_event = async {
@@ -149,15 +158,16 @@ impl CascadeState {
                     let Some(event) = rds_event else {
                         self.rds_watcher = None;
                         self.rds_name = None;
+                        self.rds_route_config = None;
                         continue;
                     };
-                    self.handle_rds(event, &xds_client, &cache).await;
+                    self.handle_rds(event, &xds_client, &cache);
                 }
 
                 Some((name, event)) = self.cds_watchers.next(),
                     if !self.cds_watchers.is_empty() =>
                 {
-                    self.handle_cds(&name, event, &xds_client, &cache).await;
+                    self.handle_cds(&name, event, &xds_client, &cache);
                 }
 
                 Some((name, event)) = self.eds_watchers.next(),
@@ -169,7 +179,7 @@ impl CascadeState {
         }
     }
 
-    async fn handle_lds(
+    fn handle_lds(
         &mut self,
         event: ResourceEvent<ListenerResource>,
         xds_client: &XdsClient,
@@ -180,21 +190,31 @@ impl CascadeState {
                 result: Ok(listener),
                 done,
             } => {
+                let listener_msd_changed =
+                    self.listener_max_stream_duration != listener.max_stream_duration;
+                self.listener_max_stream_duration = listener.max_stream_duration;
                 match &listener.route_source {
                     RouteSource::Inline(rc) => {
                         // Drop any existing RDS watcher — routes are inline.
                         self.rds_watcher = None;
                         self.rds_name = None;
+                        self.rds_route_config = None;
 
                         let rc = Arc::new(rc.clone());
-                        cache.update_route_config(Arc::clone(&rc));
-                        self.reconcile_clusters(&rc, xds_client, cache).await;
+                        self.publish_route_config(&rc, cache);
+                        self.reconcile_clusters(&rc, xds_client, cache);
                     }
                     RouteSource::Rds(rds_name) => {
                         if self.rds_name.as_deref() != Some(rds_name) {
+                            // Keep serving the previous route config until the
+                            // new one arrives; it is published from `handle_rds`.
                             self.rds_watcher =
-                                Some(xds_client.watch::<RouteConfigResource>(rds_name).await);
+                                Some(xds_client.watch::<RouteConfigResource>(rds_name));
                             self.rds_name = Some(rds_name.clone());
+                            self.rds_route_config = None;
+                        } else if listener_msd_changed && let Some(rc) = &self.rds_route_config {
+                            // Same route config, new listener defaults.
+                            self.publish_route_config(rc, cache);
                         }
                     }
                 }
@@ -210,7 +230,7 @@ impl CascadeState {
         }
     }
 
-    async fn handle_rds(
+    fn handle_rds(
         &mut self,
         event: ResourceEvent<RouteConfigResource>,
         xds_client: &XdsClient,
@@ -221,8 +241,9 @@ impl CascadeState {
                 result: Ok(rc),
                 done,
             } => {
-                cache.update_route_config(Arc::clone(&rc));
-                self.reconcile_clusters(&rc, xds_client, cache).await;
+                self.publish_route_config(&rc, cache);
+                self.rds_route_config = Some(Arc::clone(&rc));
+                self.reconcile_clusters(&rc, xds_client, cache);
                 drop(done);
             }
             // Per gRFC A88: keep using cached resources on data errors.
@@ -231,7 +252,21 @@ impl CascadeState {
         }
     }
 
-    async fn handle_cds(
+    /// Publishes `rc` with the listener's default max stream duration applied
+    /// to routes that set none (gRFC A31), so routing reads a single per-route
+    /// value.
+    fn publish_route_config(&self, rc: &Arc<RouteConfigResource>, cache: &XdsCache) {
+        let rc = match self.listener_max_stream_duration {
+            // Zero means no limit, the same as unset, so there is nothing to apply.
+            Some(default) if !default.is_zero() => {
+                Arc::new((**rc).clone().with_default_max_stream_duration(default))
+            }
+            _ => Arc::clone(rc),
+        };
+        cache.update_route_config(rc);
+    }
+
+    fn handle_cds(
         &mut self,
         cluster_name: &str,
         event: ResourceEvent<ClusterResource>,
@@ -249,7 +284,7 @@ impl CascadeState {
                 if self.eds_names.get(cluster_name).map(|s| s.as_str()) != Some(&eds_name) {
                     self.eds_watchers.remove(cluster_name);
 
-                    let watcher = xds_client.watch::<EndpointsResource>(&eds_name).await;
+                    let watcher = xds_client.watch::<EndpointsResource>(&eds_name);
                     let cluster_key = cluster_name.to_string();
                     self.eds_watchers
                         .insert(cluster_key.clone(), WatcherStream(watcher));
@@ -284,7 +319,7 @@ impl CascadeState {
 
     /// Diffs the current cluster set against the route config's cluster names
     /// and starts/stops per-cluster watchers accordingly.
-    async fn reconcile_clusters(
+    fn reconcile_clusters(
         &mut self,
         route_config: &RouteConfigResource,
         xds_client: &XdsClient,
@@ -302,7 +337,7 @@ impl CascadeState {
         }
 
         for name in new_clusters.difference(&old_clusters) {
-            let watcher = xds_client.watch::<ClusterResource>(name).await;
+            let watcher = xds_client.watch::<ClusterResource>(name);
             self.cds_watchers
                 .insert(name.clone(), WatcherStream(watcher));
         }
@@ -342,6 +377,7 @@ mod tests {
                         },
                         action: RouteConfigAction::Cluster((*c).into()),
                         retry_config: None,
+                        max_stream_duration: None,
                     })
                     .collect(),
             }],
@@ -368,18 +404,28 @@ mod tests {
                             },
                             action: RouteConfigAction::Cluster((*c).into()),
                             retry_config: None,
+                            max_stream_duration: None,
                         })
                         .collect(),
                 }],
                 metadata: Default::default(),
             }),
+            max_stream_duration: None,
         })
     }
 
     fn make_listener_rds(rds_name: &str) -> Arc<ListenerResource> {
+        make_listener_rds_with_msd(rds_name, None)
+    }
+
+    fn make_listener_rds_with_msd(
+        rds_name: &str,
+        max_stream_duration: Option<Duration>,
+    ) -> Arc<ListenerResource> {
         Arc::new(ListenerResource {
             name: "listener".into(),
             route_source: RouteSource::Rds(rds_name.into()),
+            max_stream_duration,
         })
     }
 
@@ -404,31 +450,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reconcile_adds_new_clusters() {
+    #[test]
+    fn reconcile_adds_new_clusters() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
         let rc = make_route_config("rc", &["a", "b"]);
-        state.reconcile_clusters(&rc, &client, &cache).await;
+        state.reconcile_clusters(&rc, &client, &cache);
 
         assert!(state.cds_watchers.contains_key("a"));
         assert!(state.cds_watchers.contains_key("b"));
         assert_eq!(state.cds_watchers.keys().count(), 2);
     }
 
-    #[tokio::test]
-    async fn reconcile_removes_old_clusters() {
+    #[test]
+    fn reconcile_removes_old_clusters() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
         let rc1 = make_route_config("rc", &["a", "b"]);
-        state.reconcile_clusters(&rc1, &client, &cache).await;
+        state.reconcile_clusters(&rc1, &client, &cache);
 
         let rc2 = make_route_config("rc", &["b", "c"]);
-        state.reconcile_clusters(&rc2, &client, &cache).await;
+        state.reconcile_clusters(&rc2, &client, &cache);
 
         assert!(!state.cds_watchers.contains_key("a"));
         assert!(state.cds_watchers.contains_key("b"));
@@ -436,18 +482,18 @@ mod tests {
         assert_eq!(state.cds_watchers.keys().count(), 2);
     }
 
-    #[tokio::test]
-    async fn reconcile_to_empty_removes_all() {
+    #[test]
+    fn reconcile_to_empty_removes_all() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
         let rc1 = make_route_config("rc", &["a"]);
-        state.reconcile_clusters(&rc1, &client, &cache).await;
+        state.reconcile_clusters(&rc1, &client, &cache);
         assert_eq!(state.cds_watchers.keys().count(), 1);
 
         let rc2 = make_route_config("rc", &[]);
-        state.reconcile_clusters(&rc2, &client, &cache).await;
+        state.reconcile_clusters(&rc2, &client, &cache);
         assert_eq!(state.cds_watchers.keys().count(), 0);
     }
 
@@ -458,7 +504,7 @@ mod tests {
         let mut state = CascadeState::new();
 
         let rc = make_route_config("rc-1", &["cluster-a", "cluster-b"]);
-        state.handle_rds(ok_event(rc), &client, &cache).await;
+        state.handle_rds(ok_event(rc), &client, &cache);
 
         let config = cache.watch_route_config().next().await.unwrap();
         assert_eq!(config.name, "rc-1");
@@ -466,32 +512,32 @@ mod tests {
         assert!(state.cds_watchers.contains_key("cluster-b"));
     }
 
-    #[tokio::test]
-    async fn handle_rds_err_preserves_state() {
+    #[test]
+    fn handle_rds_err_preserves_state() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
         let rc = make_route_config("rc", &["c1"]);
-        state.handle_rds(ok_event(rc), &client, &cache).await;
+        state.handle_rds(ok_event(rc), &client, &cache);
         assert_eq!(state.cds_watchers.keys().count(), 1);
 
         // Per gRFC A88: data errors preserve cached state.
-        state.handle_rds(err_event(), &client, &cache).await;
+        state.handle_rds(err_event(), &client, &cache);
         assert_eq!(state.cds_watchers.keys().count(), 1);
     }
 
-    #[tokio::test]
-    async fn handle_rds_ambient_error_preserves_state() {
+    #[test]
+    fn handle_rds_ambient_error_preserves_state() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
         let rc = make_route_config("rc", &["c1"]);
-        state.handle_rds(ok_event(rc), &client, &cache).await;
+        state.handle_rds(ok_event(rc), &client, &cache);
         assert_eq!(state.cds_watchers.keys().count(), 1);
 
-        state.handle_rds(ambient_event(), &client, &cache).await;
+        state.handle_rds(ambient_event(), &client, &cache);
         assert_eq!(state.cds_watchers.keys().count(), 1);
     }
 
@@ -501,9 +547,7 @@ mod tests {
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache);
 
         let config = cache.watch_route_config().next().await.unwrap();
         assert_eq!(config.name, "inline-rc");
@@ -512,135 +556,171 @@ mod tests {
         assert!(state.cds_watchers.contains_key("c1"));
     }
 
-    #[tokio::test]
-    async fn handle_lds_inline_clears_existing_rds() {
+    #[test]
+    fn handle_lds_inline_clears_existing_rds() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache);
         assert!(state.rds_watcher.is_some());
         assert_eq!(state.rds_name.as_deref(), Some("rc-1"));
 
-        state
-            .handle_lds(ok_event(make_listener_inline(&[])), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_inline(&[])), &client, &cache);
         assert!(state.rds_watcher.is_none());
         assert!(state.rds_name.is_none());
     }
 
-    #[tokio::test]
-    async fn handle_lds_rds_sets_watcher_and_name() {
+    #[test]
+    fn handle_lds_rds_sets_watcher_and_name() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_rds("my-route")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("my-route")), &client, &cache);
 
         assert!(state.rds_watcher.is_some());
         assert_eq!(state.rds_name.as_deref(), Some("my-route"));
     }
 
-    #[tokio::test]
-    async fn handle_lds_rds_same_name_reuses_watcher() {
+    #[test]
+    fn handle_lds_rds_same_name_reuses_watcher() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc")), &client, &cache);
         assert!(state.rds_watcher.is_some());
 
         // Same name — watcher should not be replaced.
         // (We can't check identity, but rds_name should stay the same.)
-        state
-            .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc")), &client, &cache);
         assert_eq!(state.rds_name.as_deref(), Some("rc"));
     }
 
-    #[tokio::test]
-    async fn handle_lds_rds_different_name_replaces_watcher() {
+    #[test]
+    fn handle_lds_rds_different_name_replaces_watcher() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache);
         assert_eq!(state.rds_name.as_deref(), Some("rc-1"));
 
-        state
-            .handle_lds(ok_event(make_listener_rds("rc-2")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc-2")), &client, &cache);
         assert_eq!(state.rds_name.as_deref(), Some("rc-2"));
     }
 
-    #[tokio::test]
-    async fn handle_lds_err_preserves_state() {
+    #[test]
+    fn handle_lds_err_preserves_state() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache);
         assert!(state.cds_watchers.contains_key("c1"));
 
-        state
-            .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc")), &client, &cache);
         assert!(state.rds_watcher.is_some());
 
         // Per gRFC A88: data errors preserve cached state.
-        state.handle_lds(err_event(), &client, &cache).await;
+        state.handle_lds(err_event(), &client, &cache);
         assert!(state.rds_watcher.is_some());
         assert_eq!(state.rds_name.as_deref(), Some("rc"));
         assert!(state.cds_watchers.contains_key("c1"));
     }
 
-    #[tokio::test]
-    async fn handle_lds_ambient_error_preserves_state() {
+    #[test]
+    fn handle_lds_ambient_error_preserves_state() {
         let cache = test_cache();
         let client = test_client();
         let mut state = CascadeState::new();
 
-        state
-            .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
-            .await;
+        state.handle_lds(ok_event(make_listener_rds("rc")), &client, &cache);
         assert!(state.rds_watcher.is_some());
 
-        state.handle_lds(ambient_event(), &client, &cache).await;
+        state.handle_lds(ambient_event(), &client, &cache);
         assert!(state.rds_watcher.is_some());
         assert_eq!(state.rds_name.as_deref(), Some("rc"));
     }
 
-    /// End-to-end replica of the production Istio hang: an RDS update that
-    /// references far more clusters than the xds-client worker's command
-    /// channel buffers (64), reconciled through the real cascade path —
-    /// `handle_rds` holds the event's `ProcessingDone` token while
-    /// `reconcile_clusters` awaits one `watch()` per cluster.
-    ///
-    /// Before xds-client gained ADS flow control, the worker sat inside
-    /// `handle_response` awaiting that token and stopped draining commands;
-    /// once the command channel filled, `reconcile_clusters` blocked on the
-    /// 65th watch and the client deadlocked. This test times out under that
-    /// behavior and completes under the fixed worker.
+    /// The route config currently published by `cache`.
+    async fn published(cache: &XdsCache) -> Arc<RouteConfigResource> {
+        cache.watch_route_config().next().await.unwrap()
+    }
+
+    /// The max stream duration of the published config's first route.
+    async fn published_msd(cache: &XdsCache) -> Option<Duration> {
+        published(cache).await.virtual_hosts[0].routes[0].max_stream_duration
+    }
+
+    #[tokio::test]
+    async fn handle_lds_inline_applies_listener_max_stream_duration() {
+        let cache = test_cache();
+        let client = test_client();
+        let mut state = CascadeState::new();
+
+        let mut listener = Arc::into_inner(make_listener_inline(&["c1"])).unwrap();
+        listener.max_stream_duration = Some(Duration::from_secs(4));
+        state.handle_lds(ok_event(Arc::new(listener)), &client, &cache);
+
+        assert_eq!(published_msd(&cache).await, Some(Duration::from_secs(4)));
+    }
+
+    #[tokio::test]
+    async fn rds_route_config_follows_listener_max_stream_duration() {
+        let cache = test_cache();
+        let client = test_client();
+        let mut state = CascadeState::new();
+        let secs = |s| Some(Duration::from_secs(s));
+
+        // The RDS config is published with the listener's default applied.
+        let listener = make_listener_rds_with_msd("rc", secs(7));
+        state.handle_lds(ok_event(Arc::clone(&listener)), &client, &cache);
+        let rc = make_route_config("rc", &["c1"]);
+        state.handle_rds(ok_event(Arc::clone(&rc)), &client, &cache);
+        let config = published(&cache).await;
+        assert_eq!(config.name, "rc");
+        assert_eq!(published_msd(&cache).await, secs(7));
+
+        // An unchanged listener does not republish.
+        state.handle_lds(ok_event(listener), &client, &cache);
+        assert!(Arc::ptr_eq(&published(&cache).await, &config));
+
+        // A listener-only change republishes the route config with the new
+        // default, applied to the config as received rather than the old one.
+        let listener = make_listener_rds_with_msd("rc", secs(3));
+        state.handle_lds(ok_event(listener), &client, &cache);
+        assert_eq!(published_msd(&cache).await, secs(3));
+        let listener = make_listener_rds_with_msd("rc", None);
+        state.handle_lds(ok_event(listener), &client, &cache);
+        assert!(Arc::ptr_eq(&published(&cache).await, &rc));
+
+        // A new RDS name keeps serving the old config until the new one arrives,
+        // which is then published with the new default.
+        let listener = make_listener_rds_with_msd("rc-2", secs(9));
+        state.handle_lds(ok_event(listener), &client, &cache);
+        assert!(Arc::ptr_eq(&published(&cache).await, &rc));
+
+        state.handle_rds(
+            ok_event(make_route_config("rc-2", &["c1"])),
+            &client,
+            &cache,
+        );
+        assert_eq!(published(&cache).await.name, "rc-2");
+        assert_eq!(published_msd(&cache).await, secs(9));
+    }
+
+    /// An RDS update registers all referenced clusters through the real cascade
+    /// path while holding its `ProcessingDone` token.
     #[tokio::test]
     async fn rds_referencing_many_clusters_reconciles_without_deadlock() {
-        use std::time::Duration;
         use xds_client::{
             ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder,
             XdsClient as RealXdsClient,
         };
         use xds_test_util::{XdsTestControlPlaneService, config};
 
-        // Well past the worker's 64-slot command channel.
         const CLUSTER_COUNT: usize = 100;
 
         let control_plane = XdsTestControlPlaneService::new()
@@ -667,7 +747,7 @@ mod tests {
         )
         .build();
 
-        let mut watcher = xds_client.watch::<RouteConfigResource>("rc-many").await;
+        let mut watcher = xds_client.watch::<RouteConfigResource>("rc-many");
         let event = tokio::time::timeout(Duration::from_secs(10), watcher.next())
             .await
             .expect("timed out waiting for the RDS update")
@@ -675,12 +755,7 @@ mod tests {
 
         let cache = test_cache();
         let mut state = CascadeState::new();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            state.handle_rds(event, &xds_client, &cache),
-        )
-        .await
-        .expect("deadlock: reconcile_clusters blocked while the worker awaited ProcessingDone");
+        state.handle_rds(event, &xds_client, &cache);
 
         assert_eq!(state.cds_watchers.len(), CLUSTER_COUNT);
     }

@@ -25,9 +25,10 @@
 use crate::common::async_util::BoxFuture;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
+use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
 use crate::xds::resource::cluster::ClusterResource;
 use crate::xds::resource::security::ClusterSecurityConfig;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use std::task::{Context, Poll};
 use tower::{BoxError, Service, load::Load};
@@ -69,6 +70,15 @@ impl EndpointAddress {
         Self {
             host: EndpointHost::from(host.into()),
             port,
+        }
+    }
+
+    /// Returns the IP address, or `None` if the host is a hostname.
+    pub(crate) fn ip(&self) -> Option<IpAddr> {
+        match self.host {
+            EndpointHost::Ipv4(ip) => Some(IpAddr::V4(ip)),
+            EndpointHost::Ipv6(ip) => Some(IpAddr::V6(ip)),
+            EndpointHost::Hostname(_) => None,
         }
     }
 }
@@ -217,6 +227,11 @@ pub struct ClusterConfig<'a> {
     /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal;
     /// read publicly through `ClusterConfig::tls`.
     pub(crate) security: Option<&'a ClusterSecurityConfig>,
+    /// EDS service name of the cluster's endpoints. Crate-internal; keys the
+    /// cluster's A32 request counter together with the cluster name.
+    pub(crate) eds_service_name: &'a str,
+    /// A32 circuit-breaking thresholds. Crate-internal.
+    pub(crate) circuit_breaking: CircuitBreakingConfig,
     /// Cert-provider registry. Ambient here so [`ClusterTlsConfig`] can resolve
     /// provider instance names without the caller handling the registry.
     #[cfg(feature = "_tls-any")]
@@ -234,6 +249,8 @@ impl<'a> ClusterConfig<'a> {
         Self {
             name: &cluster.name,
             security: cluster.security.as_ref(),
+            eds_service_name: cluster.eds_service_name(),
+            circuit_breaking: cluster.circuit_breaking,
             registry,
         }
     }
@@ -244,11 +261,13 @@ impl<'a> ClusterConfig<'a> {
         Self {
             name: &cluster.name,
             security: cluster.security.as_ref(),
+            eds_service_name: cluster.eds_service_name(),
+            circuit_breaking: cluster.circuit_breaking,
         }
     }
 
     /// The cluster name.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'a str {
         self.name
     }
 

@@ -37,7 +37,7 @@ use rustls_pki_types::CertificateDer;
 use tokio::sync::watch;
 use tokio_rustls::TlsStream;
 
-use grpc::__unstable::Internal;
+use grpc::__unstable::credentials::protocol_info_new;
 use grpc::__unstable::rt::EndpointIoStream;
 use grpc::__unstable::rt::GrpcEndpoint;
 use grpc::__unstable::rt::StreamEndpoint;
@@ -46,6 +46,12 @@ use grpc::credentials::ProtocolInfo;
 pub mod client;
 mod key_log;
 pub mod server;
+
+mod private {
+    /// A zero-sized type used so only the grpc-rustls crate can call or
+    /// implement methods with this argument. It is private to this crate.
+    pub struct SealedToken;
+}
 
 const ALPN_PROTO_STR_H2: &[u8; 2] = b"h2";
 
@@ -109,7 +115,7 @@ pub trait Provider<T> {
     /// This allows the consumer to observe the current value and await
     /// future updates.
     #[doc(hidden)]
-    fn get_receiver(self, _token: Internal) -> watch::Receiver<T>;
+    fn get_receiver(self, _token: private::SealedToken) -> watch::Receiver<T>;
 }
 
 /// A provider that supplies a constant, immutable value.
@@ -125,7 +131,7 @@ impl<T> StaticProvider<T> {
 }
 
 impl<T> Provider<T> for StaticProvider<T> {
-    fn get_receiver(self, _token: Internal) -> watch::Receiver<T> {
+    fn get_receiver(self, _token: private::SealedToken) -> watch::Receiver<T> {
         // We drop the sender (_) immediately.
         // This ensures the receiver sees the initial value but knows
         // no future updates will arrive.
@@ -140,7 +146,7 @@ pub type StaticRootCertificatesProvider = StaticProvider<RootCertificates>;
 /// A provider for a single, fixed identity.
 pub type StaticIdentityProvider = StaticProvider<Identity>;
 
-static TLS_PROTO_INFO: ProtocolInfo = ProtocolInfo::unstable_new("tls");
+static TLS_PROTO_INFO: ProtocolInfo = protocol_info_new("tls");
 
 /// A [`GrpcEndpoint`] that carries TLS over an underlying transport endpoint.
 type TlsEndpoint<T> = StreamEndpoint<TlsStream<EndpointIoStream<T>>>;

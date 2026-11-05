@@ -32,25 +32,46 @@
 mod test {
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
+    use envoy_types::pb::envoy::admin::v3::ClientResourceStatus;
+    use envoy_types::pb::envoy::config::core::v3::HttpProtocolOptions;
+    use envoy_types::pb::envoy::config::listener::v3::Listener;
+    use envoy_types::pb::envoy::config::route::v3::RetryPolicy;
+    use envoy_types::pb::envoy::config::route::v3::RouteAction;
+    use envoy_types::pb::envoy::config::route::v3::RouteConfiguration;
+    use envoy_types::pb::envoy::config::route::v3::retry_policy::RetryBackOff;
+    use envoy_types::pb::envoy::config::route::v3::route::Action;
+    use envoy_types::pb::envoy::config::route::v3::route_action;
+    use envoy_types::pb::envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager;
+    use envoy_types::pb::envoy::service::status::v3::client_status_discovery_service_client::ClientStatusDiscoveryServiceClient;
+    use envoy_types::pb::envoy::service::status::v3::{ClientConfig, ClientStatusRequest};
+    use envoy_types::pb::google::protobuf::Duration as ProtoDuration;
+    use envoy_types::pb::google::protobuf::UInt32Value;
+    use prost::Message;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
     use tokio::time::Duration;
+    use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::sync::CancellationToken;
     use xds_test_util::RunningControlPlane;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config;
 
     use crate::BootstrapConfig;
+    use crate::CsdsService;
     use crate::XdsChannelBuilder;
     use crate::XdsChannelConfig;
     use crate::XdsChannelGrpc;
     use crate::XdsClientPool;
     use crate::XdsUri;
     use crate::client::channel::{LB_BACKENDS, LbBackend};
+    use crate::csds::CsdsRegistry;
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
+    use crate::testutil::grpc::ScriptedGreeter;
     use crate::testutil::grpc::spawn_greeter_server;
+    use crate::testutil::grpc::spawn_scripted_server;
 
     /// Starts the fake ADS control plane on an ephemeral port. Returns the
     /// running control plane (which injects config and shuts down on drop)
@@ -494,6 +515,195 @@ mod test {
             .expect("proxy stopped accepting");
     }
 
+    /// gRFC A31: the listener's HCM `max_stream_duration` bounds calls whose
+    /// route sets none, a route value overrides it (0 lifts it), the
+    /// application's own deadline still applies on top, and the limit spans
+    /// the whole call, retries included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xds_channel_e2e_max_stream_duration() {
+        const LISTENER_MSD: Duration = Duration::from_millis(300);
+        const ROUTE_MSD: Duration = Duration::from_millis(600);
+        const SLOW_DELAY: Duration = Duration::from_secs(1);
+
+        let backend = spawn_scripted_server("backend", SLOW_DELAY)
+            .await
+            .expect("spawn backend");
+        let (control_plane, cp_addr) = start_control_plane().await;
+
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Lds,
+            HashMap::from([(
+                "my-service".to_string(),
+                rds_listener_with_max_stream_duration("my-service", "route-config", LISTENER_MSD),
+            )]),
+        );
+        serve_route_config(
+            &control_plane,
+            config::build_route_config("route-config", "my-cluster"),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Cds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cluster("my-cluster"),
+            )]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cla(
+                    "my-cluster",
+                    &[(backend.addr.ip().to_string(), backend.addr.port())],
+                ),
+            )]),
+        );
+
+        let channel = builder_for(cp_addr, "my-service")
+            .build_grpc_channel()
+            .expect("build xds channel");
+        let mut client = GreeterClient::new(channel);
+        say_hello_until_prefix(&mut client, "backend:").await;
+
+        // The route sets no limit, so the listener's applies.
+        let start = tokio::time::Instant::now();
+        let status = say(&mut client, ScriptedGreeter::SLOW, None)
+            .await
+            .expect_err("listener msd");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status:?}");
+        assert!(start.elapsed() >= LISTENER_MSD, "{:?}", start.elapsed());
+
+        // An explicit 0 on the route disables the listener's limit.
+        let mut route_config = config::build_route_config("route-config", "my-cluster");
+        route_action_mut(&mut route_config).max_stream_duration =
+            Some(route_action::MaxStreamDuration {
+                grpc_timeout_header_max: Some(ProtoDuration::default()),
+                ..Default::default()
+            });
+        serve_route_config(&control_plane, route_config);
+        say_until(&mut client, ScriptedGreeter::SLOW, Result::is_ok).await;
+
+        // The application's deadline still bounds the call.
+        let status = say(
+            &mut client,
+            ScriptedGreeter::SLOW,
+            Some(Duration::from_millis(200)),
+        )
+        .await
+        .expect_err("app deadline");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status:?}");
+
+        // The route's limit bounds the whole call, retry backoff included: a
+        // failing call outlives the listener's limit but ends at the route's
+        // with DEADLINE_EXCEEDED, long before its retries (whose backoff alone
+        // is >= 1.2s) would run out and surface UNAVAILABLE.
+        let mut route_config = config::build_route_config("route-config", "my-cluster");
+        let action = route_action_mut(&mut route_config);
+        action.max_stream_duration = Some(route_action::MaxStreamDuration {
+            max_stream_duration: Some(to_proto(ROUTE_MSD)),
+            ..Default::default()
+        });
+        action.retry_policy = Some(RetryPolicy {
+            retry_on: "unavailable".to_string(),
+            num_retries: Some(UInt32Value { value: 4 }),
+            retry_back_off: Some(RetryBackOff {
+                base_interval: Some(to_proto(Duration::from_millis(100))),
+                max_interval: None,
+            }),
+            ..Default::default()
+        });
+        serve_route_config(&control_plane, route_config);
+        let elapsed = say_until(
+            &mut client,
+            ScriptedGreeter::FAIL,
+            |reply| matches!(reply, Err(status) if status.code() == tonic::Code::DeadlineExceeded),
+        )
+        .await;
+        assert!(elapsed >= ROUTE_MSD, "{elapsed:?}");
+
+        let _ = backend.shutdown.send(());
+    }
+
+    /// Sends a request named `name` to the [`ScriptedGreeter`], optionally with
+    /// an application deadline.
+    async fn say(
+        client: &mut GreeterClient<XdsChannelGrpc>,
+        name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<String, tonic::Status> {
+        let mut request = tonic::Request::new(HelloRequest {
+            name: name.to_string(),
+        });
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
+        Ok(client.say_hello(request).await?.into_inner().message)
+    }
+
+    /// Sends `name` until its reply satisfies `done` (xDS updates apply
+    /// asynchronously), returning how long that call took.
+    async fn say_until(
+        client: &mut GreeterClient<XdsChannelGrpc>,
+        name: &str,
+        done: impl Fn(&Result<String, tonic::Status>) -> bool,
+    ) -> Duration {
+        let mut last = None;
+        for _ in 0..50 {
+            let start = tokio::time::Instant::now();
+            let reply = say(client, name, None).await;
+            if done(&reply) {
+                return start.elapsed();
+            }
+            last = Some(reply);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("never observed the expected reply to {name:?}; last seen: {last:?}");
+    }
+
+    fn serve_route_config(control_plane: &RunningControlPlane, route_config: RouteConfiguration) {
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Rds,
+            HashMap::from([(route_config.name.clone(), route_config)]),
+        );
+    }
+
+    /// An RDS listener whose HCM sets `max_stream_duration`.
+    fn rds_listener_with_max_stream_duration(
+        name: &str,
+        rds_name: &str,
+        max_stream_duration: Duration,
+    ) -> Listener {
+        let mut listener = config::build_rds_listener(name, rds_name);
+        let any = listener
+            .api_listener
+            .as_mut()
+            .and_then(|api| api.api_listener.as_mut())
+            .expect("api listener");
+        let mut hcm = HttpConnectionManager::decode(any.value.as_slice()).expect("decode HCM");
+        hcm.common_http_protocol_options = Some(HttpProtocolOptions {
+            max_stream_duration: Some(to_proto(max_stream_duration)),
+            ..Default::default()
+        });
+        any.value = hcm.encode_to_vec();
+        listener
+    }
+
+    /// The action of the first route in `route_config`.
+    fn route_action_mut(route_config: &mut RouteConfiguration) -> &mut RouteAction {
+        let Some(Action::Route(action)) = route_config.virtual_hosts[0].routes[0].action.as_mut()
+        else {
+            panic!("expected a route action");
+        };
+        action
+    }
+
+    fn to_proto(duration: Duration) -> ProtoDuration {
+        ProtoDuration {
+            seconds: duration.as_secs() as i64,
+            nanos: duration.subsec_nanos() as i32,
+        }
+    }
+
     /// Waits until exactly `want` ADS streams are subscribed to LDS.
     async fn wait_for_lds_streams(control_plane: &RunningControlPlane, want: usize) {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -604,6 +814,147 @@ mod test {
             say_hello_until_prefix(client, "backend:").await;
         }
         wait_for_lds_streams(&control_plane, 2).await;
+
+        let _ = backend.shutdown.send(());
+    }
+
+    /// Fetches the CSDS config of every reported xDS client.
+    async fn csds_configs(
+        csds: &mut ClientStatusDiscoveryServiceClient<tonic::transport::Channel>,
+        exclude_resource_contents: bool,
+    ) -> Vec<ClientConfig> {
+        let request = ClientStatusRequest {
+            exclude_resource_contents,
+            ..Default::default()
+        };
+        csds.fetch_client_status(request)
+            .await
+            .expect("fetch client status")
+            .into_inner()
+            .config
+    }
+
+    /// CSDS reports the resources of an xDS client once, however many
+    /// channels share it, and stops reporting it once the last of them is
+    /// dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn csds_reports_channel_resources() {
+        let backend = spawn_greeter_server("backend", None, None)
+            .await
+            .expect("spawn greeter backend");
+        let backend_addr = backend.addr;
+        let (control_plane, cp_addr) = start_control_plane().await;
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Lds,
+            HashMap::from([(
+                "csds-service".to_string(),
+                config::build_inline_listener("csds-service", "csds-cluster"),
+            )]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Cds,
+            HashMap::from([(
+                "csds-cluster".to_string(),
+                config::build_cluster("csds-cluster"),
+            )]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([(
+                "csds-cluster".to_string(),
+                config::build_cla(
+                    "csds-cluster",
+                    &[(backend_addr.ip().to_string(), backend_addr.port())],
+                ),
+            )]),
+        );
+
+        // A private registry, so other tests' clients are not reported.
+        let registry = Arc::new(CsdsRegistry::default());
+        let pool = XdsClientPool::builder()
+            .with_bootstrap(bootstrap_for(cp_addr))
+            .with_csds_registry(Arc::clone(&registry))
+            .build()
+            .expect("build pool");
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let target = XdsUri::parse("xds:///csds-service").expect("parse target");
+            let channel = XdsChannelBuilder::new(XdsChannelConfig::new(target))
+                .with_xds_client_pool(pool.clone())
+                .build_grpc_channel()
+                .expect("build xds channel");
+            clients.push(GreeterClient::new(channel));
+        }
+        for client in &mut clients {
+            say_hello_until_prefix(client, "backend:").await;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let csds_addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(CsdsService::with_registry(registry))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut csds = ClientStatusDiscoveryServiceClient::connect(format!("http://{csds_addr}"))
+            .await
+            .expect("connect to CSDS");
+
+        let mut configs = csds_configs(&mut csds, false).await;
+        assert_eq!(configs.len(), 1, "the shared client is reported once");
+        let config = configs.remove(0);
+        assert_eq!(config.client_scope, "xds:///csds-service");
+        assert_eq!(config.node.as_ref().expect("node is reported").id, "test");
+        assert!(
+            config
+                .generic_xds_configs
+                .iter()
+                .all(|r| r.xds_config.is_some())
+        );
+        let without_contents = csds_configs(&mut csds, true).await;
+        assert!(
+            without_contents[0]
+                .generic_xds_configs
+                .iter()
+                .all(|r| r.xds_config.is_none() && !r.version_info.is_empty())
+        );
+        let mut resources: Vec<(String, String, i32)> = config
+            .generic_xds_configs
+            .into_iter()
+            .map(|r| (r.type_url, r.name, r.client_status))
+            .collect();
+        resources.sort();
+        let acked = ClientResourceStatus::Acked as i32;
+        assert_eq!(
+            resources,
+            [
+                (
+                    "type.googleapis.com/envoy.config.cluster.v3.Cluster".to_string(),
+                    "csds-cluster".to_string(),
+                    acked
+                ),
+                (
+                    "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment"
+                        .to_string(),
+                    "csds-cluster".to_string(),
+                    acked
+                ),
+                (
+                    "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+                    "csds-service".to_string(),
+                    acked
+                ),
+            ]
+        );
+
+        drop(clients);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !csds_configs(&mut csds, false).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client of the dropped channels is still reported");
 
         let _ = backend.shutdown.send(());
     }

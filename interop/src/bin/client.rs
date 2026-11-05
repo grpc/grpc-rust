@@ -168,8 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tonic::service::interceptor::InterceptedService::new(channel, interceptor);
 
             (
-                Box::new(client_prost::TestClient::new(channel.clone())),
-                Box::new(client_prost::UnimplementedClient::new(channel)),
+                Box::new(client_prost::TestServiceClient::new(channel.clone())),
+                Box::new(client_prost::UnimplementedServiceClient::new(channel)),
             )
         }
         Codec::Protobuf => {
@@ -209,8 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let channel = channel.with_interceptor(interceptor);
 
             (
-                Box::new(client_protobuf::TestClient::new(channel.clone())),
-                Box::new(client_protobuf::UnimplementedClient::new(channel)),
+                Box::new(client_protobuf::TestServiceClient::new(channel.clone())),
+                Box::new(client_protobuf::UnimplementedServiceClient::new(channel)),
             )
         }
     };

@@ -497,8 +497,7 @@ impl XdsChannelBuilder {
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
-        let parts = self.build_xds_parts()?;
-        Ok(self.build_grpc_channel_from_runtime(parts))
+        self.build_grpc_channel_with_connector(GrpcMakeConnector::new())
     }
 
     /// Builds the transport-agnostic xDS runtime (cache, ADS client, resource
@@ -644,18 +643,39 @@ impl XdsChannelBuilder {
         )
     }
 
-    /// gRPC specialization of [`build_channel`](Self::build_channel): wires the
-    /// tonic `Channel` connector (with the cert-provider registry under a TLS
-    /// feature) and reconstructs each endpoint request body as [`TonicBody`].
-    /// Separated so tests can inject a disconnected `XdsClient` and a
-    /// pre-populated cache via [`XdsRuntimeParts`].
+    /// gRPC specialization of [`build_channel`](Self::build_channel) with the
+    /// built-in tonic `Channel` connector. Separated so tests can inject a
+    /// disconnected `XdsClient` and a pre-populated cache via
+    /// [`XdsRuntimeParts`].
+    #[cfg(test)]
+    fn build_grpc_channel_from_runtime(&self, parts: XdsRuntimeParts) -> XdsChannelGrpc {
+        self.build_grpc_channel_from_runtime_with(parts, GrpcMakeConnector::new())
+    }
+
+    /// gRPC specialization of [`build_channel`](Self::build_channel): applies
+    /// gRPC retry, deadline and outcome semantics, and reconstructs each
+    /// endpoint request body as [`TonicBody`].
     ///
     /// Only this path enforces gRFC A32 circuit breaking (see
-    /// [`grpc_make_connector`]); transport-generic channels are not limited.
-    fn build_grpc_channel_from_runtime(&self, parts: XdsRuntimeParts) -> XdsChannelGrpc {
+    /// [`grpc_make_connector`]), whichever connector is supplied;
+    /// transport-generic channels are not limited.
+    fn build_grpc_channel_from_runtime_with<MC>(
+        &self,
+        parts: XdsRuntimeParts,
+        make_connector: MC,
+    ) -> XdsChannelGrpc
+    where
+        MC: MakeConnector,
+        MC::Service: Service<
+                Request<TonicBody>,
+                Response = Response<TonicBody>,
+                Error: Into<BoxError>,
+                Future: Send + 'static,
+            > + Load<Metric: Debug + PartialOrd>,
+    {
         self.build_channel::<_, TonicBody, TonicBody, TonicBody, _>(
             parts,
-            grpc_make_connector(ClusterCircuitBreakerRegistry::new()),
+            grpc_make_connector(make_connector, ClusterCircuitBreakerRegistry::new()),
             grpc_endpoint_request,
             Arc::new(RetrySharedConfig::grpc_default()),
             DeadlinePolicy::grpc(),
@@ -719,6 +739,88 @@ impl XdsChannelBuilder {
         self.build_tonic_grpc_channel()
     }
 
+    /// Builds an `XdsChannelGrpc` whose endpoint connections come from a
+    /// custom [`MakeConnector`].
+    ///
+    /// Routing, retry, timeouts, load balancing and gRFC A32 circuit breaking
+    /// are exactly those of [`build_grpc_channel`](Self::build_grpc_channel);
+    /// only the connector differs. Each [`Connector::connect`](crate::Connector::connect) call
+    /// receives the full [`XdsEndpoint`](crate::XdsEndpoint) — the primary
+    /// address, the gRFC A61 additional addresses, and `Endpoint.hostname` —
+    /// so the connector chooses what to dial.
+    ///
+    /// To change only the dial target, wrap the built-in
+    /// [`GrpcMakeConnector`](crate::GrpcMakeConnector): it keeps the cluster's
+    /// gRFC A29 TLS and the default connection settings. To build the
+    /// connection from scratch instead, the [`ClusterConfig`](crate::ClusterConfig)
+    /// handed to the connector exposes the cluster's TLS settings via its
+    /// `tls()` accessor (under a TLS feature).
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    ///
+    /// use tonic::transport::Channel;
+    /// use tonic_xds::{
+    ///     BoxFuture, ClusterConfig, Connector, EndpointAddress, EndpointChannel,
+    ///     GrpcMakeConnector, MakeConnector, XdsChannelBuilder, XdsChannelConfig,
+    ///     XdsEndpoint, XdsUri,
+    /// };
+    ///
+    /// type SharedConnector = Arc<dyn Connector<Service = EndpointChannel<Channel>> + Send + Sync>;
+    ///
+    /// /// Dials `Endpoint.hostname`, on the primary address's port, when the
+    /// /// control plane sets one.
+    /// struct HostnameConnector(SharedConnector);
+    ///
+    /// impl Connector for HostnameConnector {
+    ///     type Service = EndpointChannel<Channel>;
+    ///
+    ///     fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+    ///         match endpoint.hostname() {
+    ///             Some(host) => {
+    ///                 let port = endpoint.address().port();
+    ///                 self.0.connect(&EndpointAddress::new(host, port).into())
+    ///             }
+    ///             None => self.0.connect(endpoint),
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// struct HostnameMakeConnector(GrpcMakeConnector);
+    ///
+    /// impl MakeConnector for HostnameMakeConnector {
+    ///     type Service = EndpointChannel<Channel>;
+    ///
+    ///     fn make_connector(
+    ///         &self,
+    ///         cluster: ClusterConfig<'_>,
+    ///     ) -> Result<SharedConnector, tower::BoxError> {
+    ///         Ok(Arc::new(HostnameConnector(self.0.make_connector(cluster)?)))
+    ///     }
+    /// }
+    ///
+    /// let target = XdsUri::parse("xds:///myservice:50051").unwrap();
+    /// let channel = XdsChannelBuilder::new(XdsChannelConfig::new(target))
+    ///     .build_grpc_channel_with_connector(HostnameMakeConnector(GrpcMakeConnector::new()))
+    ///     .unwrap();
+    /// ```
+    pub fn build_grpc_channel_with_connector<MC>(
+        &self,
+        make_connector: MC,
+    ) -> Result<XdsChannelGrpc, BuildError>
+    where
+        MC: MakeConnector,
+        MC::Service: Service<
+                Request<TonicBody>,
+                Response = Response<TonicBody>,
+                Error: Into<BoxError>,
+                Future: Send + 'static,
+            > + Load<Metric: Debug + PartialOrd>,
+    {
+        let parts = self.build_xds_parts()?;
+        Ok(self.build_grpc_channel_from_runtime_with(parts, make_connector))
+    }
+
     /// Builds a transport-generic xDS channel using a custom connector factory.
     ///
     /// Generalizes [`build_grpc_channel`](Self::build_grpc_channel) to any
@@ -769,8 +871,9 @@ impl XdsChannelBuilder {
     /// # Circuit breaking
     ///
     /// CDS `max_requests` limits (gRFC A32) are enforced only by
-    /// [`build_grpc_channel`](Self::build_grpc_channel); a transport-generic
-    /// channel does not limit in-flight requests.
+    /// [`build_grpc_channel`](Self::build_grpc_channel) and
+    /// [`build_grpc_channel_with_connector`](Self::build_grpc_channel_with_connector);
+    /// a transport-generic channel does not limit in-flight requests.
     pub fn build_transport_channel<MC, B, ResBody>(
         &self,
         make_connector: MC,
@@ -806,13 +909,14 @@ impl XdsChannelBuilder {
     }
 }
 
-/// The connector factory behind gRPC channels: [`GrpcMakeConnector`] with
-/// gRFC A32 circuit breaking on every endpoint, for either load-balancer
-/// backend.
-fn grpc_make_connector(
+/// The connector factory behind gRPC channels: `make_connector` (the built-in
+/// [`GrpcMakeConnector`] or a caller's own) with gRFC A32 circuit breaking on
+/// every endpoint, for either load-balancer backend.
+fn grpc_make_connector<MC>(
+    make_connector: MC,
     circuit_breakers: ClusterCircuitBreakerRegistry,
-) -> CircuitBreakingMakeConnector<GrpcMakeConnector> {
-    CircuitBreakingMakeConnector::new(GrpcMakeConnector::new(), circuit_breakers)
+) -> CircuitBreakingMakeConnector<MC> {
+    CircuitBreakingMakeConnector::new(make_connector, circuit_breakers)
 }
 
 /// The per-cluster load-balancer implementations.
@@ -919,7 +1023,10 @@ mod test_backends {
         ) -> GrpcClusterChannelFactory {
             self.cluster_factory::<_, TonicBody, TonicBody>(
                 cache,
-                grpc_make_connector(ClusterCircuitBreakerRegistry::new_for_test()),
+                grpc_make_connector(
+                    GrpcMakeConnector::new(),
+                    ClusterCircuitBreakerRegistry::new_for_test(),
+                ),
                 #[cfg(feature = "_tls-any")]
                 cert_registry,
                 Arc::new(GrpcOutcomeClassifier),
@@ -1320,8 +1427,7 @@ mod tests {
                 endpoints: servers
                     .iter()
                     .map(|s| ResolvedEndpoint {
-                        address: EndpointAddress::from(s.addr),
-                        additional_addresses: vec![],
+                        endpoint: Arc::new(EndpointAddress::from(s.addr).into()),
                         health_status: HealthStatus::Healthy,
                         load_balancing_weight: 1,
                     })
@@ -1844,7 +1950,7 @@ mod tests {
         type Service = EndpointChannel<EchoEndpoint>;
         fn connect(
             &self,
-            _addr: &EndpointAddress,
+            _endpoint: &crate::client::endpoint::XdsEndpoint,
         ) -> crate::common::async_util::BoxFuture<Self::Service> {
             Box::pin(async move { EndpointChannel::new(EchoEndpoint) })
         }
@@ -1871,4 +1977,111 @@ mod tests {
         let _ =
             XdsChannelBuilder::build_transport_channel::<MockHttpMakeConnector, TestBody, TestBody>;
     };
+
+    type GrpcConnector = Arc<
+        dyn crate::client::endpoint::Connector<Service = EndpointChannel<Channel>> + Send + Sync,
+    >;
+
+    /// Wraps the built-in gRPC connector to dial `Endpoint.hostname` on the
+    /// primary address's port.
+    struct HostnameConnector(GrpcConnector);
+
+    impl crate::client::endpoint::Connector for HostnameConnector {
+        type Service = EndpointChannel<Channel>;
+        fn connect(
+            &self,
+            endpoint: &crate::client::endpoint::XdsEndpoint,
+        ) -> crate::common::async_util::BoxFuture<Self::Service> {
+            let host = endpoint
+                .hostname()
+                .expect("test endpoints carry a hostname");
+            let target = EndpointAddress::new(host, endpoint.address().port());
+            self.0.connect(&target.into())
+        }
+    }
+
+    struct HostnameMakeConnector;
+
+    impl crate::client::endpoint::MakeConnector for HostnameMakeConnector {
+        type Service = EndpointChannel<Channel>;
+        fn make_connector(
+            &self,
+            cluster: crate::client::endpoint::ClusterConfig<'_>,
+        ) -> Result<GrpcConnector, tower::BoxError> {
+            let inner = crate::GrpcMakeConnector::new().make_connector(cluster)?;
+            Ok(Arc::new(HostnameConnector(inner)))
+        }
+    }
+
+    /// A custom connector is handed `Endpoint.hostname` and can dial it in
+    /// place of the primary address, which here is unroutable.
+    #[tokio::test]
+    async fn custom_connector_dials_endpoint_hostname() {
+        for backend in LB_BACKENDS {
+            dials_endpoint_hostname(backend).await;
+        }
+    }
+
+    async fn dials_endpoint_hostname(backend: LbBackend) {
+        use crate::client::endpoint::XdsEndpoint;
+        use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
+        use crate::xds::routing::XdsRouter;
+        use tonic::body::Body as TonicBody;
+
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(1).await;
+        let port = servers[0].addr.port();
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(
+            cluster_name,
+            Arc::new(EndpointsResource {
+                cluster_name: cluster_name.to_string(),
+                localities: vec![LocalityEndpoints {
+                    locality: None,
+                    endpoints: vec![ResolvedEndpoint {
+                        // TEST-NET-1 (RFC 5737): dialing it would time out.
+                        endpoint: Arc::new(
+                            XdsEndpoint::new(EndpointAddress::new("192.0.2.1", port))
+                                .with_hostname("localhost"),
+                        ),
+                        health_status: HealthStatus::Healthy,
+                        load_balancing_weight: 1,
+                    }],
+                    load_balancing_weight: 100,
+                    priority: 0,
+                }],
+            }),
+        );
+
+        let factory = backend.cluster_factory::<HostnameMakeConnector, TonicBody, TonicBody>(
+            cache.clone(),
+            HostnameMakeConnector,
+            #[cfg(feature = "_tls-any")]
+            LbBackend::empty_cert_registry(),
+            Arc::new(super::GrpcOutcomeClassifier),
+        );
+        let channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_factory(
+            Arc::new(XdsRouter::new(&cache)),
+            factory,
+            Arc::new(RetrySharedConfig::grpc_default()),
+            None,
+        );
+
+        let num_requests = 10;
+        let (successful, error_types, _) =
+            send_grpc_requests(GreeterClient::new(channel), num_requests).await;
+        assert_eq!(
+            successful, num_requests,
+            "{backend:?}: expected every request to reach the server via its hostname. \
+             Errors: {error_types:?}",
+        );
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
 }

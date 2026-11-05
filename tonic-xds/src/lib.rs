@@ -298,7 +298,8 @@ pub use client::channel::{
     XdsTransportChannel,
 };
 pub use client::endpoint::{
-    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+    ClusterConfig, Connector, ControlPlaneConfig, ControlPlaneConnector, EndpointAddress,
+    EndpointChannel, MakeConnector,
 };
 pub use client::pool::{XdsClientPool, XdsClientPoolBuilder};
 pub use client::retry::{
@@ -319,7 +320,7 @@ pub use xds::uri::{XdsUri, XdsUriError};
 /// [`ClusterSecurityConfig::from_cluster_bytes`], so callers can name it
 /// without a direct `xds-client` dependency.
 pub use xds_client::Error as XdsError;
-pub use xds_client::TonicCallCredentials;
+pub use xds_client::{ServerConfig, TonicCallCredentials};
 
 #[cfg(feature = "_tls-any")]
 pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};

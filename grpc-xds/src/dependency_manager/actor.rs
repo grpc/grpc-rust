@@ -43,7 +43,7 @@ use super::XdsConfigErrorKind;
 use super::XdsConfigWatcher;
 use super::cluster_graph::walk;
 use super::state::WatchState;
-use super::watches::Update;
+use super::watches::ClusterGraphEvent;
 use super::watches::Watches;
 use crate::resource::ListenerResource;
 use crate::resource::RouteConfigResource;
@@ -77,17 +77,18 @@ impl<T: Resource> Watched<T> {
         self.state.apply(event, |e| e.to_string().into())
     }
 
-    /// The watch's value, or why there isn't one. `failed` makes the error
+    /// The watch's value, or why there isn't one. `make_error` makes the error
     /// from the watch's name and the reason that it failed.
     fn ready(
         &self,
-        failed: impl FnOnce(String, Arc<str>) -> XdsConfigErrorKind,
+        make_error: impl FnOnce(String, Arc<str>) -> XdsConfigErrorKind,
     ) -> Result<&Arc<T>, Blocked> {
         match &self.state {
             WatchState::Pending => Err(Blocked::Pending),
-            WatchState::Failed(reason) => {
-                Err(Blocked::Failed(failed(self.name.clone(), reason.clone())))
-            }
+            WatchState::Failed(reason) => Err(Blocked::Failed(make_error(
+                self.name.clone(),
+                reason.clone(),
+            ))),
             WatchState::Ready { value, .. } => Ok(value),
         }
     }
@@ -118,12 +119,12 @@ struct Actor {
     watches: Watches,
 }
 
-/// The input to the actor: an event from one of its watches.
+/// An event from one of the actor's watches.
 #[derive(Debug)]
-enum Input {
+enum WatchEvent {
     Listener(ResourceEvent<ListenerResource>),
     RouteConfig(ResourceEvent<RouteConfigResource>),
-    Watches(Update),
+    ClusterGraph(ClusterGraphEvent),
 }
 
 /// The virtual host selected for the channel's data-plane authority.
@@ -203,9 +204,9 @@ impl Actor {
         }
     }
 
-    /// Handles inputs in batches until the XdsClient stops.
+    /// Handles events in batches until the XdsClient stops.
     ///
-    /// A batch is every input that is ready without waiting. They are all
+    /// A batch is every event that is ready without waiting. They are all
     /// applied before anything is published, so a response that changes many
     /// resources causes one update rather than one per resource. Batches are
     /// bounded, because the XdsClient doesn't read the next response until the
@@ -213,15 +214,15 @@ impl Actor {
     async fn run_loop(mut self) {
         loop {
             let mut done = Vec::new();
-            let mut next = poll_fn(|cx| self.poll_input(cx)).await;
+            let mut next = poll_fn(|cx| self.poll_watch_event(cx)).await;
             loop {
-                let Some(input) = next else {
+                let Some(event) = next else {
                     self.publisher.error(XdsConfigErrorKind::XdsClientClosed);
                     return;
                 };
-                done.extend(self.handle(input));
-                match poll_fn(|cx| Poll::Ready(self.poll_input(cx))).await {
-                    Poll::Ready(input) => next = input,
+                done.extend(self.handle_watch_event(event));
+                match poll_fn(|cx| Poll::Ready(self.poll_watch_event(cx))).await {
+                    Poll::Ready(event) => next = event,
                     Poll::Pending => break,
                 }
             }
@@ -232,33 +233,33 @@ impl Actor {
     /// Polls the watches, from the top of the resource tree down. Returns
     /// `None` once a watch has closed, which means that the XdsClient has
     /// stopped.
-    fn poll_input(&mut self, cx: &mut Context<'_>) -> Poll<Option<Input>> {
+    fn poll_watch_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<WatchEvent>> {
         if let Poll::Ready(event) = self.listener.watcher.poll_next(cx) {
-            return Poll::Ready(event.map(Input::Listener));
+            return Poll::Ready(event.map(WatchEvent::Listener));
         }
         if let Some(route_config) = &mut self.route_config
             && let Poll::Ready(event) = route_config.watcher.poll_next(cx)
         {
-            return Poll::Ready(event.map(Input::RouteConfig));
+            return Poll::Ready(event.map(WatchEvent::RouteConfig));
         }
         self.watches
             .poll_next(cx)
-            .map(|update| update.map(Input::Watches))
+            .map(|event| event.map(WatchEvent::ClusterGraph))
     }
 
-    /// Applies `input` to the cached states, and returns its flow-control
+    /// Applies `event` to the cached states, and returns its flow-control
     /// token, if it has one.
-    fn handle(&mut self, input: Input) -> Option<ProcessingDone> {
-        match input {
-            Input::Listener(event) => Some(self.listener.apply(event)),
-            Input::RouteConfig(event) => {
+    fn handle_watch_event(&mut self, event: WatchEvent) -> Option<ProcessingDone> {
+        match event {
+            WatchEvent::Listener(event) => Some(self.listener.apply(event)),
+            WatchEvent::RouteConfig(event) => {
                 let route_config = self
                     .route_config
                     .as_mut()
                     .expect("RouteConfiguration events come from the RouteConfiguration watch");
                 Some(route_config.apply(event))
             }
-            Input::Watches(update) => self.watches.apply(update),
+            WatchEvent::ClusterGraph(event) => self.watches.apply(event),
         }
     }
 
@@ -415,7 +416,7 @@ mod tests {
     }
 
     /// Drives an actor whose watches never deliver anything, by applying
-    /// inputs to it directly.
+    /// events to it directly.
     struct Harness {
         actor: Actor,
         recorder: Arc<Recorder>,
@@ -428,27 +429,30 @@ mod tests {
             Self { actor, recorder }
         }
 
-        /// Handles `inputs` as one batch, and returns what it published.
-        async fn batch(&mut self, inputs: impl IntoIterator<Item = Input>) -> Vec<XdsConfigUpdate> {
-            let done = inputs
+        /// Handles `events` as one batch, and returns what it published.
+        async fn batch(
+            &mut self,
+            events: impl IntoIterator<Item = WatchEvent>,
+        ) -> Vec<XdsConfigUpdate> {
+            let done = events
                 .into_iter()
-                .filter_map(|input| self.actor.handle(input))
+                .filter_map(|event| self.actor.handle_watch_event(event))
                 .collect();
             self.actor.finish_batch(done).await;
             std::mem::take(&mut *self.recorder.0.lock().unwrap())
         }
 
-        /// Handles `inputs` as one batch, which must publish a snapshot.
-        async fn config(&mut self, inputs: impl IntoIterator<Item = Input>) -> Arc<XdsConfig> {
-            match <[_; 1]>::try_from(self.batch(inputs).await) {
+        /// Handles `events` as one batch, which must publish a snapshot.
+        async fn config(&mut self, events: impl IntoIterator<Item = WatchEvent>) -> Arc<XdsConfig> {
+            match <[_; 1]>::try_from(self.batch(events).await) {
                 Ok([Ok(config)]) => config,
                 updates => panic!("expected one snapshot, got {updates:?}"),
             }
         }
 
-        /// Handles `inputs` as one batch, which must publish an error.
-        async fn error(&mut self, inputs: impl IntoIterator<Item = Input>) -> XdsConfigError {
-            match <[_; 1]>::try_from(self.batch(inputs).await) {
+        /// Handles `events` as one batch, which must publish an error.
+        async fn error(&mut self, events: impl IntoIterator<Item = WatchEvent>) -> XdsConfigError {
+            match <[_; 1]>::try_from(self.batch(events).await) {
                 Ok([Err(error)]) => error,
                 updates => panic!("expected one error, got {updates:?}"),
             }
@@ -547,45 +551,51 @@ mod tests {
         }
     }
 
-    fn listener(route_source: RouteSource) -> Input {
-        Input::Listener(changed(ListenerResource {
+    fn listener(route_source: RouteSource) -> WatchEvent {
+        WatchEvent::Listener(changed(ListenerResource {
             name: LISTENER.to_owned(),
             route_source,
         }))
     }
 
-    fn lds_rds(route_config: &str) -> Input {
+    fn lds_rds(route_config: &str) -> WatchEvent {
         listener(RouteSource::Rds(route_config.to_owned()))
     }
 
-    fn lds_inline(route_config: RouteConfigResource) -> Input {
+    fn lds_inline(route_config: RouteConfigResource) -> WatchEvent {
         listener(RouteSource::Inline(Arc::new(route_config)))
     }
 
-    fn rds(name: &str, clusters: &[&str]) -> Input {
-        Input::RouteConfig(changed(route_config(name, clusters)))
+    fn rds(name: &str, clusters: &[&str]) -> WatchEvent {
+        WatchEvent::RouteConfig(changed(route_config(name, clusters)))
     }
 
-    fn cds(name: &str, discovery: ClusterDiscovery) -> Input {
+    fn cds(name: &str, discovery: ClusterDiscovery) -> WatchEvent {
         let cluster = ClusterResource {
             name: name.to_owned(),
             discovery,
         };
-        Input::Watches(Update::Cluster(name.to_owned(), changed(cluster)))
+        WatchEvent::ClusterGraph(ClusterGraphEvent::Cluster(
+            name.to_owned(),
+            changed(cluster),
+        ))
     }
 
     /// An EDS cluster, whose EDS service is the cluster's name plus "-eds".
-    fn cds_eds(name: &str) -> Input {
+    fn cds_eds(name: &str) -> WatchEvent {
         let eds_service_name = format!("{name}-eds");
         cds(name, ClusterDiscovery::Eds { eds_service_name })
     }
 
-    fn eds(service: &str) -> Input {
+    fn eds(service: &str) -> WatchEvent {
         let endpoints = EndpointsResource {
             cluster_name: service.to_owned(),
             localities: Vec::new(),
         };
-        Input::Watches(Update::Endpoints(service.to_owned(), changed(endpoints)))
+        WatchEvent::ClusterGraph(ClusterGraphEvent::Endpoints(
+            service.to_owned(),
+            changed(endpoints),
+        ))
     }
 
     fn cluster_names(config: &XdsConfig) -> Vec<&str> {
@@ -640,12 +650,12 @@ mod tests {
         let cases = [
             (
                 vec![],
-                vec![Input::Listener(does_not_exist())],
+                vec![WatchEvent::Listener(does_not_exist())],
                 "[xDS node id: node-1]: LDS resource listener: resource does not exist",
             ),
             (
                 vec![lds_rds("routes")],
-                vec![Input::RouteConfig(does_not_exist())],
+                vec![WatchEvent::RouteConfig(does_not_exist())],
                 "[xDS node id: node-1]: RDS resource routes: resource does not exist",
             ),
             (
@@ -655,10 +665,10 @@ mod tests {
                  RouteConfiguration inline",
             ),
         ];
-        for (setup, inputs, expected) in cases {
+        for (setup, events, expected) in cases {
             let mut harness = Harness::new().await;
             assert!(harness.batch(setup).await.is_empty());
-            let error = harness.error(inputs).await;
+            let error = harness.error(events).await;
             assert_eq!(error.to_string(), expected);
             assert!(harness.watched_clusters().is_empty());
         }
@@ -667,10 +677,12 @@ mod tests {
     #[tokio::test]
     async fn lasting_error_is_published_once() {
         let mut harness = Harness::new().await;
-        harness.error([Input::Listener(does_not_exist())]).await;
+        harness
+            .error([WatchEvent::Listener(does_not_exist())])
+            .await;
         assert!(
             harness
-                .batch([Input::Listener(does_not_exist())])
+                .batch([WatchEvent::Listener(does_not_exist())])
                 .await
                 .is_empty()
         );
@@ -678,7 +690,9 @@ mod tests {
         harness
             .config([lds_inline(route_config("inline", &[]))])
             .await;
-        harness.error([Input::Listener(does_not_exist())]).await;
+        harness
+            .error([WatchEvent::Listener(does_not_exist())])
+            .await;
     }
 
     #[tokio::test]
@@ -699,12 +713,14 @@ mod tests {
     async fn listener_error_keeps_the_watches() {
         let mut harness = Harness::resolved(&["a"]).await;
 
-        let error = harness.error([Input::Listener(does_not_exist())]).await;
+        let error = harness
+            .error([WatchEvent::Listener(does_not_exist())])
+            .await;
         assert!(matches!(error.kind, XdsConfigErrorKind::Listener { .. }));
         assert_eq!(harness.route_config_watch(), Some("routes"));
         assert_eq!(harness.watched_clusters(), ["a"]);
         assert_eq!(harness.watched_endpoints(), ["a-eds"]);
-        // A cluster update can't publish anything until the Listener recovers.
+        // A cluster event can't publish anything until the Listener recovers.
         assert!(harness.batch([eds("a-eds")]).await.is_empty());
 
         let config = harness.config([lds_rds("routes")]).await;
@@ -746,7 +762,9 @@ mod tests {
             host: "dns.example.com".to_owned(),
             port: 443,
         };
-        let config = harness.config([Input::Watches(Update::Dns(target))]).await;
+        let config = harness
+            .config([WatchEvent::ClusterGraph(ClusterGraphEvent::Dns(target))])
+            .await;
         assert_eq!(
             leaf_note(&config, "dns"),
             Some("LogicalDNS clusters are not supported yet")
@@ -765,9 +783,12 @@ mod tests {
 
         let config = harness
             .config([
-                Input::Listener(ambient("lds down")),
-                Input::RouteConfig(ambient("rds down")),
-                Input::Watches(Update::Cluster("a".to_owned(), ambient("cds down"))),
+                WatchEvent::Listener(ambient("lds down")),
+                WatchEvent::RouteConfig(ambient("rds down")),
+                WatchEvent::ClusterGraph(ClusterGraphEvent::Cluster(
+                    "a".to_owned(),
+                    ambient("cds down"),
+                )),
             ])
             .await;
         assert_eq!(
@@ -786,8 +807,8 @@ mod tests {
         harness
             .batch([lds_inline(route_config("inline", &["a"]))])
             .await;
-        let failure = Update::Cluster("a".to_owned(), does_not_exist());
-        let config = harness.config([Input::Watches(failure)]).await;
+        let failure = ClusterGraphEvent::Cluster("a".to_owned(), does_not_exist());
+        let config = harness.config([WatchEvent::ClusterGraph(failure)]).await;
         let error = config.clusters["a"].as_ref().unwrap_err();
         assert_eq!(error.message(), "CDS resource a: resource does not exist");
     }

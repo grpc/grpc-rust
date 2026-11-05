@@ -64,9 +64,9 @@ pub(super) struct Watches {
     dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
     /// DNS targets whose resolution hasn't been reported yet.
     unresolved_dns: Vec<DnsTarget>,
-    /// Updates that have been polled but not yet returned by
+    /// Events that have been polled but not yet returned by
     /// [`Self::poll_next`]. `None` means that a watcher has closed.
-    ready: VecDeque<Option<Update>>,
+    ready: VecDeque<Option<ClusterGraphEvent>>,
 }
 
 /// An xDS resource watch, and the cached state of its resource.
@@ -78,7 +78,7 @@ struct Watch<T: Resource> {
 
 /// An event for one of the [`Watches`].
 #[derive(Debug)]
-pub(super) enum Update {
+pub(super) enum ClusterGraphEvent {
     Cluster(String, ResourceEvent<ClusterResource>),
     Endpoints(String, ResourceEvent<EndpointsResource>),
     /// A LogicalDNS target has been resolved.
@@ -108,8 +108,8 @@ impl Watches {
     ///
     /// A new watch starts as [`WatchState::Pending`].
     ///
-    /// The caller must have taken every update from [`Self::poll_next`]
-    /// first, so that no update is left for a watch that this drops.
+    /// The caller must have taken every event from [`Self::poll_next`]
+    /// first, so that no event is left for a watch that this drops.
     pub(super) async fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
         reconcile(client, &mut self.clusters, &required.clusters).await;
         reconcile(client, &mut self.endpoints, &required.eds_services).await;
@@ -124,12 +124,12 @@ impl Watches {
         }
     }
 
-    /// Returns the next update, or `None` once the XdsClient has stopped.
+    /// Returns the next event, or `None` once the XdsClient has stopped.
     ///
-    /// When no polled updates are left, this polls every watcher and keeps
-    /// all the updates that are ready, so that a response for many resources
+    /// When no polled events are left, this polls every watcher and keeps
+    /// all the events that are ready, so that a response for many resources
     /// costs one pass over the watchers rather than one pass per resource.
-    pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Update>> {
+    pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<ClusterGraphEvent>> {
         if self.ready.is_empty() {
             self.poll_watchers(cx);
         }
@@ -137,22 +137,32 @@ impl Watches {
     }
 
     fn poll_watchers(&mut self, cx: &mut Context<'_>) {
-        poll_ready(&mut self.clusters, cx, Update::Cluster, &mut self.ready);
-        poll_ready(&mut self.endpoints, cx, Update::Endpoints, &mut self.ready);
+        poll_ready(
+            &mut self.clusters,
+            cx,
+            ClusterGraphEvent::Cluster,
+            &mut self.ready,
+        );
+        poll_ready(
+            &mut self.endpoints,
+            cx,
+            ClusterGraphEvent::Endpoints,
+            &mut self.ready,
+        );
         // Resolution always fails for now, so it is reported straight away.
         self.ready.extend(
             self.unresolved_dns
                 .drain(..)
-                .map(|target| Some(Update::Dns(target))),
+                .map(|target| Some(ClusterGraphEvent::Dns(target))),
         );
     }
 
-    /// Applies `update` to its cached state, and returns its flow-control
+    /// Applies `event` to its cached state, and returns its flow-control
     /// token, if it has one.
-    pub(super) fn apply(&mut self, update: Update) -> Option<ProcessingDone> {
-        const WATCHED: &str = "an update's watch is dropped only once its updates are taken";
-        match update {
-            Update::Cluster(name, event) => {
+    pub(super) fn apply(&mut self, event: ClusterGraphEvent) -> Option<ProcessingDone> {
+        const WATCHED: &str = "an event's watch is dropped only once its events are taken";
+        match event {
+            ClusterGraphEvent::Cluster(name, event) => {
                 let watch = self.clusters.get_mut(&name).expect(WATCHED);
                 Some(
                     watch
@@ -160,7 +170,7 @@ impl Watches {
                         .apply(event, |e| format!("CDS resource {name}: {e}").into()),
                 )
             }
-            Update::Endpoints(name, event) => {
+            ClusterGraphEvent::Endpoints(name, event) => {
                 let watch = self.endpoints.get_mut(&name).expect(WATCHED);
                 Some(
                     watch
@@ -168,7 +178,7 @@ impl Watches {
                         .apply(event, |e| format!("EDS resource {name}: {e}").into()),
                 )
             }
-            Update::Dns(target) => {
+            ClusterGraphEvent::Dns(target) => {
                 let state = self.dns.get_mut(&target).expect(WATCHED);
                 *state = WatchState::Failed(DNS_UNSUPPORTED.into());
                 None
@@ -195,18 +205,19 @@ async fn reconcile<T: Resource>(
     }
 }
 
-/// Adds each event that is ready on `watches` to `ready` as an [`Update`]
-/// made by `update`, followed by `None` for each watcher that has closed.
+/// Adds each event that is ready on `watches` to `ready`, as a
+/// [`ClusterGraphEvent`] made by `make_event`, followed by `None` for each
+/// watcher that has closed.
 fn poll_ready<T: Resource>(
     watches: &mut HashMap<String, Watch<T>>,
     cx: &mut Context<'_>,
-    update: fn(String, ResourceEvent<T>) -> Update,
-    ready: &mut VecDeque<Option<Update>>,
+    make_event: fn(String, ResourceEvent<T>) -> ClusterGraphEvent,
+    ready: &mut VecDeque<Option<ClusterGraphEvent>>,
 ) {
     for (name, watch) in watches {
         while let Poll::Ready(event) = watch.watcher.poll_next(cx) {
             let closed = event.is_none();
-            ready.push_back(event.map(|event| update(name.clone(), event)));
+            ready.push_back(event.map(|event| make_event(name.clone(), event)));
             if closed {
                 break;
             }
@@ -284,12 +295,12 @@ mod tests {
             .await;
         assert_eq!(watches.dns[&target], WatchState::Pending);
 
-        // The failure arrives as an update, which starts the next batch.
+        // The failure arrives as an event, which starts the next batch.
         let mut cx = Context::from_waker(Waker::noop());
-        let Poll::Ready(Some(update)) = watches.poll_next(&mut cx) else {
-            panic!("expected the DNS update");
+        let Poll::Ready(Some(event)) = watches.poll_next(&mut cx) else {
+            panic!("expected the DNS event");
         };
-        assert!(watches.apply(update).is_none());
+        assert!(watches.apply(event).is_none());
         assert_eq!(
             watches.dns[&target],
             WatchState::Failed(DNS_UNSUPPORTED.into())

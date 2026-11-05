@@ -35,7 +35,7 @@
 //! a [`Connector`], while [`discover_addresses`] emits a bare [`IdleChannel`]
 //! for balancers that own the connection lifecycle themselves.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -43,7 +43,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower::BoxError;
 use tower::discover::Change;
 
-use crate::client::endpoint::{Connector, EndpointAddress};
+use crate::client::endpoint::{Connector, EndpointAddress, XdsEndpoint};
 use crate::client::lb::BoxDiscover;
 use crate::client::loadbalance::channel_state::IdleChannel;
 use crate::common::async_util::BoxFuture;
@@ -74,8 +74,8 @@ impl<S: Send + 'static> EndpointManager<S> {
     /// Returns a stream of endpoint changes for the given cache watch.
     ///
     /// Diffs each snapshot against the previous set of healthy endpoints,
-    /// emitting `Change::Insert` for new endpoints and `Change::Remove`
-    /// for removed ones.
+    /// emitting `Change::Insert` for new or changed endpoints and
+    /// `Change::Remove` for removed ones.
     ///
     /// Each inserted endpoint is connected through the [`Connector`], so it
     /// reaches the balancer already established. A CDS update therefore only
@@ -86,21 +86,21 @@ impl<S: Send + 'static> EndpointManager<S> {
         watch: CacheWatch<EndpointsResource>,
     ) -> BoxDiscover<EndpointAddress, S> {
         let connector = self.connector.clone();
-        spawn_diff_loop(watch, move |addr| connector.connect(addr))
+        spawn_diff_loop(watch, move |endpoint| connector.connect(endpoint))
     }
 }
 
-/// Returns a stream of endpoint changes carrying addresses only.
+/// Returns a stream of endpoint changes carrying unconnected endpoints.
 ///
 /// Each added endpoint is emitted as an [`IdleChannel`] — the initial state of
 /// the load balancer's channel state machine — without connecting. For
 /// balancers that drive connect / eject / reconnect themselves and so need the
-/// address rather than a live channel.
+/// endpoint rather than a live channel.
 pub(crate) fn discover_addresses(
     watch: CacheWatch<EndpointsResource>,
 ) -> BoxDiscover<EndpointAddress, IdleChannel> {
-    spawn_diff_loop(watch, |addr| {
-        let channel = IdleChannel::new(addr.clone());
+    spawn_diff_loop(watch, |endpoint| {
+        let channel = IdleChannel::from(Arc::clone(endpoint));
         Box::pin(async move { channel })
     })
 }
@@ -116,7 +116,7 @@ fn spawn_diff_loop<S, F>(
 ) -> BoxDiscover<EndpointAddress, S>
 where
     S: Send + 'static,
-    F: Fn(&EndpointAddress) -> BoxFuture<S> + Send + 'static,
+    F: Fn(&Arc<XdsEndpoint>) -> BoxFuture<S> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel(ENDPOINT_CHANNEL_CAPACITY);
     tokio::spawn(diff_loop(watch, make_service, tx));
@@ -126,28 +126,38 @@ where
 /// Background task: watches endpoint snapshots and emits incremental changes.
 ///
 /// Each time a new [`EndpointsResource`] arrives from the cache, we diff
-/// `healthy_endpoints()` against the previous set and emit `Insert` for
-/// new endpoints followed by `Remove` for gone ones.
+/// `healthy_endpoints()` against the previous snapshot, keyed by primary
+/// address, and emit `Insert` for new endpoints followed by `Remove` for gone
+/// ones. An endpoint whose primary address is unchanged but whose additional
+/// addresses or hostname changed is re-emitted as an `Insert` under the same
+/// key, which the balancers treat as replacing the service there, so the
+/// connector sees the updated endpoint.
 async fn diff_loop<S, F>(
     mut watch: CacheWatch<EndpointsResource>,
     make_service: F,
     tx: mpsc::Sender<Result<Change<EndpointAddress, S>, BoxError>>,
 ) where
     S: Send + 'static,
-    F: Fn(&EndpointAddress) -> BoxFuture<S>,
+    F: Fn(&Arc<XdsEndpoint>) -> BoxFuture<S>,
 {
-    let mut active: HashSet<EndpointAddress> = HashSet::new();
+    let mut active: HashMap<EndpointAddress, Arc<XdsEndpoint>> = HashMap::new();
 
     while let Some(endpoints) = watch.next().await {
-        let new_set: HashSet<EndpointAddress> = endpoints
-            .healthy_endpoints()
-            .map(|ep| ep.address.clone())
-            .collect();
+        let mut latest: HashMap<EndpointAddress, Arc<XdsEndpoint>> = HashMap::new();
+        for ep in endpoints.healthy_endpoints() {
+            // Endpoints sharing a primary address collapse to the first.
+            latest
+                .entry(ep.endpoint.address().clone())
+                .or_insert_with(|| Arc::clone(&ep.endpoint));
+        }
 
-        for added in new_set.difference(&active) {
-            let svc = make_service(added).await;
+        for (addr, endpoint) in &latest {
+            if active.get(addr) == Some(endpoint) {
+                continue;
+            }
+            let svc = make_service(endpoint).await;
             if tx
-                .send(Ok(Change::Insert(added.clone(), svc)))
+                .send(Ok(Change::Insert(addr.clone(), svc)))
                 .await
                 .is_err()
             {
@@ -155,13 +165,13 @@ async fn diff_loop<S, F>(
             }
         }
 
-        for removed in active.difference(&new_set) {
+        for removed in active.keys().filter(|addr| !latest.contains_key(*addr)) {
             if tx.send(Ok(Change::Remove(removed.clone()))).await.is_err() {
                 return;
             }
         }
 
-        active = new_set;
+        active = latest;
     }
 }
 
@@ -173,14 +183,18 @@ mod tests {
     use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
     use tokio_stream::StreamExt;
 
-    /// Test [`Connector`] that returns the address as its `Service` (just a
-    /// `String`).
+    /// Test [`Connector`] whose `Service` is a `String` describing the
+    /// endpoint it was asked to connect: every address, then the hostname.
     struct StringConnector;
 
     impl Connector for StringConnector {
         type Service = String;
-        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
-            let s = addr.to_string();
+        fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+            let addrs: Vec<String> = endpoint.addresses().map(ToString::to_string).collect();
+            let s = match endpoint.hostname() {
+                Some(hostname) => format!("{} ({hostname})", addrs.join(",")),
+                None => addrs.join(","),
+            };
             Box::pin(async move { s })
         }
     }
@@ -197,12 +211,40 @@ mod tests {
                 endpoints: addrs
                     .iter()
                     .map(|(host, port)| ResolvedEndpoint {
-                        address: EndpointAddress::new(*host, *port),
-                        additional_addresses: vec![],
+                        endpoint: Arc::new(EndpointAddress::new(*host, *port).into()),
                         health_status: HealthStatus::Healthy,
                         load_balancing_weight: 1,
                     })
                     .collect(),
+                load_balancing_weight: 100,
+                priority: 0,
+            }],
+        })
+    }
+
+    /// A single-endpoint resource for `10.0.0.1:8080` with the given extras.
+    fn make_single_endpoint(
+        additional: &[&str],
+        hostname: Option<&str>,
+        health_status: HealthStatus,
+    ) -> Arc<EndpointsResource> {
+        Arc::new(EndpointsResource {
+            cluster_name: "c1".to_string(),
+            localities: vec![LocalityEndpoints {
+                locality: None,
+                endpoints: vec![ResolvedEndpoint {
+                    endpoint: Arc::new(
+                        XdsEndpoint::new(EndpointAddress::new("10.0.0.1", 8080))
+                            .with_additional_addresses(
+                                additional
+                                    .iter()
+                                    .map(|host| EndpointAddress::new(*host, 8080)),
+                            )
+                            .with_hostname(hostname.unwrap_or_default()),
+                    ),
+                    health_status,
+                    load_balancing_weight: 1,
+                }],
                 load_balancing_weight: 100,
                 priority: 0,
             }],
@@ -292,8 +334,7 @@ mod tests {
             localities: vec![LocalityEndpoints {
                 locality: None,
                 endpoints: vec![ResolvedEndpoint {
-                    address: EndpointAddress::new("10.0.0.1", 8080),
-                    additional_addresses: vec![],
+                    endpoint: Arc::new(EndpointAddress::new("10.0.0.1", 8080).into()),
                     health_status: HealthStatus::Unhealthy,
                     load_balancing_weight: 1,
                 }],
@@ -373,5 +414,78 @@ mod tests {
         }
         assert!(saw_remove, "should have removed old endpoint");
         assert!(saw_insert, "should have inserted new endpoint");
+    }
+
+    /// A connector sees every field of the endpoint, and a change to any
+    /// field but the primary address reconnects under the same key.
+    #[tokio::test]
+    async fn changed_endpoint_reinserted_under_same_key() {
+        let cache = XdsCache::new();
+        let manager = EndpointManager::new(test_connector());
+
+        cache.update_endpoints("c1", make_single_endpoint(&[], None, HealthStatus::Healthy));
+        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        match stream.next().await.unwrap().unwrap() {
+            Change::Insert(_, svc) => assert_eq!(svc, "10.0.0.1:8080"),
+            Change::Remove(_) => panic!("expected Insert"),
+        }
+
+        let updates = [
+            (
+                make_single_endpoint(&["2001:db8::1"], None, HealthStatus::Healthy),
+                "10.0.0.1:8080,[2001:db8::1]:8080",
+            ),
+            (
+                make_single_endpoint(&["2001:db8::1"], Some("backend-1"), HealthStatus::Healthy),
+                "10.0.0.1:8080,[2001:db8::1]:8080 (backend-1)",
+            ),
+        ];
+        for (update, expected) in updates {
+            cache.update_endpoints("c1", update);
+            match stream.next().await.unwrap().unwrap() {
+                Change::Insert(addr, svc) => {
+                    assert_eq!(addr, EndpointAddress::new("10.0.0.1", 8080));
+                    assert_eq!(svc, expected);
+                }
+                Change::Remove(_) => panic!("expected Insert for changed endpoint"),
+            }
+        }
+    }
+
+    /// Re-delivering an endpoint with the same addresses and hostname, even
+    /// under a different usable health status, does not reconnect it.
+    #[tokio::test]
+    async fn unchanged_endpoint_not_reinserted() {
+        let cache = XdsCache::new();
+        let manager = EndpointManager::new(test_connector());
+
+        cache.update_endpoints(
+            "c1",
+            make_single_endpoint(&["2001:db8::1"], Some("backend-1"), HealthStatus::Healthy),
+        );
+        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let _ = stream.next().await; // consume initial
+
+        cache.update_endpoints(
+            "c1",
+            make_single_endpoint(&["2001:db8::1"], Some("backend-1"), HealthStatus::Unknown),
+        );
+        // The cache is a watch channel, so let the diff loop see the
+        // re-delivery before the next update would coalesce it away.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // A later, real change must be the next item: nothing was emitted for
+        // the re-delivery.
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.2", 8080)]));
+
+        let mut changes = Vec::new();
+        for _ in 0..2 {
+            changes.push(match stream.next().await.unwrap().unwrap() {
+                Change::Insert(addr, _) => format!("insert {addr}"),
+                Change::Remove(addr) => format!("remove {addr}"),
+            });
+        }
+        assert_eq!(changes, ["insert 10.0.0.2:8080", "remove 10.0.0.1:8080"]);
     }
 }

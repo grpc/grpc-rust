@@ -73,6 +73,11 @@ impl EndpointAddress {
         }
     }
 
+    /// The port number.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Returns the IP address, or `None` if the host is a hostname.
     pub(crate) fn ip(&self) -> Option<IpAddr> {
         match self.host {
@@ -105,6 +110,90 @@ impl From<SocketAddr> for EndpointAddress {
                 port: v6_addr.port(),
             },
         }
+    }
+}
+
+/// An endpoint from EDS, as handed to [`Connector::connect`].
+///
+/// Carries what the control plane says about how to reach one backend: its
+/// primary [`address`](Self::address), further
+/// [`additional_addresses`](Self::additional_addresses) of the same backend
+/// (gRFC A61, e.g. an IPv4 address alongside an IPv6 primary), and the
+/// [`hostname`](Self::hostname) from `Endpoint.hostname`. The [`Connector`]
+/// decides which of these to dial; the built-in connectors dial the primary
+/// address.
+///
+/// The load balancer identifies the endpoint by its primary address, so
+/// picking and outlier detection follow that address. If the control plane
+/// changes any other field of an endpoint, the endpoint is reconnected through
+/// the connector.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct XdsEndpoint {
+    address: EndpointAddress,
+    additional_addresses: Vec<EndpointAddress>,
+    hostname: Option<String>,
+}
+
+impl XdsEndpoint {
+    /// Creates an endpoint with a single address and no hostname.
+    pub fn new(address: EndpointAddress) -> Self {
+        Self {
+            address,
+            additional_addresses: Vec::new(),
+            hostname: None,
+        }
+    }
+
+    /// Sets the additional addresses, replacing any set before.
+    #[must_use]
+    pub fn with_additional_addresses(
+        mut self,
+        addresses: impl IntoIterator<Item = EndpointAddress>,
+    ) -> Self {
+        self.additional_addresses = addresses.into_iter().collect();
+        self
+    }
+
+    /// Sets the hostname. An empty string clears it, matching how an unset
+    /// `Endpoint.hostname` is read.
+    #[must_use]
+    pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        let hostname = hostname.into();
+        self.hostname = (!hostname.is_empty()).then_some(hostname);
+        self
+    }
+
+    /// The primary address (`Endpoint.address`). The load balancer keys the
+    /// endpoint by it.
+    pub fn address(&self) -> &EndpointAddress {
+        &self.address
+    }
+
+    /// The addresses from `Endpoint.additional_addresses` (gRFC A61), in
+    /// control-plane order. Empty when the control plane sent none.
+    pub fn additional_addresses(&self) -> &[EndpointAddress] {
+        &self.additional_addresses
+    }
+
+    /// Every address of the endpoint: the primary first, then the additional
+    /// ones in control-plane order.
+    pub fn addresses(&self) -> impl Iterator<Item = &EndpointAddress> {
+        std::iter::once(&self.address).chain(&self.additional_addresses)
+    }
+
+    /// `Endpoint.hostname`, or `None` when the control plane left it empty.
+    ///
+    /// xDS does not define it as a dial target, so the built-in connectors
+    /// ignore it; a custom [`Connector`] may resolve and dial it instead of the
+    /// addresses.
+    pub fn hostname(&self) -> Option<&str> {
+        self.hostname.as_deref()
+    }
+}
+
+impl From<EndpointAddress> for XdsEndpoint {
+    fn from(address: EndpointAddress) -> Self {
+        Self::new(address)
     }
 }
 
@@ -208,10 +297,13 @@ pub trait Connector {
     /// The service type produced by this connector.
     type Service;
 
-    /// Connect to the given endpoint address.
+    /// Connect to the given endpoint.
+    ///
+    /// The implementation chooses what to dial from the endpoint's addresses
+    /// and hostname; see [`XdsEndpoint`].
     fn connect(
         &self,
-        addr: &EndpointAddress,
+        endpoint: &XdsEndpoint,
     ) -> crate::common::async_util::BoxFuture<Self::Service>;
 }
 

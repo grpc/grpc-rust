@@ -41,15 +41,13 @@
 use std::sync::Arc;
 
 use grpc::__unstable::client::load_balancing::ChannelController;
+use grpc::__unstable::client::load_balancing::FailingPicker;
 use grpc::__unstable::client::load_balancing::LbConfigJson;
 use grpc::__unstable::client::load_balancing::LbPolicy;
 use grpc::__unstable::client::load_balancing::LbPolicyBuilder;
 use grpc::__unstable::client::load_balancing::LbPolicyOptions;
 use grpc::__unstable::client::load_balancing::LbState;
 use grpc::__unstable::client::load_balancing::ParsedLbConfig;
-use grpc::__unstable::client::load_balancing::PickOptions;
-use grpc::__unstable::client::load_balancing::PickResult;
-use grpc::__unstable::client::load_balancing::Picker;
 use grpc::__unstable::client::load_balancing::WorkData;
 use grpc::__unstable::client::load_balancing::WorkScheduler;
 use grpc::__unstable::client::load_balancing::child_manager::Child;
@@ -57,8 +55,6 @@ use grpc::__unstable::client::load_balancing::registry::GLOBAL_LB_REGISTRY;
 use grpc::__unstable::client::name_resolution::Endpoint;
 use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::__unstable::rt::GrpcRuntime;
-use grpc::StatusCodeError;
-use grpc::StatusError;
 use grpc::client::ConnectivityState;
 use serde::Deserialize;
 use serde_json::Value;
@@ -94,13 +90,6 @@ struct WrrLocalityPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     #[cfg(test)]
     child_policy_name: &'static str,
-}
-
-// Picker that fails every pick with UNAVAILABLE when no weighted localities
-// can be configured.
-#[derive(Debug)]
-struct FailingPicker {
-    error: String,
 }
 
 impl WrrLocalityBuilder {
@@ -311,15 +300,6 @@ impl LbPolicy for WrrLocalityPolicy {
     }
 }
 
-impl Picker for FailingPicker {
-    fn pick(&self, _options: PickOptions<'_>) -> PickResult {
-        PickResult::Fail(StatusError::new(
-            StatusCodeError::Unavailable,
-            self.error.clone(),
-        ))
-    }
-}
-
 /// Register WRR locality as an LbPolicy.
 pub(crate) fn reg() {
     GLOBAL_LB_REGISTRY.add_builder(WrrLocalityBuilder);
@@ -330,13 +310,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    use grpc::__unstable::client::load_balancing::QueuingPicker;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
-    use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
-    use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
-    use grpc::client::CallOptions;
-    use grpc::client::RequestHeaders;
-    use grpc::core::Address;
-    use serde::Serialize;
+    use grpc::__unstable::client::load_balancing::test_utils;
+    use grpc::__unstable::client::load_balancing::test_utils::StubPolicyFuncs;
+    use grpc::__unstable::client::load_balancing::test_utils::TestEnv;
+    use grpc::__unstable::rt::default_runtime;
 
     use super::*;
 
@@ -383,7 +362,7 @@ mod tests {
 
     #[test]
     fn resolver_update_synthesizes_weighted_targets_and_forwards_update() {
-        let mut t = Harness::new();
+        let (mut t, received) = new_recording_env("mock_wrr_synthesizes_targets");
         let endpoints = vec![
             locality_endpoint("region-1", "zone-1", "subzone-1", 20),
             locality_endpoint("region-2", "zone-2", "subzone-2", 80),
@@ -393,14 +372,15 @@ mod tests {
         update.endpoints = Ok(endpoints.clone());
         update.resolution_note = Some("eds_note".to_string());
 
-        t.update(update, MockBehavior::Ready)
+        t.policy
+            .resolver_update(update, &WrrLocalityConfig::default(), &mut t.tcc)
             .expect("resolver update should succeed");
+        t.expect_queuing_picker();
+        t.expect_no_events();
 
-        let state = t.take_state();
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        let picked = assert_picks(&*state.picker);
+        let (received_update, targets) = received.lock().unwrap().take().unwrap();
         assert_eq!(
-            picked.targets,
+            targets,
             BTreeMap::from([
                 (
                     "{region=\"region-1\", zone=\"zone-1\", sub_zone=\"subzone-1\"}".to_string(),
@@ -412,14 +392,13 @@ mod tests {
                 ),
             ])
         );
-        assert_eq!(picked.update.endpoints, Ok(endpoints));
-        assert_eq!(picked.update.attributes.get(), Some(&"custom_attr"));
-        assert_eq!(picked.update.resolution_note.as_deref(), Some("eds_note"));
+        assert_eq!(received_update.endpoints, Ok(endpoints));
+        assert_eq!(received_update.attributes.get(), Some(&"custom_attr"));
+        assert_eq!(received_update.resolution_note.as_deref(), Some("eds_note"));
     }
 
     #[test]
     fn conflicting_weights_for_same_locality_uses_first_weight() {
-        let mut t = Harness::new();
         let endpoints = vec![
             locality_endpoint("r1", "z1", "sz1", 35),
             locality_endpoint("r1", "z1", "sz1", 35),
@@ -427,7 +406,7 @@ mod tests {
         ];
 
         assert_eq!(
-            t.parse_child_targets(&endpoints),
+            parse_child_targets(&endpoints),
             BTreeMap::from([(
                 "{region=\"r1\", zone=\"z1\", sub_zone=\"sz1\"}".to_string(),
                 35,
@@ -437,7 +416,6 @@ mod tests {
 
     #[test]
     fn endpoints_without_locality_or_positive_weight_are_skipped() {
-        let mut t = Harness::new();
         let mut missing_weight = Endpoint::default();
         missing_weight.attributes = missing_weight.attributes.add(Locality {
             region: "r1".to_string(),
@@ -455,7 +433,7 @@ mod tests {
         ];
 
         assert_eq!(
-            t.parse_child_targets(&endpoints),
+            parse_child_targets(&endpoints),
             BTreeMap::from([(
                 "{region=\"r3\", zone=\"z3\", sub_zone=\"sz3\"}".to_string(),
                 50,
@@ -465,25 +443,22 @@ mod tests {
 
     #[test]
     fn dynamic_locality_updates_refresh_targets() {
-        let mut t = Harness::new();
+        let (mut t, received) = new_recording_env("mock_wrr_dynamic_updates");
 
-        let mut first = ResolverUpdate::default();
-        first.endpoints = Ok(vec![
+        t.send_resolver_update(vec![
             locality_endpoint("r1", "z1", "sz1", 10),
             locality_endpoint("r2", "z2", "sz2", 20),
-        ]);
-        t.update(first, MockBehavior::Ready)
-            .expect("initial update should succeed");
-        let picked = assert_picks(&*t.take_state().picker);
-        assert_eq!(picked.targets.len(), 2);
+        ])
+        .expect("initial update should succeed");
+        t.expect_queuing_picker();
+        assert_eq!(received.lock().unwrap().take().unwrap().1.len(), 2);
 
-        let mut second = ResolverUpdate::default();
-        second.endpoints = Ok(vec![locality_endpoint("r2", "z2", "sz2", 75)]);
-        t.update(second, MockBehavior::Ready)
+        t.send_resolver_update(vec![locality_endpoint("r2", "z2", "sz2", 75)])
             .expect("second update should succeed");
-        let picked = assert_picks(&*t.take_state().picker);
+        t.expect_queuing_picker();
+        t.expect_no_events();
         assert_eq!(
-            picked.targets,
+            received.lock().unwrap().take().unwrap().1,
             BTreeMap::from([(
                 "{region=\"r2\", zone=\"z2\", sub_zone=\"sz2\"}".to_string(),
                 75,
@@ -493,14 +468,12 @@ mod tests {
 
     #[test]
     fn empty_or_unweighted_endpoints_transitions_to_transient_failure() {
-        let mut t = Harness::new();
+        let mut t = new_env();
 
-        // Establish an active READY child first to verify it is replaced.
-        let mut initial = ResolverUpdate::default();
-        initial.endpoints = Ok(vec![locality_endpoint("r1", "z1", "sz1", 10)]);
-        t.update(initial, MockBehavior::Ready)
+        // Establish an active child first to verify it is replaced.
+        t.send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
             .expect("initial update should succeed");
-        assert_eq!(t.take_state().connectivity_state, ConnectivityState::Ready);
+        t.expect_queuing_picker();
 
         // Update with an endpoint missing locality weight.
         let mut unweighted = Endpoint::default();
@@ -509,140 +482,148 @@ mod tests {
             zone: "z1".to_string(),
             sub_zone: "sz1".to_string(),
         });
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Ok(vec![unweighted]);
 
         let err = t
-            .update(update, MockBehavior::Ready)
+            .send_resolver_update(vec![unweighted])
             .expect_err("update without weighted localities should fail");
-        assert!(err.contains("no localities with positive weight"));
-
-        let state = t.take_state();
         assert_eq!(
-            state.connectivity_state,
-            ConnectivityState::TransientFailure
+            err,
+            "xds_wrr_locality_experimental: no localities with positive weight in resolver update"
         );
-        assert_fails_unavailable(&*state.picker, "no localities with positive weight");
+
+        t.expect_failing_picker(&err);
+        t.expect_no_events();
     }
 
     #[test]
     fn resolver_error_without_child_transitions_to_transient_failure() {
-        let mut t = Harness::new();
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Err("eds stream closed".to_string());
+        let mut t = new_env();
 
         let err = t
-            .update(update, MockBehavior::Ready)
+            .send_resolver_error("eds stream closed".to_string())
             .expect_err("resolver error without child should fail update");
-        assert!(err.contains("eds stream closed"));
-
-        let state = t.take_state();
         assert_eq!(
-            state.connectivity_state,
-            ConnectivityState::TransientFailure
+            err,
+            "xds_wrr_locality_experimental: resolver error: eds stream closed"
         );
-        assert_fails_unavailable(&*state.picker, "eds stream closed");
+
+        t.expect_failing_picker(&err);
+        t.expect_no_events();
     }
 
     #[test]
     fn resolver_error_with_existing_child_forwards_to_child() {
-        let mut t = Harness::new();
-        let mut initial = ResolverUpdate::default();
-        initial.endpoints = Ok(vec![locality_endpoint("r1", "z1", "sz1", 40)]);
-        t.update(initial, MockBehavior::Ready)
+        let (mut t, received) = new_recording_env("mock_wrr_resolver_error_forwarded");
+        t.send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 40)])
             .expect("initial update should succeed");
-        assert_eq!(t.take_state().connectivity_state, ConnectivityState::Ready);
+        t.expect_queuing_picker();
 
-        let mut err_update = ResolverUpdate::default();
-        err_update.endpoints = Err("eds stream closed".to_string());
-        t.update(err_update, MockBehavior::Ready)
+        t.send_resolver_error("eds stream closed".to_string())
             .expect("resolver error should be forwarded to existing child");
+        t.expect_queuing_picker();
+        t.expect_no_events();
 
-        let state = t.take_state();
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        let picked = assert_picks(&*state.picker);
+        let (received_update, targets) = received.lock().unwrap().take().unwrap();
         assert_eq!(
-            picked.targets,
+            targets,
             BTreeMap::from([(
                 "{region=\"r1\", zone=\"z1\", sub_zone=\"sz1\"}".to_string(),
                 40,
             )])
         );
         assert_eq!(
-            picked.update.endpoints,
+            received_update.endpoints,
             Err("eds stream closed".to_string())
         );
     }
 
     #[test]
     fn generated_child_config_parse_error_transitions_to_transient_failure() {
-        let mut t = Harness::with_child_policy_name("unregistered_child_policy");
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Ok(vec![locality_endpoint("r1", "z1", "sz1", 10)]);
+        let mut t = new_env_with_child("unregistered_child_policy");
 
         let err = t
-            .update(update, MockBehavior::Ready)
+            .send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
             .expect_err("unregistered child policy should fail update");
-        assert!(err.contains("failed to parse generated child config"));
-
-        let state = t.take_state();
-        assert_eq!(
-            state.connectivity_state,
-            ConnectivityState::TransientFailure
+        assert!(
+            err.starts_with(
+                "xds_wrr_locality_experimental: failed to parse generated child config:"
+            )
         );
-        assert_fails_unavailable(&*state.picker, "failed to parse generated child config");
+
+        t.expect_failing_picker(&err);
+        t.expect_no_events();
     }
 
     #[test]
     fn child_error_still_publishes_picker() {
-        let mut t = Harness::new();
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Ok(vec![locality_endpoint("r1", "z1", "sz1", 10)]);
+        test_utils::reg_stub_policy(
+            "stub_wrr_child_error",
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new(|_data, _update, _cfg, controller| {
+                    controller.update_picker(LbState::initial());
+                    Err("mock child failure".to_string())
+                })),
+                ..Default::default()
+            },
+        );
+        let mut t = new_env_with_child("stub_wrr_child_error");
 
         let err = t
-            .update(update, MockBehavior::PublishReadyAndFail)
+            .send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
             .expect_err("child failure should return error");
         assert_eq!(
             err,
             "xds_wrr_locality_experimental: failed to update child policy: mock child failure"
         );
 
-        let state = t.take_state();
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        let picked = assert_picks(&*state.picker);
-        assert_eq!(picked.targets.len(), 1);
+        t.expect_queuing_picker();
+        t.expect_no_events();
     }
 
     #[test]
     fn work_and_exit_idle_delegate_to_child_and_republish_on_update() {
-        let mut t = Harness::new();
-        let mut update = ResolverUpdate::default();
-        update.endpoints = Ok(vec![locality_endpoint("r1", "z1", "sz1", 10)]);
+        test_utils::reg_stub_policy(
+            "stub_wrr_work_and_exit_idle",
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new(|_data, _update, _cfg, controller| {
+                    controller.update_picker(LbState {
+                        connectivity_state: ConnectivityState::Idle,
+                        picker: Arc::new(QueuingPicker),
+                    });
+                    Ok(())
+                })),
+                exit_idle: Some(Arc::new(|data, controller| {
+                    if data.test_data.replace(Box::new(())).is_none() {
+                        controller.update_picker(LbState::initial());
+                        data.lb_policy_options.work_scheduler.schedule_work(None);
+                    }
+                })),
+                work: Some(Arc::new(|_data, _work_data, controller| {
+                    controller.update_picker(LbState {
+                        connectivity_state: ConnectivityState::Ready,
+                        picker: Arc::new(QueuingPicker),
+                    });
+                })),
+            },
+        );
+        let mut t = new_env_with_child("stub_wrr_work_and_exit_idle");
 
         // Child starts IDLE.
-        t.update(update, MockBehavior::Idle)
+        t.send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
             .expect("update should succeed");
-        assert_eq!(t.take_state().connectivity_state, ConnectivityState::Idle);
+        t.expect_picker_state(ConnectivityState::Idle);
 
         // `exit_idle` moves child to CONNECTING and schedules work.
-        t.policy.exit_idle(&mut t.controller);
-        assert_eq!(
-            t.take_state().connectivity_state,
-            ConnectivityState::Connecting
-        );
+        t.policy.exit_idle(&mut t.tcc);
+        t.expect_queuing_picker();
 
         // Running scheduled work moves child to READY.
         t.run_work();
-        let state = t.take_state();
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        assert_eq!(assert_picks(&*state.picker).targets.len(), 1);
+        t.expect_picker_state(ConnectivityState::Ready);
 
-        // Calling `exit_idle` when already READY does not republish a picker.
-        t.policy.exit_idle(&mut t.controller);
-        assert!(
-            t.controller.states.is_empty(),
-            "policy should not republish when child did not update"
-        );
+        // Calling `exit_idle` when child does not update does not republish a picker.
+        t.policy.exit_idle(&mut t.tcc);
+        t.expect_no_events();
     }
 
     #[test]
@@ -651,86 +632,78 @@ mod tests {
         should_panic(expected = "xds_wrr_locality_experimental: work called with None value")
     )]
     fn work_with_none_panics_in_debug() {
-        let mut t = Harness::new();
-        t.policy.work(None, &mut t.controller);
+        let mut t = new_env();
+        t.policy.work(None, &mut t.tcc);
     }
 
-    struct Harness {
-        policy: WrrLocalityPolicy,
-        controller: RecordingChannelController,
-        scheduler: Arc<RecordingWorkScheduler>,
-    }
-
-    impl Harness {
-        fn new() -> Self {
-            Self::with_child_policy_name(MOCK_CHILD_POLICY_NAME)
-        }
-
-        fn with_child_policy_name(child_policy_name: &'static str) -> Self {
-            GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder);
-            GLOBAL_LB_REGISTRY.add_builder(MockLeafBuilder);
-            let scheduler = Arc::new(RecordingWorkScheduler::default());
-            let policy = WrrLocalityBuilder.build_with_child_policy_name(
-                LbPolicyOptions {
-                    work_scheduler: scheduler.clone(),
-                    runtime: grpc::__unstable::rt::default_runtime(),
-                },
-                child_policy_name,
-            );
+    impl Default for WrrLocalityConfig {
+        fn default() -> Self {
             Self {
-                policy,
-                controller: RecordingChannelController::default(),
-                scheduler,
+                child_policy: vec![json!({ RR_POLICY_NAME: {} })],
             }
         }
+    }
 
-        fn update(&mut self, update: ResolverUpdate, behavior: MockBehavior) -> Result<(), String> {
-            let json = json!({
-                "childPolicy": [{
-                    MOCK_LEAF_POLICY_NAME: { "behavior": behavior }
-                }]
-            });
-            let config = WrrLocalityBuilder
-                .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
-                .expect("test config should parse");
-            self.policy
-                .resolver_update(update, &config, &mut self.controller)
-        }
+    const MOCK_CHILD_POLICY_NAME: &str = "test_wrr_locality_mock_child";
 
-        fn parse_child_targets(&mut self, endpoints: &[Endpoint]) -> BTreeMap<String, u32> {
-            let child_policy = vec![json!({ RR_POLICY_NAME: {} })];
-            let parsed = self
-                .policy
-                .parse_child_config(endpoints, &child_policy, &mut self.controller)
-                .expect("child config should parse");
-            let child_cfg = parsed
-                .config
-                .downcast_ref::<MockChildConfig>()
-                .expect("child config should be MockChildConfig");
-            assert!(
-                child_cfg
-                    .targets
-                    .values()
-                    .all(|target| target.child_policy.builder.name() == RR_POLICY_NAME)
-            );
+    type RecordedUpdate = (ResolverUpdate, BTreeMap<String, u32>);
+
+    fn new_env() -> TestEnv<WrrLocalityPolicy> {
+        GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder {
+            name: MOCK_CHILD_POLICY_NAME,
+            received: Arc::default(),
+        });
+        new_env_with_child(MOCK_CHILD_POLICY_NAME)
+    }
+
+    fn new_env_with_child(child_policy_name: &'static str) -> TestEnv<WrrLocalityPolicy> {
+        TestEnv::new(|work_scheduler| {
+            WrrLocalityBuilder.build_with_child_policy_name(
+                LbPolicyOptions {
+                    work_scheduler,
+                    runtime: default_runtime(),
+                },
+                child_policy_name,
+            )
+        })
+    }
+
+    fn new_recording_env(
+        child_policy_name: &'static str,
+    ) -> (
+        TestEnv<WrrLocalityPolicy>,
+        Arc<Mutex<Option<RecordedUpdate>>>,
+    ) {
+        let received: Arc<Mutex<Option<RecordedUpdate>>> = Arc::default();
+        GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder {
+            name: child_policy_name,
+            received: received.clone(),
+        });
+        (new_env_with_child(child_policy_name), received)
+    }
+
+    fn parse_child_targets(endpoints: &[Endpoint]) -> BTreeMap<String, u32> {
+        let mut t = new_env();
+        let child_policy = WrrLocalityConfig::default().child_policy;
+        let parsed = t
+            .policy
+            .parse_child_config(endpoints, &child_policy, &mut t.tcc)
+            .expect("child config should parse");
+        let child_cfg = parsed
+            .config
+            .downcast_ref::<MockChildConfig>()
+            .expect("child config should be MockChildConfig");
+        assert!(
             child_cfg
                 .targets
-                .iter()
-                .map(|(name, target)| (name.clone(), target.weight))
-                .collect()
-        }
-
-        fn take_state(&mut self) -> LbState {
-            let mut states = std::mem::take(&mut self.controller.states);
-            assert_eq!(states.len(), 1, "policy should publish exactly one state");
-            states.pop().unwrap()
-        }
-
-        fn run_work(&mut self) {
-            let mut work = std::mem::take(&mut *self.scheduler.0.lock().unwrap());
-            assert_eq!(work.len(), 1, "exactly one work item should be pending");
-            self.policy.work(work.pop().unwrap(), &mut self.controller);
-        }
+                .values()
+                .all(|target| target.child_policy.builder.name() == RR_POLICY_NAME)
+        );
+        child_cfg
+            .targets
+            .iter()
+            .map(|(name, target)| (name.clone(), target.weight))
+            .collect()
     }
 
     fn locality_endpoint(region: &str, zone: &str, sub_zone: &str, weight: u32) -> Endpoint {
@@ -746,101 +719,6 @@ mod tests {
         endpoint
     }
 
-    fn assert_picks(picker: &dyn Picker) -> PickedState {
-        let headers = RequestHeaders::new();
-        let slot: PickedSlot = Arc::default();
-        let mut call_options = CallOptions::new();
-        call_options.set_option(slot.clone());
-        let result = picker.pick(PickOptions::new(&headers, &call_options));
-        assert!(
-            matches!(result, PickResult::Queue),
-            "pick should queue, got {result:?}"
-        );
-        slot.lock()
-            .unwrap()
-            .take()
-            .expect("pick should reach mock child")
-    }
-
-    fn assert_fails_unavailable(picker: &dyn Picker, expected_substring: &str) {
-        let headers = RequestHeaders::new();
-        let call_options = CallOptions::new();
-        match picker.pick(PickOptions::new(&headers, &call_options)) {
-            PickResult::Fail(err) => {
-                assert_eq!(err.code(), StatusCodeError::Unavailable);
-                assert!(
-                    err.message().contains(expected_substring),
-                    "error '{}' should contain '{expected_substring}'",
-                    err.message()
-                );
-            }
-            other => panic!("expected Fail(Unavailable), got {other:?}"),
-        }
-    }
-
-    const MOCK_CHILD_POLICY_NAME: &str = "test_wrr_locality_mock_child";
-    const MOCK_LEAF_POLICY_NAME: &str = "test_wrr_locality_mock_leaf";
-
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    enum MockBehavior {
-        Ready,
-        Idle,
-        PublishReadyAndFail,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct MockLeafConfig {
-        behavior: MockBehavior,
-    }
-
-    #[derive(Debug)]
-    struct MockLeafPolicy;
-
-    impl LbPolicy for MockLeafPolicy {
-        type LbConfig = MockLeafConfig;
-
-        fn resolver_update(
-            &mut self,
-            _update: ResolverUpdate,
-            _config: &Self::LbConfig,
-            _channel_controller: &mut dyn ChannelController,
-        ) -> Result<(), String> {
-            unreachable!("leaf policy is only parsed, not driven directly by wrr_locality")
-        }
-
-        fn work(
-            &mut self,
-            _data: Option<WorkData>,
-            _channel_controller: &mut dyn ChannelController,
-        ) {
-            unreachable!()
-        }
-
-        fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {
-            unreachable!()
-        }
-    }
-
-    #[derive(Debug)]
-    struct MockLeafBuilder;
-
-    impl LbPolicyBuilder for MockLeafBuilder {
-        type LbPolicy = MockLeafPolicy;
-
-        fn build(&self, _options: LbPolicyOptions) -> Self::LbPolicy {
-            MockLeafPolicy
-        }
-
-        fn name(&self) -> &'static str {
-            MOCK_LEAF_POLICY_NAME
-        }
-
-        fn parse_config(&self, config: &LbConfigJson) -> Result<MockLeafConfig, String> {
-            config.convert_to().map_err(|e| e.to_string())
-        }
-    }
-
     #[derive(Debug, Deserialize)]
     struct MockTargetConfig {
         weight: u32,
@@ -854,43 +732,20 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct PickedState {
-        targets: BTreeMap<String, u32>,
-        update: ResolverUpdate,
+    struct MockChildBuilder {
+        name: &'static str,
+        received: Arc<Mutex<Option<RecordedUpdate>>>,
     }
-
-    type PickedSlot = Arc<Mutex<Option<PickedState>>>;
-
-    #[derive(Debug)]
-    struct MockPicker(PickedState);
-
-    impl Picker for MockPicker {
-        fn pick(&self, options: PickOptions<'_>) -> PickResult {
-            let slot = options
-                .call_options
-                .get_option::<PickedSlot>()
-                .expect("pick should include PickedSlot option");
-            *slot.lock().unwrap() = Some(self.0.clone());
-            PickResult::Queue
-        }
-    }
-
-    #[derive(Debug)]
-    struct MockChildBuilder;
 
     impl LbPolicyBuilder for MockChildBuilder {
-        type LbPolicy = MockChildPolicy;
+        type LbPolicy = Self;
 
-        fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
-            MockChildPolicy {
-                work_scheduler: options.work_scheduler,
-                state: None,
-                picked: None,
-            }
+        fn build(&self, _options: LbPolicyOptions) -> Self::LbPolicy {
+            self.clone()
         }
 
         fn name(&self) -> &'static str {
-            MOCK_CHILD_POLICY_NAME
+            self.name
         }
 
         fn parse_config(&self, config: &LbConfigJson) -> Result<MockChildConfig, String> {
@@ -898,26 +753,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct MockChildPolicy {
-        work_scheduler: Arc<dyn WorkScheduler>,
-        state: Option<ConnectivityState>,
-        picked: Option<PickedState>,
-    }
-
-    impl MockChildPolicy {
-        fn publish(&mut self, state: ConnectivityState, controller: &mut dyn ChannelController) {
-            self.state = Some(state);
-            controller.update_picker(LbState {
-                connectivity_state: state,
-                picker: Arc::new(MockPicker(
-                    self.picked.clone().expect("picked state should be set"),
-                )),
-            });
-        }
-    }
-
-    impl LbPolicy for MockChildPolicy {
+    impl LbPolicy for MockChildBuilder {
         type LbConfig = MockChildConfig;
 
         fn resolver_update(
@@ -926,86 +762,26 @@ mod tests {
             config: &Self::LbConfig,
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
-            let mut behavior = MockBehavior::Ready;
             let targets = config
                 .targets
                 .iter()
                 .map(|(name, target)| {
-                    let leaf_cfg = target
-                        .child_policy
-                        .config
-                        .downcast_ref::<MockLeafConfig>()
-                        .expect("child policy should be MockLeafConfig");
-                    behavior = leaf_cfg.behavior;
+                    assert_eq!(target.child_policy.builder.name(), RR_POLICY_NAME);
                     (name.clone(), target.weight)
                 })
                 .collect();
-
-            self.picked = Some(PickedState { targets, update });
-
-            match behavior {
-                MockBehavior::Ready => {
-                    self.publish(ConnectivityState::Ready, channel_controller);
-                    Ok(())
-                }
-                MockBehavior::Idle => {
-                    self.publish(ConnectivityState::Idle, channel_controller);
-                    Ok(())
-                }
-                MockBehavior::PublishReadyAndFail => {
-                    self.publish(ConnectivityState::Ready, channel_controller);
-                    Err("mock child failure".to_string())
-                }
-            }
+            *self.received.lock().unwrap() = Some((update, targets));
+            channel_controller.update_picker(LbState::initial());
+            Ok(())
         }
 
         fn work(
             &mut self,
             _data: Option<WorkData>,
-            channel_controller: &mut dyn ChannelController,
+            _channel_controller: &mut dyn ChannelController,
         ) {
-            if self.state == Some(ConnectivityState::Connecting) {
-                self.publish(ConnectivityState::Ready, channel_controller);
-            }
         }
 
-        fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-            if self.state == Some(ConnectivityState::Idle) {
-                self.publish(ConnectivityState::Connecting, channel_controller);
-                self.work_scheduler.schedule_work(None);
-            }
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingWorkScheduler(Mutex<Vec<Option<WorkData>>>);
-
-    impl WorkScheduler for RecordingWorkScheduler {
-        fn schedule_work(&self, data: Option<WorkData>) {
-            self.0.lock().unwrap().push(data);
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingChannelController {
-        states: Vec<LbState>,
-    }
-
-    impl ChannelController for RecordingChannelController {
-        fn new_subchannel(
-            &mut self,
-            _address: &Address,
-            _work_scheduler: Arc<dyn WorkScheduler>,
-        ) -> (Arc<dyn Subchannel>, SubchannelState) {
-            unimplemented!()
-        }
-
-        fn update_picker(&mut self, update: LbState) {
-            self.states.push(update);
-        }
-
-        fn request_resolution(&mut self) {
-            unimplemented!()
-        }
+        fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {}
     }
 }

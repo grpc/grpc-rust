@@ -65,7 +65,8 @@ use crate::credentials::ServerCredentials;
 use crate::credentials::server::HandshakeOutput;
 use crate::metadata::MetadataMap;
 use crate::metadata::MetadataValue;
-use crate::private::Internal;
+use crate::private::SealedToken;
+use crate::private::UnstableToken;
 use crate::rt::BoxEndpoint;
 use crate::rt::EndpointIoStream;
 use crate::rt::EndpointListener;
@@ -245,7 +246,7 @@ impl ServerCredentials for InsecureTestCreds {
         &self,
         source: BoxEndpoint,
         _runtime: GrpcRuntime,
-        _token: Internal,
+        _token: UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         Ok(HandshakeOutput {
             endpoint: source,
@@ -353,8 +354,8 @@ async fn keep_alive_closes_connection_when_client_stops_responding() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds)).with_config(config);
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), SealedToken));
 
     // Send the HTTP/2 client preface and an empty SETTINGS frame, then never
     // read again, so the server's pings are never acked.
@@ -384,8 +385,8 @@ async fn keep_alive_keeps_responsive_connection_open() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds)).with_config(config);
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
     send_req.ready().await.unwrap();
 
@@ -416,9 +417,9 @@ async fn send_message_without_headers_auto_flushes_headers_and_delivers_messages
 
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let handler = Arc::new(StreamMessagesWithoutHeadersHandle { count: 3 });
-    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), Internal));
+    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -500,8 +501,8 @@ async fn oversize_request_message_surfaces_recv_error_to_handler() {
 
     let (server_ep, endpoint) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(ReadOnceHandler), rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(Arc::new(ReadOnceHandler), rt.clone(), SealedToken));
     let (mut sender, client_conn) = ClientHttp2Builder::new(HyperCompatExec { inner: rt.clone() })
         .handshake::<_, Full<Bytes>>(HyperStream::new(endpoint))
         .await
@@ -563,8 +564,8 @@ async fn client_rst_stream_before_headers_cancels_handler() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -615,8 +616,8 @@ async fn client_rst_stream_after_headers_cancels_handler() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -669,10 +670,10 @@ async fn dropping_serving_connection_cancels_in_flight_handler() {
     let listener = listener_with(accept_rx, creds);
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
 
     let (drop_conn_tx, drop_conn_rx) = oneshot::channel::<()>();
-    let serving = conn.serve(handler, rt.clone(), Internal);
+    let serving = conn.serve(handler, rt.clone(), SealedToken);
     let server_task = tokio::spawn(async move {
         tokio::select! {
             outcome = serving => Some(outcome),
@@ -789,9 +790,9 @@ async fn custom_trailer_metadata_preserved_on_streaming_response() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let server_task =
-        tokio::spawn(conn.serve(Arc::new(CustomTrailersHandler), rt.clone(), Internal));
+        tokio::spawn(conn.serve(Arc::new(CustomTrailersHandler), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -840,9 +841,9 @@ async fn custom_trailer_metadata_preserved_on_trailers_only_response() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let server_task =
-        tokio::spawn(conn.serve(Arc::new(CustomTrailersHandler), rt.clone(), Internal));
+        tokio::spawn(conn.serve(Arc::new(CustomTrailersHandler), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -892,9 +893,9 @@ async fn custom_trailer_metadata_preserved_on_error_response() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let server_task =
-        tokio::spawn(conn.serve(Arc::new(CustomTrailersHandler), rt.clone(), Internal));
+        tokio::spawn(conn.serve(Arc::new(CustomTrailersHandler), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -992,9 +993,9 @@ async fn outgoing_reserved_headers_stripped_and_messages_delivered() {
 
     let (server_ep, endpoint) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let server_task =
-        tokio::spawn(conn.serve(Arc::new(ReservedHeadersHandler), rt.clone(), Internal));
+        tokio::spawn(conn.serve(Arc::new(ReservedHeadersHandler), rt.clone(), SealedToken));
     let (mut sender, client_task) = connect_client(endpoint, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1094,7 +1095,7 @@ impl ServerCredentials for TestHandshakeCreds {
         &self,
         source: BoxEndpoint,
         runtime: GrpcRuntime,
-        token: Internal,
+        token: UnstableToken,
     ) -> Result<HandshakeOutput, String> {
         let idx = self.attempt.fetch_add(1, Ordering::SeqCst);
         if idx == 0 {
@@ -1298,9 +1299,9 @@ async fn malformed_bin_header_returns_internal_error_without_invoking_handler() 
 
     let (server_ep, endpoint) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let handler = Arc::new(TrackingHandler(handler_called_clone));
-    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), Internal));
+    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), SealedToken));
     let (mut sender, client_task) = connect_client(endpoint, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1372,12 +1373,12 @@ async fn request_reserved_headers_extracted_and_filtered_from_metadata() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let (headers_tx, headers_rx) = oneshot::channel();
     let handler = Arc::new(CaptureRequestHeadersHandle {
         tx: Mutex::new(Some(headers_tx)),
     });
-    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), Internal));
+    let server_task = tokio::spawn(conn.serve(handler, rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1470,9 +1471,9 @@ async fn response_content_type_overwritten_when_handler_sets_it() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
+    let conn = listener.accept(SealedToken).await.unwrap();
     let server_task =
-        tokio::spawn(conn.serve(Arc::new(ContentTypeOverrideHandle), rt.clone(), Internal));
+        tokio::spawn(conn.serve(Arc::new(ContentTypeOverrideHandle), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1526,8 +1527,8 @@ async fn invalid_content_type_rejected_with_unsupported_media_type() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1561,8 +1562,8 @@ async fn invalid_method_rejected_with_method_not_allowed() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1596,8 +1597,8 @@ async fn unsupported_grpc_encoding_rejected_with_unimplemented() {
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
     accept_tx.send(server_ep).unwrap();
-    let conn = listener.accept(Internal).await.unwrap();
-    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), Internal));
+    let conn = listener.accept(SealedToken).await.unwrap();
+    let server_task = tokio::spawn(conn.serve(Arc::new(DummyHandle), rt.clone(), SealedToken));
     let (mut send_req, client_task) = connect_client(client_ep, &rt).await.unwrap();
 
     let req = Request::builder()
@@ -1671,8 +1672,8 @@ async fn unix_listener_reports_unix_connection_info_to_handler() {
 
     let accept_rt = rt.clone();
     let server_task = tokio::spawn(async move {
-        let conn = listener.accept(Internal).await.unwrap();
-        conn.serve(handler, accept_rt, Internal).await
+        let conn = listener.accept(SealedToken).await.unwrap();
+        conn.serve(handler, accept_rt, SealedToken).await
     });
 
     let client_ep = rt

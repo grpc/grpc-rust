@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::credentials::ServerCredentials;
-use crate::private::Internal;
+use crate::private::SealedToken;
 use crate::rt::EndpointListener;
 use crate::rt::GrpcRuntime;
 use crate::rt::UnixSocketOptions;
@@ -104,7 +104,7 @@ impl HyperListener {
 impl Listener for HyperListener {
     type Transport = HyperTransport;
 
-    async fn accept(&self, _token: Internal) -> Result<Self::Transport, String> {
+    async fn accept(&self, _token: SealedToken) -> Result<Self::Transport, String> {
         self.listener
             .accept()
             .await
@@ -130,7 +130,7 @@ mod tests {
     use super::HyperListener;
     use crate::async_trait;
     use crate::credentials::LocalServerCredentials;
-    use crate::private::Internal;
+    use crate::private::SealedToken;
     use crate::rt::BoxEndpoint;
     use crate::rt::EndpointListener;
     use crate::rt::TcpOptions;
@@ -184,7 +184,7 @@ mod tests {
             .0;
         let _client = rt.tcp_stream(addr, TcpOptions::default()).await.unwrap();
 
-        let _transport = listener.accept(Internal).await.expect("accept failed");
+        let _transport = listener.accept(SealedToken).await.expect("accept failed");
     }
 
     #[tokio::test]
@@ -219,7 +219,7 @@ mod tests {
             .await
             .unwrap();
 
-        let _transport = listener.accept(Internal).await.expect("accept failed");
+        let _transport = listener.accept(SealedToken).await.expect("accept failed");
     }
 
     #[tokio::test]
@@ -243,7 +243,7 @@ mod tests {
     async fn accept_returns_endpoint_listener_error() {
         let listener = fake_listener();
 
-        let err = listener.accept(Internal).await.err();
+        let err = listener.accept(SealedToken).await.err();
 
         assert_eq!(err.as_deref(), Some(FAKE_ACCEPT_ERROR));
     }

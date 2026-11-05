@@ -40,7 +40,8 @@ use crate::core::Address;
 use crate::core::ConnectionInfo;
 use crate::credentials::ServerCredentials;
 use crate::credentials::server::HandshakeOutput;
-use crate::private::Internal;
+use crate::private::SealedToken;
+use crate::private::UnstableToken;
 use crate::rt::BoxEndpoint;
 use crate::rt::BoxFuture;
 use crate::rt::GrpcRuntime;
@@ -97,7 +98,7 @@ impl Transport for HyperTransport {
         self,
         handler: Arc<dyn DynHandle>,
         runtime: GrpcRuntime,
-        _token: Internal,
+        _token: SealedToken,
     ) -> HyperServingConnection {
         HyperServingConnection::new(self.io, self.creds, self.config, handler, runtime)
     }
@@ -204,7 +205,8 @@ impl HyperServingConnection {
 
         // TODO: Change `ServerCredentials::accept` to return a `'static` `BoxFuture`
         // so `creds.accept(...)` can be stored directly without double-boxing here.
-        let handshake_fut = Box::pin(async move { creds.accept(io, rt_clone, Internal).await });
+        let handshake_fut =
+            Box::pin(async move { creds.accept(io, rt_clone, UnstableToken).await });
         // TODO: Also time out the wait for the client's HTTP/2 preface. hyper currently
         // has no timeout or API to wait for it, and graceful shutdown can't interrupt it.
         // See https://github.com/grpc/grpc-rust/issues/2965.
@@ -342,7 +344,7 @@ impl Future for HyperServingConnection {
 }
 
 impl GracefulConnection for HyperServingConnection {
-    fn graceful_shutdown(self: Pin<&mut Self>, _token: Internal) {
+    fn graceful_shutdown(self: Pin<&mut Self>, _token: SealedToken) {
         self.get_mut().phase.initiate_graceful_shutdown();
     }
 }
@@ -398,7 +400,7 @@ mod tests {
             &self,
             _source: BoxEndpoint,
             _runtime: GrpcRuntime,
-            _token: Internal,
+            _token: UnstableToken,
         ) -> Result<HandshakeOutput, String> {
             match self.0 {
                 HandshakeBehavior::Fail => Err("simulated handshake error".to_string()),
@@ -435,7 +437,7 @@ mod tests {
         let (server_ep, _client_ep) = endpoint_pair();
         let creds = Arc::new(StubHandshakeCreds(HandshakeBehavior::Fail));
         let transport = HyperTransport::new(server_ep, creds, Arc::new(Http2Config::new()));
-        let serving = transport.serve(Arc::new(DummyHandle), rt, Internal);
+        let serving = transport.serve(Arc::new(DummyHandle), rt, SealedToken);
         assert_eq!(serving.await, Err("simulated handshake error".to_string()));
     }
 
@@ -446,7 +448,7 @@ mod tests {
         let creds = Arc::new(StubHandshakeCreds(HandshakeBehavior::Stall));
         let config = Http2Config::new().with_handshake_timeout(Duration::from_millis(30));
         let transport = HyperTransport::new(server_ep, creds, Arc::new(config));
-        let serving = transport.serve(Arc::new(DummyHandle), rt, Internal);
+        let serving = transport.serve(Arc::new(DummyHandle), rt, SealedToken);
         assert_eq!(serving.await, Err("handshake timed out".to_string()));
     }
 
@@ -456,7 +458,7 @@ mod tests {
         let (server_ep, _client_ep) = endpoint_pair();
         let creds = Arc::new(StubHandshakeCreds(HandshakeBehavior::Stall));
         let transport = HyperTransport::new(server_ep, creds, Arc::new(Http2Config::new()));
-        let mut serving = pin!(transport.serve(Arc::new(DummyHandle), rt, Internal));
+        let mut serving = pin!(transport.serve(Arc::new(DummyHandle), rt, SealedToken));
 
         poll_fn(|cx| {
             assert_eq!(serving.as_mut().poll(cx), Poll::Pending);
@@ -464,7 +466,7 @@ mod tests {
         })
         .await;
 
-        serving.as_mut().graceful_shutdown(Internal);
+        serving.as_mut().graceful_shutdown(SealedToken);
         assert_eq!(serving.await, Ok(()));
     }
 
@@ -476,7 +478,7 @@ mod tests {
         let handler = Arc::new(SlowHandle(Duration::from_secs(60)));
 
         let transport = HyperTransport::new(server_ep, creds, Arc::new(Http2Config::new()));
-        let serving = transport.serve(handler, rt.clone(), Internal);
+        let serving = transport.serve(handler, rt.clone(), SealedToken);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let server_task = tokio::spawn(async move {
             let mut serving = pin!(serving);
@@ -484,7 +486,7 @@ mod tests {
                 outcome = serving.as_mut() => return outcome,
                 _ = shutdown_rx => {}
             }
-            serving.as_mut().graceful_shutdown(Internal);
+            serving.as_mut().graceful_shutdown(SealedToken);
             serving.await
         });
 

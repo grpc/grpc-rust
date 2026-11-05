@@ -166,6 +166,8 @@ mod tests {
     use crate::async_trait;
     use crate::client::CallOptions;
     use crate::client::Channel;
+    use crate::client::ChannelRecvStream;
+    use crate::client::ChannelSendStream;
     use crate::client::DynInvoke;
     use crate::client::DynRecvStream;
     use crate::client::DynSendStream;
@@ -482,7 +484,7 @@ mod tests {
     }
 
     /// The streams of an RPC started by [`start_unary_echo`].
-    type UnaryEchoRpc = (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
+    type UnaryEchoRpc = (ChannelSendStream, ChannelRecvStream);
 
     /// Starts a unary echo RPC on `channel` without sending its request, so
     /// the RPC stays in progress until it's passed to [`finish_unary_echo`].

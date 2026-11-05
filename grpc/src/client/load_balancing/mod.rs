@@ -28,6 +28,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::Once;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -42,6 +43,9 @@ use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
 pub(crate) mod subchannel_sharing;
+pub(crate) mod weighted_target;
+
+mod sampling;
 
 pub mod child_manager;
 pub mod endpoint_filtering;
@@ -54,8 +58,22 @@ pub mod round_robin;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
 
-#[cfg(test)]
-pub(crate) mod test_utils;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
+static START: Once = Once::new();
+
+/// Registers the built-in load balancing policies into the global LB registry.
+///
+/// Only the first call has an effect; any additional ones are ignored.
+pub(crate) fn register() {
+    START.call_once(|| {
+        pick_first::reg();
+        priority::reg();
+        round_robin::reg();
+        weighted_target::reg();
+    });
+}
 
 /// An LB policy factory that produces LbPolicy instances used by the channel
 /// to manage connections and pick connections for RPCs.
@@ -506,7 +524,7 @@ impl Debug for Pick {
 /// QueuingPicker always returns Queue.  LB policies that are not actively
 /// Connecting should not use this picker.
 #[derive(Debug)]
-pub(crate) struct QueuingPicker;
+pub struct QueuingPicker;
 
 impl Picker for QueuingPicker {
     fn pick(&self, _options: PickOptions<'_>) -> PickResult {
@@ -515,7 +533,7 @@ impl Picker for QueuingPicker {
 }
 
 #[derive(Debug)]
-pub(crate) struct FailingPicker {
+pub struct FailingPicker {
     pub error: String,
 }
 
@@ -530,13 +548,13 @@ impl Picker for FailingPicker {
 
 /// A dynamic LB policy config implementation that can be downcast to a specific
 /// config as needed.
-pub(crate) type DynLbConfig = Arc<dyn Any + Send + Sync>;
+pub type DynLbConfig = Arc<dyn Any + Send + Sync>;
 
 /// A builder of dynamic LB policies.
-pub(crate) type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
+pub type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
 
 /// An LB policy that accepts dynamic configs.
-pub(crate) type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
+pub type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
 
 impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     type LbConfig = T::LbConfig;

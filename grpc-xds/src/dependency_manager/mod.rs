@@ -62,12 +62,12 @@ use crate::xds_config::XdsConfig;
 pub(crate) type XdsConfigUpdate = Result<Arc<XdsConfig>, XdsConfigError>;
 
 /// Receives the dependency manager's updates.
-pub(crate) trait XdsConfigWatcher: Send + Sync + 'static {
+pub(crate) trait XdsConfigWatcher: Send + 'static {
     /// Called with each update, in order.
     ///
     /// This runs on the dependency manager's task, so it must not block. It
     /// would typically store the update and schedule work to handle it.
-    fn on_update(&self, update: XdsConfigUpdate);
+    fn on_update(&mut self, update: XdsConfigUpdate);
 }
 
 /// What [`XdsDependencyManager::start`] needs.
@@ -84,7 +84,7 @@ pub(crate) struct DependencyManagerOptions {
     pub(crate) node_id: Option<Arc<str>>,
     /// Where the dependency manager's task runs.
     pub(crate) runtime: GrpcRuntime,
-    pub(crate) watcher: Arc<dyn XdsConfigWatcher>,
+    pub(crate) watcher: Box<dyn XdsConfigWatcher>,
 }
 
 impl fmt::Debug for DependencyManagerOptions {
@@ -214,7 +214,7 @@ mod tests {
     struct Sender(mpsc::UnboundedSender<XdsConfigUpdate>);
 
     impl XdsConfigWatcher for Sender {
-        fn on_update(&self, update: XdsConfigUpdate) {
+        fn on_update(&mut self, update: XdsConfigUpdate) {
             let _ = self.0.send(update);
         }
     }
@@ -281,7 +281,7 @@ mod tests {
             data_plane_authority: "example.com".to_owned(),
             node_id: None,
             runtime: GrpcRuntime::default(),
-            watcher: Arc::new(Sender(tx)),
+            watcher: Box::new(Sender(tx)),
         });
         (dependency_manager, rx)
     }

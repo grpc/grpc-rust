@@ -104,12 +104,10 @@ impl CachedResources for Watches {
 impl Watches {
     /// Starts the watches in `required` that don't exist yet, and drops the
     /// ones that aren't in it. Dropping a watcher unsubscribes from its
-    /// resource.
+    /// resource, and drops its events that [`Self::poll_next`] hasn't
+    /// returned yet.
     ///
     /// A new watch starts as [`WatchState::Pending`].
-    ///
-    /// The caller must have taken every event from [`Self::poll_next`]
-    /// first, so that no event is left for a watch that this drops.
     pub(super) async fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
         reconcile(client, &mut self.clusters, &required.clusters).await;
         reconcile(client, &mut self.endpoints, &required.eds_services).await;
@@ -122,6 +120,16 @@ impl Watches {
                 self.unresolved_dns.push(target.clone());
             }
         }
+
+        self.unresolved_dns
+            .retain(|target| self.dns.contains_key(target));
+        self.ready.retain(|event| match event {
+            // A closed watcher means that the XdsClient has stopped.
+            None => true,
+            Some(ClusterGraphEvent::Cluster(name, _)) => self.clusters.contains_key(name),
+            Some(ClusterGraphEvent::Endpoints(name, _)) => self.endpoints.contains_key(name),
+            Some(ClusterGraphEvent::Dns(target)) => self.dns.contains_key(target),
+        });
     }
 
     /// Returns the next event, or `None` once the XdsClient has stopped.
@@ -160,7 +168,7 @@ impl Watches {
     /// Applies `event` to its cached state, and returns its flow-control
     /// token, if it has one.
     pub(super) fn apply(&mut self, event: ClusterGraphEvent) -> Option<ProcessingDone> {
-        const WATCHED: &str = "an event's watch is dropped only once its events are taken";
+        const WATCHED: &str = "reconcile drops the events of the watches that it drops";
         match event {
             ClusterGraphEvent::Cluster(name, event) => {
                 let watch = self.clusters.get_mut(&name).expect(WATCHED);
@@ -311,6 +319,34 @@ mod tests {
             .reconcile(&XdsClient::disconnected(), &RequiredWatches::default())
             .await;
         assert!(watches.dns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_the_events_of_dropped_watches() {
+        let client = XdsClient::disconnected();
+        let two_targets = RequiredWatches {
+            dns_targets: ["a.example.com", "b.example.com"]
+                .map(|host| DnsTarget {
+                    host: host.to_owned(),
+                    port: 443,
+                })
+                .into(),
+            ..Default::default()
+        };
+        let none = RequiredWatches::default();
+        let mut watches = Watches::default();
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Results that haven't been polled yet.
+        watches.reconcile(&client, &two_targets).await;
+        watches.reconcile(&client, &none).await;
+        assert!(watches.poll_next(&mut cx).is_pending());
+
+        // Events that have been polled but not yet returned.
+        watches.reconcile(&client, &two_targets).await;
+        assert!(watches.poll_next(&mut cx).is_ready());
+        watches.reconcile(&client, &none).await;
+        assert!(watches.poll_next(&mut cx).is_pending());
     }
 
     #[tokio::test]

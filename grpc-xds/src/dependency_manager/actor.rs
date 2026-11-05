@@ -152,7 +152,7 @@ enum Blocked {
 
 /// Publishes updates to the [`XdsConfigWatcher`].
 struct Publisher {
-    watcher: Arc<dyn XdsConfigWatcher>,
+    watcher: Box<dyn XdsConfigWatcher>,
     node_id: Option<Arc<str>>,
     /// The last update published, if it was an error. A lasting error is
     /// published only once.
@@ -205,28 +205,29 @@ impl Actor {
     }
 
     /// Handles events in batches until the XdsClient stops.
-    ///
-    /// A batch is every event that is ready without waiting. They are all
-    /// applied before anything is published, so a response that changes many
-    /// resources causes one update rather than one per resource. Batches are
-    /// bounded, because the XdsClient doesn't read the next response until the
-    /// batch releases its flow-control tokens.
     async fn run_loop(mut self) {
+        while let Some(events) = poll_fn(|cx| self.poll_batch(cx)).await {
+            self.handle_batch(events).await;
+        }
+        self.publisher.error(XdsConfigErrorKind::XdsClientClosed);
+    }
+
+    /// Takes every event that is ready without waiting. Pending until there
+    /// is at least one, and `None` once the XdsClient has stopped.
+    ///
+    /// A batch is handled as one, so a response that changes many resources
+    /// causes one update rather than one per resource. Batches are bounded,
+    /// because the XdsClient doesn't read the next response until the batch
+    /// releases its flow-control tokens.
+    fn poll_batch(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<WatchEvent>>> {
+        let mut batch = Vec::new();
         loop {
-            let mut done = Vec::new();
-            let mut next = poll_fn(|cx| self.poll_watch_event(cx)).await;
-            loop {
-                let Some(event) = next else {
-                    self.publisher.error(XdsConfigErrorKind::XdsClientClosed);
-                    return;
-                };
-                done.extend(self.handle_watch_event(event));
-                match poll_fn(|cx| Poll::Ready(self.poll_watch_event(cx))).await {
-                    Poll::Ready(event) => next = event,
-                    Poll::Pending => break,
-                }
+            match self.poll_watch_event(cx) {
+                Poll::Ready(Some(event)) => batch.push(event),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending if batch.is_empty() => return Poll::Pending,
+                Poll::Pending => return Poll::Ready(Some(batch)),
             }
-            self.finish_batch(done).await;
         }
     }
 
@@ -263,14 +264,18 @@ impl Actor {
         }
     }
 
-    /// Updates the watches to match the cached states, and publishes the
-    /// result.
+    /// Applies `events` to the cached states, then updates the watches to
+    /// match and publishes the result.
     ///
     /// Everything is derived again from the cached states, whatever the batch
-    /// changed. `done` holds the batch's flow-control tokens: the XdsClient
-    /// reads the next response once they are dropped (gRFC A88), so they are
-    /// held until the result has been published.
-    async fn finish_batch(&mut self, done: Vec<ProcessingDone>) {
+    /// changed. The events' flow-control tokens are held until the result has
+    /// been published: the XdsClient reads the next response once they are
+    /// dropped (gRFC A88).
+    async fn handle_batch(&mut self, events: impl IntoIterator<Item = WatchEvent>) {
+        let done: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| self.handle_watch_event(event))
+            .collect();
         match self.resolve().await {
             Ok(config) => self.publisher.config(config),
             Err(Blocked::Pending) => {}
@@ -385,7 +390,7 @@ impl Actor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::mpsc;
 
     use grpc::__unstable::rt::GrpcRuntime;
 
@@ -406,12 +411,11 @@ mod tests {
     const LISTENER: &str = "listener";
     const AUTHORITY: &str = "example.com";
 
-    #[derive(Debug, Default)]
-    struct Recorder(Mutex<Vec<XdsConfigUpdate>>);
+    struct Sender(mpsc::Sender<XdsConfigUpdate>);
 
-    impl XdsConfigWatcher for Recorder {
-        fn on_update(&self, update: XdsConfigUpdate) {
-            self.0.lock().unwrap().push(update);
+    impl XdsConfigWatcher for Sender {
+        fn on_update(&mut self, update: XdsConfigUpdate) {
+            let _ = self.0.send(update);
         }
     }
 
@@ -419,14 +423,14 @@ mod tests {
     /// events to it directly.
     struct Harness {
         actor: Actor,
-        recorder: Arc<Recorder>,
+        updates: mpsc::Receiver<XdsConfigUpdate>,
     }
 
     impl Harness {
         async fn new() -> Self {
-            let recorder = Arc::new(Recorder::default());
-            let actor = Actor::new(options(recorder.clone())).await;
-            Self { actor, recorder }
+            let (options, updates) = options();
+            let actor = Actor::new(options).await;
+            Self { actor, updates }
         }
 
         /// Handles `events` as one batch, and returns what it published.
@@ -434,12 +438,8 @@ mod tests {
             &mut self,
             events: impl IntoIterator<Item = WatchEvent>,
         ) -> Vec<XdsConfigUpdate> {
-            let done = events
-                .into_iter()
-                .filter_map(|event| self.actor.handle_watch_event(event))
-                .collect();
-            self.actor.finish_batch(done).await;
-            std::mem::take(&mut *self.recorder.0.lock().unwrap())
+            self.actor.handle_batch(events).await;
+            self.updates.try_iter().collect()
         }
 
         /// Handles `events` as one batch, which must publish a snapshot.
@@ -487,15 +487,19 @@ mod tests {
         }
     }
 
-    fn options(watcher: Arc<dyn XdsConfigWatcher>) -> DependencyManagerOptions {
-        DependencyManagerOptions {
+    /// Options for an actor with a disconnected XdsClient, and the receiver
+    /// of what the actor publishes.
+    fn options() -> (DependencyManagerOptions, mpsc::Receiver<XdsConfigUpdate>) {
+        let (tx, rx) = mpsc::channel();
+        let options = DependencyManagerOptions {
             xds_client: XdsClient::disconnected(),
             listener_name: LISTENER.to_owned(),
             data_plane_authority: AUTHORITY.to_owned(),
             node_id: Some("node-1".into()),
             runtime: GrpcRuntime::default(),
-            watcher,
-        }
+            watcher: Box::new(Sender(tx)),
+        };
+        (options, rx)
     }
 
     fn sorted<'a>(names: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
@@ -816,9 +820,9 @@ mod tests {
     #[tokio::test]
     async fn stops_once_the_xds_client_stops() {
         // A disconnected XdsClient's watches close straight away.
-        let recorder = Arc::new(Recorder::default());
-        run(options(recorder.clone())).await;
-        let updates = recorder.0.lock().unwrap();
+        let (options, updates) = options();
+        run(options).await;
+        let updates: Vec<_> = updates.try_iter().collect();
         let [Err(error)] = updates.as_slice() else {
             panic!("expected one error, got {updates:?}");
         };

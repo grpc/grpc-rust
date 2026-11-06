@@ -23,22 +23,11 @@
  */
 
 //! A process-wide pool of [`XdsClient`]s, keyed by the channel's target
-//! string.
-//!
-//! Channels with the same target share a single [`XdsClient`] (and therefore a
-//! single ADS stream). The first caller for a target wins: the arguments it
-//! passes are used to construct the client, and the arguments passed by later
-//! callers for the same target are ignored while that client is alive.
-//!
-//! The pool holds only weak references to its clients. A client stays in the
-//! pool while any caller holds a [`SharedXdsClient`] returned by
-//! [`XdsClientPool::get_or_create`]; once the last one is dropped, the next
-//! call for that target creates a fresh client. Dead entries are pruned
-//! whenever a new client is added.
+//! string. Callers with the same target share clients, and clients are
+//! discarded when unused.
 
 #![allow(dead_code)] // TODO: remove once the xDS resolver uses the pool.
 
-/// Adapter from the `grpc` crate's runtime to [`xds_client::Runtime`].
 mod runtime;
 
 use std::collections::BTreeMap;

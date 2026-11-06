@@ -45,8 +45,6 @@ mod generated {
 /// xDS Bootstrap data structure and parser.
 mod bootstrap;
 
-/// Process-wide pool of [`xds_client::XdsClient`]s shared by channels with the
-/// same target.
 mod client_pool;
 
 /// Validated xDS resource types (LDS/RDS/CDS/EDS), each implementing

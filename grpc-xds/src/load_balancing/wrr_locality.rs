@@ -30,7 +30,7 @@
 //!
 //! Because xDS provides locality weights dynamically via EDS endpoint
 //! attributes rather than static service config, this policy extracts those
-//! per-locality weights from each resolver update and synthesizes a
+//! per-locality weights from each resolver update and builds a
 //! `weighted_target_experimental` child policy configuration.
 //!
 //! Specifications:
@@ -67,7 +67,14 @@ static CHILD_POLICY_NAME: &str = "weighted_target_experimental";
 
 // Endpoint attribute carrying the xDS locality load-balancing weight.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct LocalityWeight(pub(super) u32);
+struct LocalityWeight(u32);
+
+/// Sets the xDS locality load-balancing weight on `endpoint`.
+#[allow(dead_code, reason = "no caller until there is an xDS resolver.")]
+pub(crate) fn set_locality_weight(mut endpoint: Endpoint, weight: u32) -> Endpoint {
+    endpoint.attributes = endpoint.attributes.add(LocalityWeight(weight));
+    endpoint
+}
 
 // Validated configuration for the WRR Locality LB policy.
 #[derive(Debug, Deserialize)]
@@ -88,22 +95,7 @@ struct WrrLocalityPolicy {
     child: Option<(Child, ParsedLbConfig)>,
     runtime: GrpcRuntime,
     work_scheduler: Arc<dyn WorkScheduler>,
-    #[cfg(test)]
     child_policy_name: &'static str,
-}
-
-impl WrrLocalityBuilder {
-    #[cfg(test)]
-    fn build_with_child_policy_name(
-        &self,
-        options: LbPolicyOptions,
-        child_policy_name: &'static str,
-    ) -> WrrLocalityPolicy {
-        WrrLocalityPolicy {
-            child_policy_name,
-            ..self.build(options)
-        }
-    }
 }
 
 impl LbPolicyBuilder for WrrLocalityBuilder {
@@ -114,7 +106,6 @@ impl LbPolicyBuilder for WrrLocalityBuilder {
             child: None,
             runtime: options.runtime,
             work_scheduler: options.work_scheduler,
-            #[cfg(test)]
             child_policy_name: CHILD_POLICY_NAME,
         }
     }
@@ -136,24 +127,13 @@ impl LbPolicyBuilder for WrrLocalityBuilder {
 }
 
 impl WrrLocalityPolicy {
-    fn child_policy_name(&self) -> &'static str {
-        #[cfg(not(test))]
-        {
-            CHILD_POLICY_NAME
-        }
-        #[cfg(test)]
-        {
-            self.child_policy_name
-        }
-    }
-
     // Drops any active child policy, transitions the channel to
     // TRANSIENT_FAILURE with a FailingPicker, and returns the error.
-    fn fail_update<T>(
+    fn fail_update(
         &mut self,
         error: String,
         channel_controller: &mut dyn ChannelController,
-    ) -> Result<T, String> {
+    ) -> String {
         self.child = None;
         channel_controller.update_picker(LbState {
             connectivity_state: ConnectivityState::TransientFailure,
@@ -161,14 +141,13 @@ impl WrrLocalityPolicy {
                 error: error.clone(),
             }),
         });
-        Err(error)
+        error
     }
 
-    // Synthesizes and parses the child LB policy configuration from
-    // per-locality endpoint weights. Per gRFC A52, if a locality appears with
-    // conflicting weights across endpoints, the first weight encountered is
-    // used. Fails the update if no localities with positive weight are present
-    // or if the generated child config fails to parse.
+    // Builds and parses the child LB policy configuration from per-locality
+    // endpoint weights. Per gRFC A52, if a locality appears with conflicting
+    // weights across endpoints, the first weight encountered is used. Fails the
+    // update if the generated child config fails to parse.
     fn parse_child_config(
         &mut self,
         endpoints: &[Endpoint],
@@ -189,24 +168,17 @@ impl WrrLocalityPolicy {
             });
         }
 
-        if targets.is_empty() {
-            return self.fail_update(
-                format!("{POLICY_NAME}: no localities with positive weight in resolver update"),
-                channel_controller,
-            );
-        }
-
         let child_policy_json = json!([{
-            self.child_policy_name(): {
+            self.child_policy_name: {
                 "targets": targets,
             }
         }]);
         match ParsedLbConfig::parse(&child_policy_json.to_string()) {
             Ok(parsed) => Ok(parsed),
-            Err(err) => self.fail_update(
+            Err(err) => Err(self.fail_update(
                 format!("{POLICY_NAME}: failed to parse generated child config: {err}"),
                 channel_controller,
-            ),
+            )),
         }
     }
 
@@ -216,19 +188,17 @@ impl WrrLocalityPolicy {
         &mut self,
         child_config: ParsedLbConfig,
     ) -> &mut (Child, ParsedLbConfig) {
-        if let Some((_, last_config)) = &mut self.child {
-            *last_config = child_config;
-        } else {
-            let child = Child::new(
+        let child = match self.child.take() {
+            Some((child, _old_config)) => child,
+            None => Child::new(
                 &*child_config.builder,
                 LbPolicyOptions {
                     work_scheduler: self.work_scheduler.clone(),
                     runtime: self.runtime.clone(),
                 },
-            );
-            self.child = Some((child, child_config));
-        }
-        self.child.as_mut().unwrap()
+            ),
+        };
+        self.child.insert((child, child_config))
     }
 
     // Use whenever forwarding a resolver update to an active child so that any
@@ -260,10 +230,10 @@ impl LbPolicy for WrrLocalityPolicy {
             Ok(endpoints) => endpoints,
             Err(err) => {
                 let Some((child, last_config)) = &mut self.child else {
-                    return self.fail_update(
+                    return Err(self.fail_update(
                         format!("{POLICY_NAME}: resolver error: {err}"),
                         channel_controller,
-                    );
+                    ));
                 };
 
                 return Self::update_child(child, last_config, update, channel_controller);
@@ -361,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    fn resolver_update_synthesizes_weighted_targets_and_forwards_update() {
-        let (mut t, received) = new_recording_env("mock_wrr_synthesizes_targets");
+    fn resolver_update_builds_weighted_targets_and_forwards_update() {
+        let (mut t, received) = new_recording_env("mock_wrr_builds_targets");
         let endpoints = vec![
             locality_endpoint("region-1", "zone-1", "subzone-1", 20),
             locality_endpoint("region-2", "zone-2", "subzone-2", 80),
@@ -422,8 +392,7 @@ mod tests {
             zone: "z1".to_string(),
             sub_zone: "sz1".to_string(),
         });
-        let mut missing_locality = Endpoint::default();
-        missing_locality.attributes = missing_locality.attributes.add(LocalityWeight(10));
+        let missing_locality = set_locality_weight(Endpoint::default(), 10);
 
         let endpoints = vec![
             missing_weight,
@@ -467,15 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_unweighted_endpoints_transitions_to_transient_failure() {
-        let mut t = new_env();
+    fn empty_or_unweighted_endpoints_forwards_empty_targets_to_child() {
+        let (mut t, received) = new_recording_env("mock_wrr_empty_targets");
 
-        // Establish an active child first to verify it is replaced.
+        // Establish an active child first.
         t.send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
             .expect("initial update should succeed");
         t.expect_queuing_picker();
+        assert_eq!(received.lock().unwrap().take().unwrap().1.len(), 1);
 
-        // Update with an endpoint missing locality weight.
+        // Update with an endpoint missing locality weight forwards empty targets
+        // to the child policy rather than dropping the child.
         let mut unweighted = Endpoint::default();
         unweighted.attributes = unweighted.attributes.add(Locality {
             region: "r1".to_string(),
@@ -483,16 +454,14 @@ mod tests {
             sub_zone: "sz1".to_string(),
         });
 
-        let err = t
-            .send_resolver_update(vec![unweighted])
-            .expect_err("update without weighted localities should fail");
-        assert_eq!(
-            err,
-            "xds_wrr_locality_experimental: no localities with positive weight in resolver update"
-        );
-
-        t.expect_failing_picker(&err);
+        t.send_resolver_update(vec![unweighted.clone()])
+            .expect("update without weighted localities should be forwarded to child");
+        t.expect_queuing_picker();
         t.expect_no_events();
+
+        let (received_update, targets) = received.lock().unwrap().take().unwrap();
+        assert!(targets.is_empty());
+        assert_eq!(received_update.endpoints, Ok(vec![unweighted]));
     }
 
     #[test]
@@ -657,14 +626,12 @@ mod tests {
     }
 
     fn new_env_with_child(child_policy_name: &'static str) -> TestEnv<WrrLocalityPolicy> {
-        TestEnv::new(|work_scheduler| {
-            WrrLocalityBuilder.build_with_child_policy_name(
-                LbPolicyOptions {
-                    work_scheduler,
-                    runtime: default_runtime(),
-                },
-                child_policy_name,
-            )
+        TestEnv::new(|work_scheduler| WrrLocalityPolicy {
+            child_policy_name,
+            ..WrrLocalityBuilder.build(LbPolicyOptions {
+                work_scheduler,
+                runtime: default_runtime(),
+            })
         })
     }
 
@@ -708,15 +675,12 @@ mod tests {
 
     fn locality_endpoint(region: &str, zone: &str, sub_zone: &str, weight: u32) -> Endpoint {
         let mut endpoint = Endpoint::default();
-        endpoint.attributes = endpoint
-            .attributes
-            .add(Locality {
-                region: region.to_string(),
-                zone: zone.to_string(),
-                sub_zone: sub_zone.to_string(),
-            })
-            .add(LocalityWeight(weight));
-        endpoint
+        endpoint.attributes = endpoint.attributes.add(Locality {
+            region: region.to_string(),
+            zone: zone.to_string(),
+            sub_zone: sub_zone.to_string(),
+        });
+        set_locality_weight(endpoint, weight)
     }
 
     #[derive(Debug, Deserialize)]

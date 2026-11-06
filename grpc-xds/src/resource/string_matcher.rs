@@ -36,10 +36,10 @@ use crate::generated::envoy::r#type::matcher::v3::string_matcher::MatchPatternOn
 /// reject non-Envoy-spec-compliant values (e.g. empty prefix, suffix, and
 /// contains values). When `ignore_case` is set, literal values are stored
 /// ASCII-lowercased.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StringMatcher(Kind);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
     Exact { value: String, ignore_case: bool },
     Prefix { value: String, ignore_case: bool },

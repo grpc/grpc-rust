@@ -45,7 +45,7 @@ use crate::resource::RouteSource;
 use crate::resource::VirtualHost;
 
 /// The atomic xDS configuration snapshot for a channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct XdsConfig {
     /// The channel's Listener resource (LDS).
@@ -136,7 +136,7 @@ impl std::error::Error for ClusterResolutionError {}
 
 /// A single resolved cluster: its static CDS configuration plus its
 /// dynamically resolved children.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct ClusterConfig {
     /// The validated CDS resource itself (name, discovery mechanism, ...).
@@ -146,7 +146,7 @@ pub(crate) struct ClusterConfig {
 }
 
 /// A cluster's dynamically resolved children.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClusterChildren {
     /// A leaf cluster (EDS or LogicalDNS): its resolved endpoints.
     Leaf(LeafEndpoints),
@@ -156,7 +156,7 @@ pub(crate) enum ClusterChildren {
 }
 
 /// Resolved aggregate-cluster dependencies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct AggregateClusters {
     pub(crate) leaf_clusters: Vec<String>,
@@ -165,7 +165,7 @@ pub(crate) struct AggregateClusters {
 }
 
 /// A leaf cluster's resolved endpoints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct LeafEndpoints {
     /// A leaf cluster's resolved endpoints, if any have been resolved yet.
@@ -181,7 +181,7 @@ pub(crate) struct LeafEndpoints {
 }
 
 /// The origin of a leaf cluster's endpoints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LeafEndpointSource {
     /// Resolved via EDS: the validated ClusterLoadAssignment resource.
     Eds(Arc<EndpointsResource>),

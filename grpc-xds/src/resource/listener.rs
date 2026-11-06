@@ -42,7 +42,7 @@ use crate::generated::envoy::extensions::filters::network::http_connection_manag
 const HTTP_CONNECTION_MANAGER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
 
 /// How the listener obtains its route configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteSource {
     /// Route configuration fetched dynamically via RDS, keyed by this route
     /// config name.
@@ -57,7 +57,7 @@ pub(crate) enum RouteSource {
 /// `ApiListener` -> `HttpConnectionManager` -> `route_specifier` chain per
 /// gRFC A27. `scoped_routes` is not supported, matching other gRPC xDS
 /// client implementation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ListenerResource {
     pub(crate) name: String,
     pub(crate) route_source: RouteSource,

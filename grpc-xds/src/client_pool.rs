@@ -43,7 +43,6 @@ pub mod runtime;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -52,6 +51,8 @@ use std::sync::Weak;
 use grpc::__unstable::rt::GrpcRuntime;
 use xds_client::MetricsRecorder;
 use xds_client::ProstCodec;
+use xds_client::Resource;
+use xds_client::ResourceWatcher;
 use xds_client::XdsClient;
 
 use crate::bootstrap::BootstrapConfig;
@@ -134,17 +135,24 @@ impl XdsClientPool {
 /// The client stays in the pool while any `SharedXdsClient` for it is alive.
 /// Cloning creates another reference to the same client.
 ///
-/// Note that the pool tracks usage via `SharedXdsClient` references only.
-/// Cloning the inner [`XdsClient`] keeps its background worker alive but does
-/// not keep the pool entry alive.
+/// The inner [`XdsClient`] is deliberately not exposed: a clone of it would
+/// keep its background worker alive without keeping the pool entry alive.
+/// Instead, its methods are forwarded.
 #[derive(Clone)]
 pub struct SharedXdsClient(Arc<XdsClient>);
 
-impl Deref for SharedXdsClient {
-    type Target = XdsClient;
+impl SharedXdsClient {
+    /// Starts watching the resource of type `T` named `name`. See
+    /// [`XdsClient::watch`].
+    pub fn watch<T: Resource>(&self, name: impl Into<String>) -> ResourceWatcher<T> {
+        self.0.watch(name)
+    }
 
-    fn deref(&self) -> &XdsClient {
-        &self.0
+    /// Returns the status of every resource the client is subscribed to. See
+    /// [`XdsClient::resource_snapshot`].
+    #[cfg(test)]
+    pub async fn resource_snapshot(&self) -> Vec<xds_client::ResourceSnapshot> {
+        self.0.resource_snapshot().await
     }
 }
 

@@ -896,7 +896,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn test_pick_first_stickiness() {
         let mut env = new_env();
-        env.simulate_successful_connection(&["addr1", "addr2"]);
+        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
 
         // New resolver update including addr1.
         let endpoints_new = create_endpoints(&["addr2", "addr1", "addr3"]);
@@ -908,6 +908,12 @@ mod test {
 
         // Should NOT have any more events (no Connect, no UpdatePicker),
         // because it stuck to the original selected subchannel.
+        env.expect_no_events();
+
+        // addr1 is still selected: only the selected subchannel going IDLE
+        // moves the policy to IDLE.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_picker_state(ConnectivityState::Idle);
         env.expect_no_events();
     }
 
@@ -957,8 +963,12 @@ mod test {
     async fn test_pick_first_duplicate_de_duplication() {
         let mut env = new_env();
 
-        // Create endpoints with duplicates.
-        let endpoints = vec![endpoint(&["addr1", "addr1"]), endpoint(&["addr2", "addr1"])];
+        // Create endpoints with duplicates. The addresses are not TCP, so this
+        // also checks that every non-TCP address survives the interleaving.
+        let mut endpoints = vec![endpoint(&["addr1", "addr1"]), endpoint(&["addr2", "addr1"])];
+        for addr in endpoints.iter_mut().flat_map(|ep| ep.addresses.iter_mut()) {
+            addr.network_type = crate::client::name_resolution::UNIX_NETWORK_TYPE;
+        }
 
         env.send_resolver_update(endpoints).unwrap();
 

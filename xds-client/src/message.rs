@@ -163,7 +163,7 @@ impl Node {
 }
 
 /// Locality information identifying where a node is running.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Locality {
     /// Region the node is in.
     pub region: String,

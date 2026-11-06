@@ -90,14 +90,6 @@ struct WrrLocalityConfig {
 #[derive(Debug)]
 struct WrrLocalityBuilder;
 
-#[derive(Debug)]
-struct WrrLocalityPolicy {
-    child: Option<(Child, ParsedLbConfig)>,
-    runtime: GrpcRuntime,
-    work_scheduler: Arc<dyn WorkScheduler>,
-    child_policy_name: &'static str,
-}
-
 impl LbPolicyBuilder for WrrLocalityBuilder {
     type LbPolicy = WrrLocalityPolicy;
 
@@ -126,6 +118,14 @@ impl LbPolicyBuilder for WrrLocalityBuilder {
     }
 }
 
+#[derive(Debug)]
+struct WrrLocalityPolicy {
+    child: Option<(Child, ParsedLbConfig)>,
+    runtime: GrpcRuntime,
+    work_scheduler: Arc<dyn WorkScheduler>,
+    child_policy_name: &'static str,
+}
+
 impl WrrLocalityPolicy {
     // Drops any active child policy, transitions the channel to
     // TRANSIENT_FAILURE with a FailingPicker, and returns the error.
@@ -146,13 +146,11 @@ impl WrrLocalityPolicy {
 
     // Builds and parses the child LB policy configuration from per-locality
     // endpoint weights. Per gRFC A52, if a locality appears with conflicting
-    // weights across endpoints, the first weight encountered is used. Fails the
-    // update if the generated child config fails to parse.
+    // weights across endpoints, the first weight encountered is used.
     fn parse_child_config(
-        &mut self,
+        &self,
         endpoints: &[Endpoint],
         child_policy: &[Value],
-        channel_controller: &mut dyn ChannelController,
     ) -> Result<ParsedLbConfig, String> {
         let mut targets = serde_json::Map::new();
         for (locality, weight) in endpoints.iter().filter_map(|endpoint| {
@@ -173,13 +171,8 @@ impl WrrLocalityPolicy {
                 "targets": targets,
             }
         }]);
-        match ParsedLbConfig::parse(&child_policy_json.to_string()) {
-            Ok(parsed) => Ok(parsed),
-            Err(err) => Err(self.fail_update(
-                format!("{POLICY_NAME}: failed to parse generated child config: {err}"),
-                channel_controller,
-            )),
-        }
+        serde_json::from_value(child_policy_json)
+            .map_err(|err| format!("{POLICY_NAME}: failed to parse generated child config: {err}"))
     }
 
     // Lazily initializes the child policy on first update and stores the latest
@@ -240,8 +233,10 @@ impl LbPolicy for WrrLocalityPolicy {
             }
         };
 
-        let child_config =
-            self.parse_child_config(endpoints, &config.child_policy, channel_controller)?;
+        let child_config = match self.parse_child_config(endpoints, &config.child_policy) {
+            Ok(parsed) => parsed,
+            Err(err) => return Err(self.fail_update(err, channel_controller)),
+        };
         let (child, last_config) = self.get_or_insert_child(child_config);
         Self::update_child(child, last_config, update, channel_controller)
     }
@@ -291,6 +286,15 @@ mod tests {
 
     #[test]
     fn parse_config() {
+        reg();
+        let top_level = serde_json::from_value::<ParsedLbConfig>(json!([{
+            POLICY_NAME: {
+                "childPolicy": [{ RR_POLICY_NAME: {} }]
+            }
+        }]))
+        .expect("registered policy should parse through GLOBAL_LB_REGISTRY");
+        assert_eq!(top_level.builder.name(), "xds_wrr_locality_experimental");
+
         let builder = WrrLocalityBuilder;
         assert_eq!(builder.name(), "xds_wrr_locality_experimental");
 
@@ -376,7 +380,7 @@ mod tests {
         ];
 
         assert_eq!(
-            parse_child_targets(&endpoints),
+            targets_from_update("mock_wrr_conflicting_weights", endpoints),
             BTreeMap::from([(
                 "{region=\"r1\", zone=\"z1\", sub_zone=\"sz1\"}".to_string(),
                 35,
@@ -402,7 +406,7 @@ mod tests {
         ];
 
         assert_eq!(
-            parse_child_targets(&endpoints),
+            targets_from_update("mock_wrr_skips_unweighted", endpoints),
             BTreeMap::from([(
                 "{region=\"r3\", zone=\"z3\", sub_zone=\"sz3\"}".to_string(),
                 50,
@@ -462,6 +466,16 @@ mod tests {
         let (received_update, targets) = received.lock().unwrap().take().unwrap();
         assert!(targets.is_empty());
         assert_eq!(received_update.endpoints, Ok(vec![unweighted]));
+
+        // An empty endpoint list also forwards empty targets to the child.
+        t.send_resolver_update(Vec::new())
+            .expect("empty endpoint update should be forwarded to child");
+        t.expect_queuing_picker();
+        t.expect_no_events();
+
+        let (received_update, targets) = received.lock().unwrap().take().unwrap();
+        assert!(targets.is_empty());
+        assert_eq!(received_update.endpoints, Ok(Vec::new()));
     }
 
     #[test]
@@ -577,6 +591,10 @@ mod tests {
         );
         let mut t = new_env_with_child("stub_wrr_work_and_exit_idle");
 
+        // `exit_idle` before any child exists is a no-op.
+        t.policy.exit_idle(&mut t.tcc);
+        t.expect_no_events();
+
         // Child starts IDLE.
         t.send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
             .expect("update should succeed");
@@ -613,16 +631,10 @@ mod tests {
         }
     }
 
-    const MOCK_CHILD_POLICY_NAME: &str = "test_wrr_locality_mock_child";
-
     type RecordedUpdate = (ResolverUpdate, BTreeMap<String, u32>);
 
     fn new_env() -> TestEnv<WrrLocalityPolicy> {
-        GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder {
-            name: MOCK_CHILD_POLICY_NAME,
-            received: Arc::default(),
-        });
-        new_env_with_child(MOCK_CHILD_POLICY_NAME)
+        new_env_with_child(CHILD_POLICY_NAME)
     }
 
     fn new_env_with_child(child_policy_name: &'static str) -> TestEnv<WrrLocalityPolicy> {
@@ -649,28 +661,16 @@ mod tests {
         (new_env_with_child(child_policy_name), received)
     }
 
-    fn parse_child_targets(endpoints: &[Endpoint]) -> BTreeMap<String, u32> {
-        let mut t = new_env();
-        let child_policy = WrrLocalityConfig::default().child_policy;
-        let parsed = t
-            .policy
-            .parse_child_config(endpoints, &child_policy, &mut t.tcc)
-            .expect("child config should parse");
-        let child_cfg = parsed
-            .config
-            .downcast_ref::<MockChildConfig>()
-            .expect("child config should be MockChildConfig");
-        assert!(
-            child_cfg
-                .targets
-                .values()
-                .all(|target| target.child_policy.builder.name() == RR_POLICY_NAME)
-        );
-        child_cfg
-            .targets
-            .iter()
-            .map(|(name, target)| (name.clone(), target.weight))
-            .collect()
+    fn targets_from_update(
+        child_policy_name: &'static str,
+        endpoints: Vec<Endpoint>,
+    ) -> BTreeMap<String, u32> {
+        let (mut t, received) = new_recording_env(child_policy_name);
+        t.send_resolver_update(endpoints)
+            .expect("resolver update should succeed");
+        t.expect_queuing_picker();
+        t.expect_no_events();
+        received.lock().unwrap().take().unwrap().1
     }
 
     fn locality_endpoint(region: &str, zone: &str, sub_zone: &str, weight: u32) -> Endpoint {

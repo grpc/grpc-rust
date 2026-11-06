@@ -39,7 +39,7 @@
 #![allow(dead_code)] // TODO: remove once the xDS resolver uses the pool.
 
 /// Adapter from the `grpc` crate's runtime to [`xds_client::Runtime`].
-pub mod runtime;
+mod runtime;
 
 use std::collections::BTreeMap;
 use std::fmt;

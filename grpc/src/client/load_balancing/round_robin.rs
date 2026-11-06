@@ -27,9 +27,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use crate::StatusCodeError;
+use crate::StatusError;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::FailingPicker;
+use crate::client::load_balancing::FixedResultPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
@@ -93,7 +95,10 @@ impl RoundRobinPolicy {
     ) {
         channel_controller.update_picker(LbState {
             connectivity_state: ConnectivityState::TransientFailure,
-            picker: Arc::new(FailingPicker { error }),
+            picker: Arc::new(FixedResultPicker(PickResult::Fail(StatusError::new(
+                StatusCodeError::Unavailable,
+                error,
+            )))),
         });
         channel_controller.request_resolution();
     }

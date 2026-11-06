@@ -376,7 +376,6 @@ impl Picker for UnwrapPicker {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Debug;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::mpsc;
@@ -385,11 +384,11 @@ mod tests {
     use crate::client::CallOptions;
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::DynLbConfig;
+    use crate::client::load_balancing::FixedResultPicker;
     use crate::client::load_balancing::LbPolicy;
     use crate::client::load_balancing::LbPolicyOptions;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::PickResult;
-    use crate::client::load_balancing::Picker;
     use crate::client::load_balancing::subchannel::SubchannelState;
     use crate::client::load_balancing::test_utils::StubPolicy;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
@@ -735,23 +734,13 @@ mod tests {
                     .0;
                 *sc_out_clone.lock().unwrap() = Some(sc.clone());
 
-                #[derive(Debug)]
-                struct MockPicker {
-                    sc: Arc<dyn Subchannel>,
-                }
-                impl Picker for MockPicker {
-                    fn pick(&self, _options: PickOptions<'_>) -> PickResult {
-                        PickResult::Pick(Pick {
-                            subchannel: self.sc.clone(),
-                            metadata: MetadataMap::new(),
-                            on_complete: None,
-                        })
-                    }
-                }
-
                 cc.update_picker(LbState {
                     connectivity_state: ConnectivityState::Ready,
-                    picker: Arc::new(MockPicker { sc }),
+                    picker: Arc::new(FixedResultPicker(PickResult::Pick(Pick {
+                        subchannel: sc,
+                        metadata: MetadataMap::new(),
+                        on_complete: None,
+                    }))),
                 });
             })),
             ..Default::default()

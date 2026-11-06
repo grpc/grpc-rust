@@ -31,9 +31,11 @@ use std::sync::atomic::Ordering;
 
 use rand::seq::SliceRandom;
 
+use crate::StatusCodeError;
+use crate::StatusError;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::FailingPicker;
+use crate::client::load_balancing::FixedResultPicker;
 use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
@@ -43,7 +45,6 @@ use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickOptions;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -248,7 +249,11 @@ impl PickFirstPolicy {
 
         self.update_picker(
             ConnectivityState::Ready,
-            Arc::new(OneSubchannelPicker { sc: subchannel }),
+            Arc::new(FixedResultPicker(PickResult::Pick(Pick {
+                subchannel,
+                metadata: MetadataMap::new(),
+                on_complete: None,
+            }))),
             channel_controller,
         );
     }
@@ -266,7 +271,7 @@ impl PickFirstPolicy {
             // TODO: avoid this update if we are in TF (i.e. sticky TF)?
             self.update_picker(
                 ConnectivityState::Connecting,
-                Arc::new(QueuingPicker {}),
+                Arc::new(FixedResultPicker(PickResult::Queue)),
                 channel_controller,
             );
         } else {
@@ -488,7 +493,10 @@ impl PickFirstPolicy {
         };
         self.update_picker(
             ConnectivityState::TransientFailure,
-            Arc::new(FailingPicker { error: err.clone() }),
+            Arc::new(FixedResultPicker(PickResult::Fail(StatusError::new(
+                StatusCodeError::Unavailable,
+                err.clone(),
+            )))),
             channel_controller,
         );
         channel_controller.request_resolution();
@@ -664,21 +672,6 @@ impl Timer {
 impl Drop for Timer {
     fn drop(&mut self) {
         self.handle.abort();
-    }
-}
-
-#[derive(Debug)]
-struct OneSubchannelPicker {
-    sc: Arc<dyn Subchannel>,
-}
-
-impl Picker for OneSubchannelPicker {
-    fn pick(&self, _: PickOptions<'_>) -> PickResult {
-        PickResult::Pick(Pick {
-            subchannel: self.sc.clone(),
-            metadata: MetadataMap::new(),
-            on_complete: None,
-        })
     }
 }
 

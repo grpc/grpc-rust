@@ -523,9 +523,10 @@ mod test {
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::DynLbConfig;
     use crate::client::load_balancing::DynLbPolicyBuilder;
+    use crate::client::load_balancing::FixedResultPicker;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
     use crate::client::load_balancing::LbState;
-    use crate::client::load_balancing::QueuingPicker;
+    use crate::client::load_balancing::PickResult;
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::child_manager::ChildManager;
@@ -647,7 +648,7 @@ mod test {
                     .expect("expected SubchannelUpdate");
                 controller.update_picker(LbState {
                     connectivity_state: update.state.connectivity_state,
-                    picker: Arc::new(QueuingPicker {}),
+                    picker: Arc::new(FixedResultPicker(PickResult::Queue)),
                 });
             })),
             ..Default::default()

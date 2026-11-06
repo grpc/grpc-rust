@@ -29,11 +29,12 @@ use std::time::Duration;
 use super::*;
 use crate::attributes::Attributes;
 use crate::client::ConnectivityState;
+use crate::client::load_balancing::FixedResultPicker;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
-use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::endpoint_filtering;
 use crate::client::load_balancing::pick_first::PickFirstConfig;
@@ -227,7 +228,7 @@ fn reg_stub(policy_name: &'static str) {
             }
             controller.update_picker(LbState {
                 connectivity_state: update.state.connectivity_state,
-                picker: Arc::new(QueuingPicker {}),
+                picker: Arc::new(FixedResultPicker(PickResult::Queue)),
             });
         })),
         ..Default::default()
@@ -970,14 +971,14 @@ async fn exit_idle_wakes_only_current_priority() {
                     .expect("expected SubchannelUpdate");
                 controller.update_picker(LbState {
                     connectivity_state: update.state.connectivity_state,
-                    picker: Arc::new(QueuingPicker {}),
+                    picker: Arc::new(FixedResultPicker(PickResult::Queue)),
                 });
             })),
             exit_idle: Some(Arc::new(move |_data, controller| {
                 calls.lock().unwrap().push(child_name);
                 controller.update_picker(LbState {
                     connectivity_state: ConnectivityState::Connecting,
-                    picker: Arc::new(QueuingPicker {}),
+                    picker: Arc::new(FixedResultPicker(PickResult::Queue)),
                 });
             })),
         };

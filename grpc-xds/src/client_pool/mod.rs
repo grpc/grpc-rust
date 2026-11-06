@@ -28,8 +28,6 @@
 
 #![allow(dead_code)] // TODO: remove once the xDS resolver uses the pool.
 
-mod runtime;
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -45,7 +43,7 @@ use xds_client::ResourceWatcher;
 use xds_client::XdsClient;
 
 use crate::bootstrap::BootstrapConfig;
-use runtime::XdsRuntime;
+use crate::xds_client_runtime::XdsRuntime;
 
 /// The process-wide [`XdsClientPool`] used by xDS channels.
 pub static GLOBAL_XDS_CLIENT_POOL: XdsClientPool = XdsClientPool::new();

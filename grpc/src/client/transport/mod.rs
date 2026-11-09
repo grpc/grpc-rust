@@ -28,6 +28,7 @@ use std::time::Duration;
 use http::HeaderValue;
 
 use crate::client::DynInvoke;
+use crate::client::ErasedInvoke;
 use crate::client::Invoke;
 use crate::core::Address;
 use crate::core::ConnectionInfo;
@@ -105,6 +106,11 @@ pub(crate) trait Transport: Sync {
     >;
 }
 
+/// A dyn-compatible version of [`Transport`].
+///
+/// [`Transport`] is also blanket implemented for every `DynTransport`
+/// implementation.  To use a [`Transport`] as a `DynTransport`, wrap it in an
+/// [`ErasedTransport`].
 #[async_trait]
 pub(crate) trait DynTransport: Send + Sync {
     async fn dyn_connect(
@@ -123,8 +129,35 @@ pub(crate) trait DynTransport: Send + Sync {
     >;
 }
 
+impl<T: DynTransport + ?Sized> Transport for T {
+    type Service = Box<dyn DynInvoke>;
+
+    async fn connect(
+        &self,
+        address: &Address,
+        runtime: GrpcRuntime,
+        security_opts: &SecurityOpts,
+        opts: &TransportOptions,
+    ) -> Result<
+        (
+            Self::Service,
+            ConnectionInfo,
+            oneshot::Receiver<Result<(), String>>,
+        ),
+        String,
+    > {
+        self.dyn_connect(address, runtime, security_opts, opts)
+            .await
+    }
+}
+
+/// Adapts a [`Transport`] into a [`DynTransport`], e.g. to store it as an
+/// `Arc<dyn DynTransport>`.  Boxes the services it returns.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ErasedTransport<T>(pub T);
+
 #[async_trait]
-impl<T: Transport> DynTransport for T {
+impl<T: Transport> DynTransport for ErasedTransport<T> {
     async fn dyn_connect(
         &self,
         address: &Address,
@@ -139,8 +172,11 @@ impl<T: Transport> DynTransport for T {
         ),
         String,
     > {
-        let (i, sc, rx) = self.connect(address, runtime, security_opts, opts).await?;
-        Ok((Box::new(i), sc, rx))
+        let (i, sc, rx) = self
+            .0
+            .connect(address, runtime, security_opts, opts)
+            .await?;
+        Ok((Box::new(ErasedInvoke(i)), sc, rx))
     }
 }
 

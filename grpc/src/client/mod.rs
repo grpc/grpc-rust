@@ -49,6 +49,7 @@
 //!   trailers received from the server during its response.
 
 use std::fmt::Display;
+use std::sync::Arc;
 
 use crate::async_trait;
 use crate::core::ConnectionInfo;
@@ -143,8 +144,10 @@ pub trait Invoke: Sync {
 }
 
 /// A dyn-compatible version of [`Invoke`].
+///
+/// [`Invoke`] is also blanket implemented for every `DynInvoke` implementation.
 #[async_trait]
-pub trait DynInvoke: Send + Sync {
+pub(crate) trait DynInvoke: Send + Sync {
     /// Starts an RPC, returning the send and receive streams to interact with
     /// it.
     ///
@@ -158,14 +161,56 @@ pub trait DynInvoke: Send + Sync {
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
 }
 
+impl<T: DynInvoke + ?Sized> Invoke for T {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        self.dyn_invoke(headers, options).await
+    }
+}
+
+impl<T: Invoke + ?Sized + Send> Invoke for Arc<T> {
+    type SendStream = T::SendStream;
+    type RecvStream = T::RecvStream;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        (**self).invoke(headers, options).await
+    }
+}
+
 #[async_trait]
-impl<T: Invoke> DynInvoke for T {
+impl<T: DynInvoke + ?Sized> DynInvoke for Box<T> {
     async fn dyn_invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        let (tx, rx) = self.invoke(headers, options).await;
+        (**self).dyn_invoke(headers, options).await
+    }
+}
+
+/// Adapts an [`Invoke`] into a [`DynInvoke`], e.g. to store it as an
+/// `Arc<dyn DynInvoke>`.  Boxes the streams it returns.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ErasedInvoke<I>(pub I);
+
+#[async_trait]
+impl<I: Invoke> DynInvoke for ErasedInvoke<I> {
+    async fn dyn_invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        let (tx, rx) = self.0.invoke(headers, options).await;
         (Box::new(tx), Box::new(rx))
     }
 }
@@ -192,7 +237,7 @@ pub trait InvokeOnce: Sync {
     ) -> (Self::SendStream, Self::RecvStream);
 }
 
-impl<T: Invoke> InvokeOnce for &T {
+impl<T: Invoke + ?Sized> InvokeOnce for &T {
     type SendStream = T::SendStream;
     type RecvStream = T::RecvStream;
 

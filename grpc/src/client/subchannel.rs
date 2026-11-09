@@ -38,12 +38,12 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::async_trait;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
+use crate::client::Invoke;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -172,13 +172,15 @@ impl PartialEq for InternalSubchannelState {
     }
 }
 
-#[async_trait]
-impl DynInvoke for InternalSubchannel {
-    async fn dyn_invoke(
+impl Invoke for InternalSubchannel {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
         &self,
         mut headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+    ) -> (Self::SendStream, Self::RecvStream) {
         let (state, call_creds) = {
             let data = self.data.lock().unwrap();
 

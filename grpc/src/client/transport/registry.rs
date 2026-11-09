@@ -29,6 +29,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 
 use crate::client::transport::DynTransport;
+use crate::client::transport::ErasedTransport;
 use crate::client::transport::Transport;
 
 /// A registry to store and retrieve transports.  Transports are indexed by
@@ -58,10 +59,10 @@ impl TransportRegistry {
     where
         T: Transport + 'static,
     {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(address_type.to_string(), Arc::new(transport));
+        self.inner.lock().unwrap().insert(
+            address_type.to_string(),
+            Arc::new(ErasedTransport(transport)),
+        );
     }
 
     /// Retrieve a name resolver from the registry, or None if not found.

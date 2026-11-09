@@ -72,6 +72,7 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::config_selector::ConfigSelector;
 use crate::client::name_resolution::config_selector::DefaultConfigSelector;
+use crate::client::name_resolution::config_selector::DynInvoker;
 use crate::client::name_resolution::config_selector::RpcConfig;
 use crate::client::name_resolution::config_selector::SelectConfigOptions;
 use crate::client::name_resolution::dns;
@@ -459,7 +460,7 @@ impl Invoke for ActiveChannel {
         match config.interceptor {
             Some(interceptor) => {
                 interceptor
-                    .dyn_intercept(headers, options, self.lb.clone())
+                    .dyn_intercept(headers, options, DynInvoker::new(self.lb.clone()))
                     .await
             }
             // Avoid heap allocations and dynamic dispatch.
@@ -477,10 +478,13 @@ struct LbInvoker {
     lb_watcher: Arc<Watcher<LbState>>,
 }
 
-// Note: `LbInvoker` implements `DynInvoke` directly, rather than `Invoke`, as
-// its streams are already boxed; the blanket `DynInvoke` implementation for
-// `Invoke` would box them a second time when it is passed to the config
-// selector's interceptor.
+// Note: `LbInvoker` implements `DynInvoke` directly, rather than `Invoke`,
+// because it is passed to the config selector's interceptor as a `DynInvoker`
+// (wrapping an `Arc<dyn DynInvoke>`).  Its streams are already boxed, so
+// wrapping an `Invoke` implementation in `ErasedInvoke` would box them a second
+// time.  (It is also an `Invoke` through the blanket implementation for
+// `DynInvoke`, but that boxes the future, so it also has an inherent `invoke`
+// method for the non-intercepted path.)
 impl LbInvoker {
     /// Starts an RPC on a subchannel picked by the current LB picker, waiting
     /// for a new picker while picks are queued.
@@ -503,7 +507,7 @@ impl LbInvoker {
             {
                 PickResult::Pick(pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
-                        return sc.dyn_invoke(headers, options).await;
+                        return sc.invoke(headers, options).await;
                     } else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"

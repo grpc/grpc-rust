@@ -35,8 +35,40 @@ use crate::client::CallOptions;
 use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
+use crate::client::Invoke;
 use crate::client::RequestHeaders;
 use crate::client::name_resolution::ResolverUpdate;
+
+/// The next step in an RPC's call chain, passed to a [`DynIntercept`].
+///
+/// Cheap to clone; the interceptor may keep it for as long as it likes.
+#[derive(Clone)]
+pub struct DynInvoker(Arc<dyn DynInvoke>);
+
+impl DynInvoker {
+    pub(crate) fn new(inner: Arc<dyn DynInvoke>) -> Self {
+        Self(inner)
+    }
+}
+
+impl Debug for DynInvoker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynInvoker").finish_non_exhaustive()
+    }
+}
+
+impl Invoke for DynInvoker {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        self.0.dyn_invoke(headers, options).await
+    }
+}
 
 /// A dyn-compatible version of
 /// [`Intercept`](crate::client::interceptor::Intercept).
@@ -50,7 +82,7 @@ pub trait DynIntercept: Send + Sync {
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-        next: Arc<dyn DynInvoke>,
+        next: DynInvoker,
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
 }
 
@@ -168,10 +200,8 @@ mod tests {
     use crate::client::Channel;
     use crate::client::ChannelRecvStream;
     use crate::client::ChannelSendStream;
-    use crate::client::DynInvoke;
     use crate::client::DynRecvStream;
     use crate::client::DynSendStream;
-    use crate::client::Invoke as _;
     use crate::client::RecvStream as _;
     use crate::client::RequestHeaders;
     use crate::client::ResponseStreamItem;
@@ -262,11 +292,11 @@ mod tests {
             &self,
             headers: RequestHeaders,
             options: CallOptions,
-            next: Arc<dyn DynInvoke>,
+            next: DynInvoker,
         ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
             // The test may have stopped listening.
             let _ = self.intercepted_tx.send(());
-            next.dyn_invoke(headers, options).await
+            next.invoke(headers, options).await
         }
     }
 

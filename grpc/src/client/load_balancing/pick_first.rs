@@ -764,17 +764,51 @@ impl SteadyState {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::*;
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils;
+    use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::rt::default_runtime;
 
     // The Connection Attempt Delay (gRFC A61): how long the policy waits for a
     // connection attempt before also starting one on the next address.
     const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+    // A ChannelController wrapper that delegates to TestChannelController,
+    // overriding the initial SubchannelState returned by new_subchannel for
+    // configured addresses.
+    struct InitialStateController<'a> {
+        tcc: &'a mut TestChannelController,
+        initial_states: HashMap<&'a str, SubchannelState>,
+    }
+
+    impl ChannelController for InitialStateController<'_> {
+        fn new_subchannel(
+            &mut self,
+            address: &Address,
+            work_scheduler: Arc<dyn WorkScheduler>,
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let (sc, state) = self.tcc.new_subchannel(address, work_scheduler);
+            let state = self
+                .initial_states
+                .get(&*address.address)
+                .cloned()
+                .unwrap_or(state);
+            (sc, state)
+        }
+
+        fn update_picker(&mut self, update: LbState) {
+            self.tcc.update_picker(update);
+        }
+
+        fn request_resolution(&mut self) {
+            self.tcc.request_resolution();
+        }
+    }
 
     // Creates an endpoint containing `addrs`, in order.
     fn endpoint(addrs: &[&str]) -> Endpoint {
@@ -863,14 +897,46 @@ mod test {
                 .resolver_update(update, &PickFirstConfig::default(), &mut self.tcc)
         }
 
+        // Sends a resolver update for `addrs` while overriding the initial
+        // SubchannelState returned by new_subchannel for entries in
+        // `initial_states`.
+        fn send_resolver_update_with_initial_states(
+            &mut self,
+            addrs: &[&str],
+            initial_states: &[(&str, SubchannelState)],
+        ) -> Result<(), String> {
+            let update = ResolverUpdate {
+                endpoints: Ok(create_endpoints(addrs)),
+                ..Default::default()
+            };
+            let mut controller = InitialStateController {
+                tcc: &mut self.tcc,
+                initial_states: initial_states.iter().cloned().collect(),
+            };
+            self.policy
+                .resolver_update(update, &PickFirstConfig::default(), &mut controller)
+        }
+
+        // Advances virtual time by `duration` on the paused Tokio runtime,
+        // yielding before and after so spawned timer tasks can register on the
+        // timer wheel and schedule their completion work.
+        async fn advance_time(&mut self, duration: Duration) {
+            tokio::task::yield_now().await;
+            tokio::time::advance(duration).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Advances the paused clock past the Connection Attempt Delay, letting
+        // any pending timer fire.
+        async fn advance_past_timer(&mut self) {
+            self.advance_time(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1))
+                .await;
+        }
+
         // Lets the Connection Attempt Delay timer fire, and delivers the
-        // resulting work to the policy. Requires a paused clock. Yields before
-        // and after advancing the clock, so that the timer task can register
-        // its sleep, and then schedule its work.
+        // resulting work to the policy. Requires a paused clock.
         async fn fire_timer(&mut self) {
-            tokio::task::yield_now().await;
-            tokio::time::advance(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1)).await;
-            tokio::task::yield_now().await;
+            self.advance_past_timer().await;
             self.run_work();
         }
     }
@@ -914,6 +980,31 @@ mod test {
         // moves the policy to IDLE.
         env.send_subchannel_update(&scs[0], &SubchannelState::idle());
         env.expect_picker_state(ConnectivityState::Idle);
+        env.expect_no_events();
+    }
+
+    // When an update removes the selected address, the policy starts a new
+    // first pass from the start of the new list and reports CONNECTING.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_without_selected_address_starts_first_pass() {
+        let mut env = new_env();
+
+        // Select addr2, so the old pass ended past the start of the list.
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[1]);
+
+        // The update drops addr2. addr1 gets a new subchannel: its old one was
+        // discarded when addr2 was selected.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr3"]))
+            .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr3"]);
+        // The new pass starts at the head of the new list, not where the old
+        // pass left off.
+        env.expect_connect_to("addr1");
+        // The policy reports CONNECTING rather than going IDLE.
+        env.expect_queuing_picker();
         env.expect_no_events();
     }
 
@@ -986,7 +1077,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn test_pick_first_empty_update_clears_state() {
         let mut env = new_env();
-        env.simulate_successful_connection(&["addr1", "addr2"]);
+        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
 
         // Send empty update.
         let res = env.send_resolver_update(vec![]);
@@ -998,6 +1089,25 @@ mod test {
 
         // Check that re-resolution was requested.
         env.expect_request_resolution();
+        env.expect_no_events();
+
+        // The subchannels were cleared, so updates from them are ignored. The
+        // old selected subchannel going IDLE does not move the policy to IDLE.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_no_events();
+        // Nor is it selected when it becomes READY again.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // The selection was cleared too: addr1 returning READY in a new update
+        // is selected again.
+        env.send_resolver_update_with_initial_states(
+            &["addr1"],
+            &[("addr1", SubchannelState::ready())],
+        )
+        .unwrap();
+        let sc = env.expect_new_subchannel_for("addr1");
+        env.expect_ready_picker(&sc);
         env.expect_no_events();
     }
 
@@ -1104,6 +1214,44 @@ mod test {
         env.expect_no_events();
     }
 
+    // In steady state the policy requests re-resolution (gRFC A61) after N
+    // (subchannel count) failures.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_steady_state_reresolves_every_n_failures() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+
+        // The first failure in steady state is counted, without re-resolving.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 again"));
+        env.expect_no_events();
+
+        // The second failure reaches N.
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 again"));
+        env.expect_request_resolution();
+        env.expect_no_events();
+
+        // The count starts over.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 third"));
+        env.expect_no_events();
+
+        // Another N failures request re-resolution again.
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 third"));
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
     // This test is meant to validate that if a new address with different
     // attributes is sent as part of a resolver update, the policy treats it as
     // a different address and creates a new subchannel for it, rather than
@@ -1125,6 +1273,78 @@ mod test {
         let sc = env.expect_new_subchannel_for(addr);
         assert_ne!(sc.address(), scs[0].address());
         env.expect_connect_to(addr);
+        env.expect_no_events();
+    }
+
+    // When a resolver update arrives during the first pass, subchannels that
+    // already failed keep their TRANSIENT_FAILURE state, so the new pass skips
+    // them instead of attempting them again (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_preserves_subchannel_failure_state() {
+        let mut env = new_env();
+
+        // addr1 fails. The pass moves on to addr2.
+        env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+
+        // The new list keeps addr1, which already failed, and adds addr3.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr3"]))
+            .unwrap();
+        // addr1's subchannel is reused; only addr3 gets a new one.
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        // The new pass skips addr1, though it is first in the list.
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+
+        // When addr3 fails too, the pass is over.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+        // addr1 still counts as failed, so it is not retried. Had it been reset
+        // to IDLE, the end of the pass would connect it here.
+        env.expect_no_events();
+    }
+
+    // Updates from subchannels whose addresses were removed by a resolver
+    // update are ignored, both during the first pass and in steady state.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_removed_subchannel_updates() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2"]);
+
+        // Replace the address list with [addr3].
+        env.send_resolver_update(create_endpoints(&["addr3"]))
+            .unwrap();
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        env.expect_connect_to("addr3");
+
+        // In the first pass, READY from a removed subchannel does not select
+        // it.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // addr3 fails, ending the first pass.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+
+        // In steady state, a subchannel going IDLE is asked to connect, but
+        // not a removed one.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_no_events();
+        // With one address left, every failure in steady state requests
+        // re-resolution, but not a removed subchannel's failure.
+        env.send_subchannel_update(
+            &scs[1],
+            &SubchannelState::transient_failure("connection refused"),
+        );
+        env.expect_no_events();
+
+        // addr3 is still the only address in use.
+        env.send_subchannel_update(&sc3, &SubchannelState::idle());
+        env.expect_connect_to("addr3");
+        env.send_subchannel_update(&sc3, &SubchannelState::ready());
+        env.expect_ready_picker(&sc3);
         env.expect_no_events();
     }
 
@@ -1177,6 +1397,157 @@ mod test {
         env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
 
         env.expect_failing_picker("addr1 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // An earlier connection attempt that succeeds after the timer moved the
+    // pass on is selected, and the running timer is cancelled (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_earlier_attempt_ready_cancels_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3", "addr4"]);
+
+        // Each timer moves the pass on and starts the next attempt's timer: the
+        // second timer fires only because the first one started it.
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.fire_timer().await;
+        env.expect_connect_to("addr3");
+
+        // addr1's attempt, from two timers back, succeeds and is selected.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+
+        // No timer fires: the timer for addr3's attempt was cancelled.
+        env.advance_past_timer().await;
+        env.expect_no_events();
+    }
+
+    // When the current connection attempt fails, the next attempt starts at
+    // once with its own Connection Attempt Delay timer; the failed attempt's
+    // timer is cancelled (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_attempt_failure_restarts_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        // addr1 fails partway through its delay; addr2 is attempted at once.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY / 2).await;
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+
+        // Past addr1's original deadline, but before addr2's: nothing fires.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY * 3 / 4).await;
+        env.expect_no_events();
+
+        // addr2's own timer fires 250ms after its attempt started, moving the
+        // pass on to addr3.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY / 4 + Duration::from_millis(1))
+            .await;
+        env.run_work();
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+    }
+
+    // A failure from a subchannel the pass has not reached yet does not count
+    // toward ending the pass: the subchannel may be IDLE again by the time the
+    // pass reaches it, and the pass then attempts it and waits for the result.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_failure_not_yet_reached_not_counted() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        // addr2 fails and finishes backoff before the pass reaches it.
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+
+        // addr1 fails; the pass moves on and attempts addr2.
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+
+        // addr2's timer moves the pass on to addr3, which fails. Every address
+        // has now failed once, but the pass is not over: addr2's earlier
+        // failure does not count, and its attempt in this pass is in flight.
+        env.fire_timer().await;
+        env.expect_connect_to("addr3");
+        env.send_subchannel_update(&scs[2], &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_no_events();
+
+        // addr2 fails during this pass, completing it.
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 again"));
+        env.expect_failing_picker("addr2 again");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // Timer work from an earlier first pass, delivered after a resolver update
+    // started a new pass, does not move the new pass on.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_stale_timer_work_ignored_in_new_pass() {
+        let mut env = new_env();
+        env.simulate_connection(&["addr1", "addr2"]);
+
+        // Hold the timer's work, as if the resolver update was handled before
+        // it. The new pass reuses the subchannels and starts over at addr1.
+        env.advance_past_timer().await;
+        let timer_work = env.expect_schedule_work();
+        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
+            .unwrap();
+        env.expect_connect_to("addr1");
+        env.expect_no_events();
+
+        // The stale work does not move the new pass on to addr2.
+        env.policy.work(timer_work, &mut env.tcc);
+        env.expect_no_events();
+
+        // The new pass's own timer moves it on to addr2.
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+    }
+
+    // If new_subchannel returns a subchannel that is already READY, the policy
+    // selects it immediately, without asking any other subchannel to connect
+    // (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_subchannel_initially_ready() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2", "addr3"],
+            &[("addr2", SubchannelState::ready())],
+        )
+        .unwrap();
+
+        let scs = env.expect_new_subchannels(&["addr1", "addr2", "addr3"]);
+        env.expect_ready_picker(&scs[1]);
+        env.expect_no_events();
+    }
+
+    // If new_subchannel returns a subchannel already in TRANSIENT_FAILURE, the
+    // first pass counts it as failed and skips to the next address (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_subchannel_initially_transient_failure() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[(
+                "addr1",
+                SubchannelState::transient_failure("initial failure"),
+            )],
+        )
+        .unwrap();
+
+        let scs = env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.expect_queuing_picker();
+        env.expect_no_events();
+
+        // Once addr2 also fails, the pass finishes without waiting for addr1.
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
         env.expect_request_resolution();
         env.expect_no_events();
     }

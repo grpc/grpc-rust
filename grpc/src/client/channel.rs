@@ -478,24 +478,21 @@ struct LbInvoker {
     lb_watcher: Arc<Watcher<LbState>>,
 }
 
-// Note: `LbInvoker` implements `DynInvoke` directly, rather than `Invoke`,
-// because it is passed to the config selector's interceptor as a `DynInvoker`
-// (wrapping an `Arc<dyn DynInvoke>`).  Its streams are already boxed, so
-// wrapping an `Invoke` implementation in `ErasedInvoke` would box them a second
-// time.  (It is also an `Invoke` through the blanket implementation for
-// `DynInvoke`, but that boxes the future, so it also has an inherent `invoke`
-// method for the non-intercepted path.)
-impl LbInvoker {
+// Note: `LbInvoker` implements both `Invoke`, for RPCs without an interceptor
+// (avoiding boxing the future), and `DynInvoke`, so it can be passed to the
+// config selector's interceptor as a `DynInvoker`.  Its streams are already
+// boxed, so wrapping it in `ErasedInvoke` instead would box them a second time.
+impl Invoke for LbInvoker {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
     /// Starts an RPC on a subchannel picked by the current LB picker, waiting
     /// for a new picker while picks are queued.
-    ///
-    /// Unlike [`DynInvoke::dyn_invoke`], this doesn't box the returned future,
-    /// so callers that don't need dynamic dispatch avoid an allocation.
     async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+    ) -> (Self::SendStream, Self::RecvStream) {
         // Fast path: snapshot the latest LB state without locking and pick
         // with its picker.
         let mut snapshot = self.lb_watcher.snapshot();

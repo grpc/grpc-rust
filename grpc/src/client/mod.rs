@@ -145,7 +145,7 @@ pub trait Invoke: Sync {
 
 /// A dyn-compatible version of [`Invoke`].
 ///
-/// [`Invoke`] is also blanket implemented for every `DynInvoke` implementation.
+/// To use an [`Invoke`] as a `DynInvoke`, wrap it in an [`ErasedInvoke`].
 #[async_trait]
 pub(crate) trait DynInvoke: Send + Sync {
     /// Starts an RPC, returning the send and receive streams to interact with
@@ -161,19 +161,6 @@ pub(crate) trait DynInvoke: Send + Sync {
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
 }
 
-impl<T: DynInvoke + ?Sized> Invoke for T {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
-
-    async fn invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Self::SendStream, Self::RecvStream) {
-        self.dyn_invoke(headers, options).await
-    }
-}
-
 impl<T: Invoke + ?Sized + Send> Invoke for Arc<T> {
     type SendStream = T::SendStream;
     type RecvStream = T::RecvStream;
@@ -184,17 +171,6 @@ impl<T: Invoke + ?Sized + Send> Invoke for Arc<T> {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         (**self).invoke(headers, options).await
-    }
-}
-
-#[async_trait]
-impl<T: DynInvoke + ?Sized> DynInvoke for Box<T> {
-    async fn dyn_invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        (**self).dyn_invoke(headers, options).await
     }
 }
 

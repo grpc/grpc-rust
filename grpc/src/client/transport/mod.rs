@@ -108,8 +108,7 @@ pub(crate) trait Transport: Sync {
 
 /// A dyn-compatible version of [`Transport`].
 ///
-/// [`Transport`] is also blanket implemented for every `DynTransport`
-/// implementation.  To use a [`Transport`] as a `DynTransport`, wrap it in an
+/// To use a [`Transport`] as a `DynTransport`, wrap it in an
 /// [`ErasedTransport`].
 #[async_trait]
 pub(crate) trait DynTransport: Send + Sync {
@@ -127,28 +126,6 @@ pub(crate) trait DynTransport: Send + Sync {
         ),
         String,
     >;
-}
-
-impl<T: DynTransport + ?Sized> Transport for T {
-    type Service = Box<dyn DynInvoke>;
-
-    async fn connect(
-        &self,
-        address: &Address,
-        runtime: GrpcRuntime,
-        security_opts: &SecurityOpts,
-        opts: &TransportOptions,
-    ) -> Result<
-        (
-            Self::Service,
-            ConnectionInfo,
-            oneshot::Receiver<Result<(), String>>,
-        ),
-        String,
-    > {
-        self.dyn_connect(address, runtime, security_opts, opts)
-            .await
-    }
 }
 
 /// Adapts a [`Transport`] into a [`DynTransport`], e.g. to store it as an

@@ -22,7 +22,7 @@
  *
  */
 
-use grpc::client::Channel;
+use grpc::client::Invoke;
 use grpc::client::metadata_utils::AttachHeadersInterceptor;
 use grpc::client::metadata_utils::CaptureHeadersInterceptor;
 use grpc::client::metadata_utils::CaptureTrailersInterceptor;
@@ -38,13 +38,10 @@ use tonic::async_trait;
 use crate::TestAssertion;
 use crate::client::InteropTest;
 use crate::client::InteropTestUnimplemented;
-use crate::grpc_pb::test_service_client::*;
-use crate::grpc_pb::unimplemented_service_client::*;
+pub use crate::grpc_pb::test_service_client::TestServiceClient;
+pub use crate::grpc_pb::unimplemented_service_client::UnimplementedServiceClient;
 use crate::grpc_pb::*;
 use crate::test_assert;
-
-pub type TestClient = TestServiceClient<Channel>;
-pub type UnimplementedClient = UnimplementedServiceClient<Channel>;
 
 const LARGE_REQ_SIZE: usize = 271_828;
 const LARGE_RSP_SIZE: i32 = 314_159;
@@ -55,7 +52,7 @@ const SPECIAL_TEST_STATUS_MESSAGE: &str =
     "\t\ntest with whitespace\r\nand Unicode BMP ☺ and non-BMP 😈\t\n";
 
 #[async_trait]
-impl InteropTest for TestClient {
+impl<I: Invoke> InteropTest for TestServiceClient<I> {
     async fn empty_unary(&mut self, assertions: &mut Vec<TestAssertion>) {
         let result = self.empty_call(proto!(Empty {})).await;
 
@@ -410,7 +407,7 @@ impl InteropTest for TestClient {
 }
 
 #[async_trait]
-impl InteropTestUnimplemented for UnimplementedClient {
+impl<I: Invoke> InteropTestUnimplemented for UnimplementedServiceClient<I> {
     async fn unimplemented_service(&mut self, assertions: &mut Vec<TestAssertion>) {
         let result = self.unimplemented_call(Empty::default()).await;
         assertions.push(test_assert!(

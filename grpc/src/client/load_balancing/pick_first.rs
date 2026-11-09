@@ -145,7 +145,7 @@ enum AddressFamily {
     // Not an IP address and port, e.g. a hostname or a Unix socket path.
     // Neither gRFC A61 nor RFC 8305 specifies how to handle non-IP addresses;
     // grouping them into a third family that participates in interleaving is
-    // intentional.
+    // intentional and matches Go.
     Unknown,
 }
 
@@ -154,7 +154,7 @@ impl From<&Address> for AddressFamily {
         if addr.network_type != TCP_IP_NETWORK_TYPE {
             return Self::Unknown;
         }
-        // An IPv4-mapped IPv6 address counts as IPv4.
+        // An IPv4-mapped IPv6 address counts as IPv4, as in Go and Java.
         match addr.address.parse::<SocketAddr>() {
             Ok(sa) if sa.ip().to_canonical().is_ipv4() => Self::Ipv4,
             Ok(_) => Self::Ipv6,

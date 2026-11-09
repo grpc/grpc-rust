@@ -207,9 +207,9 @@ mod test {
             security_level_for_endpoint("[::1]:8080", TCP_IP_NETWORK_TYPE),
             Ok(SecurityLevel::NoSecurity)
         );
-        // Local TCP credentials assign NoSecurity to loopback connections, 
+        // Local TCP credentials assign NoSecurity to loopback connections,
         // including IPv4-mapped IPv6 loopback addresses observed on dual-stack
-        // (`[::]`) listeners (L62).
+        // (`[::]`) listeners.
         assert_eq!(
             security_level_for_endpoint("[::ffff:127.0.0.1]:8080", TCP_IP_NETWORK_TYPE),
             Ok(SecurityLevel::NoSecurity)

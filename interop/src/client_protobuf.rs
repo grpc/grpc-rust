@@ -22,6 +22,8 @@
  *
  */
 
+use std::time::Duration;
+
 use grpc::client::Invoke;
 use grpc::client::metadata_utils::AttachHeadersInterceptor;
 use grpc::client::metadata_utils::CaptureHeadersInterceptor;
@@ -50,6 +52,7 @@ const RESPONSE_LENGTHS: &[i32] = &[31415, 9, 2653, 58979];
 const TEST_STATUS_MESSAGE: &str = "test status message";
 const SPECIAL_TEST_STATUS_MESSAGE: &str =
     "\t\ntest with whitespace\r\nand Unicode BMP ☺ and non-BMP 😈\t\n";
+const SAFETY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 impl<I: Invoke> InteropTest for TestServiceClient<I> {
@@ -402,6 +405,30 @@ impl<I: Invoke> InteropTest for TestServiceClient<I> {
             "metadata bin must match in unary",
             response_trailers.get_bin(key2) == Some(&value2),
             format!("result={:?}", response_trailers.get_bin(key1))
+        ));
+    }
+
+    async fn timeout_on_sleeping_server(&mut self, assertions: &mut Vec<TestAssertion>) {
+        let req = proto!(StreamingOutputCallRequest {
+            payload: crate::grpc_utils::client_payload(27182),
+        });
+
+        let (mut tx, rx) = self
+            .full_duplex_call()
+            .with_timeout(Duration::from_millis(1))
+            .await;
+        let _ = tx.send(req).await;
+
+        let result = tokio::time::timeout(SAFETY_TIMEOUT, rx.status()).await;
+        drop(tx);
+
+        assertions.push(test_assert!(
+            "call must fail with deadline_exceeded status code",
+            matches!(
+                &result,
+                Ok(Err(status)) if status.code() == StatusCodeError::DeadlineExceeded
+            ),
+            format!("result={result:?}")
         ));
     }
 }

@@ -45,9 +45,33 @@ pub trait InteropTest: Send {
 
     async fn large_unary(&mut self, assertions: &mut Vec<TestAssertion>);
 
+    async fn client_compressed_unary(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires client request compression support",
+        });
+    }
+
+    async fn server_compressed_unary(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires client response decompression support",
+        });
+    }
+
     async fn client_streaming(&mut self, assertions: &mut Vec<TestAssertion>);
 
+    async fn client_compressed_streaming(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires per-message client streaming compression support",
+        });
+    }
+
     async fn server_streaming(&mut self, assertions: &mut Vec<TestAssertion>);
+
+    async fn server_compressed_streaming(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires client streaming response decompression support",
+        });
+    }
 
     async fn ping_pong(&mut self, assertions: &mut Vec<TestAssertion>);
 
@@ -60,6 +84,72 @@ pub trait InteropTest: Send {
     async fn unimplemented_method(&mut self, assertions: &mut Vec<TestAssertion>);
 
     async fn custom_metadata(&mut self, assertions: &mut Vec<TestAssertion>);
+
+    async fn cancel_after_begin(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires client call cancellation status inspection",
+        });
+    }
+
+    async fn cancel_after_first_response(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires client call cancellation status inspection",
+        });
+    }
+
+    async fn timeout_on_sleeping_server(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires client deadline status propagation",
+        });
+    }
+
+    async fn compute_engine_creds(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires GCE OAuth2 call credentials support",
+        });
+    }
+
+    async fn jwt_token_creds(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires JWT call credentials support",
+        });
+    }
+
+    async fn oauth2_auth_token(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires OAuth2 token call credentials support",
+        });
+    }
+
+    async fn per_rpc_creds(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires per-RPC call credentials support",
+        });
+    }
+
+    async fn google_default_credentials(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires Google Default Credentials support",
+        });
+    }
+
+    async fn compute_engine_channel_credentials(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires Compute Engine ALTS channel credentials support",
+        });
+    }
+
+    async fn orca_per_rpc(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires ORCA per-RPC load reporting support",
+        });
+    }
+
+    async fn orca_oob(&mut self, assertions: &mut Vec<TestAssertion>) {
+        assertions.push(TestAssertion::NotImplemented {
+            reason: "requires ORCA out-of-band load reporting support",
+        });
+    }
 }
 
 #[async_trait]

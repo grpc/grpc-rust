@@ -1029,7 +1029,7 @@ mod tests {
                 (StatusCodeError::Unavailable, StatusCodeError::Unavailable),
                 (StatusCodeError::NotFound, StatusCodeError::Internal),
             ] {
-                let active_channel = Arc::new(ActiveChannel {
+                let lb_invoker = LbInvoker {
                     abort_handle: Box::new(NopTaskHandle),
                     lb_watcher: Arc::new(Watcher::new(LbState {
                         connectivity_state: ConnectivityState::TransientFailure,
@@ -1038,9 +1038,8 @@ mod tests {
                             status: StatusError::new(code, "picker status"),
                         }),
                     })),
-                    config_selector: SharedConfigSelector::new(),
-                });
-                let (_tx, mut rx) = active_channel
+                };
+                let (_tx, mut rx) = lb_invoker
                     .invoke(RequestHeaders::new(), CallOptions::new())
                     .await;
                 match rx.recv(&mut NopRecvMessage).await {

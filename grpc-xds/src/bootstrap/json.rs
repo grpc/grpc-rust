@@ -39,6 +39,7 @@ use xds_client::message::Node;
 
 use super::BootstrapConfig;
 use super::XdsServerConfig;
+use super::credentials::InsecureChannelCredentials;
 use super::default_node;
 
 /// Environment variable pointing to a bootstrap JSON file path.
@@ -224,12 +225,13 @@ fn select_channel_credentials(
                 })?;
                 return Ok(Arc::new(tls_creds));
             }
+            "insecure" => return Ok(Arc::new(InsecureChannelCredentials::new())),
             _ => {}
         }
     }
 
     Err(BootstrapError::Validation(format!(
-        "xds_servers[{server_index}].channel_creds contains no supported credential types (supported: tls)"
+        "xds_servers[{server_index}].channel_creds contains no supported credential types (supported: tls, insecure)"
     )))
 }
 
@@ -413,6 +415,24 @@ mod tests {
         let err = BootstrapConfig::from_json(json).unwrap_err();
         assert!(matches!(err, BootstrapError::InvalidJson(_)));
         assert!(err.to_string().contains("missing field `channel_creds`"));
+    }
+
+    #[test]
+    fn parse_insecure_channel_creds() {
+        let json = r#"{
+            "xds_servers": [{
+                "server_uri": "localhost:50051",
+                "channel_creds": [{"type": "insecure"}]
+            }]
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
+        assert_eq!(
+            config.xds_servers[0]
+                .channel_credentials
+                .info()
+                .security_protocol(),
+            "insecure"
+        );
     }
 
     #[test]

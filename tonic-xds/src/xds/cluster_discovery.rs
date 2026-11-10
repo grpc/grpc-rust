@@ -120,7 +120,7 @@ impl<MC> XdsClusterDiscovery<MC> {
 impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsClusterDiscovery<MC> {
     fn discover_cluster(&self, cluster_name: &str) -> BoxDiscover<EndpointAddress, MC::Service> {
         let connector = Arc::new(ClusterConnector::spawn(
-            self.cache.clone(),
+            &self.cache,
             cluster_name.to_string(),
             self.make_connector.clone(),
             #[cfg(feature = "_tls-any")]

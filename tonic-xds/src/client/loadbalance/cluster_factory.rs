@@ -109,7 +109,7 @@ where
         cluster_name: &str,
     ) -> ClusterChannel<Req, <MC::Service as Service<Req>>::Response> {
         let connector = Arc::new(ClusterConnector::spawn(
-            self.cache.clone(),
+            &self.cache,
             cluster_name.to_string(),
             self.make_connector.clone(),
             #[cfg(feature = "_tls-any")]

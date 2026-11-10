@@ -1464,6 +1464,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_dropping_xds_channel_releases_cache() {
+        for backend in LB_BACKENDS {
+            releases_cache_on_drop(backend).await;
+        }
+    }
+
+    async fn releases_cache_on_drop(backend: LbBackend) {
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(1).await;
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+
+        let channel = build_xds_channel_from_cache(&cache, backend);
+        let (successful, error_types, _) =
+            send_grpc_requests(GreeterClient::new(channel.clone()), 5).await;
+        assert_eq!(successful, 5, "{backend:?}: {error_types:?}");
+
+        let weak_cache = Arc::downgrade(&cache);
+        drop(cache);
+        drop(channel);
+        let released = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            while weak_cache.strong_count() > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "{backend:?}: cache outlived the channel");
+
+        shutdown(servers).await;
+    }
+
     /// The CDS `max_requests` limit is enforced on the request path.
     #[tokio::test]
     async fn test_xds_channel_enforces_cds_circuit_breaking_limit() {

@@ -40,7 +40,7 @@ use tonic::transport::{Channel, Endpoint};
 use tower::BoxError;
 
 use crate::client::endpoint::{
-    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector, XdsEndpoint,
 };
 #[cfg(feature = "_tls-any")]
 use crate::client::endpoint::{ClusterTlsConfig, ClusterTlsError};
@@ -131,15 +131,22 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
     }
 }
 
-/// The default gRPC [`MakeConnector`].
+/// The [`MakeConnector`] behind
+/// [`XdsChannelBuilder::build_grpc_channel`](crate::XdsChannelBuilder::build_grpc_channel).
 ///
-/// Builds a plaintext or (under a TLS feature) TLS connector from a cluster's
-/// parsed CDS TLS config ([`ClusterConfig::tls`]), resolving cert-provider
-/// instances against the registry carried by the cluster view.
-pub(crate) struct GrpcMakeConnector;
+/// For each cluster it builds a connector that opens a lazily-connected tonic
+/// `Channel` to an endpoint's primary address: plaintext, or (under a TLS
+/// feature) TLS per the cluster's gRFC A29 config. Wrap it to change only what
+/// is dialed, e.g. a [`Connector`] that rewrites the [`XdsEndpoint`] it is
+/// given before delegating; see
+/// [`build_grpc_channel_with_connector`](crate::XdsChannelBuilder::build_grpc_channel_with_connector).
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct GrpcMakeConnector;
 
 impl GrpcMakeConnector {
-    pub(crate) fn new() -> Self {
+    /// Creates the connector factory.
+    pub fn new() -> Self {
         Self
     }
 }
@@ -200,7 +207,8 @@ pub(crate) struct PlaintextConnector;
 impl Connector for PlaintextConnector {
     type Service = EndpointChannel<Channel>;
 
-    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+    fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+        let addr = endpoint.address();
         // EndpointAddress only holds validated Ipv4/Ipv6/Hostname + u16 port,
         // and its Display impl produces "ip:port" or "hostname:port". Prefixing
         // with "http://" always yields a valid URI, so from_shared cannot fail.
@@ -241,9 +249,10 @@ impl TlsConnector {
 impl Connector for TlsConnector {
     type Service = EndpointChannel<Channel>;
 
-    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+    fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
         use rustls::client::danger::ServerCertVerifier;
 
+        let addr = endpoint.address();
         let verifier: Arc<dyn ServerCertVerifier> = self.verifier.clone();
 
         // Fetch identity per `connect` so file_watcher-driven rotation reaches
@@ -509,9 +518,11 @@ mod tests {
             identity_provider: Some(identity_provider),
         };
 
-        let addr = EndpointAddress::from("1.2.3.4:443".parse::<std::net::SocketAddr>().unwrap());
-        let _ = connector.connect(&addr).await;
-        let _ = connector.connect(&addr).await;
+        let endpoint = XdsEndpoint::from(EndpointAddress::from(
+            "1.2.3.4:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let _ = connector.connect(&endpoint).await;
+        let _ = connector.connect(&endpoint).await;
 
         assert_eq!(
             counter.count.load(Ordering::Relaxed),

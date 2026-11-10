@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use crate::client::endpoint::{ClusterConfig, Connector, EndpointAddress, MakeConnector};
+use crate::client::endpoint::{ClusterConfig, Connector, MakeConnector, XdsEndpoint};
 use crate::common::async_util::{AbortOnDrop, BoxFuture};
 use crate::xds::cache::{CacheWatch, XdsCache};
 #[cfg(feature = "_tls-any")]
@@ -100,22 +100,32 @@ impl<S: Send + 'static> ClusterConnector<S> {
 impl<S: Send + 'static> Connector for ClusterConnector<S> {
     type Service = S;
 
-    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+    fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+        // Common case: CDS already published a connector, so hand it the
+        // borrowed endpoint directly. Bound first so the watch guard is
+        // released before connecting.
+        let current = self.rx.borrow().clone();
+        if let Some(connector) = current {
+            return connector.connect(endpoint);
+        }
+
+        // Only before the first CDS update: wait for a connector, which needs
+        // an owned endpoint.
         let mut rx = self.rx.clone();
         let cluster_name = self.cluster_name.clone();
-        let addr = addr.clone();
+        let endpoint = endpoint.clone();
 
         Box::pin(async move {
             loop {
                 // Clone out of the borrow guard; it is not held across an await.
                 let current = rx.borrow_and_update().clone();
                 if let Some(connector) = current {
-                    return connector.connect(&addr).await;
+                    return connector.connect(&endpoint).await;
                 }
                 if rx.changed().await.is_err() {
                     tracing::error!(
                         cluster = %cluster_name,
-                        endpoint = %addr,
+                        endpoint = %endpoint.address(),
                         "cluster removed from cache before any CDS update produced a \
                          connector; parking the connect until discovery drops it",
                     );
@@ -168,6 +178,7 @@ mod tests {
     use tower::BoxError;
 
     use super::*;
+    use crate::client::endpoint::EndpointAddress;
     use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::cluster::LbPolicy;
 
@@ -179,8 +190,8 @@ mod tests {
     impl Connector for AddrConnector {
         type Service = String;
 
-        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<String> {
-            let addr = addr.to_string();
+        fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<String> {
+            let addr = endpoint.address().to_string();
             Box::pin(async move { addr })
         }
     }
@@ -240,8 +251,8 @@ mod tests {
         let cache = XdsCache::new();
         cache.update_cluster(CLUSTER, cluster());
         let (connector, mut task_stopped) = spawn_connector(&cache);
-        let addr = EndpointAddress::new("10.0.0.1", 8080);
-        assert_eq!(connector.connect(&addr).await, "10.0.0.1:8080");
+        let endpoint = XdsEndpoint::new(EndpointAddress::new("10.0.0.1", 8080));
+        assert_eq!(connector.connect(&endpoint).await, "10.0.0.1:8080");
         assert_eq!(task_stopped.try_recv(), Err(TryRecvError::Empty));
 
         // The cluster is still in the cache, so only the drop can stop it.

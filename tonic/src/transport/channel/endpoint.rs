@@ -80,6 +80,7 @@ pub struct Endpoint {
     pub(crate) http2_reset_stream_duration: Option<Duration>,
     pub(crate) http2_max_local_error_reset_streams: Option<Option<usize>>,
     pub(crate) connect_timeout: Option<Duration>,
+    pub(crate) reconnect_delay: Option<Duration>,
     pub(crate) http2_adaptive_window: Option<bool>,
     pub(crate) local_address: Option<IpAddr>,
     pub(crate) executor: SharedExec,
@@ -133,6 +134,7 @@ impl Endpoint {
             http2_reset_stream_duration: None,
             http2_max_local_error_reset_streams: None,
             connect_timeout: None,
+            reconnect_delay: None,
             http2_adaptive_window: None,
             executor: SharedExec::tokio(),
             local_address: None,
@@ -167,6 +169,7 @@ impl Endpoint {
             http2_reset_stream_duration: None,
             http2_max_local_error_reset_streams: None,
             connect_timeout: None,
+            reconnect_delay: None,
             http2_adaptive_window: None,
             executor: SharedExec::tokio(),
             local_address: None,
@@ -297,6 +300,20 @@ impl Endpoint {
     pub fn connect_timeout(self, dur: Duration) -> Self {
         Endpoint {
             connect_timeout: Some(dur),
+            ..self
+        }
+    }
+
+    /// Set the reconnect delay for load-balanced channels when a connection fails.
+    ///
+    /// When an endpoint in a load-balanced channel (`Channel::balance_list`, `Channel::balance_channel`)
+    /// fails to connect or loses connection, it will wait for this duration before attempting
+    /// to reconnect, avoiding tight reconnect loops while allowing healthy endpoints to serve requests.
+    ///
+    /// Defaults to 100 milliseconds.
+    pub fn reconnect_delay(self, dur: Duration) -> Self {
+        Endpoint {
+            reconnect_delay: Some(dur),
             ..self
         }
     }

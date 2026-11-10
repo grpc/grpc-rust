@@ -26,9 +26,9 @@
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::client::BoxRecvStream;
+use crate::client::BoxSendStream;
 use crate::client::CallOptions;
-use crate::client::DynRecvStream;
-use crate::client::DynSendStream;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
@@ -205,10 +205,10 @@ impl FailingRecvStream {
     pub(crate) fn new_stream_pair(
         status: StatusError,
         connection_info: Option<ConnectionInfo>,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+    ) -> (BoxSendStream, BoxRecvStream) {
         (
-            Box::new(NopSendStream),
-            Box::new(Self {
+            BoxSendStream::new(NopSendStream),
+            BoxRecvStream::new(Self {
                 status: Some(status),
                 connection_info,
             }),

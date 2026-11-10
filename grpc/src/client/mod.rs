@@ -49,14 +49,19 @@
 //!   trailers received from the server during its response.
 
 use std::fmt::Display;
-use std::sync::Arc;
 
-use crate::async_trait;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::core::StreamEnded;
 use crate::metadata::MetadataMap;
+
+pub(crate) mod boxed;
+pub(crate) use boxed::ArcInterceptor;
+pub(crate) use boxed::ArcInvoker;
+pub(crate) use boxed::BoxInvoker;
+pub(crate) use boxed::BoxRecvStream;
+pub(crate) use boxed::BoxSendStream;
 
 mod call_options;
 pub use call_options::CallOptions;
@@ -143,54 +148,6 @@ pub trait Invoke: Sync {
     ) -> (Self::SendStream, Self::RecvStream);
 }
 
-/// A dyn-compatible version of [`Invoke`].
-///
-/// To use an [`Invoke`] as a `DynInvoke`, wrap it in an [`ErasedInvoke`].
-#[async_trait]
-pub(crate) trait DynInvoke: Send + Sync {
-    /// Starts an RPC, returning the send and receive streams to interact with
-    /// it.
-    ///
-    /// Note that dyn_invoke is asynchronous, and may block as needed if the
-    /// channel is still connecting or if the connection the RPC is routed to
-    /// has reached its maximum stream limit.
-    async fn dyn_invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
-}
-
-impl<T: Invoke + ?Sized + Send> Invoke for Arc<T> {
-    type SendStream = T::SendStream;
-    type RecvStream = T::RecvStream;
-
-    async fn invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Self::SendStream, Self::RecvStream) {
-        (**self).invoke(headers, options).await
-    }
-}
-
-/// Adapts an [`Invoke`] into a [`DynInvoke`], e.g. to store it as an
-/// `Arc<dyn DynInvoke>`.  Boxes the streams it returns.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ErasedInvoke<I>(pub I);
-
-#[async_trait]
-impl<I: Invoke> DynInvoke for ErasedInvoke<I> {
-    async fn dyn_invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        let (tx, rx) = self.0.invoke(headers, options).await;
-        (Box::new(tx), Box::new(rx))
-    }
-}
-
 /// Like [`Invoke`], but not reusable.  Blanket implemented on references to
 /// [`Invoke`]s.
 #[trait_variant::make(Send)]
@@ -213,7 +170,7 @@ pub trait InvokeOnce: Sync {
     ) -> (Self::SendStream, Self::RecvStream);
 }
 
-impl<T: Invoke + ?Sized> InvokeOnce for &T {
+impl<T: Invoke> InvokeOnce for &T {
     type SendStream = T::SendStream;
     type RecvStream = T::RecvStream;
 
@@ -248,38 +205,6 @@ pub trait SendStream {
         msg: &dyn SendMessage,
         options: SendOptions,
     ) -> Result<(), StreamEnded>;
-}
-
-/// A dyn-compatible version of [`SendStream`].
-#[async_trait]
-pub trait DynSendStream: Send {
-    /// A dynamic version of [`SendStream::send`].
-    async fn dyn_send(
-        &mut self,
-        msg: &dyn SendMessage,
-        options: SendOptions,
-    ) -> Result<(), StreamEnded>;
-}
-
-#[async_trait]
-impl<T: SendStream> DynSendStream for T {
-    async fn dyn_send(
-        &mut self,
-        msg: &dyn SendMessage,
-        options: SendOptions,
-    ) -> Result<(), StreamEnded> {
-        self.send(msg, options).await
-    }
-}
-
-impl SendStream for Box<dyn DynSendStream + '_> {
-    async fn send(
-        &mut self,
-        msg: &dyn SendMessage,
-        options: SendOptions,
-    ) -> Result<(), StreamEnded> {
-        (**self).dyn_send(msg, options).await
-    }
 }
 
 /// Settings for sending request messages on a client [`SendStream`].
@@ -359,26 +284,6 @@ pub trait RecvStream {
     /// future is not polled to completion, the behavior of any subsequent calls
     /// to the RecvStream are undefined and data may be lost.
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem;
-}
-
-/// A dyn-compatible version of [`RecvStream`].
-#[async_trait]
-pub trait DynRecvStream: Send {
-    /// A dynamic version of [`RecvStream::recv`].
-    async fn dyn_recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem;
-}
-
-#[async_trait]
-impl<T: RecvStream> DynRecvStream for T {
-    async fn dyn_recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
-        self.recv(msg).await
-    }
-}
-
-impl RecvStream for Box<dyn DynRecvStream + '_> {
-    async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
-        (**self).dyn_recv(msg).await
-    }
 }
 
 /// Contains all information transmitted in the response headers of an RPC.

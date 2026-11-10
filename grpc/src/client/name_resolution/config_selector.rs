@@ -31,60 +31,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::StatusError;
-use crate::client::CallOptions;
-use crate::client::DynInvoke;
-use crate::client::DynRecvStream;
-use crate::client::DynSendStream;
-use crate::client::Invoke;
-use crate::client::RequestHeaders;
+use crate::client::ArcInterceptor;
 use crate::client::name_resolution::ResolverUpdate;
-
-/// The next step in an RPC's call chain, passed to a [`DynIntercept`].
-///
-/// Cheap to clone; the interceptor may keep it for as long as it likes.
-#[derive(Clone)]
-pub struct DynInvoker(Arc<dyn DynInvoke>);
-
-impl DynInvoker {
-    pub(crate) fn new(inner: Arc<dyn DynInvoke>) -> Self {
-        Self(inner)
-    }
-}
-
-impl Debug for DynInvoker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynInvoker").finish_non_exhaustive()
-    }
-}
-
-impl Invoke for DynInvoker {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
-
-    async fn invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Self::SendStream, Self::RecvStream) {
-        self.0.dyn_invoke(headers, options).await
-    }
-}
-
-/// A dyn-compatible version of
-/// [`Intercept`](crate::client::interceptor::Intercept).
-#[crate::async_trait]
-pub trait DynIntercept: Send + Sync {
-    /// A dynamic version of
-    /// [`Intercept::intercept`](crate::client::interceptor::Intercept::intercept).
-    /// `next` is owned by the interceptor, which may clone it and keep it for
-    /// as long as it likes.
-    async fn dyn_intercept(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-        next: DynInvoker,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
-}
 
 /// The configuration to apply to a single RPC, as chosen by a
 /// [`ConfigSelector`].
@@ -94,13 +42,13 @@ pub trait DynIntercept: Send + Sync {
 #[non_exhaustive]
 pub struct RpcConfig {
     /// The interceptor to run the RPC through, if any.
-    pub interceptor: Option<Arc<dyn DynIntercept>>,
+    pub interceptor: Option<ArcInterceptor>,
 }
 
 impl RpcConfig {
     /// Sets the interceptor to run the RPC through, replacing any previously
     /// set interceptor, and returns the updated `RpcConfig`.
-    pub fn with_interceptor(mut self, interceptor: Arc<dyn DynIntercept>) -> Self {
+    pub fn with_interceptor(mut self, interceptor: ArcInterceptor) -> Self {
         self.interceptor = Some(interceptor);
         self
     }
@@ -196,17 +144,20 @@ mod tests {
     use super::*;
     use crate::StatusCodeError;
     use crate::async_trait;
+    use crate::client::ArcInvoker;
+    use crate::client::BoxRecvStream;
+    use crate::client::BoxSendStream;
     use crate::client::CallOptions;
     use crate::client::Channel;
     use crate::client::ChannelRecvStream;
     use crate::client::ChannelSendStream;
-    use crate::client::DynRecvStream;
-    use crate::client::DynSendStream;
+    use crate::client::Invoke as _;
     use crate::client::RecvStream as _;
     use crate::client::RequestHeaders;
     use crate::client::ResponseStreamItem;
     use crate::client::SendOptions;
     use crate::client::SendStream as _;
+    use crate::client::interceptor::Intercept;
     use crate::client::name_resolution::ChannelController;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::Resolver;
@@ -286,14 +237,16 @@ mod tests {
         intercepted_tx: mpsc::UnboundedSender<()>,
     }
 
-    #[async_trait]
-    impl DynIntercept for ClusterInterceptor {
-        async fn dyn_intercept(
+    impl Intercept<&ArcInvoker> for ClusterInterceptor {
+        type SendStream = BoxSendStream;
+        type RecvStream = BoxRecvStream;
+
+        async fn intercept(
             &self,
             headers: RequestHeaders,
             options: CallOptions,
-            next: DynInvoker,
-        ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+            next: &ArcInvoker,
+        ) -> (Self::SendStream, Self::RecvStream) {
             // The test may have stopped listening.
             let _ = self.intercepted_tx.send(());
             next.invoke(headers, options).await
@@ -326,7 +279,8 @@ mod tests {
 
     impl ConfigSelector for ClusterConfigSelector {
         fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
-            Ok(RpcConfig::default().with_interceptor(self.interceptor.clone()))
+            Ok(RpcConfig::default()
+                .with_interceptor(ArcInterceptor::from_arc(self.interceptor.clone())))
         }
     }
 

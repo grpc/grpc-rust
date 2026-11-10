@@ -47,9 +47,9 @@ use crate::StatusCodeError;
 use crate::StatusError;
 use crate::async_trait;
 use crate::attributes::Attributes;
+use crate::client::BoxInvoker;
 use crate::client::CallOptions;
 use crate::client::Channel;
-use crate::client::DynInvoke;
 use crate::client::Invoke as _;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
@@ -60,6 +60,7 @@ use crate::client::SendStream as _;
 use crate::client::Trailers;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
+use crate::client::transport::Transport as _;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
 use crate::core::Address;
@@ -148,7 +149,7 @@ pub(crate) async fn tonic_transport_rpc() {
         attributes: Attributes::new(),
     };
     let (conn, _sec_info, mut disconnection_listener) = builder
-        .dyn_connect(
+        .connect(
             &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
@@ -158,7 +159,7 @@ pub(crate) async fn tonic_transport_rpc() {
         .unwrap();
 
     let (mut tx, mut rx) = conn
-        .dyn_invoke(
+        .invoke(
             RequestHeaders::new()
                 .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
             CallOptions::default(),
@@ -630,7 +631,7 @@ async fn tonic_transport_invalid_base64_headers() {
         attributes: Attributes::new(),
     };
     let (conn, _sec_info, _disconnection_listener) = builder
-        .dyn_connect(
+        .connect(
             &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
@@ -640,7 +641,7 @@ async fn tonic_transport_invalid_base64_headers() {
         .unwrap();
 
     let (mut tx, mut rx) = conn
-        .dyn_invoke(
+        .invoke(
             RequestHeaders::new()
                 .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
             CallOptions::default(),
@@ -694,7 +695,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
         attributes: Attributes::new(),
     };
     let (conn, _sec_info, _disconnection_listener) = builder
-        .dyn_connect(
+        .connect(
             &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
@@ -704,7 +705,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
         .unwrap();
 
     let (mut tx, rx) = conn
-        .dyn_invoke(
+        .invoke(
             RequestHeaders::new()
                 .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
             CallOptions::default(),
@@ -1002,7 +1003,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     };
 
     let (conn, _sec_info, _disconnection_listener) = builder
-        .dyn_connect(
+        .connect(
             &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
@@ -1012,7 +1013,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
         .unwrap();
 
     let (mut tx, rx) = conn
-        .dyn_invoke(
+        .invoke(
             RequestHeaders::new()
                 .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
             CallOptions::default(),
@@ -1038,7 +1039,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
 /// Returns the connection and its disconnection listener.
 async fn connect_transport(
     addr: SocketAddr,
-) -> (Box<dyn DynInvoke>, oneshot::Receiver<Result<(), String>>) {
+) -> (BoxInvoker, oneshot::Receiver<Result<(), String>>) {
     let builder = GLOBAL_TRANSPORT_REGISTRY
         .get_transport(TCP_IP_NETWORK_TYPE)
         .unwrap();
@@ -1053,7 +1054,7 @@ async fn connect_transport(
         attributes: Attributes::new(),
     };
     let (conn, _sec_info, disconnection_listener) = builder
-        .dyn_connect(
+        .connect(
             &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &security_opts,
@@ -1265,7 +1266,7 @@ async fn tonic_transport_deadline_already_expired() {
     let (conn, _disconnection_listener) = connect_transport(server.addr()).await;
 
     let (mut tx, mut rx) = conn
-        .dyn_invoke(
+        .invoke(
             RequestHeaders::new().with_method_name("/grpc.examples.echo.Echo/UnaryEcho"),
             call_options_with_deadline(now() - Duration::from_secs(1)),
         )

@@ -22,13 +22,15 @@
  *
  */
 
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
 use http::HeaderValue;
+use tokio::sync::oneshot;
 
-use crate::client::DynInvoke;
-use crate::client::ErasedInvoke;
+use crate::async_trait;
+use crate::client::BoxInvoker;
 use crate::client::Invoke;
 use crate::core::Address;
 use crate::core::ConnectionInfo;
@@ -45,10 +47,8 @@ mod registry;
 #[cfg(feature = "_runtime-tokio")]
 pub(crate) mod tonic;
 
-use crate::async_trait;
 pub(crate) use registry::GLOBAL_TRANSPORT_REGISTRY;
 pub(crate) use registry::TransportRegistry;
-use tokio::sync::oneshot;
 
 // TODO: The following options are specific to HTTP/2. We should
 // instead pass an `Attribute` like struct to the connect method instead which
@@ -108,10 +108,9 @@ pub(crate) trait Transport: Sync {
 
 /// A dyn-compatible version of [`Transport`].
 ///
-/// To use a [`Transport`] as a `DynTransport`, wrap it in an
-/// [`ErasedTransport`].
+/// To erase a [`Transport`], use [`ArcTransport::new`].
 #[async_trait]
-pub(crate) trait DynTransport: Send + Sync {
+trait DynTransport: Send + Sync {
     async fn dyn_connect(
         &self,
         address: &Address,
@@ -120,7 +119,7 @@ pub(crate) trait DynTransport: Send + Sync {
         opts: &TransportOptions,
     ) -> Result<
         (
-            Box<dyn DynInvoke>,
+            BoxInvoker,
             ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
@@ -128,13 +127,10 @@ pub(crate) trait DynTransport: Send + Sync {
     >;
 }
 
-/// Adapts a [`Transport`] into a [`DynTransport`], e.g. to store it as an
-/// `Arc<dyn DynTransport>`.  Boxes the services it returns.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ErasedTransport<T>(pub T);
-
+/// Every [`Transport`] is a [`DynTransport`]; the connections it returns are
+/// type-erased into [`BoxInvoker`]s.
 #[async_trait]
-impl<T: Transport> DynTransport for ErasedTransport<T> {
+impl<T: Transport> DynTransport for T {
     async fn dyn_connect(
         &self,
         address: &Address,
@@ -143,17 +139,58 @@ impl<T: Transport> DynTransport for ErasedTransport<T> {
         opts: &TransportOptions,
     ) -> Result<
         (
-            Box<dyn DynInvoke>,
+            BoxInvoker,
             ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
     > {
-        let (i, sc, rx) = self
-            .0
-            .connect(address, runtime, security_opts, opts)
-            .await?;
-        Ok((Box::new(ErasedInvoke(i)), sc, rx))
+        let (i, sc, rx) = self.connect(address, runtime, security_opts, opts).await?;
+        Ok((BoxInvoker::new(i), sc, rx))
+    }
+}
+
+/// A type-erased, cloneable [`Transport`] whose connections are
+/// [`BoxInvoker`]s.
+///
+/// Cheap to clone; clones share the same underlying transport.
+#[derive(Clone)]
+pub(crate) struct ArcTransport(Arc<dyn DynTransport>);
+
+impl ArcTransport {
+    /// Wraps `transport` in an `ArcTransport`.  The connections it returns are
+    /// type-erased into [`BoxInvoker`]s.
+    pub(crate) fn new<T: Transport + 'static>(transport: T) -> Self {
+        Self(Arc::new(transport))
+    }
+}
+
+impl Debug for ArcTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArcTransport").finish_non_exhaustive()
+    }
+}
+
+impl Transport for ArcTransport {
+    type Service = BoxInvoker;
+
+    async fn connect(
+        &self,
+        address: &Address,
+        runtime: GrpcRuntime,
+        security_opts: &SecurityOpts,
+        opts: &TransportOptions,
+    ) -> Result<
+        (
+            Self::Service,
+            ConnectionInfo,
+            oneshot::Receiver<Result<(), String>>,
+        ),
+        String,
+    > {
+        self.0
+            .dyn_connect(address, runtime, security_opts, opts)
+            .await
     }
 }
 

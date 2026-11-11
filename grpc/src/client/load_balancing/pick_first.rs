@@ -28,6 +28,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use rand::seq::SliceRandom;
 
@@ -57,6 +58,10 @@ use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 
 pub static POLICY_NAME: &str = "pick_first";
+
+// The Connection Attempt Delay (gRFC A61): how long to wait for a connection
+// attempt before also starting one on the next address.
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
@@ -648,7 +653,7 @@ impl Timer {
         let expired = Arc::new(AtomicBool::new(false));
         let expired_clone = expired.clone();
         let handle = runtime.clone().spawn(Box::pin(async move {
-            runtime.sleep(std::time::Duration::from_millis(250)).await;
+            runtime.sleep(CONNECTION_ATTEMPT_DELAY).await;
             expired_clone.store(true, Ordering::SeqCst);
             work_scheduler.schedule_work(None);
         }));
@@ -773,10 +778,6 @@ mod test {
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::rt::default_runtime;
-
-    // The Connection Attempt Delay (gRFC A61): how long the policy waits for a
-    // connection attempt before also starting one on the next address.
-    const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
     // A ChannelController wrapper that delegates to TestChannelController,
     // overriding the initial SubchannelState returned by new_subchannel for

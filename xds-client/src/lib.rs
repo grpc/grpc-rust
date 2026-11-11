@@ -81,6 +81,7 @@
 pub mod client;
 pub mod codec;
 pub mod error;
+pub mod lrs;
 pub mod message;
 pub mod metrics;
 pub mod resource;

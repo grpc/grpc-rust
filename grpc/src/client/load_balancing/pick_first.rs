@@ -1152,25 +1152,6 @@ mod test {
         env.expect_no_events();
     }
 
-    // If all addresses fail during a connection pass, the LB should enter
-    // steady state and monitor for backoff expiry to retry connections.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_steady_state_retries() {
-        let mut env = new_env();
-        let scs = env.simulate_failed_connection(&["addr1"]);
-
-        // Expect UpdatePicker(TransientFailure) and RequestResolution.
-        env.expect_failing_picker("connection refused");
-        env.expect_request_resolution();
-
-        // Simulate addr1 transitioning to IDLE (backoff over).
-        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
-
-        // Should automatically call connect() again.
-        env.expect_connect_to("addr1");
-        env.expect_no_events();
-    }
-
     // A subchannel that returns to IDLE during the first pass is not retried
     // until the first pass completes. Entering steady state connects it
     // immediately, steady state retries it on IDLE, and the policy switches to
@@ -1375,33 +1356,6 @@ mod test {
         env.expect_no_events();
     }
 
-    // Out-of-Order Failure Detection
-    // Ensures the policy waits for all parallel connection attempts to drop
-    // before failing the channel.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_happy_eyeballs_out_of_order_failure() {
-        let mut env = new_env();
-        let scs = env.simulate_connection(&["addr1", "addr2"]);
-
-        // Simulate Happy Eyeballs timer firing to launch parallel connection
-        // to addr2.
-        env.fire_timer().await;
-        env.expect_connect_to("addr2");
-
-        // Simulate addr2 failing first while addr1 is still in flight.
-        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
-
-        // Verify policy does NOT enter TransientFailure yet.
-        env.expect_no_events();
-
-        // Simulate addr1 failing. Pass is now fully exhausted.
-        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
-
-        env.expect_failing_picker("addr1 failed");
-        env.expect_request_resolution();
-        env.expect_no_events();
-    }
-
     // An earlier connection attempt that succeeds after the timer moved the
     // pass on is selected, and the running timer is cancelled (gRFC A61).
     #[tokio::test(start_paused = true)]
@@ -1452,11 +1406,14 @@ mod test {
         env.expect_no_events();
     }
 
-    // A failure from a subchannel the pass has not reached yet does not count
-    // toward ending the pass: the subchannel may be IDLE again by the time the
-    // pass reaches it, and the pass then attempts it and waits for the result.
+    // The first pass ends only when every address has failed during this pass.
+    //
+    // A later attempt failing while an earlier one is still in flight does not
+    // end it. Nor does a failure reported before the pass reached the address:
+    // that subchannel may be IDLE again by then, and the pass attempts it and
+    // waits for the result.
     #[tokio::test(start_paused = true)]
-    async fn test_pick_first_failure_not_yet_reached_not_counted() {
+    async fn test_pick_first_pass_ends_when_every_attempt_in_it_fails() {
         let mut env = new_env();
         let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
 
@@ -1469,15 +1426,16 @@ mod test {
         env.expect_connect_to("addr2");
         env.expect_no_events();
 
-        // addr2's timer moves the pass on to addr3, which fails. Every address
-        // has now failed once, but the pass is not over: addr2's earlier
-        // failure does not count, and its attempt in this pass is in flight.
+        // addr2's timer moves the pass on to addr3, the last address, which
+        // fails while addr2's attempt is still in flight. Every address has now
+        // failed once, but the pass is not over: addr2's earlier failure does
+        // not count, and its attempt in this pass has not finished.
         env.fire_timer().await;
         env.expect_connect_to("addr3");
         env.send_subchannel_update(&scs[2], &SubchannelState::transient_failure("addr3 failed"));
         env.expect_no_events();
 
-        // addr2 fails during this pass, completing it.
+        // addr2's attempt fails too, ending the pass with its error.
         env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 again"));
         env.expect_failing_picker("addr2 again");
         env.expect_request_resolution();

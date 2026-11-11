@@ -471,7 +471,7 @@ mod tests {
         t.send_resolver_update(vec![endpoint])
             .expect("resolver update should succeed");
         let subchannel = t.expect_new_subchannel_for("addr1");
-        assert_eq!(&*t.expect_connect().address, "addr1");
+        t.expect_connect_to("addr1");
         t.expect_queuing_picker();
 
         t.send_subchannel_update(&subchannel, &SubchannelState::ready());

@@ -765,7 +765,7 @@ mod tests {
         // The READY picker excludes "b" once it is IDLE, so no pick would wake
         // it; the parent has to ask it to exit idle.
         t.send_subchannel_update(&b, &SubchannelState::idle());
-        assert_eq!(&*t.expect_connect().address, "b");
+        t.expect_connect_to("b");
         t.expect_ready_picker(&a);
         t.expect_no_events();
     }
@@ -782,7 +782,7 @@ mod tests {
         // aggregating, so "a" connects and reports CONNECTING, and the parent
         // never publishes IDLE.
         t.send_subchannel_update(&a, &SubchannelState::idle());
-        assert_eq!(&*t.expect_connect().address, "a");
+        t.expect_connect_to("a");
         t.expect_queuing_picker();
         t.expect_no_events();
     }

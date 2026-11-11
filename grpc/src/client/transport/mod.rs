@@ -30,8 +30,8 @@ use http::HeaderValue;
 use tokio::sync::oneshot;
 
 use crate::async_trait;
-use crate::client::BoxInvoker;
 use crate::client::Invoke;
+use crate::client::boxed::BoxInvoker;
 use crate::core::Address;
 use crate::core::ConnectionInfo;
 use crate::credentials::ChannelCredentials;

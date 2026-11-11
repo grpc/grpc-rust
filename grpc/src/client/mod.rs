@@ -57,11 +57,6 @@ use crate::core::StreamEnded;
 use crate::metadata::MetadataMap;
 
 pub(crate) mod boxed;
-pub(crate) use boxed::ArcInterceptor;
-pub(crate) use boxed::ArcInvoker;
-pub(crate) use boxed::BoxInvoker;
-pub(crate) use boxed::BoxRecvStream;
-pub(crate) use boxed::BoxSendStream;
 
 mod call_options;
 pub use call_options::CallOptions;

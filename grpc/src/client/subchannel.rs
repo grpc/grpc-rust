@@ -38,13 +38,13 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::client::BoxInvoker;
-use crate::client::BoxRecvStream;
-use crate::client::BoxSendStream;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::Invoke;
 use crate::client::RequestHeaders;
+use crate::client::boxed::BoxInvoker;
+use crate::client::boxed::BoxRecvStream;
+use crate::client::boxed::BoxSendStream;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;

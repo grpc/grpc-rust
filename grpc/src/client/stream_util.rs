@@ -26,8 +26,6 @@
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::client::BoxRecvStream;
-use crate::client::BoxSendStream;
 use crate::client::CallOptions;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
@@ -36,6 +34,8 @@ use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::client::Trailers;
+use crate::client::boxed::BoxRecvStream;
+use crate::client::boxed::BoxSendStream;
 use crate::client::interceptor::Intercept;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;

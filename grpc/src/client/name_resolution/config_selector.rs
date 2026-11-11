@@ -31,7 +31,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::StatusError;
-use crate::client::ArcInterceptor;
+use crate::client::boxed::ArcInterceptor;
 use crate::client::name_resolution::ResolverUpdate;
 
 /// The configuration to apply to a single RPC, as chosen by a
@@ -144,9 +144,6 @@ mod tests {
     use super::*;
     use crate::StatusCodeError;
     use crate::async_trait;
-    use crate::client::ArcInvoker;
-    use crate::client::BoxRecvStream;
-    use crate::client::BoxSendStream;
     use crate::client::CallOptions;
     use crate::client::Channel;
     use crate::client::ChannelRecvStream;
@@ -157,6 +154,9 @@ mod tests {
     use crate::client::ResponseStreamItem;
     use crate::client::SendOptions;
     use crate::client::SendStream as _;
+    use crate::client::boxed::ArcInvoker;
+    use crate::client::boxed::BoxRecvStream;
+    use crate::client::boxed::BoxSendStream;
     use crate::client::interceptor::Intercept;
     use crate::client::name_resolution::ChannelController;
     use crate::client::name_resolution::Endpoint;

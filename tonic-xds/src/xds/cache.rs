@@ -236,8 +236,7 @@ mod tests {
             localities: vec![LocalityEndpoints {
                 locality: None,
                 endpoints: vec![ResolvedEndpoint {
-                    address: EndpointAddress::new("10.0.0.1", 8080),
-                    additional_addresses: vec![],
+                    endpoint: Arc::new(EndpointAddress::new("10.0.0.1", 8080).into()),
                     health_status: HealthStatus::Healthy,
                     load_balancing_weight: 1,
                 }],

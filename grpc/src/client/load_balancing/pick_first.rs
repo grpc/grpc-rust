@@ -1013,10 +1013,6 @@ mod test {
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::rt::default_runtime;
 
-    // The Connection Attempt Delay (gRFC A61): how long the policy waits for a
-    // connection attempt before also starting one on the next address.
-    const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
-
     // A ChannelController wrapper that delegates to TestChannelController,
     // overriding the initial SubchannelState returned by new_subchannel for
     // configured addresses.

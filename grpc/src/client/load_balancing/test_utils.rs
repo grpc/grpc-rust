@@ -590,3 +590,9 @@ impl LbPolicyBuilder for StubPolicyBuilder {
 pub fn reg_stub_policy(name: &'static str, funcs: StubPolicyFuncs) {
     super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }));
 }
+
+/// Registers the LB policies that a channel registers by default, for tests
+/// that build policies without a channel.
+pub fn register_default_policies() {
+    super::register();
+}

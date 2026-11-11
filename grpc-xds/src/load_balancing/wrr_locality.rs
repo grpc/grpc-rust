@@ -65,7 +65,6 @@ use crate::resource::Locality;
 static POLICY_NAME: &str = "xds_wrr_locality_experimental";
 static CHILD_POLICY_NAME: &str = "weighted_target_experimental";
 
-// Endpoint attribute carrying the xDS locality load-balancing weight.
 #[derive(Debug, PartialEq, Eq)]
 struct LocalityWeight(u32);
 
@@ -76,13 +75,12 @@ pub(crate) fn set_locality_weight(mut endpoint: Endpoint, weight: u32) -> Endpoi
     endpoint
 }
 
-// Validated configuration for the WRR Locality LB policy.
 #[derive(Debug, Deserialize)]
 struct WrrLocalityConfig {
-    // Prototype LB policy configuration for picking endpoints within a
-    // locality. Kept as raw JSON so it can be replicated into each locality
-    // entry when constructing the `weighted_target_experimental` config on
-    // resolver updates.
+    /// Prototype LB policy configuration for picking endpoints within a
+    /// locality. Kept as raw JSON so it can be replicated into each locality
+    /// entry when constructing the `weighted_target_experimental` config on
+    /// resolver updates.
     #[serde(rename = "childPolicy")]
     child_policy: Vec<Value>,
 }
@@ -127,13 +125,19 @@ struct WrrLocalityPolicy {
 }
 
 impl WrrLocalityPolicy {
-    // Drops any active child policy, transitions the channel to
-    // TRANSIENT_FAILURE with a FailingPicker, and returns the error.
+    /// Drops any active child policy and reports TRANSIENT_FAILURE with a
+    /// picker that fails RPCs with `error`, followed by the resolver's note if
+    /// there is one. Returns the error the picker reports.
     fn fail_update(
         &mut self,
         error: String,
+        resolution_note: Option<&str>,
         channel_controller: &mut dyn ChannelController,
     ) -> String {
+        let error = match resolution_note {
+            Some(note) if !note.is_empty() => format!("{error} ({note})"),
+            _ => error,
+        };
         self.child = None;
         channel_controller.update_picker(LbState {
             connectivity_state: ConnectivityState::TransientFailure,
@@ -144,9 +148,9 @@ impl WrrLocalityPolicy {
         error
     }
 
-    // Builds and parses the child LB policy configuration from per-locality
-    // endpoint weights. Per gRFC A52, if a locality appears with conflicting
-    // weights across endpoints, the first weight encountered is used.
+    /// Builds and parses the child LB policy configuration from per-locality
+    /// endpoint weights. Per gRFC A52, if a locality appears with conflicting
+    /// weights across endpoints, the first weight encountered is used.
     fn parse_child_config(
         &self,
         endpoints: &[Endpoint],
@@ -175,8 +179,9 @@ impl WrrLocalityPolicy {
             .map_err(|err| format!("{POLICY_NAME}: failed to parse generated child config: {err}"))
     }
 
-    // Lazily initializes the child policy on first update and stores the latest
-    // parsed child configuration.
+    /// Returns the child policy and its config, creating the child on first
+    /// use. `child_config` always replaces the stored config, even when the
+    /// child already exists.
     fn get_or_insert_child(
         &mut self,
         child_config: ParsedLbConfig,
@@ -194,8 +199,8 @@ impl WrrLocalityPolicy {
         self.child.insert((child, child_config))
     }
 
-    // Use whenever forwarding a resolver update to an active child so that any
-    // picker intercepted by `Child` is published to the channel.
+    /// Use whenever forwarding a resolver update to an active child so that any
+    /// picker intercepted by `Child` is published to the channel.
     fn update_child(
         child: &mut Child,
         config: &ParsedLbConfig,
@@ -225,6 +230,7 @@ impl LbPolicy for WrrLocalityPolicy {
                 let Some((child, last_config)) = &mut self.child else {
                     return Err(self.fail_update(
                         format!("{POLICY_NAME}: resolver error: {err}"),
+                        update.resolution_note.as_deref(),
                         channel_controller,
                     ));
                 };
@@ -235,7 +241,13 @@ impl LbPolicy for WrrLocalityPolicy {
 
         let child_config = match self.parse_child_config(endpoints, &config.child_policy) {
             Ok(parsed) => parsed,
-            Err(err) => return Err(self.fail_update(err, channel_controller)),
+            Err(err) => {
+                return Err(self.fail_update(
+                    err,
+                    update.resolution_note.as_deref(),
+                    channel_controller,
+                ));
+            }
         };
         let (child, last_config) = self.get_or_insert_child(child_config);
         Self::update_child(child, last_config, update, channel_controller)
@@ -276,11 +288,14 @@ mod tests {
     use std::sync::Mutex;
 
     use grpc::__unstable::client::load_balancing::QueuingPicker;
+    use grpc::__unstable::client::load_balancing::endpoint_filtering::set_path_in_endpoint;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
+    use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
     use grpc::__unstable::client::load_balancing::test_utils;
     use grpc::__unstable::client::load_balancing::test_utils::StubPolicyFuncs;
     use grpc::__unstable::client::load_balancing::test_utils::TestEnv;
     use grpc::__unstable::rt::default_runtime;
+    use grpc::core::Address;
 
     use super::*;
 
@@ -439,55 +454,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_or_unweighted_endpoints_forwards_empty_targets_to_child() {
-        let (mut t, received) = new_recording_env("mock_wrr_empty_targets");
+    #[tokio::test]
+    async fn weighted_locality_endpoints_become_ready_through_child_policies() {
+        let mut t = new_env();
+        let mut endpoint = locality_endpoint("r1", "z1", "sz1", 10);
+        let mut address = Address::default();
+        address.address = "addr1".to_string().into();
+        endpoint.addresses = vec![address];
+        // weighted_target gives each endpoint to the target named by the first
+        // element of its hierarchical path.
+        let endpoint = set_path_in_endpoint(
+            endpoint,
+            vec!["{region=\"r1\", zone=\"z1\", sub_zone=\"sz1\"}".to_string()],
+        );
 
-        // Establish an active child first.
-        t.send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
-            .expect("initial update should succeed");
+        t.send_resolver_update(vec![endpoint])
+            .expect("resolver update should succeed");
+        let subchannel = t.expect_new_subchannel_for("addr1");
+        assert_eq!(&*t.expect_connect().address, "addr1");
         t.expect_queuing_picker();
-        assert_eq!(received.lock().unwrap().take().unwrap().1.len(), 1);
 
-        // Update with an endpoint missing locality weight forwards empty targets
-        // to the child policy rather than dropping the child.
+        t.send_subchannel_update(&subchannel, &SubchannelState::ready());
+        t.expect_ready_picker(&subchannel);
+        t.expect_no_events();
+    }
+
+    #[test]
+    fn empty_or_unweighted_endpoints_fail_picks_in_child() {
+        let mut t = new_env();
+
+        // An endpoint without a locality weight leaves no targets. The update
+        // succeeds and the picker fails with weighted_target's error, so the
+        // empty config reached the child instead of failing here. The
+        // resolver's note reaches the picker too.
         let mut unweighted = Endpoint::default();
         unweighted.attributes = unweighted.attributes.add(Locality {
             region: "r1".to_string(),
             zone: "z1".to_string(),
             sub_zone: "sz1".to_string(),
         });
-
-        t.send_resolver_update(vec![unweighted.clone()])
-            .expect("update without weighted localities should be forwarded to child");
-        t.expect_queuing_picker();
+        send_update_with_note(&mut t, Ok(vec![unweighted]), "eds note")
+            .expect("update without weighted localities should succeed");
+        t.expect_failing_picker("weighted_target_experimental: no targets (eds note)");
         t.expect_no_events();
 
-        let (received_update, targets) = received.lock().unwrap().take().unwrap();
-        assert!(targets.is_empty());
-        assert_eq!(received_update.endpoints, Ok(vec![unweighted]));
-
-        // An empty endpoint list also forwards empty targets to the child.
+        // An empty endpoint list also reaches the child.
         t.send_resolver_update(Vec::new())
-            .expect("empty endpoint update should be forwarded to child");
-        t.expect_queuing_picker();
+            .expect("empty endpoint update should succeed");
+        t.expect_failing_picker("weighted_target_experimental: no targets");
         t.expect_no_events();
-
-        let (received_update, targets) = received.lock().unwrap().take().unwrap();
-        assert!(targets.is_empty());
-        assert_eq!(received_update.endpoints, Ok(Vec::new()));
     }
 
     #[test]
     fn resolver_error_without_child_transitions_to_transient_failure() {
         let mut t = new_env();
 
-        let err = t
-            .send_resolver_error("eds stream closed".to_string())
+        let err = send_update_with_note(&mut t, Err("eds stream closed".to_string()), "eds note")
             .expect_err("resolver error without child should fail update");
+        // The resolver's note follows the error.
         assert_eq!(
             err,
-            "xds_wrr_locality_experimental: resolver error: eds stream closed"
+            "xds_wrr_locality_experimental: resolver error: eds stream closed (eds note)"
         );
 
         t.expect_failing_picker(&err);
@@ -524,13 +551,18 @@ mod tests {
     fn generated_child_config_parse_error_transitions_to_transient_failure() {
         let mut t = new_env_with_child("unregistered_child_policy");
 
-        let err = t
-            .send_resolver_update(vec![locality_endpoint("r1", "z1", "sz1", 10)])
-            .expect_err("unregistered child policy should fail update");
+        let err = send_update_with_note(
+            &mut t,
+            Ok(vec![locality_endpoint("r1", "z1", "sz1", 10)]),
+            "eds note",
+        )
+        .expect_err("unregistered child policy should fail update");
+        // The resolver's note follows the parse error.
         assert!(
             err.starts_with(
                 "xds_wrr_locality_experimental: failed to parse generated child config:"
-            )
+            ) && err.ends_with(" (eds note)"),
+            "unexpected error: {err}"
         );
 
         t.expect_failing_picker(&err);
@@ -608,7 +640,8 @@ mod tests {
         t.run_work();
         t.expect_picker_state(ConnectivityState::Ready);
 
-        // Calling `exit_idle` when child does not update does not republish a picker.
+        // Calling `exit_idle` when child does not update does not republish a
+        // picker.
         t.policy.exit_idle(&mut t.tcc);
         t.expect_no_events();
     }
@@ -634,6 +667,7 @@ mod tests {
     type RecordedUpdate = (ResolverUpdate, BTreeMap<String, u32>);
 
     fn new_env() -> TestEnv<WrrLocalityPolicy> {
+        test_utils::register_default_policies();
         new_env_with_child(CHILD_POLICY_NAME)
     }
 
@@ -671,6 +705,18 @@ mod tests {
         t.expect_queuing_picker();
         t.expect_no_events();
         received.lock().unwrap().take().unwrap().1
+    }
+
+    fn send_update_with_note(
+        t: &mut TestEnv<WrrLocalityPolicy>,
+        endpoints: Result<Vec<Endpoint>, String>,
+        note: &str,
+    ) -> Result<(), String> {
+        let mut update = ResolverUpdate::default();
+        update.endpoints = endpoints;
+        update.resolution_note = Some(note.to_string());
+        t.policy
+            .resolver_update(update, &WrrLocalityConfig::default(), &mut t.tcc)
     }
 
     fn locality_endpoint(region: &str, zone: &str, sub_zone: &str, weight: u32) -> Endpoint {

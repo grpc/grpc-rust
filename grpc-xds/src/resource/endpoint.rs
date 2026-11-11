@@ -65,9 +65,9 @@ pub(crate) struct Locality {
     pub(crate) sub_zone: String,
 }
 
-// Formats the locality as `{region="<region>", zone="<zone>",
-// sub_zone="<sub_zone>"}`: the name of the locality's child policy under
-// `xds_wrr_locality`, and its metric label value (gRFC A78).
+/// Formats the locality as `{region="<region>", zone="<zone>",
+/// sub_zone="<sub_zone>"}`: the name of the locality's child policy under
+/// `xds_wrr_locality`, and its metric label value (gRFC A78).
 impl fmt::Display for Locality {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

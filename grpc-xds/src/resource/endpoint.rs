@@ -32,11 +32,11 @@ use xds_client::Error;
 use xds_client::Resource;
 use xds_client::resource::TypeUrl;
 
-use crate::generated::envoy::config::core::v3::HealthStatus as EnvoyHealthStatus;
-use crate::generated::envoy::config::endpoint::v3::ClusterLoadAssignment;
-use crate::generated::envoy::config::endpoint::v3::lb_endpoint::HostIdentifierOneof;
-use crate::generated::envoy::r#type::v3::FractionalPercentView;
-use crate::generated::envoy::r#type::v3::fractional_percent::DenominatorType;
+use crate::generated::envoy_config_core_v3_health_check_proto::HealthStatus as EnvoyHealthStatus;
+use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::lb_endpoint::HostIdentifierOneof;
+use crate::generated::envoy_config_endpoint_v3_endpoint_proto::ClusterLoadAssignment;
+use crate::generated::envoy_type_v3_percent_proto::FractionalPercentView;
+use crate::generated::envoy_type_v3_percent_proto::fractional_percent::DenominatorType;
 
 /// Validated ClusterLoadAssignment (EDS resource).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,7 +301,7 @@ fn fractional_percent_to_million(frac: FractionalPercentView<'_>) -> Result<u32,
 }
 
 fn validate_lb_endpoint(
-    lb_ep: crate::generated::envoy::config::endpoint::v3::LbEndpointView<'_>,
+    lb_ep: crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::LbEndpointView<'_>,
 ) -> xds_client::Result<Option<LbEndpoint>> {
     let health_status = HealthStatus::from(lb_ep.health_status());
 
@@ -383,12 +383,12 @@ impl EndpointsResource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::envoy::config::core::v3::Address;
-    use crate::generated::envoy::config::core::v3::Locality as EnvoyLocality;
-    use crate::generated::envoy::config::core::v3::SocketAddress;
-    use crate::generated::envoy::config::endpoint::v3::Endpoint;
-    use crate::generated::envoy::config::endpoint::v3::LbEndpoint as EnvoyLbEndpoint;
-    use crate::generated::envoy::config::endpoint::v3::LocalityLbEndpoints as EnvoyLocalityLbEndpoints;
+    use crate::generated::envoy_config_core_v3_address_proto::Address;
+    use crate::generated::envoy_config_core_v3_address_proto::SocketAddress;
+    use crate::generated::envoy_config_core_v3_base_proto::Locality as EnvoyLocality;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::Endpoint;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::LbEndpoint as EnvoyLbEndpoint;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::LocalityLbEndpoints as EnvoyLocalityLbEndpoints;
     use protobuf::Serialize;
     use protobuf_well_known_types::UInt32Value;
 
@@ -724,9 +724,9 @@ mod tests {
 
     #[test]
     fn validate_drop_overloads() {
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
-        use crate::generated::envoy::r#type::v3::FractionalPercent;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::Policy;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy_type_v3_percent_proto::FractionalPercent;
 
         let make_drop = |category: &str, num: u32, denom: DenominatorType| {
             let mut frac = FractionalPercent::new();
@@ -783,8 +783,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_drop_percentage() {
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::Policy;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
 
         let mut drop_overload = EnvoyDropOverload::new();
         drop_overload.set_category("unset_pct");
@@ -803,9 +803,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_drop_category() {
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
-        use crate::generated::envoy::r#type::v3::FractionalPercent;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::Policy;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy_type_v3_percent_proto::FractionalPercent;
 
         let mut frac = FractionalPercent::new();
         frac.set_numerator(10);
@@ -827,9 +827,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_unknown_drop_denominator() {
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::Policy;
-        use crate::generated::envoy::config::endpoint::v3::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
-        use crate::generated::envoy::r#type::v3::FractionalPercent;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::Policy;
+        use crate::generated::envoy_config_endpoint_v3_endpoint_proto::cluster_load_assignment::policy::DropOverload as EnvoyDropOverload;
+        use crate::generated::envoy_type_v3_percent_proto::FractionalPercent;
 
         let mut frac = FractionalPercent::new();
         frac.set_numerator(10);

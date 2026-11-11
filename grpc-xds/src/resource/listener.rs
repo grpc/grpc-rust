@@ -33,8 +33,8 @@ use xds_client::Resource;
 use xds_client::resource::TypeUrl;
 
 use super::route::RouteConfigResource;
-use crate::generated::envoy::config::listener::v3::Listener;
-use crate::generated::envoy::extensions::filters::network::http_connection_manager::v3::{
+use crate::generated::envoy_config_listener_v3_listener_proto::Listener;
+use crate::generated::envoy_extensions_filters_network_http_connection_manager_v3_http_connection_manager_proto::{
     HttpConnectionManager, http_connection_manager::RouteSpecifierOneof,
 };
 
@@ -162,16 +162,16 @@ impl ListenerResource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::envoy::config::core::v3::AggregatedConfigSource;
-    use crate::generated::envoy::config::core::v3::ConfigSource;
-    use crate::generated::envoy::config::core::v3::SelfConfigSource;
-    use crate::generated::envoy::config::listener::v3::ApiListener;
-    use crate::generated::envoy::config::route::v3::Route;
-    use crate::generated::envoy::config::route::v3::RouteAction;
-    use crate::generated::envoy::config::route::v3::RouteConfiguration;
-    use crate::generated::envoy::config::route::v3::RouteMatch;
-    use crate::generated::envoy::config::route::v3::VirtualHost;
-    use crate::generated::envoy::extensions::filters::network::http_connection_manager::v3::Rds;
+    use crate::generated::envoy_config_core_v3_config_source_proto::AggregatedConfigSource;
+    use crate::generated::envoy_config_core_v3_config_source_proto::ConfigSource;
+    use crate::generated::envoy_config_core_v3_config_source_proto::SelfConfigSource;
+    use crate::generated::envoy_config_listener_v3_api_listener_proto::ApiListener;
+    use crate::generated::envoy_config_route_v3_route_components_proto::Route;
+    use crate::generated::envoy_config_route_v3_route_components_proto::RouteAction;
+    use crate::generated::envoy_config_route_v3_route_components_proto::RouteMatch;
+    use crate::generated::envoy_config_route_v3_route_components_proto::VirtualHost;
+    use crate::generated::envoy_config_route_v3_route_proto::RouteConfiguration;
+    use crate::generated::envoy_extensions_filters_network_http_connection_manager_v3_http_connection_manager_proto::Rds;
     use protobuf::Serialize;
 
     const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";

@@ -39,14 +39,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tower::BoxError;
 use tower::discover::Change;
 
 use crate::client::endpoint::{Connector, EndpointAddress, XdsEndpoint};
 use crate::client::lb::BoxDiscover;
 use crate::client::loadbalance::channel_state::IdleChannel;
-use crate::common::async_util::BoxFuture;
+use crate::common::async_util::{BoxFuture, TaskStream};
 use crate::xds::cache::CacheWatch;
 use crate::xds::resource::EndpointsResource;
 
@@ -107,9 +106,9 @@ pub(crate) fn discover_addresses(
 
 /// Spawns the shared diff loop and returns the change stream it feeds.
 ///
-/// The spawned task exits naturally when either:
-/// - The `CacheWatch` closes (`cache.remove_endpoints()` drops the watch sender)
-/// - The receiver is dropped (consumer no longer reading `Change` events)
+/// The spawned task exits when the `CacheWatch` closes
+/// (`cache.remove_endpoints()` drops the watch sender), which ends the stream,
+/// and is aborted when the stream is dropped.
 fn spawn_diff_loop<S, F>(
     watch: CacheWatch<EndpointsResource>,
     make_service: F,
@@ -118,9 +117,9 @@ where
     S: Send + 'static,
     F: Fn(&Arc<XdsEndpoint>) -> BoxFuture<S> + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel(ENDPOINT_CHANNEL_CAPACITY);
-    tokio::spawn(diff_loop(watch, make_service, tx));
-    Box::pin(ReceiverStream::new(rx))
+    Box::pin(TaskStream::spawn(ENDPOINT_CHANNEL_CAPACITY, |tx| {
+        diff_loop(watch, make_service, tx)
+    }))
 }
 
 /// Background task: watches endpoint snapshots and emits incremental changes.
@@ -177,10 +176,13 @@ async fn diff_loop<S, F>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::common::async_util::BoxFuture;
     use crate::xds::cache::XdsCache;
     use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
+    use tokio::sync::oneshot::{self, error::TryRecvError};
     use tokio_stream::StreamExt;
 
     /// Test [`Connector`] whose `Service` is a `String` describing the
@@ -201,6 +203,19 @@ mod tests {
 
     fn test_connector() -> Arc<dyn Connector<Service = String> + Send + Sync> {
         Arc::new(StringConnector)
+    }
+
+    /// A [`StringConnector`] that holds a sender only to drop it, which tells
+    /// the receiver that the last holder of this connector is gone.
+    struct ProbeConnector {
+        _dropped: oneshot::Sender<()>,
+    }
+
+    impl Connector for ProbeConnector {
+        type Service = String;
+        fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+            StringConnector.connect(endpoint)
+        }
     }
 
     fn make_endpoints(cluster: &str, addrs: &[(&str, u16)]) -> Arc<EndpointsResource> {
@@ -363,6 +378,28 @@ mod tests {
         cache.remove_endpoints("c1");
 
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_stops_diff_loop() {
+        let cache = XdsCache::new();
+        let (dropped, mut loop_stopped) = oneshot::channel();
+
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
+
+        let mut stream = EndpointManager::new(Arc::new(ProbeConnector { _dropped: dropped }))
+            .discover_endpoints(cache.watch_endpoints("c1"));
+        let _ = stream.next().await; // consume initial
+        assert_eq!(
+            loop_stopped.try_recv(),
+            Err(TryRecvError::Empty),
+            "held by the diff loop"
+        );
+
+        // The endpoints are still in the cache, so only the drop can stop it.
+        drop(stream);
+        let stopped = tokio::time::timeout(Duration::from_secs(1), loop_stopped).await;
+        assert!(stopped.is_ok(), "diff loop outlived its stream");
     }
 
     #[tokio::test]

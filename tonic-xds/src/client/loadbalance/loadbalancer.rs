@@ -28,24 +28,23 @@
 //! manages the connection lifecycle via the channel state machine,
 //! and routes requests to ready endpoints via a [`ChannelPicker`].
 //!
-//! Outlier detection (gRFC A50) is integrated via [`OutlierDetector`],
-//! which is always present. The actor inside is conditionally spawned
-//! based on the [`OutlierDetectionConfig`] passed at construction —
-//! `OutlierDetectionConfig::default()` is the disabled config, in
-//! which case the sweep never runs and no ejections fire. When
-//! enabled, the sweep broadcasts the current ejected-address set on a
-//! `watch` channel each time the set changes; the LB consumes the
-//! latest snapshot, consumes the matching [`ReadyChannel`] via
-//! [`ReadyChannel::eject`], and tracks the resulting
-//! [`EjectedChannel`] in `ejected`. When the timer fires, the
-//! resolved [`UnejectedChannel`] is routed back into `ready` or
-//! `connecting`.
+//! Outlier detection (gRFC A50) is integrated via [`OutlierDetector`].
+//! CDS sends the cluster's [`OutlierDetectionConfig`] over a `watch`
+//! channel the sweep listens to, so detection can be turned on,
+//! retuned or turned off without the LB being rebuilt. The sweep
+//! broadcasts the current ejected-address set on a `watch` channel
+//! each time the set changes; the LB consumes the latest snapshot,
+//! consumes the matching [`ReadyChannel`] via [`ReadyChannel::eject`],
+//! and tracks the resulting [`EjectedChannel`] in `ejected`. When the
+//! timer fires, the resolved [`UnejectedChannel`] is routed back into
+//! `ready` or `connecting`.
 //!
-//! TODO: wire dynamic outlier-detection config updates from xDS
-//! (`ArcSwap::store` on the config + A50 §7 disable transition
-//! handling). The actor will pick up new configs by reading the
-//! `ArcSwap` on each tick — no restart needed. To land in a
-//! follow-up PR.
+//! TODO: A50 §7 asks that removing outlier detection from CDS un-eject
+//! every address at once. Today removal stops new ejections
+//! immediately, but addresses already ejected return when their own
+//! `EjectedChannel` timer expires (bounded by `max_ejection_time`)
+//! rather than instantly. Forcing them back early needs a way to
+//! resolve those timers ahead of their deadline.
 //!
 //! [`EjectedChannel`]: crate::client::loadbalance::channel_state::EjectedChannel
 //! [`UnejectedChannel`]: crate::client::loadbalance::channel_state::UnejectedChannel
@@ -57,10 +56,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use indexmap::{IndexMap, IndexSet};
+use tokio::sync::watch;
 use tower::Service;
 use tower::discover::{Change, Discover};
-
-use arc_swap::ArcSwap;
 
 use crate::client::endpoint::{Connector, EndpointAddress};
 use crate::client::loadbalance::channel_state::{
@@ -146,11 +144,6 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// `EjectedChannel` whose `Sleep` fires when the ejection
     /// window expires.
     ejected: KeyedFutures<EndpointAddress, UnejectedChannel<C::Service>>,
-    /// Per-LB outlier-detection plumbing. Always present; the
-    /// housekeeping actor inside is conditionally spawned based on
-    /// whether the config had an algorithm enabled at construction.
-    /// When disabled, the data path's `record_outcome` short-circuits
-    /// and nothing reads from `eject_rx`.
     outlier: OutlierDetector,
     picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
     /// Transport-specific mapping of each call's result to an outlier-detection
@@ -167,18 +160,14 @@ where
     C: Connector + Send + Sync + 'static,
     C::Service: Clone + Send + 'static,
 {
-    /// Construct a load balancer driven by `config`. Wrapping the
-    /// config in `ArcSwap` lets future xDS subscription updates
-    /// reconfigure detection without rebuilding the LB; until that
-    /// wiring lands, the value is effectively read-once at
-    /// construction. `OutlierDetectionConfig::default()` is the
-    /// disabled config — both algorithms `None` ⇒ no actor, no
-    /// ejection.
+    /// Construct a load balancer driven by `config`, the channel CDS updates
+    /// are sent over. `OutlierDetectionConfig::default()` is the disabled
+    /// config.
     pub(crate) fn new(
         discovery: D,
         connector: Arc<C>,
         picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
-        config: Arc<ArcSwap<OutlierDetectionConfig>>,
+        config: watch::Receiver<OutlierDetectionConfig>,
         outcome_classifier: Arc<dyn OutcomeClassifier>,
     ) -> Self {
         let (registry, eject_rx) = OutlierStatsRegistry::new(config);
@@ -421,13 +410,21 @@ where
         // Cheap clone (all Arc-shared internals) so the async block
         // can take ownership without holding the picker borrow.
         let mut svc = picked.clone();
-        let classifier = Arc::clone(&self.outcome_classifier);
+        // `None` while outlier detection is off, so a disabled cluster pays
+        // neither the `Arc` clone nor the classification.
+        let classifier = self
+            .outlier
+            .registry()
+            .is_counting_enabled()
+            .then(|| Arc::clone(&self.outcome_classifier));
         LbFuture::Pending(Box::pin(async move {
             tower::ServiceExt::ready(&mut svc)
                 .await
                 .map_err(|e| LbError::LbChannelPollReadyError(e.into()))?;
             let result = svc.call(req).await;
-            if let Some(success) = outlier_outcome(&result, classifier.as_ref()) {
+            if let Some(classifier) = classifier.as_deref()
+                && let Some(success) = outlier_outcome(&result, classifier)
+            {
                 svc.record_outcome(success);
             }
             result.map_err(|e| LbError::LbChannelCallError(e.into()))
@@ -621,7 +618,7 @@ mod tests {
         let connector = Arc::new(MockConnector::new());
         let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
             Arc::new(P2cPicker);
-        let config = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
+        let (_config_tx, config) = watch::channel(OutlierDetectionConfig::default());
         let lb = LoadBalancer::new(
             discover,
             connector.clone(),
@@ -679,7 +676,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
             Arc::new(RecordingPicker { seen: seen.clone() });
-        let config = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
+        let (_config_tx, config) = watch::channel(OutlierDetectionConfig::default());
         let lb = LoadBalancer::new(
             discover,
             connector,
@@ -1132,7 +1129,7 @@ mod tests {
         let connector = Arc::new(MockConnector::new());
         let picker: Arc<dyn ChannelPicker<ReadyChannel<MockService>, &'static str> + Send + Sync> =
             Arc::new(P2cPicker);
-        let config = Arc::new(ArcSwap::from_pointee(config));
+        let (_config_tx, config) = watch::channel(config);
         let lb = LoadBalancer::new(discover, connector.clone(), picker, config, classifier);
         let registry = lb.outlier.registry().clone();
         (lb, connector, registry)
@@ -1268,6 +1265,25 @@ mod tests {
         // `add_channel` is get-or-create, so this reads the state the load
         // balancer has been recording into.
         for port in 8080..=8084 {
+            assert_eq!(registry.add_channel(addr(port)).counters(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn calls_are_not_recorded_while_outlier_detection_is_disabled() {
+        let (tx, discover) = new_discover();
+        let (mut lb, connector, registry) =
+            make_lb_with_outlier(discover, OutlierDetectionConfig::default());
+
+        for port in 8080..=8081 {
+            tx.send(Ok(Change::Insert(addr(port), IdleChannel::new(addr(port)))))
+                .await
+                .unwrap();
+        }
+        drive_to_ready(&mut lb, &connector).await;
+        call_each(&mut lb, 20).await;
+
+        for port in 8080..=8081 {
             assert_eq!(registry.add_channel(addr(port)).counters(), (0, 0));
         }
     }

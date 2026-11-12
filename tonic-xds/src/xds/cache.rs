@@ -225,6 +225,7 @@ mod tests {
             lb_policy: lb,
             security: None,
             circuit_breaking: CircuitBreakingConfig::default(),
+            outlier_detection: Default::default(),
         })
     }
 

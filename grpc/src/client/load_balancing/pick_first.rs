@@ -22,9 +22,9 @@
  *
  */
 
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -52,6 +52,7 @@ use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
@@ -65,7 +66,7 @@ const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
-#[derive(Debug, serde::Deserialize, Clone, Default)]
+#[derive(Debug, serde::Deserialize, Default)]
 pub(crate) struct PickFirstConfig {
     #[serde(default, rename = "shuffleAddressList")]
     shuffle_address_list: bool,
@@ -81,16 +82,14 @@ impl LbPolicyBuilder for PickFirstBuilder {
         PickFirstPolicy {
             work_scheduler: options.work_scheduler,
             runtime: options.runtime,
-            connectivity_state: ConnectivityState::Idle,
-            subchannels: Vec::default(),
-            subchannel_states: HashMap::default(),
-            selected: None,
-            frontier_index: 0,
-            last_connection_error: None,
-            resolution_note: None,
             shuffler: build_shuffler(),
-            timer: None,
-            steady_state: None,
+            state: PickFirstState::Idle(IdleState {
+                addresses: Vec::new(),
+            }),
+            // Not yet reported. IDLE, not CONNECTING, so that `update_picker`
+            // doesn't drop the first CONNECTING as a repeat.
+            connectivity_state: ConnectivityState::Idle,
+            resolution_note: None,
         }
     }
 
@@ -108,448 +107,159 @@ pub(crate) fn reg() {
     super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {});
 }
 
+// A load balancing policy that receives endpoints from the name resolver and
+// connects to the first available backend using the Happy Eyeballs connection
+// algorithm (https://datatracker.ietf.org/doc/html/rfc8305).
 pub(crate) struct PickFirstPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
+    // Injectable shuffler for deterministic testing.
+    shuffler: Arc<ShufflerFn>,
+    state: PickFirstState, // Current state of the LB's finite state machine.
+    // The connectivity state most recently reported to the channel. This is
+    // distinct from the LB's internal `state`: a first pass started while
+    // in TRANSIENT_FAILURE keeps reporting TRANSIENT_FAILURE (sticky-TF, gRFC
+    // A62), even when the LB's internal state is FirstPass.
     connectivity_state: ConnectivityState,
-
-    // Subchannel information.
-    subchannels: Vec<Arc<dyn Subchannel>>,
-    subchannel_states: HashMap<Address, SubchannelState>, // Cached states for all subchannels by address.
-    selected: Option<Arc<dyn Subchannel>>,
-    frontier_index: usize,
-
-    // Detailed error tracking.
-    last_connection_error: Option<String>,
-
     // The resolution note from the latest resolver update. It is added to the
     // status of every TRANSIENT_FAILURE this policy reports.
     resolution_note: Option<String>,
-
-    // Injectable shuffler for deterministic testing.
-    shuffler: Arc<ShufflerFn>,
-
-    // Timer state tracks when the last connect attempt was started.
-    timer: Option<Timer>,
-
-    // Steady state tracking for continuous retries after pass exhaustion.
-    // TODO: should steady_state be a "mode" selector enum, e.g.:
-    // - FirstPass - holds the timer above
-    // - SteadyState - existing info
-    // - Ready - holds selected subchannel
-    // - Error - for zero addresses; holds no data
-    steady_state: Option<SteadyState>,
 }
 
 impl Debug for PickFirstPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PickFirstPolicy")
-            .field("subchannels", &self.subchannels)
-            .field("selected", &self.selected)
-            .field("frontier_index", &self.frontier_index)
+            .field("state", &self.state)
             .field("connectivity_state", &self.connectivity_state)
-            .field("last_connection_error", &self.last_connection_error)
             .field("resolution_note", &self.resolution_note)
-            .finish()
+            .finish_non_exhaustive()
+    }
+}
+
+// An address family, for interleaving addresses as per RFC 8305 section 4
+// (gRFC A61).
+#[derive(PartialEq)]
+enum AddressFamily {
+    Ipv4,
+    Ipv6,
+    // Not an IP address and port, e.g. a hostname or a Unix socket path.
+    // Neither gRFC A61 nor RFC 8305 specifies how to handle non-IP addresses;
+    // grouping them into a third family that participates in interleaving is
+    // intentional and matches Go.
+    Unknown,
+}
+
+impl From<&Address> for AddressFamily {
+    fn from(addr: &Address) -> Self {
+        if addr.network_type != TCP_IP_NETWORK_TYPE {
+            return Self::Unknown;
+        }
+        // An IPv4-mapped IPv6 address counts as IPv4, as in Go and Java.
+        match addr.address.parse::<SocketAddr>() {
+            Ok(sa) if sa.ip().to_canonical().is_ipv4() => Self::Ipv4,
+            Ok(_) => Self::Ipv6,
+            Err(_) => Self::Unknown,
+        }
     }
 }
 
 impl PickFirstPolicy {
-    fn rebuild_subchannels(
-        &mut self,
-        new_addresses: Vec<Address>,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Option<Arc<dyn Subchannel>> {
-        // Map existing subchannels by address.
-        let mut existing_subchannels: HashMap<Address, Arc<dyn Subchannel>> = self
-            .subchannels
-            .drain(..)
-            .map(|sc| (sc.address(), sc))
-            .collect();
-
-        let mut new_subchannels = Vec::with_capacity(new_addresses.len());
-        let mut new_states = HashMap::with_capacity(new_addresses.len());
-        let mut ready_subchannel = None;
-
-        for addr in new_addresses {
-            let (sc, state) = if let Some(sc) = existing_subchannels.remove(&addr) {
-                let state = self.subchannel_states.get(&addr).unwrap().clone();
-                (sc, state)
-            } else {
-                // Get a new subchannel handle from the controller if we don't
-                // have an existing one.  Updates for it are delivered to our
-                // work method via our work scheduler.
-                channel_controller.new_subchannel(&addr, self.work_scheduler.clone())
-            };
-
-            // Track the best candidate for immediate activation:
-            // 1. Priority: The currently selected subchannel if still READY.
-            // 2. Fallback: The first generic READY subchannel encountered.
-            if state.connectivity_state == ConnectivityState::Ready {
-                if self.subchannel_is_selected(&sc) {
-                    // Sticky channel wins immediately and overrides any
-                    // fallback candidates.
-                    ready_subchannel = Some(sc.clone());
-                } else if ready_subchannel.is_none() {
-                    // Capture fallback candidate, but does not overwrite if a
-                    //sticky channel was already found.
-                    ready_subchannel = Some(sc.clone());
-                }
-            }
-
-            new_subchannels.push(sc);
-            new_states.insert(addr, state);
-        }
-
-        self.subchannels = new_subchannels;
-        self.subchannel_states = new_states;
-        ready_subchannel
-    }
-
-    /// Call when the selected subchannel loses connection.
-    // This causes the LB to go IDLE.
-    fn subchannel_drop(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.selected = None;
-        self.update_picker(
-            ConnectivityState::Idle,
-            Arc::new(IdlePicker::new(self.work_scheduler.clone())),
-            channel_controller,
-        );
-    }
-
-    fn update_picker(
-        &mut self,
-        connectivity_state: ConnectivityState,
-        picker: Arc<dyn Picker>,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        if self.connectivity_state == connectivity_state
-            && connectivity_state == ConnectivityState::Connecting
-        {
-            // Prevent redundant connecting updates.
-            // TODO: prevent redundant IDLE updates?
-            return;
-        }
-        self.connectivity_state = connectivity_state;
-        channel_controller.update_picker(LbState {
-            connectivity_state,
-            picker,
-        });
-    }
-
-    fn subchannel_activate(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        if self.subchannel_is_selected(&subchannel) {
-            // Already selected; skip activation.
-            return;
-        }
-        self.selected = Some(subchannel.clone());
-        self.subchannels = vec![subchannel.clone()]; // Keep only the winner.
-        self.steady_state = None; // Reset mode to First Pass.
-        self.timer = None; // Stop the happy eyeballs timer.
-
-        self.update_picker(
-            ConnectivityState::Ready,
-            Arc::new(OneSubchannelPicker { sc: subchannel }),
-            channel_controller,
-        );
-    }
-
-    /// Starts a connection pass through the address list.
-    // This clears the selected subchannel.
-    fn start_connection_pass(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.selected = None;
-
-        // If there is a viable subchannel at the frontier, connect to it and
-        // update picker to CONNECTING.
-        if let Some(sc) = self.advance_frontier(true) {
-            self.trigger_subchannel_connection(sc, channel_controller);
-
-            // TODO: avoid this update if we are in TF (i.e. sticky TF)?
-            self.update_picker(
-                ConnectivityState::Connecting,
-                Arc::new(QueuingPicker {}),
-                channel_controller,
-            );
-        } else {
-            // Otherwise all addresses are in transient failure: update picker.
-            // TODO: set the last connection error?  Is it correct to do so,
-            // e.g. if the address it came from was removed from the address
-            // list and a name resolver update triggered this connection pass?
-            _ = self.set_transient_failure(channel_controller, None);
-        }
-    }
-
-    // Book-keeping for tracking progress on the first pass through the address
-    // list. Assumes the subchannel is in a non-READY state.
-    // If the failure is from the subchannel at the frontier, advances the
-    // frontier and triggers a connection on the next subchannel.
-    fn update_first_pass(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        // Advance frontier if this failure is from the active frontier subchannel.
-        if let Some(attempting) = self.subchannels.get(self.frontier_index)
-            && attempting.address() == subchannel.address()
-            && state.connectivity_state == ConnectivityState::TransientFailure
-            && let Some(next_sc) = self.advance_frontier(false)
-        {
-            self.trigger_subchannel_connection(next_sc, channel_controller);
-        }
-
-        // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
-        if self.frontier_index >= self.subchannels.len() {
-            let any_connecting = self.subchannels.iter().any(|sc| {
-                self.subchannel_states
-                    .get(&sc.address())
-                    .is_some_and(|s| s.connectivity_state == ConnectivityState::Connecting)
-            });
-
-            if !any_connecting {
-                // Nothing currently connecting; first pass complete.  Enter
-                // steady state.
-                self.timer = None;
-                let error = self.last_connection_error.clone();
-                _ = self.set_transient_failure(channel_controller, error);
-                self.steady_state = Some(SteadyState::new(self.subchannels.len()));
-
-                // Trigger connection attempts on any subchannels that
-                // transitioned to IDLE during the first pass, ensuring they
-                // don't get stuck.
-                for sc in &self.subchannels {
-                    let is_idle = self
-                        .subchannel_states
-                        .get(&sc.address())
-                        .is_some_and(|s| s.connectivity_state == ConnectivityState::Idle);
-                    if is_idle {
-                        sc.connect();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Advances the frontier to the next non-TransientFailure subchannel and
-    /// returns it. If `reset` is true, starts the scan from index 0.
-    // The frontier is the latest index in which connectivity has been attempted.
-    // Returns a cloned Subchannel to avoid borrowing from self.
-    fn advance_frontier(&mut self, reset: bool) -> Option<Arc<dyn Subchannel>> {
-        if reset {
-            self.frontier_index = 0;
-        } else {
-            self.frontier_index += 1;
-        }
-
-        while self.frontier_index < self.subchannels.len() {
-            let sc = &self.subchannels[self.frontier_index];
-            let addr = sc.address();
-            let state = self
-                .subchannel_states
-                .get(&addr)
-                .map(|s| s.connectivity_state)
-                .expect("Expected non-None subchannel state");
-
-            match state {
-                // Push the frontier if sc is in TransientFailure
-                ConnectivityState::TransientFailure => self.frontier_index += 1,
-                // Otherwise return the subchannel.
-                _ => return Some(sc.clone()),
-            }
-        }
-        None
-    }
-
-    /// Returns true if the given subchannel matches the currently selected
-    /// active subchannel.
-    fn subchannel_is_selected(&self, subchannel: &Arc<dyn Subchannel>) -> bool {
-        self.selected
-            .as_ref()
-            .is_some_and(|sel| sel.address() == subchannel.address())
-    }
-
-    /// Returns true if the subchannel's address is present in the most recently
-    /// received address list.
-    // This compares against the current list of subchannels the LB is
-    // attempting to connect to. To see if the LB already connected to the
-    // channel, use 'subchannel_is_selected'.
-    fn subchannel_is_current(&self, subchannel: &Arc<dyn Subchannel>) -> bool {
-        self.subchannels
-            .iter()
-            .any(|sc| sc.address() == subchannel.address())
-    }
-
-    /// Triggers a connection on the subchannel, and starts the 250ms timer.
-    /// If no connection succeeds before the timer expires, the frontier will
-    /// advance to the next subchannel.
-    fn trigger_subchannel_connection(
-        &mut self,
-        sc: Arc<dyn Subchannel>,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        self.subchannel_states.insert(
-            sc.address(),
-            SubchannelState {
-                connectivity_state: ConnectivityState::Connecting,
-                last_connection_error: None,
-            },
-        );
-        sc.connect();
-
-        // Start happy eyeballs timer; replacing any pre-existing timer.
-        self.timer = Some(Timer::start(
-            self.runtime.clone(),
-            self.work_scheduler.clone(),
-        ));
-    }
-
     // Converts the update endpoints to an address list.
-    // Shuffles endpoints (if enabled) before flattening and de-duplication.
+    // Shuffles endpoints (if enabled) before flattening, de-duplication and
+    // interleaving (gRFC A61). Returns an error if the list is empty.
     fn compile_address(
-        &mut self,
+        &self,
         mut endpoints: Vec<Endpoint>,
         config: &PickFirstConfig,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Vec<Address> {
+    ) -> Result<Vec<Address>, String> {
         // Shuffle endpoints if enabled.
         if config.shuffle_address_list {
             (self.shuffler)(&mut endpoints);
         }
 
-        // Flatten and de-duplicate unique addresses in order.
+        // Flatten and de-duplicate unique addresses in order, grouping them by
+        // address family. Families are kept in order of first appearance.
         let mut seen = HashSet::new();
-        let unique_addresses: Vec<Address> = endpoints
+        let mut families: Vec<(AddressFamily, Vec<Address>)> = Vec::new();
+        for addr in endpoints.into_iter().flat_map(|ep| ep.addresses) {
+            if !seen.insert(addr.clone()) {
+                continue;
+            }
+            let family = AddressFamily::from(&addr);
+            match families.iter_mut().find(|(f, _)| *f == family) {
+                Some((_, addrs)) => addrs.push(addr),
+                None => families.push((family, vec![addr])),
+            }
+        }
+
+        // Interleave the families as per RFC 8305 section 4: take one address
+        // from each family in turn, starting with the family of the first
+        // address.
+        let mut families: Vec<_> = families
             .into_iter()
-            .flat_map(|ep| ep.addresses)
-            .filter(|addr| seen.insert(addr.clone()))
+            .map(|(_, addrs)| addrs.into_iter())
             .collect();
-
-        // Partition out all 'unknown' non-TCP addresses.
-        // This is to remain consistent with similar behavior in C++ and Java.
-        let (tcp_addresses, unknown): (Vec<Address>, Vec<Address>) =
-            unique_addresses.into_iter().partition(|addr| {
-                addr.network_type == crate::client::name_resolution::TCP_IP_NETWORK_TYPE
-            });
-
-        // Partition by family (Basic IPv6 detection via colon).
-        let (ipv6, ipv4): (Vec<Address>, Vec<Address>) = tcp_addresses
-            .into_iter()
-            .partition(|addr| addr.address.contains(':'));
-
-        // Interleave the two lists so ipv6 and ipv4 addresses are alternated.
-        let mut interleaved = Vec::with_capacity(ipv6.len() + ipv4.len() + unknown.len());
-        let mut v6_iter = ipv6.into_iter();
-        let mut v4_iter = ipv4.into_iter();
-        let mut unknown_iter = unknown.into_iter();
-
-        loop {
-            let mut more = false;
-
-            if let Some(v6) = v6_iter.next() {
-                interleaved.push(v6);
-                more = true;
-            }
-            if let Some(v4) = v4_iter.next() {
-                interleaved.push(v4);
-                more = true;
-            }
-            if let Some(unknown) = unknown_iter.next() {
-                interleaved.push(unknown);
-                more = true;
-            }
-
-            if !more {
-                break;
+        let mut interleaved = Vec::with_capacity(seen.len());
+        while interleaved.len() < seen.len() {
+            for addrs in &mut families {
+                if let Some(addr) = addrs.next() {
+                    interleaved.push(addr);
+                }
             }
         }
-        interleaved
-    }
 
-    // Sets LB state to TRANSIENT_FAILURE and updates picker with error.
-    // Triggers a re-resolution request.
-    // TODO: make error mandatory.
-    fn set_transient_failure(
-        &mut self,
-        channel_controller: &mut dyn ChannelController,
-        error: Option<String>,
-    ) -> Result<(), String> {
-        // Replace the last connection error if we have a new one.
-        if let Some(e) = error {
-            self.last_connection_error = Some(e);
+        if interleaved.is_empty() {
+            return Err("empty address list".to_string());
         }
-        let err = self
-            .last_connection_error
-            .clone()
-            .expect("no last connection error set");
-        // Include the resolver's note, which may explain the failure (e.g. why
-        // the address list is empty).
-        let err = match self.resolution_note.as_deref() {
-            Some(note) if !note.is_empty() => format!("{err} ({note})"),
-            _ => err,
-        };
-        self.update_picker(
-            ConnectivityState::TransientFailure,
-            Arc::new(FailingPicker { error: err.clone() }),
-            channel_controller,
-        );
-        channel_controller.request_resolution();
-        Err(err.clone())
+
+        Ok(interleaved)
     }
 
     fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
         state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
+        controller: &mut dyn ChannelController,
     ) {
-        if !self.subchannel_is_current(&subchannel) {
-            // This update is from an outdated subchannel that is no longer in
-            // the address list. Ignore it.
-            return;
+        let mut ctx = PickFirstContext {
+            runtime: &self.runtime,
+            work_scheduler: &self.work_scheduler,
+            connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
+            controller,
+        };
+        let current = std::mem::take(&mut self.state);
+        self.state = current.subchannel_update(&mut ctx, subchannel, state);
+    }
+
+    // Handles a resolver update whose endpoints are in an error state.
+    fn resolver_error(
+        &mut self,
+        error: String,
+        controller: &mut dyn ChannelController,
+    ) -> Result<(), String> {
+        let mut ctx = PickFirstContext {
+            runtime: &self.runtime,
+            work_scheduler: &self.work_scheduler,
+            connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
+            controller,
+        };
+
+        // No previous good update: there is nothing to connect to.
+        if matches!(&self.state, PickFirstState::Idle(s) if s.addresses.is_empty()) {
+            let err = ctx.format_error(&error);
+            self.state = SteadyState::enter(&mut ctx, Vec::new(), error);
+            return Err(err);
         }
 
-        // Update the cache for all updates.
-        self.subchannel_states
-            .insert(subchannel.address(), state.clone());
-
-        match (
-            // Does the load balancer have an active subchannel already?
-            self.subchannel_is_selected(&subchannel),
-            // What is the updating subchannel's state?
-            state.connectivity_state,
-        ) {
-            (true, ConnectivityState::Ready) => {
-                // The selected subchannel is still ready; do nothing w/update.
-            }
-            (true, _) => {
-                // The selected subchannel has failed (is no longer READY);
-                // drop the connection.
-                self.subchannel_drop(channel_controller);
-            }
-            (false, ConnectivityState::Ready) => {
-                // The updating subchannel is READY; activate it.
-                self.subchannel_activate(subchannel, channel_controller);
-            }
-            (false, _) => {
-                // Always capture freshest unselected error.
-                if state.connectivity_state == ConnectivityState::TransientFailure
-                    && let Some(err) = &state.last_connection_error
-                {
-                    self.last_connection_error = Some(err.clone());
-                }
-
-                // Track progress based on whether we are in a connection pass.
-                if let Some(steady) = self.steady_state.as_mut() {
-                    steady.subchannel_nonready(channel_controller, subchannel, state);
-                } else {
-                    self.update_first_pass(subchannel, state, channel_controller);
-                }
-            }
+        // Keep using the previous addresses. If already failing, surface the
+        // resolver error in the picker.
+        if ctx.connectivity_state() == ConnectivityState::TransientFailure {
+            ctx.set_failing_picker(&error);
         }
+        // Returning the error tells the resolver to re-resolve with backoff.
+        Err(ctx.format_error(&error))
     }
 }
 
@@ -560,109 +270,681 @@ impl LbPolicy for PickFirstPolicy {
         &mut self,
         update: ResolverUpdate,
         config: &Self::LbConfig,
-        channel_controller: &mut dyn ChannelController,
+        controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        self.timer = None;
-
-        // Reset steady state on new update
-        self.steady_state = None;
-
         self.resolution_note = update.resolution_note;
 
-        match update.endpoints {
-            Ok(endpoints) => {
-                let new_addresses = self.compile_address(endpoints, config, channel_controller);
-                // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
-                if new_addresses.is_empty() {
-                    self.subchannels.clear();
-                    self.selected = None;
-                    self.set_transient_failure(
-                        channel_controller,
-                        Some("empty address list".to_string()),
-                    )?;
-                }
+        let addresses = match update.endpoints {
+            Ok(endpoints) => self.compile_address(endpoints, config),
+            Err(error) => return self.resolver_error(error, controller),
+        };
 
-                if let Some(ready_subchannel) =
-                    self.rebuild_subchannels(new_addresses, channel_controller)
-                {
-                    self.subchannel_activate(ready_subchannel, channel_controller);
-                } else {
-                    self.start_connection_pass(channel_controller);
-                }
+        let mut ctx = PickFirstContext {
+            runtime: &self.runtime,
+            work_scheduler: &self.work_scheduler,
+            connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
+            controller,
+        };
+
+        match addresses {
+            Ok(addresses) => {
+                let current = std::mem::take(&mut self.state);
+                self.state = current.resolver_update(&mut ctx, addresses);
+                Ok(())
             }
             Err(e) => {
-                let error = e.to_string();
-                if self.subchannels.is_empty()
-                    || self.connectivity_state == ConnectivityState::TransientFailure
-                {
-                    self.set_transient_failure(channel_controller, Some(error))?;
-                }
+                let err = ctx.format_error(&e);
+                self.state = SteadyState::enter(&mut ctx, Vec::new(), e);
+                Err(err)
             }
         }
-
-        Ok(())
     }
 
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        if let Some(data) = data {
-            // If data is set, it should be a subchannel update.
-            match data.downcast::<SubchannelUpdate>() {
-                Ok(update) => {
-                    self.subchannel_update(update.subchannel, &update.state, channel_controller);
-                }
-                Err(data) => debug_assert!(
+    fn work(&mut self, data: Option<WorkData>, controller: &mut dyn ChannelController) {
+        let work = match PickFirstWork::try_from(data) {
+            Ok(work) => work,
+            Err(data) => {
+                debug_assert!(
                     false,
-                    "work called with {data:?}; expected a SubchannelUpdate"
-                ),
+                    "work called with {data:?}; expected SubchannelUpdate or PickFirstWork"
+                );
+                return;
             }
+        };
+        match work {
+            PickFirstWork::Subchannel(update) => {
+                self.subchannel_update(update.subchannel, &update.state, controller);
+            }
+            PickFirstWork::LeaveIdle => {
+                self.exit_idle(controller);
+            }
+            PickFirstWork::TimerExpired => {
+                let mut ctx = PickFirstContext {
+                    runtime: &self.runtime,
+                    work_scheduler: &self.work_scheduler,
+                    connectivity_state: &mut self.connectivity_state,
+                    resolution_note: self.resolution_note.as_deref(),
+                    controller,
+                };
+                let current = std::mem::take(&mut self.state);
+                self.state = current.timer_expired(&mut ctx);
+            }
+        }
+    }
+
+    fn exit_idle(&mut self, controller: &mut dyn ChannelController) {
+        let mut ctx = PickFirstContext {
+            runtime: &self.runtime,
+            work_scheduler: &self.work_scheduler,
+            connectivity_state: &mut self.connectivity_state,
+            resolution_note: self.resolution_note.as_deref(),
+            controller,
+        };
+        let current = std::mem::take(&mut self.state);
+        self.state = current.exit_idle(&mut ctx);
+    }
+}
+
+struct PickFirstContext<'a> {
+    runtime: &'a GrpcRuntime,
+    work_scheduler: &'a Arc<dyn WorkScheduler>,
+    // The policy's reported connectivity state. Only `update_picker` writes
+    // it.
+    connectivity_state: &'a mut ConnectivityState,
+    resolution_note: Option<&'a str>,
+    // Publish pickers via `update_picker` rather than directly, so that
+    // `connectivity_state` stays accurate.
+    controller: &'a mut dyn ChannelController,
+}
+
+impl PickFirstContext<'_> {
+    // Returns the connectivity state most recently reported to the channel.
+    fn connectivity_state(&self) -> ConnectivityState {
+        *self.connectivity_state
+    }
+
+    // Reports `connectivity_state` and `picker` to the channel. A repeat of
+    // IDLE or CONNECTING is dropped, since its picker behaves like the current
+    // one.
+    fn update_picker(&mut self, connectivity_state: ConnectivityState, picker: Arc<dyn Picker>) {
+        if connectivity_state == *self.connectivity_state
+            && matches!(
+                connectivity_state,
+                ConnectivityState::Idle | ConnectivityState::Connecting
+            )
+        {
             return;
         }
-        if self.connectivity_state == ConnectivityState::Idle {
-            // TODO: is it safe to assume any call to work() while idle means we
-            // should connect?
-            self.exit_idle(channel_controller);
-        } else if self.timer.as_ref().is_some_and(|t| t.expired()) {
-            // Advance frontier and trigger next connection.
-            if let Some(next_sc) = self.advance_frontier(false) {
-                self.trigger_subchannel_connection(next_sc, channel_controller);
-            }
+        *self.connectivity_state = connectivity_state;
+        self.controller.update_picker(LbState {
+            connectivity_state,
+            picker,
+        });
+    }
+
+    // Includes the resolver's note, which may explain the failure (e.g. why
+    // the address list is empty).
+    fn format_error(&self, err: &str) -> String {
+        match self.resolution_note {
+            Some(note) if !note.is_empty() => format!("{err} ({note})"),
+            _ => err.to_string(),
         }
     }
 
-    fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        // Only start a connection pass when in Idle and have already
-        // received a non-empty resolver update (`subchannels` is non-empty).
-        // Before the first resolver update, `connectivity_state` is Idle while
-        // `subchannels` is empty.
-        if self.connectivity_state == ConnectivityState::Idle && !self.subchannels.is_empty() {
-            self.start_connection_pass(channel_controller);
+    fn set_failing_picker(&mut self, error: &str) {
+        let error = self.format_error(error);
+        self.update_picker(
+            ConnectivityState::TransientFailure,
+            Arc::new(FailingPicker { error }),
+        );
+    }
+}
+
+// State node: Idle.
+#[derive(Debug, Default)]
+struct IdleState {
+    addresses: Vec<Address>,
+}
+
+impl IdleState {
+    fn enter(ctx: &mut PickFirstContext<'_>, addresses: Vec<Address>) -> PickFirstState {
+        let picker = Arc::new(IdlePicker::new(ctx.work_scheduler.clone()));
+        ctx.update_picker(ConnectivityState::Idle, picker);
+        PickFirstState::Idle(IdleState { addresses })
+    }
+
+    fn resolver_update(
+        self,
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+    ) -> PickFirstState {
+        // No previous good update: connect as soon as the initial address list
+        // arrives (gRFC A61). After a disconnect, stay IDLE until a pick or
+        // `exit_idle`.
+        if self.addresses.is_empty() {
+            return FirstPassState::fresh_enter(ctx, addresses);
+        }
+        Self::enter(ctx, addresses)
+    }
+
+    fn subchannel_update(
+        self,
+        _ctx: &mut PickFirstContext<'_>,
+        _subchannel: Arc<dyn Subchannel>,
+        _state: &SubchannelState,
+    ) -> PickFirstState {
+        PickFirstState::Idle(self)
+    }
+
+    fn exit_idle(self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
+        // No address list yet: nothing to connect to. The first resolver
+        // update starts connecting.
+        if self.addresses.is_empty() {
+            return PickFirstState::Idle(self);
+        }
+        FirstPassState::fresh_enter(ctx, self.addresses)
+    }
+}
+
+// An entry associating a created subchannel handle with its cached
+// connectivity state.
+#[derive(Debug)]
+struct SubchannelEntry {
+    subchannel: Arc<dyn Subchannel>,
+    // The state most recently reported by the subchannel.
+    state: SubchannelState,
+    // Whether a connection attempt failed during the current first pass.
+    // Reset when a first pass starts; only read by `FirstPassState`.
+    failed_in_first_pass: bool,
+}
+
+// Returns the position of `subchannel` in `entries`, or `None` if it isn't
+// there (an outdated subchannel from an earlier list). Matches the subchannel
+// object itself, not its address: a subchannel from an earlier list is
+// outdated even if its address is still present.
+fn index_of(entries: &[SubchannelEntry], subchannel: &Arc<dyn Subchannel>) -> Option<usize> {
+    entries
+        .iter()
+        .position(|e| Arc::ptr_eq(&e.subchannel, subchannel))
+}
+
+// Returns the addresses of the subchannels in `entries`, in order.
+fn entry_addresses(entries: &[SubchannelEntry]) -> Vec<Address> {
+    entries.iter().map(|e| e.subchannel.address()).collect()
+}
+
+// State node: FirstPass (Happy Eyeballs).
+#[derive(Debug)]
+struct FirstPassState {
+    subchannels: Vec<SubchannelEntry>,
+    frontier_index: usize,
+    // The Connection Attempt Delay timer for the current connection attempt.
+    // `None` when attempting the last subchannel in the list, or once the
+    // pass has moved past the end of the list.
+    timer: Option<Timer>,
+    last_connection_error: Option<String>,
+}
+
+impl FirstPassState {
+    fn fresh_enter(ctx: &mut PickFirstContext<'_>, addresses: Vec<Address>) -> PickFirstState {
+        Self::enter(ctx, addresses, Vec::new())
+    }
+
+    fn enter(
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+        mut existing: Vec<SubchannelEntry>,
+    ) -> PickFirstState {
+        let mut new_subchannels = Vec::with_capacity(addresses.len());
+
+        for addr in &addresses {
+            let entry = if let Some(pos) = existing
+                .iter()
+                .position(|e| e.subchannel.address() == *addr)
+            {
+                // A new first pass starts with no failures recorded.
+                let mut entry = existing.swap_remove(pos);
+                entry.failed_in_first_pass = false;
+                entry
+            } else {
+                // Updates for the new subchannel are delivered to our work
+                // method via our work scheduler.
+                let (subchannel, state) = ctx
+                    .controller
+                    .new_subchannel(addr, ctx.work_scheduler.clone());
+                SubchannelEntry {
+                    subchannel,
+                    state,
+                    failed_in_first_pass: false,
+                }
+            };
+
+            if entry.state.connectivity_state == ConnectivityState::Ready {
+                return ReadyState::enter(ctx, addresses, entry.subchannel);
+            }
+
+            new_subchannels.push(entry);
+        }
+
+        // Subchannels already in TRANSIENT_FAILURE count as failed in this
+        // pass. Start from the last of their errors in list order, so that the
+        // pass reports a real connection error even if no subchannel fails
+        // again.
+        let last_connection_error = new_subchannels
+            .iter()
+            .rev()
+            .filter(|e| e.state.connectivity_state == ConnectivityState::TransientFailure)
+            .find_map(|e| e.state.last_connection_error.clone());
+
+        let mut first_pass = FirstPassState {
+            subchannels: new_subchannels,
+            frontier_index: 0,
+            timer: None,
+            last_connection_error,
+        };
+
+        if first_pass.advance_frontier(true) {
+            first_pass.start_connection_attempt(ctx);
+
+            // No subchannel is READY here (checked above). Sticky
+            // TRANSIENT_FAILURE (gRFC A62): if already reporting
+            // TRANSIENT_FAILURE, don't switch to CONNECTING; keep the
+            // failing picker. ReadyState::enter reports READY once a
+            // subchannel connects.
+            if ctx.connectivity_state() != ConnectivityState::TransientFailure {
+                ctx.update_picker(ConnectivityState::Connecting, Arc::new(QueuingPicker {}));
+            }
+
+            PickFirstState::FirstPass(first_pass)
+        } else {
+            first_pass.enter_steady_state(ctx)
+        }
+    }
+
+    // Ensures error is carried into the steady state transition.
+    fn enter_steady_state(self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
+        let err = self
+            .last_connection_error
+            .unwrap_or_else(|| "all addresses in transient failure".to_string());
+        SteadyState::enter(ctx, self.subchannels, err)
+    }
+
+    // Starts a connection attempt on the subchannel the pass has reached. Only
+    // requests a connection if the subchannel last reported IDLE; if it is
+    // already CONNECTING, waits for that attempt.
+    fn start_connection_attempt(&mut self, ctx: &mut PickFirstContext<'_>) {
+        let entry = &self.subchannels[self.frontier_index];
+        if entry.state.connectivity_state == ConnectivityState::Idle {
+            entry.subchannel.connect();
+        }
+        // Start the Connection Attempt Delay timer unless this is the last
+        // subchannel in the list (gRFC A61). Replacing the timer cancels any
+        // previous one.
+        let is_last = self.frontier_index + 1 >= self.subchannels.len();
+        self.timer =
+            (!is_last).then(|| Timer::start(ctx.runtime.clone(), ctx.work_scheduler.clone()));
+    }
+
+    // Moves the pass to the next subchannel not in TRANSIENT_FAILURE,
+    // starting from the beginning if `reset`. Subchannels skipped because they
+    // are in TRANSIENT_FAILURE count as failed in this pass. Returns false if
+    // the pass moved past the end of the list.
+    fn advance_frontier(&mut self, reset: bool) -> bool {
+        if reset {
+            self.frontier_index = 0;
+        } else {
+            self.frontier_index += 1;
+        }
+
+        while let Some(entry) = self.subchannels.get_mut(self.frontier_index) {
+            if entry.state.connectivity_state != ConnectivityState::TransientFailure {
+                return true;
+            }
+            entry.failed_in_first_pass = true;
+            self.frontier_index += 1;
+        }
+        false
+    }
+
+    fn resolver_update(
+        self,
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+    ) -> PickFirstState {
+        FirstPassState::enter(ctx, addresses, self.subchannels)
+    }
+
+    fn subchannel_update(
+        mut self,
+        ctx: &mut PickFirstContext<'_>,
+        subchannel: Arc<dyn Subchannel>,
+        state: &SubchannelState,
+    ) -> PickFirstState {
+        let Some(index) = index_of(&self.subchannels, &subchannel) else {
+            // This update is from an outdated subchannel that is no longer in
+            // the subchannel list. Ignore it.
+            return PickFirstState::FirstPass(self);
+        };
+
+        let entry = &mut self.subchannels[index];
+        entry.state = state.clone();
+
+        if state.connectivity_state == ConnectivityState::Ready {
+            let addresses = entry_addresses(&self.subchannels);
+            return ReadyState::enter(ctx, addresses, subchannel);
+        }
+
+        if state.connectivity_state == ConnectivityState::TransientFailure {
+            if let Some(err) = &state.last_connection_error {
+                self.last_connection_error = Some(err.clone());
+            }
+
+            // Only count failures of subchannels this pass has reached. A
+            // subchannel the pass has not reached yet may be failing an attempt
+            // this pass did not start, and may be IDLE again by the time the
+            // pass reaches it.
+            if index <= self.frontier_index {
+                entry.failed_in_first_pass = true;
+            }
+
+            // The current connection attempt failed: cancel its timer and move
+            // on to the next subchannel, if any.
+            if index == self.frontier_index {
+                self.timer = None;
+                if self.advance_frontier(false) {
+                    self.start_connection_attempt(ctx);
+                }
+            }
+        }
+
+        if self.is_complete() {
+            return self.enter_steady_state(ctx);
+        }
+
+        PickFirstState::FirstPass(self)
+    }
+
+    // Returns whether the first pass is complete: every subchannel has been
+    // reached and has failed at least once during this pass (gRFC A61).
+    fn is_complete(&self) -> bool {
+        self.frontier_index >= self.subchannels.len()
+            && self.subchannels.iter().all(|e| e.failed_in_first_pass)
+    }
+
+    // Handles a TimerExpired wakeup. The wakeup may come from the timer of an
+    // earlier first pass; only act if the current timer has expired.
+    fn timer_expired(mut self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
+        if self.timer.take_if(|t| t.expired()).is_some() && self.advance_frontier(false) {
+            self.start_connection_attempt(ctx);
+        }
+        PickFirstState::FirstPass(self)
+    }
+}
+
+// State node: SteadyState (Sticky TRANSIENT_FAILURE).
+#[derive(Debug)]
+struct SteadyState {
+    subchannels: Vec<SubchannelEntry>,
+    failure_count: usize,
+    last_connection_error: String,
+}
+
+impl SteadyState {
+    fn enter(
+        ctx: &mut PickFirstContext<'_>,
+        subchannels: Vec<SubchannelEntry>,
+        last_error: String,
+    ) -> PickFirstState {
+        ctx.set_failing_picker(&last_error);
+        ctx.controller.request_resolution();
+
+        for entry in &subchannels {
+            if entry.state.connectivity_state == ConnectivityState::Idle {
+                entry.subchannel.connect();
+            }
+        }
+
+        PickFirstState::SteadyState(SteadyState {
+            failure_count: 0,
+            last_connection_error: last_error,
+            subchannels,
+        })
+    }
+
+    fn resolver_update(
+        self,
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+    ) -> PickFirstState {
+        FirstPassState::enter(ctx, addresses, self.subchannels)
+    }
+
+    fn subchannel_update(
+        mut self,
+        ctx: &mut PickFirstContext<'_>,
+        subchannel: Arc<dyn Subchannel>,
+        state: &SubchannelState,
+    ) -> PickFirstState {
+        let Some(index) = index_of(&self.subchannels, &subchannel) else {
+            // This update is from an outdated subchannel that is no longer in
+            // the subchannel list. Ignore it.
+            return PickFirstState::SteadyState(self);
+        };
+        self.subchannels[index].state = state.clone();
+
+        match state.connectivity_state {
+            ConnectivityState::Ready => {
+                let addresses = entry_addresses(&self.subchannels);
+                ReadyState::enter(ctx, addresses, subchannel)
+            }
+            ConnectivityState::Idle => {
+                subchannel.connect();
+                PickFirstState::SteadyState(self)
+            }
+            ConnectivityState::TransientFailure => {
+                if let Some(err) = &state.last_connection_error {
+                    self.last_connection_error.clone_from(err);
+                }
+                // Every N failures, where N is the number of subchannels,
+                // report the latest error and request re-resolution
+                // (gRFC A61).
+                self.failure_count += 1;
+                if self.failure_count >= self.subchannels.len() {
+                    self.failure_count = 0;
+                    ctx.set_failing_picker(&self.last_connection_error);
+                    ctx.controller.request_resolution();
+                }
+                PickFirstState::SteadyState(self)
+            }
+            ConnectivityState::Connecting => PickFirstState::SteadyState(self),
         }
     }
 }
 
-/// Implements the happy eyeballs timer task.  `expired` becomes set when it
-/// fires.  When dropped, the timer is cancelled.
+// State node: Ready.
+#[derive(Debug)]
+struct ReadyState {
+    addresses: Vec<Address>,
+    selected: Arc<dyn Subchannel>,
+}
+
+impl ReadyState {
+    fn enter(
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+        selected: Arc<dyn Subchannel>,
+    ) -> PickFirstState {
+        let picker = Arc::new(OneSubchannelPicker {
+            sc: selected.clone(),
+        });
+        ctx.update_picker(ConnectivityState::Ready, picker);
+        PickFirstState::Ready(ReadyState {
+            addresses,
+            selected,
+        })
+    }
+
+    fn resolver_update(
+        mut self,
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+    ) -> PickFirstState {
+        let selected_addr = self.selected.address();
+        if addresses.contains(&selected_addr) {
+            self.addresses = addresses;
+            return PickFirstState::Ready(self);
+        }
+
+        FirstPassState::fresh_enter(ctx, addresses)
+    }
+
+    fn subchannel_update(
+        self,
+        ctx: &mut PickFirstContext<'_>,
+        subchannel: Arc<dyn Subchannel>,
+        state: &SubchannelState,
+    ) -> PickFirstState {
+        if Arc::ptr_eq(&self.selected, &subchannel)
+            && state.connectivity_state != ConnectivityState::Ready
+        {
+            // The connection was lost, so the addresses may be stale.
+            // Request re-resolution.
+            ctx.controller.request_resolution();
+            IdleState::enter(ctx, self.addresses)
+        } else {
+            PickFirstState::Ready(self)
+        }
+    }
+}
+
+// `PickFirstPolicy` is structured as a discrete finite state machine with
+// these states:
+// - `Idle`: Initial state until the first address list arrives, which starts
+//   a connection attempt. After a disconnect, waits for a pick or `exit_idle`
+//   to trigger a connection attempt.
+// - `FirstPass`: Happy Eyeballs pass (gRFC A61) staggering connection attempts
+//   across resolved addresses.
+// - `SteadyState`: All addresses failed, or there are none; holds sticky
+//   TRANSIENT_FAILURE and retries connections as backoffs expire.
+// - `Ready`: Successfully connected to a subchannel, routing all picks to it.
+//
+// Each state publishes pickers through `PickFirstContext::update_picker`,
+// which records the reported connectivity state.
+#[derive(Debug)]
+enum PickFirstState {
+    Idle(IdleState),
+    FirstPass(FirstPassState),
+    SteadyState(SteadyState),
+    Ready(ReadyState),
+}
+
+impl Default for PickFirstState {
+    fn default() -> Self {
+        Self::Idle(IdleState::default())
+    }
+}
+
+impl PickFirstState {
+    fn resolver_update(
+        self,
+        ctx: &mut PickFirstContext<'_>,
+        addresses: Vec<Address>,
+    ) -> PickFirstState {
+        match self {
+            Self::Idle(s) => s.resolver_update(ctx, addresses),
+            Self::FirstPass(s) => s.resolver_update(ctx, addresses),
+            Self::SteadyState(s) => s.resolver_update(ctx, addresses),
+            Self::Ready(s) => s.resolver_update(ctx, addresses),
+        }
+    }
+
+    fn subchannel_update(
+        self,
+        ctx: &mut PickFirstContext<'_>,
+        subchannel: Arc<dyn Subchannel>,
+        state: &SubchannelState,
+    ) -> PickFirstState {
+        match self {
+            Self::Idle(s) => s.subchannel_update(ctx, subchannel, state),
+            Self::FirstPass(s) => s.subchannel_update(ctx, subchannel, state),
+            Self::SteadyState(s) => s.subchannel_update(ctx, subchannel, state),
+            Self::Ready(s) => s.subchannel_update(ctx, subchannel, state),
+        }
+    }
+
+    fn timer_expired(self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
+        match self {
+            Self::FirstPass(s) => s.timer_expired(ctx),
+            _ => self,
+        }
+    }
+
+    fn exit_idle(self, ctx: &mut PickFirstContext<'_>) -> PickFirstState {
+        match self {
+            Self::Idle(s) => s.exit_idle(ctx),
+            _ => self,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PickFirstWork {
+    Subchannel(SubchannelUpdate),
+    TimerExpired,
+    LeaveIdle,
+}
+
+impl From<PickFirstWork> for Option<WorkData> {
+    fn from(work: PickFirstWork) -> Self {
+        Some(Box::new(work))
+    }
+}
+
+impl TryFrom<Option<WorkData>> for PickFirstWork {
+    type Error = Option<WorkData>;
+
+    fn try_from(data: Option<WorkData>) -> Result<Self, Self::Error> {
+        let data = data.ok_or(None)?;
+        let data = match data.downcast::<SubchannelUpdate>() {
+            Ok(update) => return Ok(Self::Subchannel(*update)),
+            Err(data) => data,
+        };
+        data.downcast::<Self>().map(|w| *w).map_err(Some)
+    }
+}
+
+// The Connection Attempt Delay timer (gRFC A61). `expired` becomes set when
+// it fires. When dropped, the timer is cancelled.
 struct Timer {
     expired: Arc<AtomicBool>,
     handle: BoxedTaskHandle,
 }
 
 impl Timer {
-    /// Starts a new timer, returning it.
+    // Starts a new timer, returning it.
     fn start(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
         let expired = Arc::new(AtomicBool::new(false));
         let expired_clone = expired.clone();
         let handle = runtime.clone().spawn(Box::pin(async move {
             runtime.sleep(CONNECTION_ATTEMPT_DELAY).await;
             expired_clone.store(true, Ordering::SeqCst);
-            work_scheduler.schedule_work(None);
+            work_scheduler.schedule_work(PickFirstWork::TimerExpired.into());
         }));
         Self { expired, handle }
     }
 
-    /// Returns whether the timer has expired yet.
+    // Returns whether the timer has expired yet.
     fn expired(&self) -> bool {
         self.expired.load(Ordering::SeqCst)
+    }
+}
+
+impl Debug for Timer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timer")
+            .field("expired", &self.expired())
+            .finish()
     }
 }
 
@@ -705,7 +987,8 @@ impl IdlePicker {
 impl Picker for IdlePicker {
     fn pick(&self, _: PickOptions<'_>) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
-            self.work_scheduler.schedule_work(None);
+            self.work_scheduler
+                .schedule_work(PickFirstWork::LeaveIdle.into());
         }
         PickResult::Queue
     }
@@ -718,64 +1001,49 @@ fn build_shuffler() -> Arc<ShufflerFn> {
     })
 }
 
-/// Tracks a the 'steady state' pass of subchannels when looking for a ready
-/// connection. If the number of reported subchannel failures reaches the
-/// failure threshold, this will ask the Name Resolver to re-resolve.
-#[derive(Debug)]
-struct SteadyState {
-    /// The number of failures before triggering a re-resolution of addresses.
-    /// This is a rough heuristic to approximate if all subchannels have failed
-    /// since we entered steady state, and can be tuned as needed.
-    failure_threshold: usize,
-    /// The number of failures connecting, used to roughly approximate if a
-    /// re-resolution needs to happen.
-    failure_count: usize,
-}
-
-impl SteadyState {
-    fn new(threshold: usize) -> Self {
-        Self {
-            failure_threshold: threshold,
-            failure_count: 0,
-        }
-    }
-
-    /// Handles non-ready subchannel updates when the LB is in 'steady state'
-    /// connection mode.
-    fn subchannel_nonready(
-        &mut self,
-        channel_controller: &mut dyn ChannelController,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-    ) {
-        match state.connectivity_state {
-            ConnectivityState::Idle => {
-                // Subchannel backoff expired: trigger reconnection attempt.
-                subchannel.connect();
-            }
-            ConnectivityState::TransientFailure => {
-                // Track failures. If all known subchannels have failed,
-                // request new addresses.
-                self.failure_count += 1;
-                if self.failure_count >= self.failure_threshold {
-                    self.failure_count = 0;
-                    channel_controller.request_resolution();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::*;
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils;
+    use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::rt::default_runtime;
+
+    // A ChannelController wrapper that delegates to TestChannelController,
+    // overriding the initial SubchannelState returned by new_subchannel for
+    // configured addresses.
+    struct InitialStateController<'a> {
+        tcc: &'a mut TestChannelController,
+        initial_states: HashMap<&'a str, SubchannelState>,
+    }
+
+    impl ChannelController for InitialStateController<'_> {
+        fn new_subchannel(
+            &mut self,
+            address: &Address,
+            work_scheduler: Arc<dyn WorkScheduler>,
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let (sc, state) = self.tcc.new_subchannel(address, work_scheduler);
+            let state = self
+                .initial_states
+                .get(&*address.address)
+                .cloned()
+                .unwrap_or(state);
+            (sc, state)
+        }
+
+        fn update_picker(&mut self, update: LbState) {
+            self.tcc.update_picker(update);
+        }
+
+        fn request_resolution(&mut self) {
+            self.tcc.request_resolution();
+        }
+    }
 
     // Creates an endpoint containing `addrs`, in order.
     fn endpoint(addrs: &[&str]) -> Endpoint {
@@ -848,6 +1116,34 @@ mod test {
             subchannels
         }
 
+        // Disconnects the selected subchannel; the policy requests
+        // re-resolution and goes IDLE. A pick then makes the policy reconnect
+        // with a new subchannel for every address. `addrs` is the address
+        // list, starting with the selected subchannel's address. Returns the
+        // new subchannels, in address order.
+        fn simulate_disconnect_and_reconnect(
+            &mut self,
+            selected: &Arc<dyn Subchannel>,
+            addrs: &[&str],
+        ) -> Vec<Arc<dyn Subchannel>> {
+            self.send_subchannel_update(selected, &SubchannelState::idle());
+            self.expect_request_resolution();
+            let picker = self.expect_picker_state(ConnectivityState::Idle);
+            self.expect_no_events();
+            assert_eq!(
+                picker.pick(PickOptions::new(
+                    &test_utils::new_request_headers(),
+                    &CallOptions::new(),
+                )),
+                PickResult::Queue
+            );
+            self.run_work();
+            let subchannels = self.expect_new_subchannels(addrs);
+            self.expect_connect_to(addrs[0]);
+            self.expect_queuing_picker();
+            subchannels
+        }
+
         /// Sends a resolver update with `endpoints` and resolution note
         /// `note`, using the default config.
         fn send_resolver_update_with_note(
@@ -864,14 +1160,46 @@ mod test {
                 .resolver_update(update, &PickFirstConfig::default(), &mut self.tcc)
         }
 
+        // Sends a resolver update for `addrs` while overriding the initial
+        // SubchannelState returned by new_subchannel for entries in
+        // `initial_states`.
+        fn send_resolver_update_with_initial_states(
+            &mut self,
+            addrs: &[&str],
+            initial_states: &[(&str, SubchannelState)],
+        ) -> Result<(), String> {
+            let update = ResolverUpdate {
+                endpoints: Ok(create_endpoints(addrs)),
+                ..Default::default()
+            };
+            let mut controller = InitialStateController {
+                tcc: &mut self.tcc,
+                initial_states: initial_states.iter().cloned().collect(),
+            };
+            self.policy
+                .resolver_update(update, &PickFirstConfig::default(), &mut controller)
+        }
+
+        // Advances virtual time by `duration` on the paused Tokio runtime,
+        // yielding before and after so spawned timer tasks can register on the
+        // timer wheel and schedule their completion work.
+        async fn advance_time(&mut self, duration: Duration) {
+            tokio::task::yield_now().await;
+            tokio::time::advance(duration).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Advances the paused clock past the Connection Attempt Delay, letting
+        // any pending timer fire.
+        async fn advance_past_timer(&mut self) {
+            self.advance_time(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1))
+                .await;
+        }
+
         // Lets the Connection Attempt Delay timer fire, and delivers the
-        // resulting work to the policy. Requires a paused clock. Yields before
-        // and after advancing the clock, so that the timer task can register
-        // its sleep, and then schedule its work.
+        // resulting work to the policy. Requires a paused clock.
         async fn fire_timer(&mut self) {
-            tokio::task::yield_now().await;
-            tokio::time::advance(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1)).await;
-            tokio::task::yield_now().await;
+            self.advance_past_timer().await;
             self.run_work();
         }
     }
@@ -903,10 +1231,6 @@ mod test {
         let endpoints_new = create_endpoints(&["addr2", "addr1", "addr3"]);
         env.send_resolver_update(endpoints_new).unwrap();
 
-        // Should create new subchannels for addr2 (was cleared by cleanup) and
-        // addr3 (was not in previous list).
-        env.expect_new_subchannels(&["addr2", "addr3"]);
-
         // Should NOT have any more events (no Connect, no UpdatePicker),
         // because it stuck to the original selected subchannel.
         env.expect_no_events();
@@ -914,7 +1238,33 @@ mod test {
         // addr1 is still selected: only the selected subchannel going IDLE
         // moves the policy to IDLE.
         env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_request_resolution();
         env.expect_picker_state(ConnectivityState::Idle);
+        env.expect_no_events();
+    }
+
+    // When an update removes the selected address, the policy starts a new
+    // first pass from the start of the new list and reports CONNECTING.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_without_selected_address_starts_first_pass() {
+        let mut env = new_env();
+
+        // Select addr2, so the old pass ended past the start of the list.
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[1]);
+
+        // The update drops addr2. addr1 gets a new subchannel: its old one was
+        // discarded when addr2 was selected.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr3"]))
+            .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr3"]);
+        // The new pass starts at the head of the new list, not where the old
+        // pass left off.
+        env.expect_connect_to("addr1");
+        // The policy reports CONNECTING rather than going IDLE.
+        env.expect_queuing_picker();
         env.expect_no_events();
     }
 
@@ -934,9 +1284,9 @@ mod test {
         // EP2: [V6_2]
         // EP3: [V4_2]
         let endpoints = vec![
-            endpoint(&["::1", "127.0.0.1"]),
-            endpoint(&["::2"]),
-            endpoint(&["127.0.0.2"]),
+            endpoint(&["[::1]:80", "127.0.0.1:80"]),
+            endpoint(&["[::2]:80"]),
+            endpoint(&["127.0.0.2:80"]),
         ];
 
         env.send_resolver_update_with_config(endpoints, &config)
@@ -951,11 +1301,115 @@ mod test {
         // IPv6: [::2, ::1]
         // IPv4: [127.0.0.2, 127.0.0.1]
         //
-        // Interleaved: [::2, 127.0.0.2, ::1, 127.0.0.1]
-        env.expect_new_subchannels(&["::2", "127.0.0.2", "::1", "127.0.0.1"]);
-        env.expect_connect_to("::2");
+        // Interleaved, starting with the family of the first address (IPv4):
+        // [127.0.0.2, ::2, 127.0.0.1, ::1]
+        env.expect_new_subchannels(&["127.0.0.2:80", "[::2]:80", "127.0.0.1:80", "[::1]:80"]);
+        env.expect_connect_to("127.0.0.2:80");
         env.expect_queuing_picker();
         env.expect_no_events();
+    }
+
+    // Sends one single-address endpoint per entry in `addrs`, as the DNS
+    // resolver does, and verifies that the policy creates subchannels and
+    // connects in `want` order.
+    fn check_address_order(addrs: &[&str], want: &[&str]) {
+        let mut env = new_env();
+        env.send_resolver_update(create_endpoints(addrs)).unwrap();
+        env.expect_new_subchannels(want);
+        env.expect_connect_to(want[0]);
+        env.expect_queuing_picker();
+        env.expect_no_events();
+    }
+
+    // Addresses are interleaved by family as per RFC 8305 section 4 (gRFC
+    // A61), starting with the family of the first address, here IPv4. An
+    // IPv4-mapped IPv6 address counts as IPv4. The zone ID is numeric, as
+    // Rust's SocketAddr parses only numeric zone IDs.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_interleaving_ipv4_preferred() {
+        check_address_order(
+            &[
+                "1.1.1.1:1111",
+                "2.2.2.2:2",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "[fe80::1%2]:3333",
+                "grpc.io:80",
+            ],
+            &[
+                "1.1.1.1:1111",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "grpc.io:80",
+                "2.2.2.2:2",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "3.3.3.3:3",
+                "[fe80::1%2]:3333",
+                "[::FFFF:192.168.0.1]:2222",
+            ],
+        );
+    }
+
+    // Addresses are interleaved by family, starting with the family of the
+    // first address, here IPv6 (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_interleaving_ipv6_preferred() {
+        check_address_order(
+            &[
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                // A duplicate, which is dropped.
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "1.1.1.1:1111",
+                "2.2.2.2:2",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:2222",
+                "[fe80::1%2]:3333",
+                "grpc.io:80",
+            ],
+            &[
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "1.1.1.1:1111",
+                "grpc.io:80",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:2222",
+                "2.2.2.2:2",
+                "[fe80::1%2]:3333",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+            ],
+        );
+    }
+
+    // Addresses that are not an IP address and port, such as hostnames, form
+    // a third family for interleaving, here the family of the first address
+    // (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_interleaving_unknown_preferred() {
+        check_address_order(
+            &[
+                "grpc.io:80",
+                "1.1.1.1:1111",
+                "2.2.2.2:2",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "[fe80::1%2]:3333",
+                "example.com:80",
+            ],
+            &[
+                "grpc.io:80",
+                "1.1.1.1:1111",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "example.com:80",
+                "2.2.2.2:2",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "3.3.3.3:3",
+                "[fe80::1%2]:3333",
+                "[::FFFF:192.168.0.1]:2222",
+            ],
+        );
     }
 
     // De-duplicate addresses that appear multiple times within the same
@@ -987,7 +1441,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn test_pick_first_empty_update_clears_state() {
         let mut env = new_env();
-        env.simulate_successful_connection(&["addr1", "addr2"]);
+        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
 
         // Send empty update.
         let res = env.send_resolver_update(vec![]);
@@ -999,6 +1453,25 @@ mod test {
 
         // Check that re-resolution was requested.
         env.expect_request_resolution();
+        env.expect_no_events();
+
+        // The subchannels were cleared, so updates from them are ignored. The
+        // old selected subchannel going IDLE does not move the policy to IDLE.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_no_events();
+        // Nor is it selected when it becomes READY again.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // The selection was cleared too: addr1 returning READY in a new update
+        // is selected again.
+        env.send_resolver_update_with_initial_states(
+            &["addr1"],
+            &[("addr1", SubchannelState::ready())],
+        )
+        .unwrap();
+        let sc = env.expect_new_subchannel_for("addr1");
+        env.expect_ready_picker(&sc);
         env.expect_no_events();
     }
 
@@ -1105,6 +1578,46 @@ mod test {
         env.expect_no_events();
     }
 
+    // In steady state the policy reports the latest error and requests
+    // re-resolution (gRFC A61) after N (subchannel count) failures.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_steady_state_reresolves_every_n_failures() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+
+        // The first failure in steady state is counted, without re-resolving.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 again"));
+        env.expect_no_events();
+
+        // The second failure reaches N.
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 again"));
+        env.expect_failing_picker("addr2 again");
+        env.expect_request_resolution();
+        env.expect_no_events();
+
+        // The count starts over.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 third"));
+        env.expect_no_events();
+
+        // Another N failures request re-resolution again.
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 third"));
+        env.expect_failing_picker("addr2 third");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
     // This test is meant to validate that if a new address with different
     // attributes is sent as part of a resolver update, the policy treats it as
     // a different address and creates a new subchannel for it, rather than
@@ -1129,6 +1642,126 @@ mod test {
         env.expect_no_events();
     }
 
+    // When a resolver update arrives during the first pass, subchannels that
+    // already failed keep their TRANSIENT_FAILURE state, so the new pass skips
+    // them instead of attempting them again (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_preserves_subchannel_failure_state() {
+        let mut env = new_env();
+
+        // addr1 fails. The pass moves on to addr2.
+        env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+
+        // The new list keeps addr1, which already failed, and adds addr3.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr3"]))
+            .unwrap();
+        // addr1's subchannel is reused; only addr3 gets a new one.
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        // The new pass skips addr1, though it is first in the list.
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+
+        // When addr3 fails too, the pass is over.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+        // addr1 still counts as failed, so it is not retried. Had it been reset
+        // to IDLE, the end of the pass would connect it here.
+        env.expect_no_events();
+    }
+
+    // Updates from subchannels whose addresses were removed by a resolver
+    // update are ignored, both during the first pass and in steady state.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_removed_subchannel_updates() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2"]);
+
+        // Replace the address list with [addr3].
+        env.send_resolver_update(create_endpoints(&["addr3"]))
+            .unwrap();
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        env.expect_connect_to("addr3");
+
+        // In the first pass, READY from a removed subchannel does not select
+        // it.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // addr3 fails, ending the first pass.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+
+        // In steady state, a subchannel going IDLE is asked to connect, but
+        // not a removed one.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_no_events();
+        // With one address left, every failure in steady state requests
+        // re-resolution, but not a removed subchannel's failure.
+        env.send_subchannel_update(
+            &scs[1],
+            &SubchannelState::transient_failure("connection refused"),
+        );
+        env.expect_no_events();
+
+        // addr3 is still the only address in use.
+        env.send_subchannel_update(&sc3, &SubchannelState::idle());
+        env.expect_connect_to("addr3");
+        env.send_subchannel_update(&sc3, &SubchannelState::ready());
+        env.expect_ready_picker(&sc3);
+        env.expect_no_events();
+    }
+
+    // Tests that updates from a discarded subchannel are ignored during a
+    // first pass and in READY, even though its address is still in the
+    // address list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_stale_subchannel_with_current_address() {
+        let mut env = new_env();
+        let old = env.simulate_successful_connection(&["addr1", "addr2"]);
+
+        let new = env.simulate_disconnect_and_reconnect(&old[0], &["addr1", "addr2"]);
+
+        // A late READY from the discarded addr1 subchannel is ignored.
+        env.send_subchannel_update(&old[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // The new addr1 subchannel is selected.
+        env.send_subchannel_update(&new[0], &SubchannelState::ready());
+        env.expect_ready_picker(&new[0]);
+
+        // A late IDLE from the discarded addr1 subchannel does not disconnect
+        // the selected subchannel.
+        env.send_subchannel_update(&old[0], &SubchannelState::idle());
+        env.expect_no_events();
+    }
+
+    // Tests that in steady state, updates from a discarded subchannel are
+    // ignored, even though its address is still in the address list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_stale_subchannel_with_current_address_in_steady_state() {
+        let mut env = new_env();
+        let old = env.simulate_successful_connection(&["addr1"]);
+
+        let new = env.simulate_disconnect_and_reconnect(&old[0], &["addr1"]);
+
+        // The new addr1 subchannel fails, entering steady state.
+        env.send_subchannel_update(
+            &new[0],
+            &SubchannelState::transient_failure("connection refused"),
+        );
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // Updates from the discarded addr1 subchannel do not select it or
+        // trigger a connection attempt.
+        env.send_subchannel_update(&old[0], &SubchannelState::ready());
+        env.send_subchannel_update(&old[0], &SubchannelState::idle());
+        env.expect_no_events();
+    }
+
     // If a resolver error is received while the LB is in the process of
     // connecting to addresses, it should not abort the connection attempt or
     // clear the existing addresses, as long as there are still valid addresses
@@ -1141,7 +1774,11 @@ mod test {
 
         // Simulate resolver error arriving.
         let resolver_error = "dns resolution failed".to_string();
-        env.send_resolver_error(resolver_error).unwrap();
+        // The error is returned, so the resolver retries.
+        assert_eq!(
+            env.send_resolver_error(resolver_error.clone()),
+            Err(resolver_error)
+        );
 
         // Resolver errors received during active connection attempts should NOT
         // abort the attempt or force TransientFailure immediately if the load
@@ -1150,6 +1787,30 @@ mod test {
         env.expect_no_events();
 
         // The in-progress connection attempt is still honored.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+        env.expect_no_events();
+    }
+
+    // Tests that a resolver error while reporting TRANSIENT_FAILURE updates the
+    // picker with the resolver error, but keeps using the current subchannels.
+    // The returned error makes the resolver retry, so no re-resolution is
+    // requested.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_error_in_transient_failure_keeps_subchannels() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        let res = env.send_resolver_error("dns failure".to_string());
+        assert_eq!(res.unwrap_err(), "dns failure");
+        env.expect_failing_picker("dns failure");
+        env.expect_no_events();
+
+        // The existing subchannel is still retried and can become READY.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
         env.send_subchannel_update(&scs[0], &SubchannelState::ready());
         env.expect_ready_picker(&scs[0]);
         env.expect_no_events();
@@ -1182,6 +1843,259 @@ mod test {
         env.expect_no_events();
     }
 
+    // With a single address, the only connection attempt is on the last
+    // subchannel, so no timer is started (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_no_timer_for_single_address() {
+        let mut env = new_env();
+        env.simulate_connection(&["addr1"]);
+
+        env.advance_past_timer().await;
+        env.expect_no_events();
+    }
+
+    // An earlier connection attempt that succeeds after the timer moved the
+    // pass on is selected, and the running timer is cancelled (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_earlier_attempt_ready_cancels_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3", "addr4"]);
+
+        // Each timer moves the pass on and starts the next attempt's timer: the
+        // second timer fires only because the first one started it.
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.fire_timer().await;
+        env.expect_connect_to("addr3");
+
+        // addr1's attempt, from two timers back, succeeds and is selected.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+
+        // No timer fires: the timer for addr3's attempt was cancelled.
+        env.advance_past_timer().await;
+        env.expect_no_events();
+    }
+
+    // When the current connection attempt fails, the next attempt starts at
+    // once with its own Connection Attempt Delay timer; the failed attempt's
+    // timer is cancelled (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_attempt_failure_restarts_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        // addr1 fails partway through its delay; addr2 is attempted at once.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY / 2).await;
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+
+        // Past addr1's original deadline, but before addr2's: nothing fires.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY * 3 / 4).await;
+        env.expect_no_events();
+
+        // addr2's own timer fires 250ms after its attempt started, moving the
+        // pass on to addr3.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY / 4 + Duration::from_millis(1))
+            .await;
+        env.run_work();
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+    }
+
+    // When the current connection attempt fails and no subchannel is left to
+    // attempt, the pass cancels the Connection Attempt Delay timer and waits
+    // for the earlier attempts to finish (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_attempt_failure_with_nothing_left_cancels_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+
+        // addr3 fails before the pass reaches it, then addr2 fails while addr1
+        // is still connecting.
+        env.send_subchannel_update(&scs[2], &SubchannelState::transient_failure("addr3 failed"));
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_no_events();
+
+        env.advance_past_timer().await;
+        env.expect_no_events();
+
+        // addr1 fails, ending the pass.
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_failing_picker("addr1 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // A failure from a subchannel the pass has not reached yet does not count
+    // toward ending the pass: the subchannel may be IDLE again by the time the
+    // pass reaches it, and the pass then attempts it and waits for the result.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_failure_not_yet_reached_not_counted() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        // addr2 fails and finishes backoff before the pass reaches it.
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+
+        // addr1 fails; the pass moves on and attempts addr2.
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+
+        // addr2's timer moves the pass on to addr3, which fails. Every address
+        // has now failed once, but the pass is not over: addr2's earlier
+        // failure does not count, and its attempt in this pass is in flight.
+        env.fire_timer().await;
+        env.expect_connect_to("addr3");
+        env.send_subchannel_update(&scs[2], &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_no_events();
+
+        // addr2 fails during this pass, completing it.
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 again"));
+        env.expect_failing_picker("addr2 again");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // Timer work queued behind a READY and then IDLE update is delivered after
+    // the LB has returned to Idle. It must not be treated as a connection
+    // request.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_stale_timer_work_ignored_in_idle() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2"]);
+
+        // Hold the timer's work, as if READY and IDLE were queued before it.
+        env.advance_past_timer().await;
+        let timer_work = env.expect_schedule_work();
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_request_resolution();
+        env.expect_picker_state(ConnectivityState::Idle);
+
+        env.policy.work(timer_work, &mut env.tcc);
+        env.expect_no_events();
+    }
+
+    // Timer work from an earlier first pass, delivered after a resolver update
+    // started a new pass, does not move the new pass on.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_stale_timer_work_ignored_in_new_pass() {
+        let mut env = new_env();
+        env.simulate_connection(&["addr1", "addr2"]);
+
+        // Hold the timer's work, as if the resolver update was handled before
+        // it. The new pass reuses the subchannels and starts over at addr1.
+        env.advance_past_timer().await;
+        let timer_work = env.expect_schedule_work();
+        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
+            .unwrap();
+        env.expect_connect_to("addr1");
+        env.expect_no_events();
+
+        // The stale work does not move the new pass on to addr2.
+        env.policy.work(timer_work, &mut env.tcc);
+        env.expect_no_events();
+
+        // The new pass's own timer moves it on to addr2.
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+    }
+
+    // If new_subchannel returns a subchannel that is already READY, the policy
+    // selects it immediately, without asking any other subchannel to connect or
+    // creating subchannels for later addresses (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_subchannel_initially_ready() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2", "addr3"],
+            &[("addr2", SubchannelState::ready())],
+        )
+        .unwrap();
+
+        let scs = env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_ready_picker(&scs[1]);
+        env.expect_no_events();
+    }
+
+    // If new_subchannel returns a subchannel already in TRANSIENT_FAILURE, the
+    // first pass counts it as failed and skips to the next address (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_subchannel_initially_transient_failure() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[(
+                "addr1",
+                SubchannelState::transient_failure("initial failure"),
+            )],
+        )
+        .unwrap();
+
+        let scs = env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.expect_queuing_picker();
+        env.expect_no_events();
+
+        // Once addr2 also fails, the pass finishes without waiting for addr1.
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // If new_subchannel returns a subchannel already in CONNECTING, the first
+    // pass waits on it without calling connect(), and advances when the
+    // Connection Attempt Delay timer fires (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_subchannel_initially_connecting() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[("addr1", SubchannelState::connecting())],
+        )
+        .unwrap();
+
+        env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_queuing_picker();
+        env.expect_no_events();
+
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+    }
+
+    // When every subchannel starts in TRANSIENT_FAILURE, before any connection
+    // error has been recorded, the pass ends at once: the policy reports the
+    // last of their errors in address order, and requests re-resolution.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_all_subchannels_start_in_transient_failure() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[
+                ("addr1", SubchannelState::transient_failure("addr1 failed")),
+                ("addr2", SubchannelState::transient_failure("addr2 failed")),
+            ],
+        )
+        .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr2"]);
+        // Nothing is attempted. With no error recorded yet, the reported error
+        // comes from the subchannels' own states.
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
     // Freshest Error Caching (Steady State)
     // Ensures background failures during Steady State continuously overwrite
     // stale connection errors.
@@ -1201,6 +2115,7 @@ mod test {
             &scs[0],
             &SubchannelState::transient_failure("steady state network drop"),
         );
+        env.expect_failing_picker("steady state network drop");
         env.expect_request_resolution();
 
         // Verify policy caches the freshest error: a new pass over the same
@@ -1210,6 +2125,131 @@ mod test {
             .unwrap();
         env.expect_failing_picker("steady state network drop");
         env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // Tests that once reporting TRANSIENT_FAILURE after all addresses fail,
+    // the policy keeps reporting it across resolver updates and new first
+    // passes until a subchannel becomes READY (sticky-TF, gRFC A62).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_sticky_transient_failure_across_resolver_updates() {
+        let mut env = new_env();
+        env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // Re-resolution returns [addr1, addr2]. A new pass starts without
+        // reporting CONNECTING. addr1 already failed, so addr2 is attempted.
+        let endpoints = create_endpoints(&["addr1", "addr2"]);
+        env.send_resolver_update(endpoints).unwrap();
+        let sc2 = env.expect_new_subchannel_for("addr2");
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+        env.send_subchannel_update(&sc2, &SubchannelState::connecting());
+        env.expect_no_events();
+
+        // Another update during the pass also leaves the reported state
+        // unchanged. addr2 reported CONNECTING, so it is not asked to connect
+        // again.
+        let endpoints = create_endpoints(&["addr2", "addr3"]);
+        env.send_resolver_update(endpoints).unwrap();
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        env.expect_no_events();
+
+        // addr2 fails, and the pass moves on to addr3.
+        env.send_subchannel_update(&sc2, &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+
+        // addr3 fails, ending the pass. TRANSIENT_FAILURE is reported again
+        // with the latest error.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+
+        // A READY subchannel ends sticky TRANSIENT_FAILURE.
+        env.send_subchannel_update(&sc3, &SubchannelState::ready());
+        env.expect_ready_picker(&sc3);
+        env.expect_no_events();
+    }
+
+    // Tests that when in Transient Failure, receiving a valid resolver update
+    // immediately starts connecting without waiting for exit_idle, while
+    // continuing to report TRANSIENT_FAILURE until a subchannel is READY
+    // (sticky-TF, gRFC A62).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_in_transient_failure_starts_connecting_immediately() {
+        let mut env = new_env();
+
+        // Initial resolution failure sets Transient Failure.
+        let res = env.send_resolver_error("resolver unavailable".to_string());
+        assert_eq!(res.unwrap_err(), "resolver unavailable");
+        env.expect_failing_picker("resolver unavailable");
+        env.expect_request_resolution();
+
+        // A valid resolver update arrives [addr1, addr2]. Subchannels are
+        // created and connection initiates immediately without exit_idle. No
+        // CONNECTING picker is reported.
+        let endpoints = create_endpoints(&["addr1", "addr2"]);
+        env.send_resolver_update(endpoints).unwrap();
+        let scs = env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_connect_to("addr1");
+        env.expect_no_events();
+
+        // The policy leaves TRANSIENT_FAILURE once a subchannel is READY.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+        env.expect_no_events();
+    }
+
+    // A pass that starts with every subchannel already in TRANSIENT_FAILURE
+    // ends at once, and reports the last of their errors in address order.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_pass_starting_in_transient_failure_reports_connection_error() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+
+        // In steady state, addr1 fails again with a newer error.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 newest"));
+        env.expect_no_events();
+
+        // Both subchannels are reused and still in TRANSIENT_FAILURE, so the
+        // new pass has nothing to attempt. It reports addr2's error, the last
+        // in address order, rather than the newest.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
+            .unwrap();
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // A pass that starts with every subchannel already in TRANSIENT_FAILURE
+    // enters steady state: a subchannel that then finishes its backoff is
+    // reconnected, without TRANSIENT_FAILURE being reported again.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_pass_starting_in_transient_failure_enters_steady_state() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // addr1 is reused and still in TRANSIENT_FAILURE, so the new pass has
+        // nothing to attempt.
+        env.send_resolver_update(create_endpoints(&["addr1"]))
+            .unwrap();
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // In steady state, addr1 finishing its backoff only reconnects it.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
         env.expect_no_events();
     }
 
@@ -1225,7 +2265,9 @@ mod test {
         // Simulate the subchannel disconnecting (transitioning to Idle).
         env.send_subchannel_update(&scs[0], &SubchannelState::idle());
 
-        // Verify the policy updates the picker to Idle state.
+        // Verify the policy requests re-resolution, and updates the picker to
+        // Idle state.
+        env.expect_request_resolution();
         let idle_picker = env.expect_picker_state(ConnectivityState::Idle);
 
         // At this point, there should be no more events, as we are waiting for
@@ -1243,9 +2285,40 @@ mod test {
         // connection attempt.
         env.run_work();
 
-        // Verify that the policy initiates a reconnection to addr1, and the
-        // picker goes to Connecting.
+        // Verify that the policy reconnects with a new subchannel for every
+        // address, starting with addr1, and the picker goes to Connecting.
+        let new_scs = env.expect_new_subchannels(&["addr1", "addr2"]);
         env.expect_connect_to("addr1");
+        env.expect_queuing_picker();
+
+        // The reconnect is a new pass over the whole list: when addr1 fails,
+        // the policy moves on to addr2.
+        env.send_subchannel_update(
+            &new_scs[0],
+            &SubchannelState::transient_failure("connection refused"),
+        );
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+    }
+
+    // After a disconnect, resolver updates leave the policy IDLE without
+    // creating subchannels until exit_idle is called, which connects to the
+    // latest address list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_after_disconnect_stays_idle() {
+        let mut env = new_env();
+        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_request_resolution();
+        env.expect_picker_state(ConnectivityState::Idle);
+
+        let endpoints = create_endpoints(&["addr3", "addr4"]);
+        env.send_resolver_update(endpoints).unwrap();
+        env.expect_no_events();
+
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_new_subchannels(&["addr3", "addr4"]);
+        env.expect_connect_to("addr3");
         env.expect_queuing_picker();
         env.expect_no_events();
     }

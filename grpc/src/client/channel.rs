@@ -81,6 +81,7 @@ use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
 use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
+use crate::client::stream_util::CompletionRecvStream;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
 use crate::client::subchannel::NopBackoff;
@@ -504,21 +505,33 @@ impl Invoke for LbInvoker {
                 .picker
                 .pick(PickOptions::new(&headers, &options))
             {
-                PickResult::Pick(pr) => {
-                    if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
-                        return sc.invoke(headers, options).await;
-                    } else {
+                PickResult::Pick(mut pr) => {
+                    let on_complete = pr.on_complete.take();
+                    let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"
                         );
-                    }
+                    };
+                    let (tx, rx) = sc.invoke(headers, options).await;
+                    // Notify the LB policy when the RPC completes (or is
+                    // abandoned) so it can release any per-call state.
+                    let rx = match on_complete {
+                        Some(on_complete) => {
+                            BoxRecvStream::new(CompletionRecvStream::new(rx, on_complete))
+                        }
+                        None => rx,
+                    };
+                    return (tx, rx);
                 }
                 PickResult::Queue => {}
                 PickResult::Fail(status) => {
-                    return FailingRecvStream::new_stream_pair(status, None);
+                    return FailingRecvStream::new_stream_pair(sanitize_pick_status(status), None);
                 }
                 PickResult::Drop(status) => {
-                    todo!("dropped pick: {:?}", status);
+                    // TODO: once retries are implemented, ensure dropped picks
+                    // bypass retry logic. Until then a drop is equivalent to a
+                    // failed pick.
+                    return FailingRecvStream::new_stream_pair(sanitize_pick_status(status), None);
                 }
             }
             // Queued: wait for this snapshot to be superseded, then retry the
@@ -531,6 +544,27 @@ impl Invoke for LbInvoker {
 impl Drop for LbInvoker {
     fn drop(&mut self) {
         self.abort_handle.abort();
+    }
+}
+
+/// Converts the status of a failed or dropped pick ([`PickResult::Fail`] or
+/// [`PickResult::Drop`]) to `INTERNAL` if its code is restricted from being
+/// produced by the control plane, per [gRFC A54].
+///
+/// [gRFC A54]:
+///     https://github.com/grpc/proposal/blob/master/A54-restrict-control-plane-status-codes.md
+fn sanitize_pick_status(status: StatusError) -> StatusError {
+    if status.is_restricted_control_plane_code() {
+        StatusError::new(
+            StatusCodeError::Internal,
+            format!(
+                "LB policy picker returned illegal status {:?}: {}",
+                status.code(),
+                status.message()
+            ),
+        )
+    } else {
+        status
     }
 }
 
@@ -940,6 +974,78 @@ mod tests {
                 .is_err(),
             "next() resolved without an update"
         );
+    }
+
+    #[test]
+    fn sanitize_pick_status_maps_restricted_codes_to_internal() {
+        let st = sanitize_pick_status(StatusError::new(StatusCodeError::NotFound, "nope"));
+        assert_eq!(st.code(), StatusCodeError::Internal);
+        assert!(st.message().contains("nope"), "got: {}", st.message());
+
+        let st = sanitize_pick_status(StatusError::new(StatusCodeError::Unavailable, "drop"));
+        assert_eq!(st.code(), StatusCodeError::Unavailable);
+        assert_eq!(st.message(), "drop");
+    }
+
+    struct NopTaskHandle;
+
+    impl rt::TaskHandle for NopTaskHandle {
+        fn abort(&self) {}
+    }
+
+    /// Picker that fails or drops every pick with a fixed status.
+    #[derive(Debug)]
+    struct StaticPicker {
+        drop: bool,
+        status: StatusError,
+    }
+
+    impl Picker for StaticPicker {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
+            if self.drop {
+                PickResult::Drop(self.status.clone())
+            } else {
+                PickResult::Fail(self.status.clone())
+            }
+        }
+    }
+
+    // Tests that failed and dropped picks fail the RPC with the picker's
+    // status, with A54-restricted codes converted to INTERNAL.
+    #[tokio::test]
+    async fn invoke_fails_rpc_for_failed_and_dropped_picks() {
+        use crate::client::RecvStream as _;
+        use crate::client::ResponseStreamItem;
+        use crate::client::test_util::NopRecvMessage;
+
+        for drop in [false, true] {
+            for (code, want) in [
+                (StatusCodeError::Unavailable, StatusCodeError::Unavailable),
+                (StatusCodeError::NotFound, StatusCodeError::Internal),
+            ] {
+                let lb_invoker = LbInvoker {
+                    abort_handle: Box::new(NopTaskHandle),
+                    lb_watcher: Arc::new(Watcher::new(LbState {
+                        connectivity_state: ConnectivityState::TransientFailure,
+                        picker: Arc::new(StaticPicker {
+                            drop,
+                            status: StatusError::new(code, "picker status"),
+                        }),
+                    })),
+                };
+                let (_tx, mut rx) = lb_invoker
+                    .invoke(RequestHeaders::new(), CallOptions::new())
+                    .await;
+                match rx.recv(&mut NopRecvMessage).await {
+                    ResponseStreamItem::Trailers(trailers) => {
+                        let err = trailers.status().as_ref().unwrap_err();
+                        assert_eq!(err.code(), want, "drop={drop}, code={code:?}");
+                        assert!(err.message().contains("picker status"));
+                    }
+                    other => std::panic!("expected trailers, got {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

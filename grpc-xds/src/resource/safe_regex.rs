@@ -69,6 +69,14 @@ impl fmt::Debug for SafeRegex {
     }
 }
 
+impl PartialEq for SafeRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for SafeRegex {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

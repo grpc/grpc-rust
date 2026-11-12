@@ -371,7 +371,7 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let mut self_proj = self.project();
 
-        if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
+        if let Some(cancellation_fut) = self_proj.cancellation_fut.as_mut().as_pin_mut()
             && let Poll::Ready(()) = cancellation_fut.poll(cx)
         {
             #[cfg(feature = "h2")]
@@ -390,7 +390,16 @@ where
 
         match ready!(self_proj.inner.as_mut().poll_next(cx)) {
             Some(Ok(d)) => {
-                if matches!(self_proj.state.role, Role::Client) && self_proj.inner.is_end_stream {
+                // hyper stops polling a body once it reports the end, so a
+                // cancellation landing after the check above would go unseen.
+                if matches!(self_proj.state.role, Role::Client)
+                    && self_proj.inner.is_end_stream
+                    && self_proj
+                        .cancellation_fut
+                        .as_mut()
+                        .as_pin_mut()
+                        .is_none_or(|fut| fut.poll(cx).is_pending())
+                {
                     self_proj.state.is_end_stream = true;
                 }
                 Some(Ok(Frame::data(d))).into()
@@ -527,5 +536,56 @@ mod tests {
         let frame = next_frame(&mut body).await.unwrap().unwrap();
         assert!(frame.is_data());
         assert!(body.is_end_stream());
+    }
+
+    /// Cancels the request as it ends, so the cancellation lands in the same
+    /// `poll_frame` that produced the message, after its check has passed.
+    struct CancellingSource {
+        message: Option<Bytes>,
+        cancel: Option<CancellationToken>,
+    }
+
+    impl Stream for CancellingSource {
+        type Item = Result<Bytes, Status>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(message) = self.message.take() {
+                return Poll::Ready(Some(Ok(message)));
+            }
+            if let Some(token) = self.cancel.take() {
+                token.cancel();
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    #[test]
+    fn cancelled_as_source_ends_does_not_end_the_stream() {
+        let token = CancellationToken::new();
+        let mut body = pin!(EncodeBody::new_client_with_cancellation(
+            IdentityEncoder,
+            CancellingSource {
+                message: Some(Bytes::from_static(b"hi")),
+                cancel: Some(token.clone()),
+            },
+            None,
+            None,
+            Some(token),
+        ));
+        let cx = &mut Context::from_waker(std::task::Waker::noop());
+
+        let Poll::Ready(Some(Ok(frame))) = body.as_mut().poll_frame(cx) else {
+            panic!("expected a data frame");
+        };
+        assert!(frame.is_data());
+        assert!(
+            !body.is_end_stream(),
+            "a cancelled request must not end gracefully"
+        );
+
+        let Poll::Ready(Some(Err(status))) = body.as_mut().poll_frame(cx) else {
+            panic!("expected the body to fail");
+        };
+        assert_eq!(status.code(), crate::Code::Cancelled);
     }
 }

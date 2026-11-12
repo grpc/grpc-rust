@@ -113,13 +113,6 @@ impl XdsClientPool {
         clients.insert(target.to_owned(), Arc::downgrade(&client));
         SharedXdsClient(client)
     }
-
-    /// Returns the targets that currently have an entry in the pool, in
-    /// sorted order, including dead entries that have not been pruned yet.
-    #[cfg(test)]
-    fn targets(&self) -> Vec<String> {
-        self.clients.lock().unwrap().keys().cloned().collect()
-    }
 }
 
 /// A reference to a pooled [`XdsClient`].
@@ -169,6 +162,10 @@ mod tests {
         pool.get_or_create(target, &bootstrap, GrpcRuntime::default(), None)
     }
 
+    fn targets(pool: &XdsClientPool) -> Vec<String> {
+        pool.clients.lock().unwrap().keys().cloned().collect()
+    }
+
     fn same_client(a: &SharedXdsClient, b: &SharedXdsClient) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
@@ -178,7 +175,7 @@ mod tests {
         let pool = XdsClientPool::new();
         let a = get(&pool, "xds:///a");
         assert!(same_client(&a, &get(&pool, "xds:///a")));
-        assert_eq!(pool.targets(), vec!["xds:///a"]);
+        assert_eq!(targets(&pool), vec!["xds:///a"]);
     }
 
     #[tokio::test]
@@ -187,7 +184,7 @@ mod tests {
         let a = get(&pool, "xds:///a");
         let b = get(&pool, "xds:///b");
         assert!(!same_client(&a, &b));
-        assert_eq!(pool.targets(), vec!["xds:///a", "xds:///b"]);
+        assert_eq!(targets(&pool), vec!["xds:///a", "xds:///b"]);
     }
 
     #[tokio::test]
@@ -210,11 +207,11 @@ mod tests {
         // Adding "b" prunes the dead "a" entry; "b" itself is dropped at once.
         drop(get(&pool, "xds:///b"));
         assert!(first.upgrade().is_none());
-        assert_eq!(pool.targets(), vec!["xds:///b"]);
+        assert_eq!(targets(&pool), vec!["xds:///b"]);
 
         // Adding "a" again creates a fresh client and prunes the dead "b".
         let a = get(&pool, "xds:///a");
-        assert_eq!(pool.targets(), vec!["xds:///a"]);
+        assert_eq!(targets(&pool), vec!["xds:///a"]);
         let clients = pool.clients.lock().unwrap();
         assert!(Arc::ptr_eq(&a.0, &clients["xds:///a"].upgrade().unwrap()));
     }
@@ -229,7 +226,7 @@ mod tests {
             r#"XdsClientPool { targets: ["xds:///a"] }"#
         );
         // We don't want debug to make modifications; the dead "b" entry remains.
-        assert_eq!(pool.targets(), vec!["xds:///a", "xds:///b"]);
+        assert_eq!(targets(&pool), vec!["xds:///a", "xds:///b"]);
     }
 
     #[tokio::test]

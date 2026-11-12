@@ -41,18 +41,19 @@ use crate::StatusCodeError;
 use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
-use crate::client::DynInvoke;
-use crate::client::DynRecvStream;
-use crate::client::DynSendStream;
 use crate::client::Invoke;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
+use crate::client::boxed::ArcInvoker;
+use crate::client::boxed::BoxRecvStream;
+use crate::client::boxed::BoxSendStream;
 use crate::client::deadline::DeadlineInvoker;
 use crate::client::deadline::DeadlineRecvStream;
 use crate::client::deadline::DeadlineSendStream;
+use crate::client::interceptor::Intercept as _;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
@@ -215,7 +216,7 @@ impl Invoke for Channel {
 }
 
 /// The [`SendStream`] of an RPC started on a [`Channel`].
-pub struct ChannelSendStream(DeadlineSendStream<Box<dyn DynSendStream>>);
+pub struct ChannelSendStream(DeadlineSendStream<BoxSendStream>);
 
 impl SendStream for ChannelSendStream {
     async fn send(
@@ -228,7 +229,7 @@ impl SendStream for ChannelSendStream {
 }
 
 /// The [`RecvStream`] of an RPC started on a [`Channel`].
-pub struct ChannelRecvStream(DeadlineRecvStream<Box<dyn DynSendStream>, Box<dyn DynRecvStream>>);
+pub struct ChannelRecvStream(DeadlineRecvStream<BoxSendStream, BoxRecvStream>);
 
 impl RecvStream for ChannelRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
@@ -356,8 +357,8 @@ impl PersistentChannel {
 
 /// Starts RPCs on the current [`ActiveChannel`], creating it if necessary.
 impl Invoke for PersistentChannel {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
 
     async fn invoke(
         &self,
@@ -370,9 +371,13 @@ impl Invoke for PersistentChannel {
 
 // A channel that is not idle (connecting, ready, or erroring).
 struct ActiveChannel {
-    /// Starts RPCs on subchannels picked by the LB policy.  In an `Arc` so
-    /// that it can be passed to the interceptors chosen by the config selector.
+    /// Starts RPCs on subchannels picked by the LB policy.  Used directly when
+    /// there is no config selector interceptor, avoiding dynamic dispatch.
     lb: Arc<LbInvoker>,
+    /// `lb`, but type-erased (sharing the same allocation) to pass to the
+    /// config selector interceptor.  Passed by reference to avoid the need to
+    /// clone when calling.
+    erased_lb: ArcInvoker,
     config_selector: SharedConfigSelector,
 }
 
@@ -424,11 +429,13 @@ impl ActiveChannel {
             }
         }));
 
+        let lb = Arc::new(LbInvoker {
+            abort_handle,
+            lb_watcher,
+        });
         Arc::new(Self {
-            lb: Arc::new(LbInvoker {
-                abort_handle,
-                lb_watcher,
-            }),
+            erased_lb: ArcInvoker::from_arc(lb.clone()),
+            lb,
             config_selector,
         })
     }
@@ -440,8 +447,8 @@ impl ActiveChannel {
 
 /// Applies the config chosen by the config selector to each RPC.
 impl Invoke for ActiveChannel {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
 
     async fn invoke(
         &self,
@@ -459,7 +466,7 @@ impl Invoke for ActiveChannel {
         match config.interceptor {
             Some(interceptor) => {
                 interceptor
-                    .dyn_intercept(headers, options, self.lb.clone())
+                    .intercept(headers, options, &self.erased_lb)
                     .await
             }
             // Avoid heap allocations and dynamic dispatch.
@@ -477,21 +484,17 @@ struct LbInvoker {
     lb_watcher: Arc<Watcher<LbState>>,
 }
 
-// Note: `LbInvoker` implements `DynInvoke` directly, rather than `Invoke`, as
-// its streams are already boxed; the blanket `DynInvoke` implementation for
-// `Invoke` would box them a second time when it is passed to the config
-// selector's interceptor.
-impl LbInvoker {
+impl Invoke for LbInvoker {
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
+
     /// Starts an RPC on a subchannel picked by the current LB picker, waiting
     /// for a new picker while picks are queued.
-    ///
-    /// Unlike [`DynInvoke::dyn_invoke`], this doesn't box the returned future,
-    /// so callers that don't need dynamic dispatch avoid an allocation.
     async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+    ) -> (Self::SendStream, Self::RecvStream) {
         // Fast path: snapshot the latest LB state without locking and pick
         // with its picker.
         let mut snapshot = self.lb_watcher.snapshot();
@@ -503,7 +506,7 @@ impl LbInvoker {
             {
                 PickResult::Pick(pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
-                        return sc.dyn_invoke(headers, options).await;
+                        return sc.invoke(headers, options).await;
                     } else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"
@@ -522,17 +525,6 @@ impl LbInvoker {
             // pick with the newest state.
             snapshot = snapshot.next().await;
         }
-    }
-}
-
-#[crate::async_trait]
-impl DynInvoke for LbInvoker {
-    async fn dyn_invoke(
-        &self,
-        headers: RequestHeaders,
-        options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        self.invoke(headers, options).await
     }
 }
 

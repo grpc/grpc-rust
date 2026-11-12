@@ -24,6 +24,8 @@
 
 //! Validated ClusterLoadAssignment resource (EDS).
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use envoy_types::pb::envoy::config::core::v3::{
     Address, HealthStatus as EnvoyHealthStatus, address, socket_address,
@@ -35,7 +37,7 @@ use prost::Message;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
-use crate::client::endpoint::EndpointAddress;
+use crate::client::endpoint::{EndpointAddress, XdsEndpoint};
 
 /// Validated ClusterLoadAssignment (EDS resource).
 #[derive(Debug)]
@@ -64,10 +66,10 @@ pub(crate) struct Locality {
 /// A single validated endpoint.
 #[derive(Debug)]
 pub(crate) struct ResolvedEndpoint {
-    pub address: EndpointAddress,
-    /// Further addresses of the same backend from `Endpoint.additional_addresses`
-    /// (gRFC A61), in control-plane order.
-    pub additional_addresses: Vec<EndpointAddress>,
+    /// The addresses (including gRFC A61 additional addresses) and hostname,
+    /// as handed to a [`Connector`](crate::client::endpoint::Connector).
+    /// Shared with the load balancer, so an EDS update does not copy it.
+    pub endpoint: Arc<XdsEndpoint>,
     pub health_status: HealthStatus,
     pub load_balancing_weight: u32,
 }
@@ -181,10 +183,13 @@ fn validate_lb_endpoint(lb_ep: LbEndpoint) -> xds_client::Result<Option<Resolved
         .collect::<xds_client::Result<Vec<_>>>()?;
 
     let weight = lb_ep.load_balancing_weight.map(|w| w.value).unwrap_or(1);
+    // `with_hostname` reads an empty `Endpoint.hostname` as unset.
+    let endpoint = XdsEndpoint::new(address)
+        .with_additional_addresses(additional_addresses)
+        .with_hostname(host_identifier.hostname);
 
     Ok(Some(ResolvedEndpoint {
-        address,
-        additional_addresses,
+        endpoint: Arc::new(endpoint),
         health_status,
         load_balancing_weight: weight,
     }))
@@ -337,7 +342,7 @@ mod tests {
     fn test_no_additional_addresses() {
         let validated = EndpointsResource::validate(make_cla("c1")).unwrap();
         for ep in &validated.localities[0].endpoints {
-            assert!(ep.additional_addresses.is_empty());
+            assert!(ep.endpoint.additional_addresses().is_empty());
         }
     }
 
@@ -348,11 +353,11 @@ mod tests {
             Some(make_socket_address("10.0.1.1", 9090)),
         ]);
         let validated = EndpointsResource::validate(cla).unwrap();
-        let ep = &validated.localities[0].endpoints[0];
-        assert_eq!(ep.address, EndpointAddress::new("10.0.0.1", 8080));
+        let ep = &validated.localities[0].endpoints[0].endpoint;
+        assert_eq!(ep.address(), &EndpointAddress::new("10.0.0.1", 8080));
         assert_eq!(
-            ep.additional_addresses,
-            vec![
+            ep.additional_addresses(),
+            [
                 EndpointAddress::new("2001:db8::1", 8080),
                 EndpointAddress::new("10.0.1.1", 9090),
             ]
@@ -390,5 +395,31 @@ mod tests {
             assert!(err.contains("additional_addresses[1]"), "{err}");
             assert!(err.contains(reason), "{err}");
         }
+    }
+
+    #[test]
+    fn test_hostname_parsed_and_empty_is_none() {
+        let mut named = make_lb_endpoint("10.0.0.1", 8080, EnvoyHealthStatus::Healthy as i32);
+        let Some(lb_endpoint::HostIdentifier::Endpoint(ep)) = &mut named.host_identifier else {
+            unreachable!("make_lb_endpoint always sets an Endpoint");
+        };
+        ep.hostname = "backend-1.example.com".to_string();
+        let unnamed = make_lb_endpoint("10.0.0.2", 8080, EnvoyHealthStatus::Healthy as i32);
+        let cla = ClusterLoadAssignment {
+            cluster_name: "c1".to_string(),
+            endpoints: vec![LocalityLbEndpoints {
+                lb_endpoints: vec![named, unnamed],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let validated = EndpointsResource::validate(cla).unwrap();
+        let endpoints = &validated.localities[0].endpoints;
+        assert_eq!(
+            endpoints[0].endpoint.hostname(),
+            Some("backend-1.example.com")
+        );
+        assert_eq!(endpoints[1].endpoint.hostname(), None);
     }
 }

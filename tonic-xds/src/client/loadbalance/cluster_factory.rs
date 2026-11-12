@@ -28,7 +28,7 @@
 //! [`TowerP2cClusterChannelFactory`](crate::client::lb::TowerP2cClusterChannelFactory).
 //! Where that one hands Tower's balancer a stream of already-connected
 //! endpoints, this one keeps discovery and connection separate: the balancer
-//! receives bare addresses plus a [`Connector`](crate::client::endpoint::Connector),
+//! receives unconnected endpoints plus a [`Connector`](crate::client::endpoint::Connector),
 //! so it owns the connect / eject / reconnect lifecycle that outlier detection
 //! depends on.
 
@@ -109,7 +109,7 @@ where
         cluster_name: &str,
     ) -> ClusterChannel<Req, <MC::Service as Service<Req>>::Response> {
         let connector = Arc::new(ClusterConnector::spawn(
-            self.cache.clone(),
+            &self.cache,
             cluster_name.to_string(),
             self.make_connector.clone(),
             #[cfg(feature = "_tls-any")]
@@ -183,8 +183,7 @@ mod tests {
                 endpoints: servers
                     .iter()
                     .map(|s| ResolvedEndpoint {
-                        address: EndpointAddress::from(s.addr),
-                        additional_addresses: vec![],
+                        endpoint: Arc::new(EndpointAddress::from(s.addr).into()),
                         health_status: HealthStatus::Healthy,
                         load_balancing_weight: 1,
                     })

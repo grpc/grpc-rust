@@ -55,7 +55,7 @@ use tonic::body::Body as TonicBody;
 use tower::load::Load;
 use tower::{BoxError, Service};
 
-use crate::client::endpoint::{ClusterConfig, Connector, EndpointAddress, MakeConnector};
+use crate::client::endpoint::{ClusterConfig, Connector, MakeConnector, XdsEndpoint};
 use crate::common::async_util::BoxFuture;
 use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
 
@@ -536,8 +536,8 @@ struct CircuitBreakingConnector<S> {
 impl<S: Send + 'static> Connector for CircuitBreakingConnector<S> {
     type Service = CircuitBreakingEndpointService<S>;
 
-    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
-        let connecting = self.inner.connect(addr);
+    fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+        let connecting = self.inner.connect(endpoint);
         let breaker = self.breaker.clone();
         Box::pin(async move { CircuitBreakingEndpointService::new(connecting.await, breaker) })
     }
@@ -752,6 +752,7 @@ mod tests {
     use tower::ServiceExt;
     use tower::service_fn;
 
+    use crate::client::endpoint::EndpointAddress;
     use crate::client::retry::{
         GrpcRetryClassifier, RetryBackoffConfig, RetryConfig, RetryLayer, RetryPolicy,
     };
@@ -1243,7 +1244,7 @@ mod tests {
         );
         let connector = make_connector(&make, 1).unwrap();
         let mut endpoint = connector
-            .connect(&EndpointAddress::new("10.0.0.1", 8080))
+            .connect(&EndpointAddress::new("10.0.0.1", 8080).into())
             .await;
         let mut call = async || {
             endpoint
@@ -1324,7 +1325,7 @@ mod tests {
     impl Connector for PendingConnector {
         type Service = PendingEndpoint;
 
-        fn connect(&self, _addr: &EndpointAddress) -> BoxFuture<PendingEndpoint> {
+        fn connect(&self, _endpoint: &XdsEndpoint) -> BoxFuture<PendingEndpoint> {
             Box::pin(async { PendingEndpoint })
         }
     }

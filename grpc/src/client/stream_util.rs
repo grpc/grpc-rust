@@ -272,7 +272,9 @@ where
             ResponseStreamItem::Trailers(trailers) => self.complete(
                 CallOutcome::new(trailers.status()).with_trailing_metadata(trailers.metadata()),
             ),
-            ResponseStreamItem::StreamClosed | ResponseStreamItem::Headers(_) | ResponseStreamItem::Message => {}
+            ResponseStreamItem::StreamClosed
+            | ResponseStreamItem::Headers(_)
+            | ResponseStreamItem::Message => {}
         }
         item
     }

@@ -26,6 +26,9 @@
 
 use std::sync::Arc;
 
+use xds_client::ProcessingDone;
+use xds_client::ResourceEvent;
+
 /// The latest known state of one watched resource or DNS target.
 ///
 /// Follows gRFC A88: a *resource error* (the resource itself is bad) drops
@@ -61,6 +64,28 @@ impl<T> WatchState<T> {
     fn on_ambient_error(&mut self, reason: Arc<str>) {
         if let Self::Ready { note, .. } = self {
             *note = Some(reason);
+        }
+    }
+}
+
+impl<T> WatchState<Arc<T>> {
+    /// Applies an XdsClient event, and returns its flow-control token.
+    ///
+    /// `describe` turns the event's error into the reason or note to store.
+    pub(super) fn apply(
+        &mut self,
+        event: ResourceEvent<T>,
+        describe: impl FnOnce(xds_client::Error) -> Arc<str>,
+    ) -> ProcessingDone {
+        match event {
+            ResourceEvent::ResourceChanged { result, done } => {
+                self.on_changed(result.map_err(describe));
+                done
+            }
+            ResourceEvent::AmbientError { error, done } => {
+                self.on_ambient_error(describe(error));
+                done
+            }
         }
     }
 }

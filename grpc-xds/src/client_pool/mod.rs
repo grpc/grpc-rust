@@ -62,8 +62,13 @@ impl Default for XdsClientPool {
 impl fmt::Debug for XdsClientPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        let live_targets: Vec<_> = clients
+            .iter()
+            .filter(|(_, client)| client.strong_count() > 0)
+            .map(|(target, _)| target)
+            .collect();
         f.debug_struct("XdsClientPool")
-            .field("targets", &clients.keys().collect::<Vec<_>>())
+            .field("targets", &live_targets)
             .finish()
     }
 }
@@ -212,6 +217,19 @@ mod tests {
         assert_eq!(pool.targets(), vec!["xds:///a"]);
         let clients = pool.clients.lock().unwrap();
         assert!(Arc::ptr_eq(&a.0, &clients["xds:///a"].upgrade().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn debug_omits_dead_entries_without_pruning() {
+        let pool = XdsClientPool::new();
+        let _a = get(&pool, "xds:///a");
+        drop(get(&pool, "xds:///b"));
+        assert_eq!(
+            format!("{pool:?}"),
+            r#"XdsClientPool { targets: ["xds:///a"] }"#
+        );
+        // We don't want debug to make modifications; the dead "b" entry remains.
+        assert_eq!(pool.targets(), vec!["xds:///a", "xds:///b"]);
     }
 
     #[tokio::test]

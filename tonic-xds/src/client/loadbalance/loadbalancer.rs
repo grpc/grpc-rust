@@ -439,7 +439,7 @@ where
 mod tests {
     use super::*;
     use crate::client::circuit_breaking::LocalCircuitBreakerDrop;
-    use crate::client::endpoint::Connector;
+    use crate::client::endpoint::{Connector, XdsEndpoint};
     use crate::client::loadbalance::pickers::p2c::P2cPicker;
     use crate::common::async_util::BoxFuture;
     use futures_util::FutureExt;
@@ -585,9 +585,12 @@ mod tests {
     impl Connector for MockConnector {
         type Service = MockService;
 
-        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+        fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.senders.lock().unwrap().insert(addr.clone(), tx);
+            self.senders
+                .lock()
+                .unwrap()
+                .insert(endpoint.address().clone(), tx);
             Box::pin(async move { rx.await.unwrap() })
         }
     }

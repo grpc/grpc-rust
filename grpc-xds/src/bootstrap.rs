@@ -27,6 +27,7 @@
 // TODO: remove once the xDS resolver / channel integrates bootstrap.
 #![allow(dead_code, unused_imports)]
 
+mod credentials;
 mod json;
 
 use std::fmt;

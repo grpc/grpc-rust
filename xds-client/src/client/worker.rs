@@ -2117,6 +2117,10 @@ mod tests {
             let _ = self.sleeps.send(duration);
             TokioRuntime.sleep(duration).await;
         }
+
+        fn now(&self) -> std::time::Instant {
+            TokioRuntime.now()
+        }
     }
 
     #[cfg(feature = "codegen-prost")]

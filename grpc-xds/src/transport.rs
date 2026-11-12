@@ -223,8 +223,8 @@ mod tests {
     use xds_test_util::config::build_inline_listener;
 
     use super::*;
-    use crate::generated::envoy::service::discovery::v3::DiscoveryRequest;
-    use crate::generated::envoy::service::discovery::v3::DiscoveryResponse;
+    use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryRequest;
+    use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryResponse;
     use crate::resource::ListenerResource;
 
     /// The gRPC path for the ADS StreamAggregatedResources RPC.

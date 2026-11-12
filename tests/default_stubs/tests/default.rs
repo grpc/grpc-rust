@@ -118,6 +118,15 @@ async fn test_default_stubs_uds() {
     test_default_stubs(client, client_default_stubs).await;
 }
 
+#[tokio::test()]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn test_default_stubs_uds_abstract() {
+    let addrs = run_services_in_background_uds_abstract().await;
+    let client = test_client::TestClient::connect(addrs.0).await.unwrap();
+    let client_default_stubs = test_client::TestClient::connect(addrs.1).await.unwrap();
+    test_default_stubs(client, client_default_stubs).await;
+}
+
 async fn run_services_in_background() -> (SocketAddr, SocketAddr) {
     let svc = test_server::TestServer::new(Svc {});
     let svc_default_stubs = test_default_server::TestDefaultServer::new(Svc {});
@@ -169,6 +178,43 @@ async fn run_services_in_background_uds() -> (String, String) {
     let uds_default_stubs_filepath = tmpdir.join("stub.sock").to_str().unwrap().to_string();
     let listener_default_stubs = UnixListener::bind(uds_default_stubs_filepath.as_str()).unwrap();
     let uds_default_stubs_addr = format!("unix://{uds_default_stubs_filepath}");
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc_default_stubs)
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                listener_default_stubs,
+            ))
+            .await
+            .unwrap();
+    });
+
+    (uds_addr, uds_default_stubs_addr)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn run_services_in_background_uds_abstract() -> (String, String) {
+    use tokio::net::UnixListener;
+
+    let svc = test_server::TestServer::new(Svc {});
+    let svc_default_stubs = test_default_server::TestDefaultServer::new(Svc {});
+
+    let pid = std::process::id();
+    let impl_name = format!("tonic-test-{pid}-impl.sock");
+    let listener = UnixListener::bind(format!("\0{impl_name}")).unwrap();
+    let uds_addr = format!("unix-abstract:{impl_name}");
+
+    let stub_name = format!("tonic-test-{pid}-stub.sock");
+    let listener_default_stubs = UnixListener::bind(format!("\0{stub_name}")).unwrap();
+    let uds_default_stubs_addr = format!("unix-abstract://{stub_name}");
 
     tokio::spawn(async move {
         Server::builder()

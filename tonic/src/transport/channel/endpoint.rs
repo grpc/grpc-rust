@@ -190,6 +190,12 @@ impl Endpoint {
                 .or_else(|| s.strip_prefix("unix:"))
                 .expect("Invalid unix domain socket URI");
             Self::new_uds(uds_filepath)
+        } else if s.starts_with("unix-abstract:") {
+            let uds_filepath = s
+                .strip_prefix("unix-abstract://")
+                .or_else(|| s.strip_prefix("unix-abstract:"))
+                .expect("Invalid unix abstract domain socket URI");
+            Self::new_uds(&format!("\0{uds_filepath}"))
         } else {
             let uri = Uri::from_static(s);
             Self::new_uri(uri)
@@ -212,6 +218,12 @@ impl Endpoint {
                 .or_else(|| s.strip_prefix("unix:"))
                 .ok_or(Error::new_invalid_uri())?;
             Ok(Self::new_uds(uds_filepath))
+        } else if s.starts_with("unix-abstract:") {
+            let uds_filepath = s
+                .strip_prefix("unix-abstract://")
+                .or_else(|| s.strip_prefix("unix-abstract:"))
+                .ok_or(Error::new_invalid_uri())?;
+            Ok(Self::new_uds(&format!("\0{uds_filepath}")))
         } else {
             let uri = Uri::from_maybe_shared(s).map_err(|e| Error::new_invalid_uri().with(e))?;
             Ok(Self::from(uri))

@@ -27,6 +27,7 @@
 use crate::runtime::Runtime;
 use std::future::Future;
 use std::time::Duration;
+use std::time::Instant;
 
 /// Tokio-based runtime implementation.
 #[derive(Clone, Debug, Default)]
@@ -42,5 +43,11 @@ impl Runtime for TokioRuntime {
 
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+
+    fn now(&self) -> Instant {
+        // Use tokio's clock, so that a paused or advanced test clock is
+        // respected, as by `sleep`.
+        tokio::time::Instant::now().into_std()
     }
 }

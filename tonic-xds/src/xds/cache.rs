@@ -217,11 +217,14 @@ mod tests {
     }
 
     fn make_cluster(name: &str, lb: LbPolicy) -> Arc<ClusterResource> {
+        use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
+
         Arc::new(ClusterResource {
             name: name.to_string(),
             eds_service_name: None,
             lb_policy: lb,
             security: None,
+            circuit_breaking: CircuitBreakingConfig::default(),
         })
     }
 
@@ -233,8 +236,7 @@ mod tests {
             localities: vec![LocalityEndpoints {
                 locality: None,
                 endpoints: vec![ResolvedEndpoint {
-                    address: EndpointAddress::new("10.0.0.1", 8080),
-                    additional_addresses: vec![],
+                    endpoint: Arc::new(EndpointAddress::new("10.0.0.1", 8080).into()),
                     health_status: HealthStatus::Healthy,
                     load_balancing_weight: 1,
                 }],

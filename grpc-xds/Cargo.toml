@@ -30,7 +30,7 @@ regex = "1"
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 
 [dev-dependencies]
-grpc = { version = "0.10.0", path = "../grpc" }
+grpc = { version = "0.10.0", path = "../grpc", features = ["__internal-test-utils"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 xds-test-util = { path = "../xds-test-util" }

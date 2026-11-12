@@ -35,8 +35,8 @@ use grpc::__unstable::client::channel_builder_with_runtime;
 use grpc::__unstable::rt::GrpcRuntime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
-use grpc::client::DynRecvStream;
-use grpc::client::DynSendStream;
+use grpc::client::ChannelRecvStream;
+use grpc::client::ChannelSendStream;
 use grpc::client::Invoke as _;
 use grpc::client::RecvStream as _;
 use grpc::client::RequestHeaders;
@@ -134,7 +134,7 @@ impl Transport for GrpcTransport {
 }
 
 /// Sending half of a `GrpcTransport` ADS stream.
-pub(crate) struct GrpcAdsSender(Box<dyn DynSendStream>);
+pub(crate) struct GrpcAdsSender(ChannelSendStream);
 
 impl std::fmt::Debug for GrpcAdsSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -154,7 +154,7 @@ impl TransportSender for GrpcAdsSender {
 }
 
 /// Receiving half of a `GrpcTransport` ADS stream.
-pub(crate) struct GrpcAdsReceiver(Box<dyn DynRecvStream>);
+pub(crate) struct GrpcAdsReceiver(ChannelRecvStream);
 
 impl std::fmt::Debug for GrpcAdsReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,8 +223,8 @@ mod tests {
     use xds_test_util::config::build_inline_listener;
 
     use super::*;
-    use crate::generated::envoy::service::discovery::v3::DiscoveryRequest;
-    use crate::generated::envoy::service::discovery::v3::DiscoveryResponse;
+    use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryRequest;
+    use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryResponse;
     use crate::resource::ListenerResource;
     use crate::xds_client_runtime::XdsRuntime;
 

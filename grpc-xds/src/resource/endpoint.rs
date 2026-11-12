@@ -26,15 +26,16 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt;
 
 use protobuf::Parse;
 use xds_client::Error;
 use xds_client::Resource;
 use xds_client::resource::TypeUrl;
 
-use crate::generated::envoy::config::core::v3::HealthStatus as EnvoyHealthStatus;
-use crate::generated::envoy::config::endpoint::v3::ClusterLoadAssignment;
-use crate::generated::envoy::config::endpoint::v3::lb_endpoint::HostIdentifierOneof;
+use crate::generated::envoy_config_core_v3_health_check_proto::HealthStatus as EnvoyHealthStatus;
+use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::lb_endpoint::HostIdentifierOneof;
+use crate::generated::envoy_config_endpoint_v3_endpoint_proto::ClusterLoadAssignment;
 
 /// Validated ClusterLoadAssignment (EDS resource).
 #[derive(Debug, Clone)]
@@ -62,6 +63,19 @@ pub(crate) struct Locality {
     pub(crate) region: String,
     pub(crate) zone: String,
     pub(crate) sub_zone: String,
+}
+
+/// Formats the locality as `{region="<region>", zone="<zone>",
+/// sub_zone="<sub_zone>"}`: the name of the locality's child policy under
+/// `xds_wrr_locality`, and its metric label value (gRFC A78).
+impl fmt::Display for Locality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{{region=\"{}\", zone=\"{}\", sub_zone=\"{}\"}}",
+            self.region, self.zone, self.sub_zone
+        )
+    }
 }
 
 /// A single validated endpoint.
@@ -234,7 +248,7 @@ impl Resource for EndpointsResource {
 }
 
 fn validate_lb_endpoint(
-    lb_ep: crate::generated::envoy::config::endpoint::v3::LbEndpointView<'_>,
+    lb_ep: crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::LbEndpointView<'_>,
 ) -> xds_client::Result<Option<LbEndpoint>> {
     let health_status = HealthStatus::from(lb_ep.health_status());
 
@@ -316,12 +330,12 @@ impl EndpointsResource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::envoy::config::core::v3::Address;
-    use crate::generated::envoy::config::core::v3::Locality as EnvoyLocality;
-    use crate::generated::envoy::config::core::v3::SocketAddress;
-    use crate::generated::envoy::config::endpoint::v3::Endpoint;
-    use crate::generated::envoy::config::endpoint::v3::LbEndpoint as EnvoyLbEndpoint;
-    use crate::generated::envoy::config::endpoint::v3::LocalityLbEndpoints as EnvoyLocalityLbEndpoints;
+    use crate::generated::envoy_config_core_v3_address_proto::Address;
+    use crate::generated::envoy_config_core_v3_address_proto::SocketAddress;
+    use crate::generated::envoy_config_core_v3_base_proto::Locality as EnvoyLocality;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::Endpoint;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::LbEndpoint as EnvoyLbEndpoint;
+    use crate::generated::envoy_config_endpoint_v3_endpoint_components_proto::LocalityLbEndpoints as EnvoyLocalityLbEndpoints;
     use protobuf::Serialize;
     use protobuf_well_known_types::UInt32Value;
 

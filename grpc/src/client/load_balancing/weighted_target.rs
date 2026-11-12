@@ -32,7 +32,8 @@
 //! The Weighted Target LB policy manages a collection of weighted child
 //! policies. Picks are distributed across the children in the aggregate state
 //! in proportion to their configured weights. Children that report IDLE are
-//! asked to exit idle immediately.
+//! asked to exit idle immediately. With no targets, the policy reports
+//! TRANSIENT_FAILURE and fails picks.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -43,7 +44,9 @@ use serde::Deserialize;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
+use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbConfigJson;
 use crate::client::load_balancing::LbPolicy;
@@ -106,12 +109,6 @@ impl LbPolicyBuilder for WeightedTargetBuilder {
         let parsed: WeightedTargetConfig = config
             .convert_to()
             .map_err(|e| format!("{POLICY_NAME}: invalid config: {e}"))?;
-
-        if parsed.targets.is_empty() {
-            return Err(format!(
-                "{POLICY_NAME}: invalid config: 'targets' must be non-empty"
-            ));
-        }
 
         for (target_name, target_cfg) in &parsed.targets {
             if target_cfg.weight == 0 {
@@ -191,7 +188,10 @@ impl LbPolicy for WeightedTargetPolicy {
             }
         });
 
-        let result = self.child_manager.update(child_updates, channel_controller);
+        let result = self
+            .child_manager
+            .update(child_updates, channel_controller)
+            .map_err(|e| format!("{POLICY_NAME}: failed to update children: {e}"));
 
         self.weights = config
             .targets
@@ -199,10 +199,27 @@ impl LbPolicy for WeightedTargetPolicy {
             .map(|(name, cfg)| (name.clone(), cfg.weight))
             .collect();
 
+        if self.weights.is_empty() {
+            // Reset the flag set by removing children: with none left, nothing
+            // should replace this picker until the next resolver update.
+            let _ = self.child_manager.child_updated();
+            // Include the resolver's note, which may explain why there are no
+            // targets.
+            let error = match update.resolution_note.as_deref() {
+                Some(note) if !note.is_empty() => format!("{POLICY_NAME}: no targets ({note})"),
+                _ => format!("{POLICY_NAME}: no targets"),
+            };
+            channel_controller.update_picker(LbState {
+                connectivity_state: ConnectivityState::TransientFailure,
+                picker: Arc::new(FailingPicker { error }),
+            });
+            return result;
+        }
+
         // Always publish: weight changes and removed targets alter the picker
         // even if no child reported a new state.
         self.update_picker(channel_controller);
-        result.map_err(|e| format!("{POLICY_NAME}: failed to update children: {e}"))
+        result
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
@@ -257,8 +274,6 @@ mod tests {
     use super::*;
     use crate::attributes::Attributes;
     use crate::client::CallOptions;
-    use crate::client::ConnectivityState;
-    use crate::client::load_balancing::FailingPicker;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::QueuingPicker;
     use crate::client::load_balancing::endpoint_filtering::set_path_in_endpoint;
@@ -516,16 +531,15 @@ mod tests {
             [("t1", 10, RR_POLICY_NAME), ("t2", 90, RR_POLICY_NAME)]
         );
 
+        let empty = parse(json!({ "targets": {} })).expect("empty targets should parse");
+        assert!(empty.targets.is_empty());
+
         let err = |json| parse(json).expect_err("invalid config should fail to parse");
         let missing = err(json!({}));
         assert!(
             missing.starts_with("weighted_target_experimental: invalid config: ")
                 && missing.contains("targets"),
             "unexpected error: {missing}"
-        );
-        assert_eq!(
-            err(json!({ "targets": {} })),
-            "weighted_target_experimental: invalid config: 'targets' must be non-empty"
         );
         assert_eq!(
             err(json!({ "targets": { "t1": { "weight": 0, "childPolicy": rr } } })),
@@ -659,6 +673,34 @@ mod tests {
     }
 
     #[test]
+    fn no_targets_fail_picks_with_resolution_note() {
+        reg_stub("stub_wt_no_targets");
+        let mut t = new_env();
+        t.apply("stub_wt_no_targets", [("a", 100)]);
+
+        // Removing the last target fails picks with the resolver's note.
+        let update = ResolverUpdate {
+            resolution_note: Some("note".to_string()),
+            ..Default::default()
+        };
+        t.policy
+            .resolver_update(update, &config("stub_wt_no_targets", &[]), &mut t.tcc)
+            .expect("update without targets should succeed");
+        t.expect_failing_picker("weighted_target_experimental: no targets (note)");
+        t.expect_no_events();
+
+        // With no children left, `exit_idle` doesn't replace the picker.
+        t.policy.exit_idle(&mut t.tcc);
+        t.expect_no_events();
+
+        // Without a note, the error has no suffix.
+        t.send_resolver_update_with_config(Vec::new(), &config("stub_wt_no_targets", &[]))
+            .expect("update without targets should succeed");
+        t.expect_failing_picker("weighted_target_experimental: no targets");
+        t.expect_no_events();
+    }
+
+    #[test]
     fn ready_picker_excludes_non_ready_children() {
         reg_stub("stub_wt_ready_excludes");
         // With "a" (10) and "b" (20) excluded, "c" (30) and "d" (70) map keys
@@ -723,7 +765,7 @@ mod tests {
         // The READY picker excludes "b" once it is IDLE, so no pick would wake
         // it; the parent has to ask it to exit idle.
         t.send_subchannel_update(&b, &SubchannelState::idle());
-        assert_eq!(&*t.expect_connect().address, "b");
+        t.expect_connect_to("b");
         t.expect_ready_picker(&a);
         t.expect_no_events();
     }
@@ -740,7 +782,7 @@ mod tests {
         // aggregating, so "a" connects and reports CONNECTING, and the parent
         // never publishes IDLE.
         t.send_subchannel_update(&a, &SubchannelState::idle());
-        assert_eq!(&*t.expect_connect().address, "a");
+        t.expect_connect_to("a");
         t.expect_queuing_picker();
         t.expect_no_events();
     }

@@ -91,6 +91,7 @@ fn security_level_for_endpoint(
         && SocketAddr::from_str(peer_addr)
             .map_err(|e| e.to_string())?
             .ip()
+            .to_canonical()
             .is_loopback()
     {
         return Ok(SecurityLevel::NoSecurity);
@@ -206,6 +207,13 @@ mod test {
             security_level_for_endpoint("[::1]:8080", TCP_IP_NETWORK_TYPE),
             Ok(SecurityLevel::NoSecurity)
         );
+        // Local TCP credentials assign NoSecurity to loopback connections,
+        // including IPv4-mapped IPv6 loopback addresses observed on dual-stack
+        // (`[::]`) listeners.
+        assert_eq!(
+            security_level_for_endpoint("[::ffff:127.0.0.1]:8080", TCP_IP_NETWORK_TYPE),
+            Ok(SecurityLevel::NoSecurity)
+        );
         assert_eq!(
             security_level_for_endpoint("/file/path/name.sock", UNIX_NETWORK_TYPE),
             Ok(SecurityLevel::PrivacyAndIntegrity)
@@ -219,6 +227,9 @@ mod test {
     #[test]
     fn test_security_level_for_endpoint_failure() {
         assert!(security_level_for_endpoint("192.168.1.1:8080", TCP_IP_NETWORK_TYPE).is_err());
+        assert!(
+            security_level_for_endpoint("[::ffff:192.168.1.1]:8080", TCP_IP_NETWORK_TYPE).is_err()
+        );
         assert!(security_level_for_endpoint("invalid", TCP_IP_NETWORK_TYPE).is_err());
     }
 

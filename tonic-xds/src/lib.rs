@@ -221,6 +221,7 @@
 //! | Client-side P2C load balancing | | Supported |
 //! | ADS TLS and mTLS credentials | [A65] | Supported |
 //! | TLS endpoint connections | [A29] | Supported |
+//! | xDS config dump via CSDS ([`CsdsService`]) | [A40] | Supported |
 //! | Least-request load balancing | [A48] | Planned |
 //! | Dual-stack endpoints (multiple addresses per endpoint) | [A61] | Planned |
 //!
@@ -230,7 +231,7 @@
 //! `Balance`, fed endpoints that discovery has already connected.
 //!
 //! [`LbBackend::XdsLb`] selects this crate's own balancer instead, which
-//! receives bare addresses plus a connector and so owns the connection
+//! receives unconnected endpoints plus a connector and so owns the connection
 //! lifecycle — the prerequisite for ejecting outliers and for pluggable
 //! pickers such as ring-hash. It is still maturing: outlier detection is
 //! compiled in but left disabled, and only the P2C picker is selected, so the
@@ -246,9 +247,10 @@
 //!     .unwrap();
 //! ```
 //!
-//! Both [`XdsChannelBuilder::build_grpc_channel`] and
-//! [`XdsChannelBuilder::build_transport_channel`] honour it, and the channel
-//! types are unchanged, so switching needs no other code change.
+//! [`XdsChannelBuilder::build_grpc_channel`],
+//! [`XdsChannelBuilder::build_grpc_channel_with_connector`] and
+//! [`XdsChannelBuilder::build_transport_channel`] all honour it, and the
+//! channel types are unchanged, so switching needs no other code change.
 //!
 //! ## Sharing an xDS client
 //!
@@ -280,6 +282,7 @@
 //! [A28]: https://github.com/grpc/proposal/blob/master/A28-xds-traffic-splitting-and-routing.md
 //! [A29]: https://github.com/grpc/proposal/blob/master/A29-xds-tls-security.md
 //! [A31]: https://github.com/grpc/proposal/blob/master/A31-xds-timeout-support-and-config-selector.md
+//! [A40]: https://github.com/grpc/proposal/blob/master/A40-csds-support.md
 //! [A48]: https://github.com/grpc/proposal/blob/master/A48-xds-least-request-lb-policy.md
 //! [A61]: https://github.com/grpc/proposal/blob/master/A61-IPv4-IPv6-dualstack-backends.md
 //! [A63]: https://github.com/grpc/proposal/blob/master/A63-xds-string-matcher-ignore-case.md
@@ -288,6 +291,7 @@
 
 pub(crate) mod client;
 pub(crate) mod common;
+pub(crate) mod csds;
 pub(crate) mod xds;
 
 pub use client::channel::{
@@ -295,7 +299,8 @@ pub use client::channel::{
     XdsTransportChannel,
 };
 pub use client::endpoint::{
-    ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+    ClusterConfig, Connector, ControlPlaneConfig, ControlPlaneConnector, EndpointAddress,
+    EndpointChannel, MakeConnector, XdsEndpoint,
 };
 pub use client::pool::{XdsClientPool, XdsClientPoolBuilder};
 pub use client::retry::{
@@ -304,18 +309,20 @@ pub use client::retry::{
 };
 pub use client::route::PreRouteInterceptor;
 pub use common::async_util::BoxFuture;
+pub use csds::CsdsService;
 pub use shared_http_body::SharedBody;
 pub use xds::bootstrap::{
     BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,
 };
 pub use xds::cert_provider_config::TlsChannelCredentials;
+pub use xds::cluster_discovery::GrpcMakeConnector;
 pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};
 /// Re-export of the error type returned by
 /// [`ClusterSecurityConfig::from_cluster_bytes`], so callers can name it
 /// without a direct `xds-client` dependency.
 pub use xds_client::Error as XdsError;
-pub use xds_client::TonicCallCredentials;
+pub use xds_client::{ServerConfig, TonicCallCredentials};
 
 #[cfg(feature = "_tls-any")]
 pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};

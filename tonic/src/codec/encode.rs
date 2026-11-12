@@ -56,6 +56,7 @@ struct EncodedBytes<T, U> {
     buf: BytesMut,
     uncompression_buf: BytesMut,
     error: Option<Status>,
+    is_end_stream: bool,
 }
 
 impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
@@ -90,6 +91,7 @@ impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
             buf,
             uncompression_buf,
             error: None,
+            is_end_stream: false,
         }
     }
 }
@@ -110,6 +112,7 @@ where
             buf,
             uncompression_buf,
             error,
+            is_end_stream,
         } = self.project();
         let buffer_settings = encoder.buffer_settings();
 
@@ -123,9 +126,14 @@ where
                     return Poll::Pending;
                 }
                 Poll::Ready(None) if buf.is_empty() => {
+                    *is_end_stream = true;
                     return Poll::Ready(None);
                 }
-                Poll::Pending | Poll::Ready(None) => {
+                Poll::Ready(None) => {
+                    *is_end_stream = true;
+                    return Poll::Ready(Some(Ok(buf.split_to(buf.len()).freeze())));
+                }
+                Poll::Pending => {
                     return Poll::Ready(Some(Ok(buf.split_to(buf.len()).freeze())));
                 }
                 Poll::Ready(Some(Ok(item))) => {
@@ -361,7 +369,7 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let self_proj = self.project();
+        let mut self_proj = self.project();
 
         if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
             && let Poll::Ready(()) = cancellation_fut.poll(cx)
@@ -380,8 +388,13 @@ where
             return Poll::Ready(Some(Err(status)));
         }
 
-        match ready!(self_proj.inner.poll_next(cx)) {
-            Some(Ok(d)) => Some(Ok(Frame::data(d))).into(),
+        match ready!(self_proj.inner.as_mut().poll_next(cx)) {
+            Some(Ok(d)) => {
+                if matches!(self_proj.state.role, Role::Client) && self_proj.inner.is_end_stream {
+                    self_proj.state.is_end_stream = true;
+                }
+                Some(Ok(Frame::data(d))).into()
+            }
             Some(Err(status)) => match self_proj.state.role {
                 Role::Client => Some(Err(status)).into(),
                 Role::Server => {
@@ -401,7 +414,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::catch_unwind;
+    use std::{panic::catch_unwind, pin::pin};
 
     struct PanickingEncoder;
 
@@ -448,5 +461,71 @@ mod tests {
             &[0u8; HEADER_SIZE],
             "Buffer must contain only initialized zero bytes."
         );
+    }
+    struct IdentityEncoder;
+
+    impl Encoder for IdentityEncoder {
+        type Item = Bytes;
+        type Error = Status;
+
+        fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+
+    fn client_body<U>(source: U) -> EncodeBody<IdentityEncoder, U>
+    where
+        U: Stream<Item = Result<Bytes, Status>>,
+    {
+        EncodeBody::new_client(IdentityEncoder, source, None, None)
+    }
+
+    async fn next_frame<T, U>(
+        body: &mut Pin<&mut EncodeBody<T, U>>,
+    ) -> Option<Result<Frame<Bytes>, Status>>
+    where
+        T: Encoder<Error = Status>,
+        U: Stream<Item = Result<T::Item, Status>>,
+    {
+        std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await
+    }
+
+    // A unary request must put END_STREAM on the message frame rather than on a
+    // separate empty one: h2 exempts final DATA frames from its small-frame
+    // budget, so the extra frame costs a GOAWAY under concurrency.
+    #[tokio::test]
+    async fn one_message_source_ends_on_the_message_frame() {
+        let mut body = pin!(client_body(tokio_stream::once(Ok(Bytes::from_static(
+            b"hi"
+        )))));
+
+        assert!(!body.is_end_stream(), "headers must not carry END_STREAM");
+
+        let frame = next_frame(&mut body).await.unwrap().unwrap();
+        assert!(frame.is_data());
+        assert!(body.is_end_stream());
+
+        assert!(next_frame(&mut body).await.is_none());
+    }
+
+    // A source that is still open after a frame must not end the stream.
+    #[tokio::test]
+    async fn pending_source_does_not_end_the_stream() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut body = pin!(client_body(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+        ));
+
+        tx.send(Ok(Bytes::from_static(b"one"))).unwrap();
+        let frame = next_frame(&mut body).await.unwrap().unwrap();
+        assert!(frame.is_data());
+        assert!(!body.is_end_stream(), "more messages may still arrive");
+
+        tx.send(Ok(Bytes::from_static(b"two"))).unwrap();
+        drop(tx);
+        let frame = next_frame(&mut body).await.unwrap().unwrap();
+        assert!(frame.is_data());
+        assert!(body.is_end_stream());
     }
 }

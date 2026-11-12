@@ -26,6 +26,7 @@
 
 use std::future::Future;
 use std::time::Duration;
+use std::time::Instant;
 
 use grpc::__unstable::rt::GrpcRuntime;
 
@@ -51,6 +52,10 @@ impl xds_client::Runtime for XdsRuntime {
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
         self.0.sleep(duration)
+    }
+
+    fn now(&self) -> Instant {
+        self.0.now()
     }
 }
 

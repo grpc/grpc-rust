@@ -132,13 +132,6 @@ impl SharedXdsClient {
     pub fn watch<T: Resource>(&self, name: impl Into<String>) -> ResourceWatcher<T> {
         self.0.watch(name)
     }
-
-    /// Returns the status of every resource the client is subscribed to. See
-    /// [`XdsClient::resource_snapshot`].
-    #[cfg(test)]
-    pub async fn resource_snapshot(&self) -> Vec<xds_client::ResourceSnapshot> {
-        self.0.resource_snapshot().await
-    }
 }
 
 impl fmt::Debug for SharedXdsClient {

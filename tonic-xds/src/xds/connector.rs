@@ -33,6 +33,10 @@
 //! An update whose config fails validation is rejected: the previous connector
 //! is kept and a warning is logged.
 //!
+//! The same watch is where cluster-level load-balancing config is applied: the
+//! outlier-detection config is published into the shared [`ArcSwap`] the load
+//! balancer's sweep reads.
+//!
 //! Construction is synchronous even though the first connector only exists
 //! once CDS arrives — `connect` awaits publication instead. That lets a load
 //! balancer take the connector up front and start discovery before CDS
@@ -40,6 +44,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use tokio::sync::watch;
 
 use crate::client::endpoint::{ClusterConfig, Connector, MakeConnector, XdsEndpoint};
@@ -48,6 +53,7 @@ use crate::xds::cache::{CacheWatch, XdsCache};
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::CertProviderRegistry;
 use crate::xds::resource::ClusterResource;
+use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 
 /// A type-erased per-cluster connector, as published by CDS.
 type SharedConnector<S> = Arc<dyn Connector<Service = S> + Send + Sync>;
@@ -60,6 +66,7 @@ type SharedConnector<S> = Arc<dyn Connector<Service = S> + Send + Sync>;
 pub(crate) struct ClusterConnector<S> {
     cluster_name: Arc<str>,
     rx: watch::Receiver<Option<SharedConnector<S>>>,
+    outlier_detection: Arc<ArcSwap<OutlierDetectionConfig>>,
     _task: AbortOnDrop,
 }
 
@@ -76,6 +83,7 @@ impl<S: Send + 'static> ClusterConnector<S> {
         MC: MakeConnector<Service = S>,
     {
         let (tx, rx) = watch::channel(None);
+        let outlier_detection = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
         // Subscribe here, not in the task: a subscription made after the
         // resource manager removed the cluster would recreate its entry. The
         // task also must not hold the cache, which would keep every entry,
@@ -85,6 +93,7 @@ impl<S: Send + 'static> ClusterConnector<S> {
             cluster_watch,
             cluster_name.clone(),
             make_connector,
+            outlier_detection.clone(),
             #[cfg(feature = "_tls-any")]
             registry,
             tx,
@@ -92,8 +101,17 @@ impl<S: Send + 'static> ClusterConnector<S> {
         Self {
             cluster_name: Arc::from(cluster_name),
             rx,
+            outlier_detection,
             _task: AbortOnDrop(task),
         }
+    }
+
+    /// Handle to the cluster's live outlier-detection config, seeded disabled
+    /// until the first CDS update lands. Callers that run a load balancer hand
+    /// this to it; the balancer-less
+    /// [`discover_cluster`](crate::xds::cluster_discovery) path ignores it.
+    pub(crate) fn outlier_detection(&self) -> Arc<ArcSwap<OutlierDetectionConfig>> {
+        self.outlier_detection.clone()
     }
 }
 
@@ -139,17 +157,24 @@ impl<S: Send + 'static> Connector for ClusterConnector<S> {
     }
 }
 
-/// Background task: republishes a connector on every accepted CDS update.
+/// Background task: applies every accepted CDS update by republishing the
+/// connector and storing the cluster's outlier-detection config.
 async fn publish_connectors<MC, S>(
     mut cluster_watch: CacheWatch<ClusterResource>,
     cluster_name: String,
     make_connector: Arc<MC>,
+    outlier_detection: Arc<ArcSwap<OutlierDetectionConfig>>,
     #[cfg(feature = "_tls-any")] registry: Arc<CertProviderRegistry>,
     tx: watch::Sender<Option<SharedConnector<S>>>,
 ) where
     MC: MakeConnector<Service = S>,
 {
     while let Some(cluster) = cluster_watch.next().await {
+        // Independent of connector construction: the resource is already
+        // validated, and a connector that fails to build is a transport-
+        // security problem, not a reason to run with stale ejection config.
+        outlier_detection.store(Arc::new(cluster.outlier_detection.clone()));
+
         let cluster_config = ClusterConfig::from_resource(
             &cluster,
             #[cfg(feature = "_tls-any")]
@@ -181,6 +206,7 @@ mod tests {
     use crate::client::endpoint::EndpointAddress;
     use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::cluster::LbPolicy;
+    use crate::xds::resource::outlier_detection::{FailurePercentageConfig, Percentage};
 
     const CLUSTER: &str = "c1";
 
@@ -214,13 +240,32 @@ mod tests {
     }
 
     fn cluster() -> Arc<ClusterResource> {
+        cluster_with_outlier_detection(OutlierDetectionConfig::default())
+    }
+
+    fn cluster_with_outlier_detection(
+        outlier_detection: OutlierDetectionConfig,
+    ) -> Arc<ClusterResource> {
         Arc::new(ClusterResource {
             name: CLUSTER.to_string(),
             eds_service_name: None,
             lb_policy: LbPolicy::RoundRobin,
             security: None,
             circuit_breaking: CircuitBreakingConfig::default(),
+            outlier_detection,
         })
+    }
+
+    /// Polls `cond` across task yields so the spawned CDS watch gets a
+    /// chance to apply the update it was woken for.
+    async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
     }
 
     /// Spawns a connector for [`CLUSTER`], along with a receiver that
@@ -244,6 +289,42 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), task_stopped)
             .await
             .is_ok()
+    }
+
+    #[tokio::test]
+    async fn cds_updates_republish_the_outlier_detection_config() {
+        let cache = XdsCache::new();
+        cache.update_cluster(CLUSTER, cluster());
+        let (connector, _stopped) = spawn_connector(&cache);
+        let live = connector.outlier_detection();
+
+        // Connecting waits for the first publish, which the config store
+        // precedes.
+        let endpoint = XdsEndpoint::new(EndpointAddress::new("10.0.0.1", 8080));
+        connector.connect(&endpoint).await;
+        let disabled = OutlierDetectionConfig::default();
+        assert!(!live.load().is_enabled());
+        assert_eq!(live.load().interval, disabled.interval);
+
+        cache.update_cluster(
+            CLUSTER,
+            cluster_with_outlier_detection(OutlierDetectionConfig {
+                interval: Duration::from_secs(7),
+                failure_percentage: Some(FailurePercentageConfig {
+                    threshold: Percentage::new(85).unwrap(),
+                    enforcing_failure_percentage: Percentage::new(100).unwrap(),
+                    minimum_hosts: 5,
+                    request_volume: 50,
+                }),
+                ..OutlierDetectionConfig::default()
+            }),
+        );
+        assert!(eventually(|| live.load().is_enabled()).await);
+        assert_eq!(live.load().interval, Duration::from_secs(7));
+
+        cache.update_cluster(CLUSTER, cluster());
+        assert!(eventually(|| !live.load().is_enabled()).await);
+        assert_eq!(live.load().interval, disabled.interval);
     }
 
     #[tokio::test]

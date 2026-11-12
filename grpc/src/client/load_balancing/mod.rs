@@ -51,6 +51,7 @@ pub mod child_manager;
 pub mod endpoint_filtering;
 pub mod graceful_switch;
 pub mod lazy;
+pub mod least_request;
 pub mod pick_first;
 pub mod priority;
 pub mod registry;
@@ -68,6 +69,7 @@ static START: Once = Once::new();
 /// Only the first call has an effect; any additional ones are ignored.
 pub(crate) fn register() {
     START.call_once(|| {
+        least_request::reg();
         pick_first::reg();
         priority::reg();
         round_robin::reg();

@@ -369,9 +369,8 @@ impl Debug for LeastRequestPicker {
 }
 
 impl LeastRequestPicker {
-
     fn random_child(&self) -> &PickerChild {
-        return &self.children[(self.random_index)(self.children.len())]
+        &self.children[(self.random_index)(self.children.len())]
     }
 
     /// Samples `choice_count` children (with replacement) and returns the one

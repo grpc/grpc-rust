@@ -492,6 +492,11 @@ impl Transport for TonicTransport {
     type Receiver = TonicAdsReceiver;
 
     async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
+        // Validate the method path up front rather than panicking in
+        // `PathAndQuery::from_static`.
+        let path =
+            PathAndQuery::try_from(method).map_err(|error| Error::Transport(Box::new(error)))?;
+
         let mut grpc = Grpc::new(self.channel.clone());
 
         if let Some(limit) = self.max_decoding_message_size {
@@ -511,7 +516,6 @@ impl Transport for TonicTransport {
 
         let (tx, rx) = mpsc::channel::<Bytes>(ADS_CHANNEL_BUFFER_SIZE);
         let channel_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let path = PathAndQuery::from_static(method);
         let mut request = tonic::Request::new(channel_stream);
 
         // Inject the configured call credentials.
@@ -789,6 +793,18 @@ mod tests {
         let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
         assert_eq!(response.version_info, "1");
+    }
+
+    #[tokio::test]
+    async fn invalid_method_returns_error() {
+        // No server needed: the path is validated before the channel is used.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let transport = TonicTransport::from_channel(channel);
+        let result = transport.new_stream("not a valid path").await;
+        assert!(
+            matches!(result, Err(Error::Transport(_))),
+            "expected Error::Transport, got {result:?}"
+        );
     }
 
     /// Larger than tonic's 4 MiB default decoding limit.

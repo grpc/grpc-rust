@@ -126,6 +126,14 @@ pub mod __unstable {
 pub mod __internal {
     pub use crate::private::InternalToken;
     pub use crate::private::InternalTrait;
+
+    pub mod client {
+        pub mod name_resolution {
+            pub mod config_selector {
+                pub use crate::client::name_resolution::config_selector::*;
+            }
+        }
+    }
 }
 
 /// These private types are only intended to be used in exported traits, where

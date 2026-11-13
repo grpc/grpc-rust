@@ -45,7 +45,7 @@ impl Rng for DefaultRng {
 
 /// Constructs [`WeightedSampler`] instances from `(item, weight)` pairs.
 #[derive(Clone, Debug)]
-pub struct WeightedSamplerBuilder {
+pub(super) struct WeightedSamplerBuilder {
     rng: Arc<dyn Rng>,
 }
 
@@ -58,9 +58,7 @@ impl Default for WeightedSamplerBuilder {
 }
 
 impl WeightedSamplerBuilder {
-    /// Returns a sampler for `items`, which are `(item, weight)` pairs.
-    /// Items with a weight of zero are never selected.
-    pub fn build<T>(&self, items: impl IntoIterator<Item = (T, u32)>) -> WeightedSampler<T> {
+    pub(super) fn build<T>(&self, items: impl IntoIterator<Item = (T, u32)>) -> WeightedSampler<T> {
         let mut cumulative_weight = 0u64;
         let mut first_weight = None;
         let mut equal_weights = true;
@@ -88,7 +86,7 @@ impl WeightedSamplerBuilder {
 /// Construct an instance with [`WeightedSamplerBuilder::build`] (which filters
 /// out zero-weight items) and call [`WeightedSampler::next`] to draw items.
 #[derive(Debug)]
-pub struct WeightedSampler<T> {
+pub(super) struct WeightedSampler<T> {
     // `(cumulative_weight, item)` pairs in ascending order of cumulative weight.
     items: Vec<(u64, T)>,
     equal_weights: bool,
@@ -98,7 +96,7 @@ pub struct WeightedSampler<T> {
 impl<T> WeightedSampler<T> {
     /// Selects an item from the set, or returns `None` if no items have a
     /// positive weight.
-    pub fn next(&self) -> Option<&T> {
+    pub(super) fn next(&self) -> Option<&T> {
         // Single item — return directly without invoking the RNG.
         if let [(_, item)] = self.items.as_slice() {
             return Some(item);

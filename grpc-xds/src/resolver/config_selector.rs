@@ -27,14 +27,13 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use grpc::__internal::client::name_resolution::config_selector::ConfigSelector;
+use grpc::__internal::client::name_resolution::config_selector::RpcConfig;
+use grpc::__internal::client::name_resolution::config_selector::SelectConfigOptions;
 use grpc::__unstable::client::boxed::ArcInterceptor;
 use grpc::__unstable::client::boxed::ArcInvoker;
 use grpc::__unstable::client::boxed::BoxRecvStream;
 use grpc::__unstable::client::boxed::BoxSendStream;
-use grpc::__unstable::client::load_balancing::sampling::WeightedSampler;
-use grpc::__unstable::client::name_resolution::config_selector::ConfigSelector;
-use grpc::__unstable::client::name_resolution::config_selector::RpcConfig;
-use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
 use grpc::StatusCodeError;
 use grpc::StatusError;
 use grpc::client::CallOptions;
@@ -44,6 +43,7 @@ use grpc::client::interceptor::Intercept;
 
 use crate::resolver::PickedCluster;
 use crate::resource::RouteMatch;
+use crate::sampling::WeightedSampler;
 
 /// The interceptor for the RPCs routed to a cluster. Stores the cluster's
 /// [`PickedCluster`] in each RPC's `CallOptions`, which tells the cluster
@@ -140,7 +140,6 @@ impl ConfigSelector for XdsConfigSelector {
 mod tests {
     use std::sync::Mutex;
 
-    use grpc::__unstable::client::load_balancing::sampling::WeightedSamplerBuilder;
     use grpc::client::Invoke;
     use grpc::client::RecvStream;
     use grpc::client::ResponseStreamItem;
@@ -157,6 +156,7 @@ mod tests {
     use crate::resource::HeaderMatcher;
     use crate::resource::PathSpecifier;
     use crate::resource::StringMatcher;
+    use crate::sampling::WeightedSamplerBuilder;
 
     const METHOD: &str = "/pkg.Service/Method";
 

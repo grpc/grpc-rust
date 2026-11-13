@@ -73,6 +73,12 @@ mod xds_config;
 #[cfg_attr(not(test), expect(dead_code))]
 mod resolver;
 
+/// Weighted random sampling, shared by the resolver's config selector and LB
+/// pickers.
+// TODO: remove once the resolver is no longer dead code.
+#[cfg_attr(not(test), expect(dead_code))]
+mod sampling;
+
 /// `grpc` crate based [`xds_client::Transport`] implementation.
 mod transport;
 

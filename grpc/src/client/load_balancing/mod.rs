@@ -45,6 +45,8 @@ use crate::rt::GrpcRuntime;
 pub(crate) mod subchannel_sharing;
 pub(crate) mod weighted_target;
 
+mod sampling;
+
 pub mod child_manager;
 pub mod endpoint_filtering;
 pub mod graceful_switch;
@@ -53,9 +55,6 @@ pub mod pick_first;
 pub mod priority;
 pub mod registry;
 pub mod round_robin;
-// TODO: Export this module from __internal instead of __unstable once
-// https://github.com/grpc/grpc-rust/pull/2968 is merged.
-pub mod sampling;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
 

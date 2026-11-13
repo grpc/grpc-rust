@@ -268,12 +268,15 @@ impl PickFirstPolicy {
         if let Some(sc) = self.advance_frontier(true) {
             self.trigger_subchannel_connection(sc, channel_controller);
 
-            // TODO: avoid this update if we are in TF (i.e. sticky TF)?
-            self.update_picker(
-                ConnectivityState::Connecting,
-                Arc::new(QueuingPicker {}),
-                channel_controller,
-            );
+            // Keep reporting TRANSIENT_FAILURE until a subchannel is READY
+            // (sticky TRANSIENT_FAILURE, gRFC A62).
+            if self.connectivity_state != ConnectivityState::TransientFailure {
+                self.update_picker(
+                    ConnectivityState::Connecting,
+                    Arc::new(QueuingPicker {}),
+                    channel_controller,
+                );
+            }
         } else {
             // Otherwise all addresses are in transient failure: update picker.
             // TODO: set the last connection error?  Is it correct to do so,
@@ -1150,6 +1153,35 @@ mod test {
         env.expect_no_events();
 
         // The in-progress connection attempt is still honored.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+        env.expect_no_events();
+    }
+
+    // Tests that when in Transient Failure, receiving a valid resolver update
+    // immediately starts connecting without waiting for exit_idle, while
+    // continuing to report TRANSIENT_FAILURE until a subchannel is READY
+    // (sticky-TF, gRFC A62).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_in_transient_failure_starts_connecting_immediately() {
+        let mut env = new_env();
+
+        // Initial resolution failure sets Transient Failure.
+        let res = env.send_resolver_error("resolver unavailable".to_string());
+        assert_eq!(res.unwrap_err(), "resolver unavailable");
+        env.expect_failing_picker("resolver unavailable");
+        env.expect_request_resolution();
+
+        // A valid resolver update arrives [addr1, addr2]. Subchannels are
+        // created and connection initiates immediately without exit_idle. No
+        // CONNECTING picker is reported.
+        let endpoints = create_endpoints(&["addr1", "addr2"]);
+        env.send_resolver_update(endpoints).unwrap();
+        let scs = env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_connect_to("addr1");
+        env.expect_no_events();
+
+        // The policy leaves TRANSIENT_FAILURE once a subchannel is READY.
         env.send_subchannel_update(&scs[0], &SubchannelState::ready());
         env.expect_ready_picker(&scs[0]);
         env.expect_no_events();

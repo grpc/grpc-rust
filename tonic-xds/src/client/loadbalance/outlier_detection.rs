@@ -42,7 +42,9 @@
 //!   over that snapshot, ejects qualifying channels, and decrements
 //!   multipliers for non-ejected channels. When the ejected-set membership changes,
 //!   broadcasts a fresh snapshot on the `watch` channel; quiet ticks
-//!   skip the broadcast via an O(1) version compare.
+//!   skip the broadcast via an O(1) version compare. The whole config,
+//!   `interval` included, is re-read each tick, so CDS retunes the
+//!   sweep in place.
 //!
 //! [gRFC A50]: https://github.com/grpc/proposal/blob/master/A50-xds-outlier-detection.md
 //! [`ReadyChannel`]: crate::client::loadbalance::channel_state::ReadyChannel
@@ -206,6 +208,19 @@ impl OutlierStatsRegistry {
     /// owns its own `Sleep` timer.
     pub(crate) fn run_housekeeping(&self) {
         let config = self.config.load();
+        if !config.is_enabled() {
+            // `record_outcome` counts unconditionally, so the buckets still
+            // have to be drained, and multipliers still have to decay so a
+            // cluster that re-enables doesn't inherit stale ejection backoff.
+            for entry in self.channels.iter() {
+                let state = entry.value();
+                state.snapshot_and_reset();
+                if !state.is_ejected() {
+                    state.decrement_multiplier();
+                }
+            }
+            return;
+        }
         tracing::debug!(
             channels = self.channels.len(),
             ejected = self.ejected_count.load(Ordering::Relaxed),
@@ -391,21 +406,17 @@ impl OutlierStatsRegistry {
     }
 }
 
-/// Spawn the housekeeping actor. Ticks every `config.interval` and
-/// calls [`OutlierStatsRegistry::run_housekeeping`]. Dropping the
+/// Spawn the housekeeping actor: sleep for `config.interval`, call
+/// [`OutlierStatsRegistry::run_housekeeping`], repeat. Dropping the
 /// returned [`AbortOnDrop`] stops the task.
 ///
-/// The `interval` is captured at spawn time; live updates require an
-/// actor restart, which the xDS-integration layer will own. Other
-/// config fields are re-read from the ArcSwap on each tick.
+/// The interval is re-read before each sleep, so a CDS update that
+/// changes it applies on the next tick without a respawn.
 pub(crate) fn spawn_actor(registry: Arc<OutlierStatsRegistry>) -> AbortOnDrop {
-    let interval = registry.config.load().interval;
     let task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await;
         loop {
-            ticker.tick().await;
+            let interval = registry.config.load().interval;
+            tokio::time::sleep(interval).await;
             registry.run_housekeeping();
         }
     });
@@ -413,9 +424,7 @@ pub(crate) fn spawn_actor(registry: Arc<OutlierStatsRegistry>) -> AbortOnDrop {
 }
 
 /// Per-LB outlier-detection plumbing: shared registry, snapshot
-/// receiver, and (when enabled) the housekeeping actor handle
-/// (aborted on drop). The LB always owns one of these; the actor is
-/// conditional on the config being enabled at construction.
+/// receiver, and the housekeeping actor handle (aborted on drop).
 pub(crate) struct OutlierDetector {
     registry: Arc<OutlierStatsRegistry>,
     /// Stream of ejected-address snapshots, broadcast by the sweep
@@ -423,29 +432,23 @@ pub(crate) struct OutlierDetector {
     /// current value on first poll, then yields the new value on each
     /// subsequent change.
     ejected_snapshot_stream: tokio_stream::wrappers::WatchStream<Arc<HashSet<EndpointAddress>>>,
-    /// `None` while config is disabled — `record_outcome` short-
-    /// circuits and the sweep doesn't run, so nothing ever writes
-    /// to the snapshot channel.
-    _actor: Option<AbortOnDrop>,
+    /// Always running: the config starts disabled and the CDS update
+    /// that enables outlier detection arrives later, so a conditional
+    /// spawn would leave that cluster with no sweep to enable.
+    _actor: AbortOnDrop,
 }
 
 impl OutlierDetector {
-    /// Pair the registry with the snapshot receiver and (if the
-    /// config currently has an algorithm enabled) spawn the
+    /// Pair the registry with the snapshot receiver and spawn the
     /// housekeeping actor.
     pub(crate) fn new(
         registry: Arc<OutlierStatsRegistry>,
         ejected_snapshot_rx: watch::Receiver<Arc<HashSet<EndpointAddress>>>,
     ) -> Self {
-        let _actor = registry
-            .config
-            .load()
-            .is_enabled()
-            .then(|| spawn_actor(registry.clone()));
         Self {
-            registry,
             ejected_snapshot_stream: tokio_stream::wrappers::WatchStream::new(ejected_snapshot_rx),
-            _actor,
+            _actor: spawn_actor(registry.clone()),
+            registry,
         }
     }
 
@@ -1131,7 +1134,7 @@ mod tests {
     //
     // The actor's algorithmic behavior is fully exercised by the
     // synchronous `housekeeping_*` tests above; here we only verify
-    // that dropping the `AbortOnDrop` handle reliably stops the task.
+    // task lifecycle and how it tracks config changes.
 
     #[tokio::test(start_paused = true)]
     async fn dropping_abort_stops_actor() {
@@ -1150,6 +1153,75 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(s.ejection_multiplier(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actor_spawned_while_disabled_ejects_once_a_config_update_enables_it() {
+        // The balancer builds its detector before CDS arrives, so the
+        // config is the disabled default at that point.
+        let config = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
+        let (registry, _rx) = OutlierStatsRegistry::new(config.clone());
+        let s = registry.add_channel(addr(8080));
+        let _actor = spawn_actor(registry.clone());
+        // Let the actor commit to the disabled config's interval first.
+        tokio::task::yield_now().await;
+
+        let mut enabled = fp_config(50, 2, 1);
+        enabled.interval = Duration::from_millis(50);
+        config.store(Arc::new(enabled));
+        s.record_failure();
+        s.record_failure();
+
+        // Past the default 10s interval the disabled config was sleeping on.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+
+        assert!(s.is_ejected(), "a config update alone must start ejection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actor_picks_up_an_interval_change_without_a_respawn() {
+        let mut slow = base_config();
+        slow.interval = Duration::from_secs(10);
+        let config = Arc::new(ArcSwap::from_pointee(slow));
+        let (registry, _rx) = OutlierStatsRegistry::new(config.clone());
+        let s = registry.add_channel(addr(8080));
+        s.set_ejection_multiplier(5);
+        let _actor = spawn_actor(registry.clone());
+        // Let the actor reach its first sleep before retuning it.
+        tokio::task::yield_now().await;
+
+        let mut fast = base_config();
+        fast.interval = Duration::from_millis(50);
+        config.store(Arc::new(fast));
+
+        // The sleep already in flight keeps its original deadline.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(s.ejection_multiplier(), 4, "one sweep at the old interval");
+
+        // Every sleep after it uses the new one: 60ms is nowhere near 10s.
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(s.ejection_multiplier(), 3);
+    }
+
+    #[test]
+    fn disabled_sweep_drains_counters_and_decays_multipliers() {
+        let registry = make_registry_only(base_config());
+        let s = registry.add_channel(addr(8080));
+        s.record_success();
+        s.record_failure();
+        s.set_ejection_multiplier(3);
+
+        registry.run_housekeeping();
+
+        assert_eq!(
+            s.snapshot_and_reset(),
+            (0, 0),
+            "counters must not accumulate while outlier detection is off",
+        );
+        assert_eq!(s.ejection_multiplier(), 2);
     }
 
     // ----- OutlierChannelState sanity (kept in this file as it is the

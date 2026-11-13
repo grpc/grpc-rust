@@ -34,7 +34,6 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use tower::{BoxError, Service, load::Load};
 
 use crate::client::cluster::{ClusterChannel, ClusterChannelFactory};
@@ -50,7 +49,6 @@ use crate::xds::cache::XdsCache;
 use crate::xds::cert_provider::CertProviderRegistry;
 use crate::xds::connector::ClusterConnector;
 use crate::xds::endpoint_manager::discover_addresses;
-use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
 
 /// Builds one [`LoadBalancer`] per cluster, fed by the xDS cache.
 pub(crate) struct XdsLbClusterChannelFactory<MC> {
@@ -115,6 +113,7 @@ where
             #[cfg(feature = "_tls-any")]
             self.cert_registry.clone(),
         ));
+        let outlier_detection = connector.outlier_detection();
         let discovery = discover_addresses(self.cache.watch_endpoints(cluster_name));
 
         // TODO: apply CDS updates in place rather than rebuilding this channel.
@@ -122,26 +121,22 @@ where
         // `Arc`s shared with each `ReadyChannel`, so rebuilding drops both — and
         // a fresh discovery stream replays every endpoint as a `Change::Insert`,
         // which `poll_discover` handles by dropping the ready channel and
-        // reconnecting. The shape that fits: a per-cluster config watch drained
-        // by `LoadBalancer::poll_ready` alongside discovery, applying
-        //   * picker — seed the replacement via `on_members_changed(&members)`
-        //     before swapping, since ring-hash builds its ring from that set.
-        //     Blocked on `ClusterResource.lb_policy` modelling anything past
-        //     round-robin / least-request.
-        //   * outlier detection — `config.store` covers most fields because the
-        //     sweep re-reads them, but `interval` is captured by `spawn_actor`
-        //     and the actor only exists when the config was enabled at
-        //     construction, so both need an actor respawn or drop on change.
+        // reconnecting. Outlier detection no longer needs this: the connector's
+        // CDS watch republishes its config and the sweep re-reads it. What's
+        // left is the picker, which needs a per-cluster config watch drained by
+        // `LoadBalancer::poll_ready` alongside discovery, seeding the
+        // replacement via `on_members_changed(&members)` before swapping, since
+        // ring-hash builds its ring from that set. Blocked on
+        // `ClusterResource.lb_policy` modelling anything past round-robin /
+        // least-request.
         let picker: Arc<dyn ChannelPicker<ReadyChannel<MC::Service>, Req> + Send + Sync> =
             Arc::new(P2cPicker);
-        // `default()` is the disabled config, so no ejection actor is spawned.
-        let config = Arc::new(ArcSwap::from_pointee(OutlierDetectionConfig::default()));
 
         let lb = LoadBalancer::new(
             discovery,
             connector,
             picker,
-            config,
+            outlier_detection,
             self.outcome_classifier.clone(),
         );
         ClusterChannel::from_service(ClusterChannelAdapter::new(lb))
@@ -172,6 +167,7 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             security: None,
             circuit_breaking: Default::default(),
+            outlier_detection: Default::default(),
         })
     }
 

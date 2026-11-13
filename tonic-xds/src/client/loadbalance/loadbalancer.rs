@@ -28,24 +28,23 @@
 //! manages the connection lifecycle via the channel state machine,
 //! and routes requests to ready endpoints via a [`ChannelPicker`].
 //!
-//! Outlier detection (gRFC A50) is integrated via [`OutlierDetector`],
-//! which is always present. The actor inside is conditionally spawned
-//! based on the [`OutlierDetectionConfig`] passed at construction —
-//! `OutlierDetectionConfig::default()` is the disabled config, in
-//! which case the sweep never runs and no ejections fire. When
-//! enabled, the sweep broadcasts the current ejected-address set on a
-//! `watch` channel each time the set changes; the LB consumes the
-//! latest snapshot, consumes the matching [`ReadyChannel`] via
-//! [`ReadyChannel::eject`], and tracks the resulting
-//! [`EjectedChannel`] in `ejected`. When the timer fires, the
-//! resolved [`UnejectedChannel`] is routed back into `ready` or
-//! `connecting`.
+//! Outlier detection (gRFC A50) is integrated via [`OutlierDetector`].
+//! CDS publishes the cluster's [`OutlierDetectionConfig`] into the
+//! shared `ArcSwap` the sweep reads, so detection can be turned on,
+//! retuned or turned off without the LB being rebuilt. The sweep
+//! broadcasts the current ejected-address set on a `watch` channel
+//! each time the set changes; the LB consumes the latest snapshot,
+//! consumes the matching [`ReadyChannel`] via [`ReadyChannel::eject`],
+//! and tracks the resulting [`EjectedChannel`] in `ejected`. When the
+//! timer fires, the resolved [`UnejectedChannel`] is routed back into
+//! `ready` or `connecting`.
 //!
-//! TODO: wire dynamic outlier-detection config updates from xDS
-//! (`ArcSwap::store` on the config + A50 §7 disable transition
-//! handling). The actor will pick up new configs by reading the
-//! `ArcSwap` on each tick — no restart needed. To land in a
-//! follow-up PR.
+//! TODO: A50 §7 asks that removing outlier detection from CDS un-eject
+//! every address at once. Today removal stops new ejections
+//! immediately, but addresses already ejected return when their own
+//! `EjectedChannel` timer expires (bounded by `max_ejection_time`)
+//! rather than instantly. Forcing them back early needs a way to
+//! resolve those timers ahead of their deadline.
 //!
 //! [`EjectedChannel`]: crate::client::loadbalance::channel_state::EjectedChannel
 //! [`UnejectedChannel`]: crate::client::loadbalance::channel_state::UnejectedChannel
@@ -146,11 +145,6 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// `EjectedChannel` whose `Sleep` fires when the ejection
     /// window expires.
     ejected: KeyedFutures<EndpointAddress, UnejectedChannel<C::Service>>,
-    /// Per-LB outlier-detection plumbing. Always present; the
-    /// housekeeping actor inside is conditionally spawned based on
-    /// whether the config had an algorithm enabled at construction.
-    /// When disabled, the data path's `record_outcome` short-circuits
-    /// and nothing reads from `eject_rx`.
     outlier: OutlierDetector,
     picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
     /// Transport-specific mapping of each call's result to an outlier-detection
@@ -167,13 +161,9 @@ where
     C: Connector + Send + Sync + 'static,
     C::Service: Clone + Send + 'static,
 {
-    /// Construct a load balancer driven by `config`. Wrapping the
-    /// config in `ArcSwap` lets future xDS subscription updates
-    /// reconfigure detection without rebuilding the LB; until that
-    /// wiring lands, the value is effectively read-once at
-    /// construction. `OutlierDetectionConfig::default()` is the
-    /// disabled config — both algorithms `None` ⇒ no actor, no
-    /// ejection.
+    /// Construct a load balancer driven by `config`, the live handle a
+    /// CDS update stores into and the ejection sweep reads from.
+    /// `OutlierDetectionConfig::default()` is the disabled config.
     pub(crate) fn new(
         discovery: D,
         connector: Arc<C>,

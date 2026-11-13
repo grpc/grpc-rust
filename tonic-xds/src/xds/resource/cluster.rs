@@ -31,6 +31,7 @@ use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
 use super::circuit_breaking::CircuitBreakingConfig;
+use super::outlier_detection::OutlierDetectionConfig;
 use super::security::{ClusterSecurityConfig, parse_transport_socket};
 
 // Re-exported so other modules keep using the `cluster::LbPolicy` path.
@@ -54,6 +55,9 @@ pub(crate) struct ClusterResource {
     pub security: Option<ClusterSecurityConfig>,
     /// Circuit-breaking config for the cluster.
     pub circuit_breaking: CircuitBreakingConfig,
+    /// Outlier-detection config for the cluster. Defaults to the disabled
+    /// config when CDS omits `outlier_detection`.
+    pub outlier_detection: OutlierDetectionConfig,
 }
 
 impl Resource for ClusterResource {
@@ -102,6 +106,8 @@ impl Resource for ClusterResource {
 
         let security = parse_transport_socket(message.transport_socket)?;
         let circuit_breaking = CircuitBreakingConfig::from_proto(message.circuit_breakers.as_ref());
+        let outlier_detection =
+            OutlierDetectionConfig::from_proto(message.outlier_detection.as_ref())?;
 
         Ok(ClusterResource {
             name,
@@ -109,6 +115,7 @@ impl Resource for ClusterResource {
             lb_policy,
             security,
             circuit_breaking,
+            outlier_detection,
         })
     }
 }
@@ -143,6 +150,62 @@ mod tests {
         assert_eq!(validated.lb_policy, LbPolicy::RoundRobin);
         assert!(validated.eds_service_name.is_none());
         assert_eq!(validated.circuit_breaking, CircuitBreakingConfig::default());
+        assert_eq!(
+            validated.outlier_detection,
+            OutlierDetectionConfig::default()
+        );
+        assert!(!validated.outlier_detection.is_enabled());
+    }
+
+    #[test]
+    fn test_outlier_detection_is_parsed_from_cds() {
+        use envoy_types::pb::envoy::config::cluster::v3::OutlierDetection;
+        use envoy_types::pb::google::protobuf::{Duration as ProtoDuration, UInt32Value};
+
+        let cluster = Cluster {
+            outlier_detection: Some(OutlierDetection {
+                interval: Some(ProtoDuration {
+                    seconds: 5,
+                    nanos: 0,
+                }),
+                enforcing_failure_percentage: Some(UInt32Value { value: 100 }),
+                ..Default::default()
+            }),
+            ..make_cluster("my-cluster")
+        };
+
+        let validated = ClusterResource::validate(cluster).unwrap();
+
+        assert_eq!(
+            validated.outlier_detection.interval,
+            std::time::Duration::from_secs(5)
+        );
+        assert!(validated.outlier_detection.failure_percentage.is_some());
+        assert!(validated.outlier_detection.is_enabled());
+    }
+
+    /// A malformed `outlier_detection` has to NACK the whole cluster
+    /// rather than silently degrade to the disabled default.
+    #[test]
+    fn test_invalid_outlier_detection_nacks_the_cluster() {
+        use envoy_types::pb::envoy::config::cluster::v3::OutlierDetection;
+        use envoy_types::pb::google::protobuf::UInt32Value;
+
+        let cluster = Cluster {
+            outlier_detection: Some(OutlierDetection {
+                max_ejection_percent: Some(UInt32Value { value: 101 }),
+                ..Default::default()
+            }),
+            ..make_cluster("my-cluster")
+        };
+
+        let err = ClusterResource::validate(cluster).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("outlier_detection.max_ejection_percent"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

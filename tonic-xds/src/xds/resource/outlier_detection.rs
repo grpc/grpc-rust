@@ -34,6 +34,29 @@
 
 use std::time::Duration;
 
+use envoy_types::pb::envoy::config::cluster::v3::OutlierDetection;
+use envoy_types::pb::google::protobuf::{Duration as ProtoDuration, UInt32Value};
+use xds_client::Error;
+
+/// A50 defaults, applied when the corresponding CDS field is unset.
+mod defaults {
+    use std::time::Duration;
+
+    pub(super) const INTERVAL: Duration = Duration::from_secs(10);
+    pub(super) const BASE_EJECTION_TIME: Duration = Duration::from_secs(30);
+    pub(super) const MAX_EJECTION_TIME: Duration = Duration::from_secs(300);
+    pub(super) const MAX_EJECTION_PERCENT: u32 = 10;
+    pub(super) const ENFORCING_SUCCESS_RATE: u32 = 100;
+    pub(super) const SUCCESS_RATE_STDEV_FACTOR: u32 = 1900;
+    pub(super) const SUCCESS_RATE_MINIMUM_HOSTS: u32 = 5;
+    pub(super) const SUCCESS_RATE_REQUEST_VOLUME: u32 = 100;
+    pub(super) const FAILURE_PERCENTAGE_THRESHOLD: u32 = 85;
+    /// Zero, so failure-percentage ejection is off unless CDS opts in.
+    pub(super) const ENFORCING_FAILURE_PERCENTAGE: u32 = 0;
+    pub(super) const FAILURE_PERCENTAGE_MINIMUM_HOSTS: u32 = 5;
+    pub(super) const FAILURE_PERCENTAGE_REQUEST_VOLUME: u32 = 50;
+}
+
 /// A 0–100 percentage, validated at construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Percentage(u8);
@@ -116,6 +139,135 @@ impl OutlierDetectionConfig {
     pub(crate) fn is_enabled(&self) -> bool {
         self.success_rate.is_some() || self.failure_percentage.is_some()
     }
+
+    /// Build A50 outlier-detection config from a CDS `OutlierDetection`
+    /// message. `None` — the `Cluster.outlier_detection` field is unset —
+    /// disables outlier detection, which is [`Self::default`].
+    ///
+    /// Per A50 an algorithm's sub-config is present only when its
+    /// `enforcing_*` percentage is non-zero. That distinction is
+    /// load-bearing rather than cosmetic: a config with both sub-configs
+    /// absent is a no-op that un-ejects every address and resets ejection
+    /// multipliers, whereas a present-but-never-enforced sub-config keeps
+    /// outlier detection enabled and leaves prior ejections standing.
+    pub(crate) fn from_proto(od: Option<&OutlierDetection>) -> xds_client::Result<Self> {
+        let Some(od) = od else {
+            return Ok(Self::default());
+        };
+
+        let interval = duration_or(od.interval.as_ref(), defaults::INTERVAL, "interval")?;
+        let base_ejection_time = duration_or(
+            od.base_ejection_time.as_ref(),
+            defaults::BASE_EJECTION_TIME,
+            "base_ejection_time",
+        )?;
+        // Envoy/A50: when unset this is the larger of 300s and
+        // `base_ejection_time`, so that a config raising the latter past the
+        // default doesn't end up capped below a single base interval.
+        let max_ejection_time = match od.max_ejection_time.as_ref() {
+            Some(d) => proto_duration(d, "max_ejection_time")?,
+            None => defaults::MAX_EJECTION_TIME.max(base_ejection_time),
+        };
+
+        // Every percentage is validated before it is used to gate an
+        // algorithm, so an out-of-range value NACKs the resource even when
+        // the algorithm it belongs to ends up disabled.
+        let max_ejection_percent = percentage_or(
+            od.max_ejection_percent.as_ref(),
+            defaults::MAX_EJECTION_PERCENT,
+            "max_ejection_percent",
+        )?;
+        let enforcing_success_rate = percentage_or(
+            od.enforcing_success_rate.as_ref(),
+            defaults::ENFORCING_SUCCESS_RATE,
+            "enforcing_success_rate",
+        )?;
+        let failure_percentage_threshold = percentage_or(
+            od.failure_percentage_threshold.as_ref(),
+            defaults::FAILURE_PERCENTAGE_THRESHOLD,
+            "failure_percentage_threshold",
+        )?;
+        let enforcing_failure_percentage = percentage_or(
+            od.enforcing_failure_percentage.as_ref(),
+            defaults::ENFORCING_FAILURE_PERCENTAGE,
+            "enforcing_failure_percentage",
+        )?;
+
+        let success_rate = (enforcing_success_rate.get() != 0).then(|| SuccessRateConfig {
+            stdev_factor: u32_or(
+                od.success_rate_stdev_factor.as_ref(),
+                defaults::SUCCESS_RATE_STDEV_FACTOR,
+            ),
+            enforcing_success_rate,
+            minimum_hosts: u32_or(
+                od.success_rate_minimum_hosts.as_ref(),
+                defaults::SUCCESS_RATE_MINIMUM_HOSTS,
+            ),
+            request_volume: u32_or(
+                od.success_rate_request_volume.as_ref(),
+                defaults::SUCCESS_RATE_REQUEST_VOLUME,
+            ),
+        });
+
+        let failure_percentage =
+            (enforcing_failure_percentage.get() != 0).then(|| FailurePercentageConfig {
+                threshold: failure_percentage_threshold,
+                enforcing_failure_percentage,
+                minimum_hosts: u32_or(
+                    od.failure_percentage_minimum_hosts.as_ref(),
+                    defaults::FAILURE_PERCENTAGE_MINIMUM_HOSTS,
+                ),
+                request_volume: u32_or(
+                    od.failure_percentage_request_volume.as_ref(),
+                    defaults::FAILURE_PERCENTAGE_REQUEST_VOLUME,
+                ),
+            });
+
+        Ok(Self {
+            interval,
+            base_ejection_time,
+            max_ejection_time,
+            max_ejection_percent,
+            success_rate,
+            failure_percentage,
+        })
+    }
+}
+
+/// Convert a protobuf `Duration`, rejecting the negative values the type
+/// permits but A50 has no meaning for.
+fn proto_duration(d: &ProtoDuration, field: &str) -> xds_client::Result<Duration> {
+    if d.seconds < 0 || d.nanos < 0 {
+        return Err(Error::Validation(format!(
+            "outlier_detection.{field} must not be negative, got {}s {}ns",
+            d.seconds, d.nanos
+        )));
+    }
+    Ok(Duration::new(d.seconds as u64, d.nanos as u32))
+}
+
+fn duration_or(
+    proto: Option<&ProtoDuration>,
+    default: Duration,
+    field: &str,
+) -> xds_client::Result<Duration> {
+    match proto {
+        Some(d) => proto_duration(d, field),
+        None => Ok(default),
+    }
+}
+
+fn percentage_or(
+    proto: Option<&UInt32Value>,
+    default: u32,
+    field: &str,
+) -> xds_client::Result<Percentage> {
+    let value = proto.map(|v| v.value).unwrap_or(default);
+    Percentage::new(value).map_err(|e| Error::Validation(format!("outlier_detection.{field}: {e}")))
+}
+
+fn u32_or(proto: Option<&UInt32Value>, default: u32) -> u32 {
+    proto.map(|v| v.value).unwrap_or(default)
 }
 
 impl Default for OutlierDetectionConfig {
@@ -190,5 +342,190 @@ mod tests {
     fn percentage_rejects_values_above_one_hundred() {
         assert_eq!(Percentage::new(101), Err(PercentageError(101)));
         assert_eq!(Percentage::new(u32::MAX), Err(PercentageError(u32::MAX)));
+    }
+
+    // -- `from_proto` --
+
+    fn pct(value: u32) -> Option<UInt32Value> {
+        Some(UInt32Value { value })
+    }
+
+    fn secs(seconds: i64) -> Option<ProtoDuration> {
+        Some(ProtoDuration { seconds, nanos: 0 })
+    }
+
+    #[test]
+    fn absent_outlier_detection_is_the_disabled_default() {
+        let config = OutlierDetectionConfig::from_proto(None).unwrap();
+        assert_eq!(config, OutlierDetectionConfig::default());
+        assert!(!config.is_enabled());
+    }
+
+    /// An empty message is not the same as an absent one: A50 defaults
+    /// `enforcing_success_rate` to 100, so success-rate ejection is on.
+    #[test]
+    fn empty_message_enables_success_rate_with_a50_defaults() {
+        let config =
+            OutlierDetectionConfig::from_proto(Some(&OutlierDetection::default())).unwrap();
+
+        assert_eq!(config.interval, Duration::from_secs(10));
+        assert_eq!(config.base_ejection_time, Duration::from_secs(30));
+        assert_eq!(config.max_ejection_time, Duration::from_secs(300));
+        assert_eq!(config.max_ejection_percent.get(), 10);
+        assert_eq!(
+            config.success_rate,
+            Some(SuccessRateConfig {
+                stdev_factor: 1900,
+                enforcing_success_rate: Percentage::new(100).unwrap(),
+                minimum_hosts: 5,
+                request_volume: 100,
+            })
+        );
+        // `enforcing_failure_percentage` defaults to 0, so the algorithm
+        // is absent rather than present-but-unenforced.
+        assert_eq!(config.failure_percentage, None);
+        assert!(config.is_enabled());
+    }
+
+    /// A50 treats `enforcing_* == 0` as "sub-config absent", which is what
+    /// makes `is_enabled` false and lets the sweep un-eject everything.
+    #[test]
+    fn zero_enforcing_percentage_drops_the_sub_config() {
+        let od = OutlierDetection {
+            enforcing_success_rate: pct(0),
+            enforcing_failure_percentage: pct(0),
+            ..Default::default()
+        };
+
+        let config = OutlierDetectionConfig::from_proto(Some(&od)).unwrap();
+
+        assert_eq!(config.success_rate, None);
+        assert_eq!(config.failure_percentage, None);
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn non_zero_enforcing_failure_percentage_builds_the_sub_config() {
+        let od = OutlierDetection {
+            enforcing_success_rate: pct(0),
+            enforcing_failure_percentage: pct(40),
+            failure_percentage_threshold: pct(70),
+            failure_percentage_minimum_hosts: Some(UInt32Value { value: 3 }),
+            failure_percentage_request_volume: Some(UInt32Value { value: 25 }),
+            ..Default::default()
+        };
+
+        let config = OutlierDetectionConfig::from_proto(Some(&od)).unwrap();
+
+        assert_eq!(config.success_rate, None);
+        assert_eq!(
+            config.failure_percentage,
+            Some(FailurePercentageConfig {
+                threshold: Percentage::new(70).unwrap(),
+                enforcing_failure_percentage: Percentage::new(40).unwrap(),
+                minimum_hosts: 3,
+                request_volume: 25,
+            })
+        );
+        assert!(config.is_enabled());
+    }
+
+    /// Envoy/A50: an unset `max_ejection_time` resolves to the larger of
+    /// 300s and `base_ejection_time`, so a long `base_ejection_time` is
+    /// never silently capped below itself.
+    #[test]
+    fn unset_max_ejection_time_never_undercuts_base_ejection_time() {
+        let od = OutlierDetection {
+            base_ejection_time: secs(600),
+            ..Default::default()
+        };
+
+        let config = OutlierDetectionConfig::from_proto(Some(&od)).unwrap();
+
+        assert_eq!(config.base_ejection_time, Duration::from_secs(600));
+        assert_eq!(config.max_ejection_time, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn explicit_max_ejection_time_is_taken_verbatim() {
+        let od = OutlierDetection {
+            base_ejection_time: secs(600),
+            max_ejection_time: secs(90),
+            ..Default::default()
+        };
+
+        let config = OutlierDetectionConfig::from_proto(Some(&od)).unwrap();
+
+        assert_eq!(config.max_ejection_time, Duration::from_secs(90));
+    }
+
+    /// Out-of-range percentages must NACK even when they belong to an
+    /// algorithm that this config leaves disabled — otherwise a bad
+    /// resource would be accepted and only fail once someone enabled it.
+    #[test]
+    fn out_of_range_percentage_rejects_even_when_algorithm_is_disabled() {
+        let od = OutlierDetection {
+            enforcing_success_rate: pct(0),
+            enforcing_failure_percentage: pct(0),
+            failure_percentage_threshold: pct(150),
+            ..Default::default()
+        };
+
+        let err = OutlierDetectionConfig::from_proto(Some(&od)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("outlier_detection.failure_percentage_threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_max_ejection_percent_rejects() {
+        let od = OutlierDetection {
+            max_ejection_percent: pct(101),
+            ..Default::default()
+        };
+
+        let err = OutlierDetectionConfig::from_proto(Some(&od)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("outlier_detection.max_ejection_percent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn negative_duration_rejects() {
+        let od = OutlierDetection {
+            interval: Some(ProtoDuration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+
+        let err = OutlierDetectionConfig::from_proto(Some(&od)).unwrap_err();
+
+        assert!(
+            err.to_string().contains("outlier_detection.interval"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sub_second_durations_round_trip() {
+        let od = OutlierDetection {
+            interval: Some(ProtoDuration {
+                seconds: 1,
+                nanos: 500_000_000,
+            }),
+            ..Default::default()
+        };
+
+        let config = OutlierDetectionConfig::from_proto(Some(&od)).unwrap();
+
+        assert_eq!(config.interval, Duration::from_millis(1500));
     }
 }

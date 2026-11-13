@@ -226,7 +226,7 @@ impl TonicTransport {
 pub struct TonicTransportBuilder {
     // Future extensions:
     // - Connection pooling settings
-    // - Per-server credential overrides (via ServerConfig.extensions)
+    // - Per-server credential overrides (via ServerConfig::transport_config)
     #[cfg(feature = "_tonic-tls-any")]
     tls_config_factory: Option<TlsConfigFactory>,
 

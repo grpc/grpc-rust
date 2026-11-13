@@ -55,10 +55,6 @@ use xds_client::TransportBuilder;
 use xds_client::TransportReceiver;
 use xds_client::TransportSender;
 
-/// The gRPC path for the ADS StreamAggregatedResources RPC.
-const ADS_PATH: &str =
-    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
-
 /// Factory for creating gRPC-based transports for `xds-client`.
 #[derive(Clone)]
 pub(crate) struct GrpcTransportBuilder {
@@ -122,27 +118,30 @@ impl GrpcTransport {
 }
 
 impl Transport for GrpcTransport {
-    type Sender = GrpcAdsSender;
-    type Receiver = GrpcAdsReceiver;
+    type Sender = GrpcStreamSender;
+    type Receiver = GrpcStreamReceiver;
 
-    async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
-        let headers = RequestHeaders::new().with_method_name(ADS_PATH);
+    async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
+        let headers = RequestHeaders::new().with_method_name(method);
         let (send_stream, recv_stream) = self.channel.invoke(headers, CallOptions::new()).await;
 
-        Ok((GrpcAdsSender(send_stream), GrpcAdsReceiver(recv_stream)))
+        Ok((
+            GrpcStreamSender(send_stream),
+            GrpcStreamReceiver(recv_stream),
+        ))
     }
 }
 
-/// Sending half of a `GrpcTransport` ADS stream.
-pub(crate) struct GrpcAdsSender(ChannelSendStream);
+/// Sending half of a `GrpcTransport` stream.
+pub(crate) struct GrpcStreamSender(ChannelSendStream);
 
-impl std::fmt::Debug for GrpcAdsSender {
+impl std::fmt::Debug for GrpcStreamSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrpcAdsSender").finish()
+        f.debug_struct("GrpcStreamSender").finish()
     }
 }
 
-impl TransportSender for GrpcAdsSender {
+impl TransportSender for GrpcStreamSender {
     async fn send(&mut self, request: Bytes) -> Result<()> {
         let msg = RawBytes(request);
         self.0
@@ -153,16 +152,16 @@ impl TransportSender for GrpcAdsSender {
     }
 }
 
-/// Receiving half of a `GrpcTransport` ADS stream.
-pub(crate) struct GrpcAdsReceiver(ChannelRecvStream);
+/// Receiving half of a `GrpcTransport` stream.
+pub(crate) struct GrpcStreamReceiver(ChannelRecvStream);
 
-impl std::fmt::Debug for GrpcAdsReceiver {
+impl std::fmt::Debug for GrpcStreamReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrpcAdsReceiver").finish()
+        f.debug_struct("GrpcStreamReceiver").finish()
     }
 }
 
-impl TransportReceiver for GrpcAdsReceiver {
+impl TransportReceiver for GrpcStreamReceiver {
     async fn recv(&mut self) -> Result<Option<Bytes>> {
         loop {
             let mut msg_buf = RawBytesBuffer::default();
@@ -228,6 +227,10 @@ mod tests {
     use crate::resource::ListenerResource;
     use crate::xds_client_runtime::XdsRuntime;
 
+    /// The gRPC path for the ADS StreamAggregatedResources RPC.
+    const ADS_PATH: &str =
+        "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
+
     #[test]
     fn test_raw_bytes_encode_decode() {
         let original = Bytes::from_static(b"hello xds");
@@ -254,7 +257,7 @@ mod tests {
             .await
             .expect("build transport");
 
-        let (mut tx, mut rx) = transport.new_stream().await.expect("new stream");
+        let (mut tx, mut rx) = transport.new_stream(ADS_PATH).await.expect("new stream");
 
         let mut request = DiscoveryRequest::new();
         request.set_type_url(AdsTypeUrl::Lds.to_string());

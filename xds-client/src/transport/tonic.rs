@@ -43,7 +43,7 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
 
-/// Per-stream call credentials for the ADS stream (e.g. a bearer token).
+/// Per-stream call credentials for xDS streams (e.g. a bearer token).
 ///
 /// Attached on each (re)connect, only when the channel is secure.
 #[tonic::async_trait]
@@ -62,24 +62,21 @@ pub trait TonicCallCredentials: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
-/// The gRPC path for the ADS StreamAggregatedResources RPC.
-const ADS_PATH: &str =
-    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
-
 const ADS_CHANNEL_BUFFER_SIZE: usize = 16;
 
 /// Default timeout for establishing the TCP/TLS connection to the xDS server.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default HTTP/2 keepalive PING interval on the ADS channel.
+/// Default HTTP/2 keepalive PING interval on the channel.
 ///
-/// The ADS stream is mostly idle from the client's perspective (the server
-/// only pushes on resource changes), so without keepalives a half-open
+/// xDS streams are mostly idle from the client's perspective (e.g. an ADS
+/// server only pushes on resource changes), so without keepalives a half-open
 /// connection — e.g. after an xDS server restart where the RST/GOAWAY was
 /// lost, or a dropped conntrack/NAT entry — is undetectable: `recv()` on the
-/// stream pends forever and the client keeps serving its last known
-/// resources. Keepalives surface such connections as transport errors, which
-/// triggers the worker's reconnect + re-subscribe path.
+/// stream pends forever, and the client keeps serving its last known
+/// resources, or reporting load to nowhere. Keepalives surface such
+/// connections as transport errors, which triggers the workers' reconnect
+/// path.
 ///
 /// Five minutes matches other gRPC clients' default keepalive.
 /// Also matches the A8 server side `PERMIT_KEEPALIVE_TIME` default.
@@ -144,7 +141,7 @@ impl Decoder for BytesDecoder {
     }
 }
 
-/// Factory for creating ADS streams using tonic.
+/// Factory for creating xDS streams using tonic.
 #[derive(Clone, Debug)]
 pub struct TonicTransport {
     channel: Channel,
@@ -230,7 +227,7 @@ pub struct TonicTransportBuilder {
     #[cfg(feature = "_tonic-tls-any")]
     tls_config_factory: Option<TlsConfigFactory>,
 
-    /// Per-stream call credentials for the ADS stream.
+    /// Per-stream call credentials for xDS streams.
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
 
     /// Timeout for establishing the connection to the xDS server.
@@ -242,10 +239,10 @@ pub struct TonicTransportBuilder {
     /// Time to wait for a keepalive PING ack before closing the connection.
     keep_alive_timeout: Duration,
 
-    /// Maximum size of a decoded ADS response; `None` leaves tonic's default.
+    /// Maximum size of a decoded response; `None` leaves tonic's default.
     max_decoding_message_size: Option<usize>,
 
-    /// Maximum size of an encoded ADS request; `None` leaves tonic's default.
+    /// Maximum size of an encoded request; `None` leaves tonic's default.
     max_encoding_message_size: Option<usize>,
 }
 
@@ -294,12 +291,12 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Configure HTTP/2 keepalives on the ADS channel.
+    /// Configure HTTP/2 keepalives on the channel.
     ///
-    /// A PING is sent every `interval` (even while the stream is idle); if no
+    /// A PING is sent every `interval` (even while streams are idle); if no
     /// ack arrives within `timeout` the connection is closed, surfacing a
-    /// transport error that triggers reconnect + re-subscription. Pass
-    /// `interval = None` to disable keepalives.
+    /// transport error that triggers a reconnect. Pass `interval = None` to
+    /// disable keepalives.
     pub fn with_keep_alive(mut self, interval: Option<Duration>, timeout: Duration) -> Self {
         self.keep_alive_interval = interval;
         self.keep_alive_timeout = timeout;
@@ -331,7 +328,7 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Set per-stream call credentials for the ADS stream (e.g. `google_default`).
+    /// Set per-stream call credentials for xDS streams (e.g. `google_default`).
     ///
     /// Attached on each (re)connect, only over a secure channel; over an insecure
     /// channel, [`build`](TransportBuilder::build) fails. Not refreshed mid-stream.
@@ -340,7 +337,7 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Limit the size of a decoded ADS response, in bytes.
+    /// Limit the size of a decoded response, in bytes.
     ///
     /// Defaults to tonic's 4 MiB. A control plane whose response exceeds the
     /// limit breaks the stream, so raise it to match the largest resource set
@@ -350,7 +347,7 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Limit the size of an encoded ADS request, in bytes.
+    /// Limit the size of an encoded request, in bytes.
     ///
     /// Defaults to tonic's `usize::MAX`.
     pub fn with_max_encoding_message_size(mut self, limit: usize) -> Self {
@@ -494,7 +491,12 @@ impl Transport for TonicTransport {
     type Sender = TonicAdsSender;
     type Receiver = TonicAdsReceiver;
 
-    async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
+    async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
+        // Validate the method path up front rather than panicking in
+        // `PathAndQuery::from_static`.
+        let path =
+            PathAndQuery::try_from(method).map_err(|error| Error::Transport(Box::new(error)))?;
+
         let mut grpc = Grpc::new(self.channel.clone());
 
         if let Some(limit) = self.max_decoding_message_size {
@@ -504,16 +506,16 @@ impl Transport for TonicTransport {
             grpc = grpc.max_encoding_message_size(limit);
         }
 
-        // The worker uses new_stream() completion as its resource-timer readiness
-        // fallback. This checks service capacity, not channel connectivity or ADS
-        // stream dispatch; the streaming RPC is started when the receiver is polled.
+        // Callers may use new_stream() completion as a readiness signal (the
+        // ADS worker uses it as its resource-timer readiness fallback). This
+        // checks service capacity, not channel connectivity or stream dispatch;
+        // the streaming RPC is started when the receiver is polled.
         grpc.ready()
             .await
             .map_err(|error| Error::Connection(error.to_string()))?;
 
         let (tx, rx) = mpsc::channel::<Bytes>(ADS_CHANNEL_BUFFER_SIZE);
         let channel_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let path = PathAndQuery::from_static(ADS_PATH);
         let mut request = tonic::Request::new(channel_stream);
 
         // Inject the configured call credentials.
@@ -537,7 +539,7 @@ impl Transport for TonicTransport {
     }
 }
 
-/// Sending half of a `TonicTransport` ADS stream.
+/// Sending half of a `TonicTransport` stream.
 #[derive(Debug)]
 pub struct TonicAdsSender {
     sender: mpsc::Sender<Bytes>,
@@ -567,7 +569,7 @@ impl std::fmt::Debug for TonicReceiverState {
     }
 }
 
-/// Receiving half of a `TonicTransport` ADS stream.
+/// Receiving half of a `TonicTransport` stream.
 #[derive(Debug)]
 pub struct TonicAdsReceiver {
     state: TonicReceiverState,
@@ -599,6 +601,7 @@ impl TransportReceiver for TonicAdsReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::worker::ADS_METHOD;
     use envoy_types::pb::envoy::service::discovery::v3::{
         DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
         aggregated_discovery_service_server::{
@@ -766,7 +769,7 @@ mod tests {
             ..Default::default()
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
-        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.unwrap();
         tx.send(request_bytes).await.unwrap();
         let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
@@ -785,11 +788,23 @@ mod tests {
             ..Default::default()
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
-        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.unwrap();
         tx.send(request_bytes).await.unwrap();
         let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
         assert_eq!(response.version_info, "1");
+    }
+
+    #[tokio::test]
+    async fn invalid_method_returns_error() {
+        // No server needed: the path is validated before the channel is used.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let transport = TonicTransport::from_channel(channel);
+        let result = transport.new_stream("not a valid path").await;
+        assert!(
+            matches!(result, Err(Error::Transport(_))),
+            "expected Error::Transport, got {result:?}"
+        );
     }
 
     /// Larger than tonic's 4 MiB default decoding limit.
@@ -802,7 +817,7 @@ mod tests {
             .build(&ServerConfig::new(format!("http://{addr}")))
             .await
             .unwrap();
-        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.unwrap();
         tx.send(discovery_request()).await.unwrap();
         let err = rx.recv().await.unwrap_err();
         let Error::Stream(status) = err else {
@@ -819,7 +834,7 @@ mod tests {
             .build(&ServerConfig::new(format!("http://{addr}")))
             .await
             .unwrap();
-        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.unwrap();
         tx.send(discovery_request()).await.unwrap();
         let response = rx.recv().await.unwrap().unwrap();
         let response = DiscoveryResponse::decode(response).unwrap();
@@ -933,7 +948,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("build {attempt} failed: {e:?}"));
 
-            let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+            let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.unwrap();
             tx.send(discovery_request()).await.unwrap();
             let response = rx.recv().await.unwrap().unwrap();
             let response = DiscoveryResponse::decode(response).unwrap();
@@ -1000,7 +1015,7 @@ mod tests {
         };
         let request_bytes: Bytes = request.encode_to_vec().into();
 
-        let (mut tx, mut rx) = transport.new_stream().await.unwrap();
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.unwrap();
         tx.send(request_bytes).await.unwrap();
 
         let response_bytes = rx.recv().await.unwrap().unwrap();

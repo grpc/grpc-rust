@@ -307,6 +307,63 @@ mod tests {
         assert!(body.is_end_stream());
     }
 
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct BytesMessage {
+        #[prost(uint32, tag = "1")]
+        id: u32,
+        #[prost(bytes = "bytes", tag = "2")]
+        data: bytes::Bytes,
+        #[prost(string, tag = "3")]
+        name: String,
+    }
+
+    #[tokio::test]
+    async fn encode_zero_copy_bytes_field() {
+        let data = bytes::Bytes::from(vec![7u8; 2 * 1024 * 1024]);
+        let msg = BytesMessage {
+            id: 1,
+            data: data.clone(),
+            name: "name".to_string(),
+        };
+
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(&(msg.encoded_len() as u32).to_be_bytes());
+        expected.extend_from_slice(&msg.encode_to_vec());
+
+        for (buffer_settings, shared) in [
+            (BufferSettings::default(), 0),
+            (
+                BufferSettings::default().with_zero_copy_threshold(64 * 1024),
+                1,
+            ),
+        ] {
+            let encoder = ProstEncoder::<BytesMessage>::new(buffer_settings);
+            let source = tokio_stream::iter(std::iter::once(Ok::<_, Status>(msg.clone())));
+            let mut body = pin!(EncodeBody::new_server(
+                encoder,
+                source,
+                None,
+                SingleMessageCompressionOverride::default(),
+                None,
+            ));
+
+            let mut frames = Vec::new();
+            while let Some(frame) = body.frame().await {
+                match frame.unwrap().into_data() {
+                    Ok(data) => frames.push(data),
+                    Err(_) => break,
+                }
+            }
+
+            assert_eq!(frames.concat(), expected);
+            let count = frames
+                .iter()
+                .filter(|frame| frame.as_ptr() == data.as_ptr())
+                .count();
+            assert_eq!(count, shared);
+        }
+    }
+
     // skip on windows because CI stumbles over our 4GB allocation
     #[cfg(not(target_family = "windows"))]
     #[tokio::test]

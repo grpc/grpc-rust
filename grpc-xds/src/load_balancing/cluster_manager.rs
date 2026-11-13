@@ -59,7 +59,7 @@ use grpc::StatusCodeError;
 use grpc::StatusError;
 use serde::Deserialize;
 
-use crate::resolver::picked_child_name;
+use crate::resolver::picked_cluster;
 
 static POLICY_NAME: &str = "xds_cluster_manager_experimental";
 
@@ -187,7 +187,7 @@ struct ClusterPicker {
 
 impl Picker for ClusterPicker {
     fn pick(&self, options: PickOptions<'_>) -> PickResult {
-        picked_child_name(options.call_options)
+        picked_cluster(options.call_options)
             .ok_or_else(|| {
                 debug_assert!(false, "cluster manager: cluster attribute not present");
                 StatusError::new(
@@ -230,7 +230,7 @@ mod tests {
     use grpc::core::Address;
 
     use super::*;
-    use crate::resolver::set_picked_child_for_testing;
+    use crate::resolver::set_picked_cluster;
 
     #[test]
     fn parse_config() {
@@ -276,7 +276,7 @@ mod tests {
 
         // Unknown cluster -> debug_assert panic, or Drop(Internal) in release.
         let mut opts = CallOptions::new();
-        set_picked_child_for_testing(&mut opts, "cluster_unknown");
+        set_picked_cluster(&mut opts, "cluster_unknown");
         match cluster_picker.pick(PickOptions::new(&req, &opts)) {
             PickResult::Drop(err) => {
                 assert_eq!(err.code(), StatusCodeError::Internal);
@@ -389,7 +389,7 @@ mod tests {
 
         let req = RequestHeaders::new();
         let mut opts_b = CallOptions::new();
-        set_picked_child_for_testing(&mut opts_b, "cluster_b");
+        set_picked_cluster(&mut opts_b, "cluster_b");
         match state.picker.pick(PickOptions::new(&req, &opts_b)) {
             PickResult::Drop(err) => assert_eq!(err.code(), StatusCodeError::Internal),
             other => panic!("expected Drop for removed cluster, got {other:?}"),
@@ -483,7 +483,7 @@ mod tests {
         let req = RequestHeaders::new();
         let picked = PickedChild::default();
         let mut opts = CallOptions::new();
-        set_picked_child_for_testing(&mut opts, cluster);
+        set_picked_cluster(&mut opts, cluster);
         opts.set_option(picked.clone());
         assert!(matches!(
             picker.pick(PickOptions::new(&req, &opts)),
@@ -497,7 +497,7 @@ mod tests {
         let req = RequestHeaders::new();
         let endpoints = ChildEndpoints::default();
         let mut opts = CallOptions::new();
-        set_picked_child_for_testing(&mut opts, cluster);
+        set_picked_cluster(&mut opts, cluster);
         opts.set_option(endpoints.clone());
         assert!(matches!(
             picker.pick(PickOptions::new(&req, &opts)),

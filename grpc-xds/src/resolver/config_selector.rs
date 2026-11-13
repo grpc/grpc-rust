@@ -47,7 +47,7 @@ use crate::sampling::WeightedSampler;
 
 /// The interceptor for the RPCs routed to a cluster. Stores the cluster's
 /// [`PickedCluster`] in each RPC's `CallOptions`, which tells the cluster
-/// manager picker which child to pick from.
+/// manager picker which cluster to pick from.
 ///
 /// A config selector has one per cluster, shared by every route that names
 /// the cluster, so the selector holds a ref to each cluster its routes can
@@ -61,12 +61,12 @@ pub(super) struct ClusterInterceptor {
 }
 
 impl ClusterInterceptor {
-    /// Creates the interceptor for the cluster whose cluster manager child is
-    /// named `child_name`, which keeps `cluster_ref` alive.
-    pub(super) fn new(child_name: &str, cluster_ref: Arc<()>) -> Self {
+    /// Creates the interceptor for the cluster named `cluster`, which keeps
+    /// `cluster_ref` alive.
+    pub(super) fn new(cluster: &str, cluster_ref: Arc<()>) -> Self {
         Self {
             picked: Arc::new(PickedCluster {
-                child_name: child_name.to_owned(),
+                name: cluster.to_owned(),
                 _cluster_ref: cluster_ref,
             }),
         }
@@ -151,7 +151,7 @@ mod tests {
     use grpc::metadata::MetadataMap;
 
     use super::*;
-    use crate::resolver::picked_child_name;
+    use crate::resolver::picked_cluster;
     use crate::resource::HeaderMatchSpecifier;
     use crate::resource::HeaderMatcher;
     use crate::resource::PathSpecifier;
@@ -179,13 +179,13 @@ mod tests {
         }
     }
 
-    /// The end of an interceptor chain. Records the cluster manager child
-    /// picked for each RPC that reaches it.
+    /// The end of an interceptor chain. Records the cluster picked for each
+    /// RPC that reaches it.
     #[derive(Default)]
     struct RecordingInvoker {
-        /// The child picked for each RPC, or `None` if the RPC's call options
-        /// have no pick.
-        picked_children: Mutex<Vec<Option<String>>>,
+        /// The cluster picked for each RPC, or `None` if the RPC's call
+        /// options have no pick.
+        picked_clusters: Mutex<Vec<Option<String>>>,
     }
 
     impl Invoke for RecordingInvoker {
@@ -197,16 +197,16 @@ mod tests {
             _headers: RequestHeaders,
             options: CallOptions,
         ) -> (Self::SendStream, Self::RecvStream) {
-            let picked = picked_child_name(&options).map(str::to_owned);
-            self.picked_children.lock().unwrap().push(picked);
+            let picked = picked_cluster(&options).map(str::to_owned);
+            self.picked_clusters.lock().unwrap().push(picked);
             (ClosedStream, ClosedStream)
         }
     }
 
-    /// Returns the interceptor for the cluster whose cluster manager child is
-    /// named `child_name`, with a cluster ref that nothing tracks.
-    fn cluster(child_name: &str) -> Arc<ClusterInterceptor> {
-        Arc::new(ClusterInterceptor::new(child_name, Arc::new(())))
+    /// Returns the interceptor for the cluster named `name`, with a cluster
+    /// ref that nothing tracks.
+    fn cluster(name: &str) -> Arc<ClusterInterceptor> {
+        Arc::new(ClusterInterceptor::new(name, Arc::new(())))
     }
 
     /// Returns a route match for paths starting with `prefix`.
@@ -245,8 +245,8 @@ mod tests {
 
     /// Starts an RPC with `headers` as a channel would: selects its config
     /// with `selector` and runs it through the config's interceptor. Returns
-    /// the cluster manager child the RPC was routed to, or the status the
-    /// selector failed the RPC with.
+    /// the cluster the RPC was routed to, or the status the selector failed
+    /// the RPC with.
     async fn route_rpc(
         selector: &XdsConfigSelector,
         headers: RequestHeaders,
@@ -263,16 +263,16 @@ mod tests {
                 &ArcInvoker::from_arc(invoker.clone()),
             )
             .await;
-        let picked_children = invoker.picked_children.lock().unwrap().clone();
-        match picked_children.as_slice() {
-            [Some(child)] => Ok(child.clone()),
+        let picked_clusters = invoker.picked_clusters.lock().unwrap().clone();
+        match picked_clusters.as_slice() {
+            [Some(cluster)] => Ok(cluster.clone()),
             other => panic!("expected the RPC to reach the invoker with a pick, got {other:?}"),
         }
     }
 
-    /// Returns the child picked for an RPC to `METHOD` without metadata.
+    /// Returns the cluster picked for an RPC to `METHOD` without metadata.
     /// Panics if the selector fails the RPC.
-    async fn picked_child(selector: &XdsConfigSelector) -> String {
+    async fn routed_cluster(selector: &XdsConfigSelector) -> String {
         route_rpc(selector, headers(MetadataMap::new()))
             .await
             .expect("selector should pick a cluster")
@@ -286,7 +286,7 @@ mod tests {
             route(prefix_match(""), [(cluster("b"), 1)]),
         ]);
 
-        assert_eq!(picked_child(&selector).await, "a");
+        assert_eq!(routed_cluster(&selector).await, "a");
     }
 
     #[tokio::test]
@@ -309,7 +309,7 @@ mod tests {
             "canary"
         );
 
-        assert_eq!(picked_child(&selector).await, "prod");
+        assert_eq!(routed_cluster(&selector).await, "prod");
     }
 
     #[test]
@@ -333,7 +333,7 @@ mod tests {
         )]);
 
         for _ in 0..3 {
-            assert_eq!(picked_child(&selector).await, "b");
+            assert_eq!(routed_cluster(&selector).await, "b");
         }
     }
 

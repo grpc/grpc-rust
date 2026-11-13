@@ -35,33 +35,31 @@ mod config_selector;
 /// The cluster the config selector routed an RPC to. The config selector's
 /// cluster interceptors store an `Arc<PickedCluster>` in the RPC's
 /// `CallOptions`, keyed by its type, where it tells the cluster manager picker
-/// which child to pick from.
+/// which cluster to pick from.
 #[derive(Debug)]
 struct PickedCluster {
-    /// Name of the cluster manager child for the cluster.
-    child_name: String,
+    /// Name of the cluster.
+    name: String,
     /// Keeps the cluster in use, i.e. subscribed and in the resolver's
     /// service config, while this pick is alive.
     // TODO: Get this from the Dependency Manager.
     _cluster_ref: Arc<()>,
 }
 
-/// Returns the name of the cluster manager child that the RPC with
-/// `call_options` was routed to, or `None` if the config selector didn't
-/// route it.
-pub(crate) fn picked_child_name(call_options: &CallOptions) -> Option<&str> {
+/// Returns the name of the cluster that the RPC with `call_options` was
+/// routed to, or `None` if the config selector didn't route it.
+pub(crate) fn picked_cluster(call_options: &CallOptions) -> Option<&str> {
     call_options
         .get_option::<Arc<PickedCluster>>()
-        .map(|picked| picked.child_name.as_str())
+        .map(|picked| picked.name.as_str())
 }
 
-/// Routes the RPC with `call_options` to the cluster manager child named
-/// `child_name`, as the config selector would. The pick's cluster ref isn't
-/// tracked by anything.
+/// Routes the RPC with `call_options` to the cluster named `cluster`, as the
+/// config selector would. The pick's cluster ref isn't tracked by anything.
 #[cfg(test)]
-pub(crate) fn set_picked_child_for_testing(call_options: &mut CallOptions, child_name: &str) {
+pub(crate) fn set_picked_cluster(call_options: &mut CallOptions, cluster: &str) {
     call_options.set_option(Arc::new(PickedCluster {
-        child_name: child_name.to_owned(),
+        name: cluster.to_owned(),
         _cluster_ref: Arc::new(()),
     }));
 }

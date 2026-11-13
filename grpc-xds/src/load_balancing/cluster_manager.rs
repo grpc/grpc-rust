@@ -39,7 +39,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Once;
 
 use grpc::__unstable::client::load_balancing::ChannelController;
 use grpc::__unstable::client::load_balancing::LbConfigJson;
@@ -63,7 +62,6 @@ use serde::Deserialize;
 use crate::resolver::picked_child_name;
 
 static POLICY_NAME: &str = "xds_cluster_manager_experimental";
-static START: Once = Once::new();
 
 // Validated configuration for `xds_cluster_manager_experimental`.
 // Maps a cluster name to a load balancing configuration for that cluster.
@@ -212,9 +210,7 @@ impl Picker for ClusterPicker {
 
 /// Register cluster manager as a LbPolicy.
 pub(crate) fn reg() {
-    START.call_once(|| {
-        GLOBAL_LB_REGISTRY.add_builder(ClusterManagerBuilder {});
-    });
+    GLOBAL_LB_REGISTRY.add_builder(ClusterManagerBuilder {});
 }
 
 #[cfg(test)]

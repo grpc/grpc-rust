@@ -30,6 +30,10 @@ pub(crate) mod cert_provider_config;
 pub(crate) mod cluster_discovery;
 pub(crate) mod connector;
 pub(crate) mod endpoint_manager;
+// gRFC A61: not used yet; endpoint connectors switch to it once endpoints
+// carry multiple addresses.
+#[allow(dead_code)]
+pub(crate) mod happy_eyeballs;
 pub(crate) mod resource;
 pub(crate) mod resource_manager;
 pub(crate) mod routing;

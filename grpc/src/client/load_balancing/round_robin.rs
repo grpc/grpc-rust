@@ -24,7 +24,6 @@
 
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::Once;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -48,7 +47,6 @@ use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 
 pub static POLICY_NAME: &str = "round_robin";
-static START: Once = Once::new();
 
 #[derive(Debug, Default)]
 pub(crate) struct RoundRobinConfig(PickFirstConfig);
@@ -200,9 +198,7 @@ impl LbPolicy for RoundRobinPolicy {
 
 /// Register round robin as a LbPolicy.
 pub(crate) fn reg() {
-    START.call_once(|| {
-        GLOBAL_LB_REGISTRY.add_builder(RoundRobinBuilder {});
-    });
+    GLOBAL_LB_REGISTRY.add_builder(RoundRobinBuilder {});
 }
 
 #[derive(Debug)]

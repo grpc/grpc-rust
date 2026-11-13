@@ -28,6 +28,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::Once;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -42,6 +43,7 @@ use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
 pub(crate) mod subchannel_sharing;
+pub(crate) mod weighted_target;
 
 pub mod child_manager;
 pub mod endpoint_filtering;
@@ -57,8 +59,22 @@ pub mod sampling;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
 
-#[cfg(test)]
-pub(crate) mod test_utils;
+#[cfg(any(test, feature = "__internal-test-utils"))]
+pub mod test_utils;
+
+static START: Once = Once::new();
+
+/// Registers the built-in load balancing policies into the global LB registry.
+///
+/// Only the first call has an effect; any additional ones are ignored.
+pub(crate) fn register() {
+    START.call_once(|| {
+        pick_first::reg();
+        priority::reg();
+        round_robin::reg();
+        weighted_target::reg();
+    });
+}
 
 /// An LB policy factory that produces LbPolicy instances used by the channel
 /// to manage connections and pick connections for RPCs.
@@ -483,8 +499,52 @@ impl LbState {
     }
 }
 
-/// Type alias for the completion callback function.
-pub type CompletionCallback = Box<dyn Fn() + Send + Sync>;
+/// Information about a finished RPC, passed to a [`CompletionCallback`].
+#[derive(Debug, Clone, Copy)]
+pub struct CallOutcome<'a> {
+    status: &'a crate::Result<()>,
+    trailing_metadata: Option<&'a MetadataMap>,
+}
+
+impl<'a> CallOutcome<'a> {
+    /// Creates a [`CallOutcome`] with the RPC's final status and no trailing
+    /// metadata.
+    pub fn new(status: &'a crate::Result<()>) -> Self {
+        Self {
+            status,
+            trailing_metadata: None,
+        }
+    }
+
+    /// Sets the trailing metadata received from the server.
+    pub fn with_trailing_metadata(mut self, trailing_metadata: &'a MetadataMap) -> Self {
+        self.trailing_metadata = Some(trailing_metadata);
+        self
+    }
+
+    /// Returns the RPC's final status.
+    ///
+    /// If the RPC was abandoned before completing (e.g. the application
+    /// dropped the stream), this is a `CANCELLED` error.
+    pub fn status(&self) -> &'a crate::Result<()> {
+        self.status
+    }
+
+    /// Returns the trailing metadata received from the server, if any. This
+    /// is `None` if the RPC did not receive trailers from the server (e.g. it
+    /// was abandoned).
+    ///
+    /// LB policies can use this to read per-call backend metrics (e.g. ORCA
+    /// load reports).
+    pub fn trailing_metadata(&self) -> Option<&'a MetadataMap> {
+        self.trailing_metadata
+    }
+}
+
+/// Callback invoked when an RPC that used a [`Pick`] completes.
+///
+/// See [`Pick::on_complete`] for when it is invoked.
+pub type CompletionCallback = Box<dyn for<'a> FnOnce(&CallOutcome<'a>) + Send + Sync>;
 
 /// A collection of data used by the channel for routing a request.
 pub struct Pick {
@@ -492,7 +552,16 @@ pub struct Pick {
     pub subchannel: Arc<dyn Subchannel>,
     // Metadata to be added to existing outgoing metadata.
     pub metadata: MetadataMap,
-    // Callback to be invoked once the RPC completes.
+    /// Callback to be invoked once the RPC completes.
+    ///
+    /// The channel invokes the callback when the RPC finishes (trailers are
+    /// received) or when it is abandoned before finishing (e.g. cancelled),
+    /// passing the RPC's [`CallOutcome`]. If the RPC never starts on the
+    /// subchannel, the callback is dropped without being invoked. This
+    /// includes the case where a parent LB policy discards this `Pick` (e.g.
+    /// a circuit breaker rejects it), so any per-call state acquired at pick
+    /// time must be released when the callback is dropped, not only when it
+    /// is invoked.
     pub on_complete: Option<CompletionCallback>,
 }
 
@@ -509,7 +578,7 @@ impl Debug for Pick {
 /// QueuingPicker always returns Queue.  LB policies that are not actively
 /// Connecting should not use this picker.
 #[derive(Debug)]
-pub(crate) struct QueuingPicker;
+pub struct QueuingPicker;
 
 impl Picker for QueuingPicker {
     fn pick(&self, _options: PickOptions<'_>) -> PickResult {
@@ -518,7 +587,7 @@ impl Picker for QueuingPicker {
 }
 
 #[derive(Debug)]
-pub(crate) struct FailingPicker {
+pub struct FailingPicker {
     pub error: String,
 }
 
@@ -533,13 +602,13 @@ impl Picker for FailingPicker {
 
 /// A dynamic LB policy config implementation that can be downcast to a specific
 /// config as needed.
-pub(crate) type DynLbConfig = Arc<dyn Any + Send + Sync>;
+pub type DynLbConfig = Arc<dyn Any + Send + Sync>;
 
 /// A builder of dynamic LB policies.
-pub(crate) type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
+pub type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPolicy>>;
 
 /// An LB policy that accepts dynamic configs.
-pub(crate) type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
+pub type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
 
 impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     type LbConfig = T::LbConfig;

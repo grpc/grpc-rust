@@ -47,32 +47,32 @@ pub trait ValueEncoding: Clone + Eq + PartialEq + Hash {
     #[doc(hidden)]
     fn from_bytes(
         value: &[u8],
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes>;
 
     #[doc(hidden)]
     fn from_shared(
         value: Bytes,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes>;
 
     #[doc(hidden)]
-    fn from_static(value: &'static str, _: private::Internal) -> UnencodedHeaderValue;
+    fn from_static(value: &'static str, _: private::SealedToken) -> UnencodedHeaderValue;
 
     #[doc(hidden)]
-    fn decode(value: &[u8], _: private::Internal) -> Result<Bytes, InvalidMetadataValueBytes>;
+    fn decode(value: &[u8], _: private::SealedToken) -> Result<Bytes, InvalidMetadataValueBytes>;
 
     #[doc(hidden)]
-    fn encode(value: Bytes, _: private::Internal) -> Bytes;
+    fn encode(value: Bytes, _: private::SealedToken) -> Bytes;
 
     #[doc(hidden)]
-    fn equals(a: &UnencodedHeaderValue, b: &[u8], _: private::Internal) -> bool;
+    fn equals(a: &UnencodedHeaderValue, b: &[u8], _: private::SealedToken) -> bool;
 
     #[doc(hidden)]
     fn values_equal(
         a: &UnencodedHeaderValue,
         b: &UnencodedHeaderValue,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> bool;
 }
 
@@ -132,7 +132,7 @@ impl ValueEncoding for Ascii {
 
     fn from_bytes(
         value: &[u8],
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
         let value = value.trim_ascii();
 
@@ -146,7 +146,7 @@ impl ValueEncoding for Ascii {
 
     fn from_shared(
         value: Bytes,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
         let slice = value.as_ref();
         let trimmed = slice.trim_ascii();
@@ -167,7 +167,7 @@ impl ValueEncoding for Ascii {
         Ok(UnencodedHeaderValue::from_bytes(value.slice(start..end)))
     }
 
-    fn from_static(value: &'static str, _: private::Internal) -> UnencodedHeaderValue {
+    fn from_static(value: &'static str, _: private::SealedToken) -> UnencodedHeaderValue {
         let value = value.trim_ascii();
         if !Ascii::is_valid_value(value) {
             panic!("Invalid ASCII metadata value: {}", value)
@@ -175,7 +175,7 @@ impl ValueEncoding for Ascii {
         UnencodedHeaderValue::from_bytes(Bytes::from_static(value.as_bytes()))
     }
 
-    fn decode(value: &[u8], _: private::Internal) -> Result<Bytes, InvalidMetadataValueBytes> {
+    fn decode(value: &[u8], _: private::SealedToken) -> Result<Bytes, InvalidMetadataValueBytes> {
         let value = value.trim_ascii();
 
         if value.is_empty() || !Ascii::is_valid_value(value) {
@@ -184,19 +184,19 @@ impl ValueEncoding for Ascii {
         Ok(Bytes::copy_from_slice(value))
     }
 
-    fn equals(a: &UnencodedHeaderValue, b: &[u8], _: private::Internal) -> bool {
+    fn equals(a: &UnencodedHeaderValue, b: &[u8], _: private::SealedToken) -> bool {
         a.as_bytes().as_ref() == b
     }
 
     fn values_equal(
         a: &UnencodedHeaderValue,
         b: &UnencodedHeaderValue,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> bool {
         a == b
     }
 
-    fn encode(value: Bytes, _: private::Internal) -> Bytes {
+    fn encode(value: Bytes, _: private::SealedToken) -> Bytes {
         value
     }
 }
@@ -247,7 +247,7 @@ impl ValueEncoding for Binary {
 
     fn from_bytes(
         value: &[u8],
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
         Ok(UnencodedHeaderValue::from_bytes(Bytes::copy_from_slice(
             value,
@@ -256,35 +256,35 @@ impl ValueEncoding for Binary {
 
     fn from_shared(
         value: Bytes,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
         Ok(UnencodedHeaderValue::from_bytes(value))
     }
 
-    fn from_static(value: &'static str, _: private::Internal) -> UnencodedHeaderValue {
+    fn from_static(value: &'static str, _: private::SealedToken) -> UnencodedHeaderValue {
         UnencodedHeaderValue::from_bytes(Bytes::from_static(value.as_ref()))
     }
 
-    fn decode(value: &[u8], _: private::Internal) -> Result<Bytes, InvalidMetadataValueBytes> {
+    fn decode(value: &[u8], _: private::SealedToken) -> Result<Bytes, InvalidMetadataValueBytes> {
         base64_util::STANDARD
             .decode(value)
             .map(|bytes_vec| bytes_vec.into())
             .map_err(|_| InvalidMetadataValueBytes::new())
     }
 
-    fn equals(a: &UnencodedHeaderValue, b: &[u8], _: private::Internal) -> bool {
+    fn equals(a: &UnencodedHeaderValue, b: &[u8], _: private::SealedToken) -> bool {
         a.as_bytes().as_ref() == b
     }
 
     fn values_equal(
         a: &UnencodedHeaderValue,
         b: &UnencodedHeaderValue,
-        _: private::Internal,
+        _: private::SealedToken,
     ) -> bool {
         a.as_bytes() == b.as_bytes()
     }
 
-    fn encode(value: Bytes, _: private::Internal) -> Bytes {
+    fn encode(value: Bytes, _: private::SealedToken) -> Bytes {
         let encoded_value: String = base64_util::STANDARD_NO_PAD.encode(value);
         Bytes::from(encoded_value)
     }

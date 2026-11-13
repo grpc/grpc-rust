@@ -27,19 +27,20 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use grpc::__unstable::client::boxed::ArcInterceptor;
+use grpc::__unstable::client::boxed::ArcInvoker;
+use grpc::__unstable::client::boxed::BoxRecvStream;
+use grpc::__unstable::client::boxed::BoxSendStream;
 use grpc::__unstable::client::load_balancing::sampling::WeightedSampler;
 use grpc::__unstable::client::name_resolution::config_selector::ConfigSelector;
-use grpc::__unstable::client::name_resolution::config_selector::DynIntercept;
 use grpc::__unstable::client::name_resolution::config_selector::RpcConfig;
 use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
 use grpc::StatusCodeError;
 use grpc::StatusError;
-use grpc::async_trait;
 use grpc::client::CallOptions;
-use grpc::client::DynInvoke;
-use grpc::client::DynRecvStream;
-use grpc::client::DynSendStream;
+use grpc::client::Invoke as _;
 use grpc::client::RequestHeaders;
+use grpc::client::interceptor::Intercept;
 
 use crate::resolver::PickedCluster;
 use crate::resource::RouteMatch;
@@ -72,16 +73,18 @@ impl ClusterInterceptor {
     }
 }
 
-#[async_trait]
-impl DynIntercept for ClusterInterceptor {
-    async fn dyn_intercept(
+impl Intercept<&ArcInvoker> for ClusterInterceptor {
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
+
+    async fn intercept(
         &self,
         headers: RequestHeaders,
         mut options: CallOptions,
-        next: Arc<dyn DynInvoke>,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        next: &ArcInvoker,
+    ) -> (Self::SendStream, Self::RecvStream) {
         options.set_option(self.picked.clone());
-        next.dyn_invoke(headers, options).await
+        next.invoke(headers, options).await
     }
 }
 
@@ -129,7 +132,7 @@ impl ConfigSelector for XdsConfigSelector {
                 "route has no cluster with a non-zero weight",
             )
         })?;
-        Ok(RpcConfig::default().with_interceptor(cluster.clone()))
+        Ok(RpcConfig::default().with_interceptor(ArcInterceptor::from_arc(cluster.clone())))
     }
 }
 
@@ -138,6 +141,7 @@ mod tests {
     use std::sync::Mutex;
 
     use grpc::__unstable::client::load_balancing::sampling::WeightedSamplerBuilder;
+    use grpc::client::Invoke;
     use grpc::client::RecvStream;
     use grpc::client::ResponseStreamItem;
     use grpc::client::SendOptions;
@@ -184,16 +188,18 @@ mod tests {
         picked_children: Mutex<Vec<Option<String>>>,
     }
 
-    #[async_trait]
-    impl DynInvoke for RecordingInvoker {
-        async fn dyn_invoke(
+    impl Invoke for RecordingInvoker {
+        type SendStream = ClosedStream;
+        type RecvStream = ClosedStream;
+
+        async fn invoke(
             &self,
             _headers: RequestHeaders,
             options: CallOptions,
-        ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        ) -> (Self::SendStream, Self::RecvStream) {
             let picked = picked_child_name(&options).map(str::to_owned);
             self.picked_children.lock().unwrap().push(picked);
-            (Box::new(ClosedStream), Box::new(ClosedStream))
+            (ClosedStream, ClosedStream)
         }
     }
 
@@ -251,7 +257,11 @@ mod tests {
             .expect("selector should set an interceptor");
         let invoker = Arc::new(RecordingInvoker::default());
         interceptor
-            .dyn_intercept(headers, CallOptions::new(), invoker.clone())
+            .intercept(
+                headers,
+                CallOptions::new(),
+                &ArcInvoker::from_arc(invoker.clone()),
+            )
             .await;
         let picked_children = invoker.picked_children.lock().unwrap().clone();
         match picked_children.as_slice() {

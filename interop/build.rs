@@ -34,10 +34,10 @@ fn main() {
     }
 
     tonic_prost_build::configure()
-        .compile_protos(&["grpc/testing/test.proto"], &["proto"])
+        .compile_protos(&["grpc/testing/test.proto"], &["third_party/grpc-proto"])
         .unwrap();
     grpc_protobuf_build::CodeGen::new()
-        .include("proto")
+        .include("third_party/grpc-proto")
         .inputs([
             "grpc/testing/test.proto",
             "grpc/testing/empty.proto",

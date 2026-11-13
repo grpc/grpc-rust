@@ -26,6 +26,7 @@
 
 use std::future::Future;
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(feature = "rt-tokio")]
 pub mod tokio;
@@ -42,4 +43,8 @@ pub trait Runtime: Send + Sync + Clone + 'static {
 
     /// Sleep for the given duration.
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+
+    /// Returns the current time according to this runtime's clock, the one
+    /// [`sleep`](Self::sleep) measures time with.
+    fn now(&self) -> Instant;
 }

@@ -245,7 +245,7 @@ impl<VE> MetadataValue<VE> {
 
 impl<VE: ValueEncoding> MetadataValue<VE> {
     pub(crate) fn encode(value: Bytes) -> Bytes {
-        VE::encode(value, private::Internal)
+        VE::encode(value, private::SealedToken)
     }
 
     /// Convert a static string to a `MetadataValue`.
@@ -277,7 +277,7 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     #[inline]
     pub fn from_static(src: &'static str) -> Self {
         MetadataValue {
-            inner: VE::from_static(src, private::Internal),
+            inner: VE::from_static(src, private::SealedToken),
             _phantom: PhantomData,
         }
     }
@@ -312,7 +312,7 @@ impl<VE: ValueEncoding> TryFrom<&[u8]> for MetadataValue<VE> {
 
     #[inline]
     fn try_from(src: &[u8]) -> Result<Self, Self::Error> {
-        VE::from_bytes(src, private::Internal).map(|value| MetadataValue {
+        VE::from_bytes(src, private::SealedToken).map(|value| MetadataValue {
             inner: value,
             _phantom: PhantomData,
         })
@@ -365,7 +365,7 @@ impl<VE: ValueEncoding> TryFrom<Bytes> for MetadataValue<VE> {
 
     #[inline]
     fn try_from(src: Bytes) -> Result<Self, Self::Error> {
-        VE::from_shared(src, private::Internal).map(|value| MetadataValue {
+        VE::from_shared(src, private::SealedToken).map(|value| MetadataValue {
             inner: value,
             _phantom: PhantomData,
         })
@@ -581,7 +581,7 @@ impl<VE: ValueEncoding> PartialEq for MetadataValue<VE> {
         // will count as the same value for Binary values. Also,
         // different invalid base64 values count as equal for Binary
         // values.
-        VE::values_equal(&self.inner, &other.inner, private::Internal)
+        VE::values_equal(&self.inner, &other.inner, private::SealedToken)
     }
 }
 
@@ -604,14 +604,14 @@ impl<VE: ValueEncoding> Ord for MetadataValue<VE> {
 impl<VE: ValueEncoding> PartialEq<str> for MetadataValue<VE> {
     #[inline]
     fn eq(&self, other: &str) -> bool {
-        VE::equals(&self.inner, other.as_bytes(), private::Internal)
+        VE::equals(&self.inner, other.as_bytes(), private::SealedToken)
     }
 }
 
 impl<VE: ValueEncoding> PartialEq<[u8]> for MetadataValue<VE> {
     #[inline]
     fn eq(&self, other: &[u8]) -> bool {
-        VE::equals(&self.inner, other, private::Internal)
+        VE::equals(&self.inner, other, private::SealedToken)
     }
 }
 

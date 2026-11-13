@@ -26,6 +26,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_core::Stream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// A pinned, boxed, `Send` future.
 ///
@@ -41,5 +46,42 @@ pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// A stream fed by a spawned producer task that the stream owns.
+///
+/// Dropping the stream aborts the producer.
+pub(crate) struct TaskStream<T> {
+    rx: ReceiverStream<T>,
+    _task: AbortOnDrop,
+}
+
+impl<T> TaskStream<T> {
+    /// Spawns `producer` with the sending half of a channel of `capacity`
+    /// and returns the stream of what it sends.
+    pub(crate) fn spawn<P, F>(capacity: usize, producer: P) -> Self
+    where
+        P: FnOnce(mpsc::Sender<T>) -> F,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel(capacity);
+        let task = tokio::spawn(producer(tx));
+        Self {
+            rx: ReceiverStream::new(rx),
+            _task: AbortOnDrop(task),
+        }
+    }
+}
+
+impl<T> Stream for TaskStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        Pin::new(&mut self.rx).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rx.size_hint()
     }
 }

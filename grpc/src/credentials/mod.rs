@@ -68,7 +68,10 @@ pub trait ChannelCredentials: Send + Sync + 'static {
 
     /// Returns call credentials to be used for all RPCs made on a connection.
     #[doc(hidden)]
-    fn get_call_credentials(&self, token: private::Internal) -> Option<&Arc<dyn CallCredentials>>;
+    fn get_call_credentials(
+        &self,
+        token: private::UnstableToken,
+    ) -> Option<&Arc<dyn CallCredentials>>;
 
     /// Performs the client-side authentication handshake on a raw endpoint.
     ///
@@ -91,7 +94,7 @@ pub trait ChannelCredentials: Send + Sync + 'static {
         source: BoxEndpoint,
         info: &ClientHandshakeInfo,
         runtime: &GrpcRuntime,
-        token: private::Internal,
+        token: private::UnstableToken,
     ) -> Result<HandshakeOutput, String>;
 }
 
@@ -111,7 +114,7 @@ pub trait ServerCredentials: Send + Sync + 'static {
         &self,
         source: BoxEndpoint,
         runtime: GrpcRuntime,
-        token: private::Internal,
+        token: private::UnstableToken,
     ) -> Result<server::HandshakeOutput, String>;
 }
 
@@ -254,12 +257,6 @@ pub struct ProtocolInfo {
 impl ProtocolInfo {
     pub(crate) const fn new(security_protocol: &'static str) -> Self {
         Self { security_protocol }
-    }
-
-    #[cfg(feature = "__unstable")]
-    #[doc(hidden)]
-    pub const fn unstable_new(security_protocol: &'static str) -> Self {
-        Self::new(security_protocol)
     }
 
     /// Returns the security protocol name currently in use, e.g. "tls".

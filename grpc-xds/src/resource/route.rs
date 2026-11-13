@@ -38,17 +38,17 @@ use xds_client::resource::TypeUrl;
 
 use super::safe_regex::SafeRegex;
 use super::string_matcher::StringMatcher;
-use crate::generated::envoy::config::route::v3::HeaderMatcherView;
-use crate::generated::envoy::config::route::v3::RouteActionView;
-use crate::generated::envoy::config::route::v3::RouteConfiguration;
-use crate::generated::envoy::config::route::v3::RouteMatchView;
-use crate::generated::envoy::config::route::v3::RouteView;
-use crate::generated::envoy::config::route::v3::VirtualHostView;
-use crate::generated::envoy::config::route::v3::header_matcher::HeaderMatchSpecifierOneof;
-use crate::generated::envoy::config::route::v3::route::ActionOneof;
-use crate::generated::envoy::config::route::v3::route_action::ClusterSpecifierOneof;
-use crate::generated::envoy::config::route::v3::route_match::PathSpecifierOneof;
-use crate::generated::envoy::r#type::v3::fractional_percent::DenominatorType;
+use crate::generated::envoy_config_route_v3_route_components_proto::HeaderMatcherView;
+use crate::generated::envoy_config_route_v3_route_components_proto::RouteActionView;
+use crate::generated::envoy_config_route_v3_route_components_proto::RouteMatchView;
+use crate::generated::envoy_config_route_v3_route_components_proto::RouteView;
+use crate::generated::envoy_config_route_v3_route_components_proto::VirtualHostView;
+use crate::generated::envoy_config_route_v3_route_components_proto::header_matcher::HeaderMatchSpecifierOneof;
+use crate::generated::envoy_config_route_v3_route_components_proto::route::ActionOneof;
+use crate::generated::envoy_config_route_v3_route_components_proto::route_action::ClusterSpecifierOneof;
+use crate::generated::envoy_config_route_v3_route_components_proto::route_match::PathSpecifierOneof;
+use crate::generated::envoy_config_route_v3_route_proto::RouteConfiguration;
+use crate::generated::envoy_type_v3_percent_proto::fractional_percent::DenominatorType;
 
 /// Validated RouteConfiguration.
 #[derive(Debug, Clone)]
@@ -517,19 +517,19 @@ mod tests {
     use std::panic::catch_unwind;
 
     use super::*;
-    use crate::generated::envoy::config::core::v3::RuntimeFractionalPercent;
-    use crate::generated::envoy::config::route::v3::HeaderMatcher as EnvoyHeaderMatcher;
-    use crate::generated::envoy::config::route::v3::QueryParameterMatcher;
-    use crate::generated::envoy::config::route::v3::RedirectAction;
-    use crate::generated::envoy::config::route::v3::Route as EnvoyRoute;
-    use crate::generated::envoy::config::route::v3::RouteAction as EnvoyRouteAction;
-    use crate::generated::envoy::config::route::v3::RouteMatch as EnvoyRouteMatch;
-    use crate::generated::envoy::config::route::v3::VirtualHost as EnvoyVirtualHost;
-    use crate::generated::envoy::config::route::v3::WeightedCluster as EnvoyWeightedCluster;
-    use crate::generated::envoy::config::route::v3::weighted_cluster::ClusterWeight;
-    use crate::generated::envoy::r#type::matcher::v3::RegexMatcher;
-    use crate::generated::envoy::r#type::matcher::v3::StringMatcher as EnvoyStringMatcher;
-    use crate::generated::envoy::r#type::v3::FractionalPercent;
+    use crate::generated::envoy_config_core_v3_base_proto::RuntimeFractionalPercent;
+    use crate::generated::envoy_config_route_v3_route_components_proto::HeaderMatcher as EnvoyHeaderMatcher;
+    use crate::generated::envoy_config_route_v3_route_components_proto::QueryParameterMatcher;
+    use crate::generated::envoy_config_route_v3_route_components_proto::RedirectAction;
+    use crate::generated::envoy_config_route_v3_route_components_proto::Route as EnvoyRoute;
+    use crate::generated::envoy_config_route_v3_route_components_proto::RouteAction as EnvoyRouteAction;
+    use crate::generated::envoy_config_route_v3_route_components_proto::RouteMatch as EnvoyRouteMatch;
+    use crate::generated::envoy_config_route_v3_route_components_proto::VirtualHost as EnvoyVirtualHost;
+    use crate::generated::envoy_config_route_v3_route_components_proto::WeightedCluster as EnvoyWeightedCluster;
+    use crate::generated::envoy_config_route_v3_route_components_proto::weighted_cluster::ClusterWeight;
+    use crate::generated::envoy_type_matcher_v3_regex_proto::RegexMatcher;
+    use crate::generated::envoy_type_matcher_v3_string_proto::StringMatcher as EnvoyStringMatcher;
+    use crate::generated::envoy_type_v3_percent_proto::FractionalPercent;
     use protobuf::Serialize;
     use protobuf_well_known_types::UInt32Value;
 

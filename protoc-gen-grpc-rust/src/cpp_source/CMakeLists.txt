@@ -2,7 +2,13 @@ cmake_minimum_required(VERSION 3.14)
 project(protoc-gen-grpc-rust LANGUAGES CXX)
 
 set(PROTOBUF_VERSION "36.2" CACHE STRING "Version of protobuf to download")
-set(CMAKE_BINARY_DIR "${CMAKE_BINARY_DIR}/proto-${PROTOBUF_VERSION}")
+# Abseil version that's compatible with protobuf
+set(ABSEIL_VERSION "20250512.2")
+# Use a build directory specific to the dependency versions. Otherwise, stale
+# build artifacts from a different version may be reused (e.g. after a
+# downgrade, the extracted sources have older timestamps than the existing
+# object files), resulting in compile or link failures.
+set(CMAKE_BINARY_DIR "${CMAKE_BINARY_DIR}/proto-${PROTOBUF_VERSION}-absl-${ABSEIL_VERSION}")
 
 # Parse version from Cargo.toml unless already set (e.g. from CI or environment)
 if(NOT RUST_GRPC_VERSION)
@@ -40,8 +46,6 @@ include(FetchContent)
 include(FetchProtobuf)
 
 # Download and configure abseil
-# Abseil version that's compatible with protobuf
-set(ABSEIL_VERSION "20250512.2")
 set(ABSEIL_URL "https://github.com/abseil/abseil-cpp/archive/refs/tags/${ABSEIL_VERSION}.tar.gz")
 
 message(STATUS "Downloading abseil-cpp ${ABSEIL_VERSION}")

@@ -56,13 +56,13 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::core::Address;
 use crate::status::StatusCodeError;
 
-pub(crate) fn new_request_headers() -> RequestHeaders {
+pub fn new_request_headers() -> RequestHeaders {
     RequestHeaders::default()
 }
 
 // A test subchannel that forwards connect calls to a channel.
 // This allows tests to verify when a subchannel is asked to connect.
-pub(crate) struct TestSubchannel {
+pub struct TestSubchannel {
     address: Address,
     tx_connect: mpsc::Sender<TestEvent>,
     // The work scheduler provided by the policy that created this subchannel,
@@ -100,7 +100,7 @@ impl TestSubchannel {
 /// `subchannel` must have been created by a [`TestChannelController`].  The
 /// resulting work is observable via [`TestEnv::expect_schedule_work`], and
 /// the data it contains should be passed to the policy's `work` method.
-pub(crate) fn schedule_subchannel_update(subchannel: &Arc<dyn Subchannel>, state: SubchannelState) {
+pub fn schedule_subchannel_update(subchannel: &Arc<dyn Subchannel>, state: SubchannelState) {
     let sc = subchannel
         .downcast_ref::<TestSubchannel>()
         .expect("subchannel was not created by a TestChannelController");
@@ -145,7 +145,7 @@ impl PartialEq for TestSubchannel {
 impl Eq for TestSubchannel {}
 
 /// Events created by LB policies by calling the channel controller.
-pub(crate) enum TestEvent {
+pub enum TestEvent {
     NewSubchannel(Arc<dyn Subchannel>),
     UpdatePicker(LbState),
     RequestResolution,
@@ -167,8 +167,8 @@ impl Debug for TestEvent {
 /// A test channel controller that forwards calls to a channel.  This allows
 /// tests to verify when a channel controller is asked to create subchannels or
 /// update the picker.
-pub(crate) struct TestChannelController {
-    pub(crate) tx_events: mpsc::Sender<TestEvent>,
+pub struct TestChannelController {
+    pub tx_events: mpsc::Sender<TestEvent>,
 }
 
 impl ChannelController for TestChannelController {
@@ -200,8 +200,8 @@ impl ChannelController for TestChannelController {
 }
 
 #[derive(Debug)]
-pub(crate) struct TestWorkScheduler {
-    pub(crate) tx_work: mpsc::Sender<Option<WorkData>>,
+pub struct TestWorkScheduler {
+    pub tx_work: mpsc::Sender<Option<WorkData>>,
 }
 
 impl WorkScheduler for TestWorkScheduler {
@@ -219,7 +219,7 @@ impl WorkScheduler for TestWorkScheduler {
 /// Prefer [`TestEnv::run_work`].  This is for tests that use a channel
 /// controller other than [`TestChannelController`] and so cannot use
 /// [`TestEnv`].
-pub(crate) fn run_pending_work<P: LbPolicy + ?Sized>(
+pub fn run_pending_work<P: LbPolicy + ?Sized>(
     policy: &mut P,
     rx_work: &mpsc::Receiver<Option<WorkData>>,
     channel_controller: &mut dyn ChannelController,
@@ -237,17 +237,17 @@ pub(crate) fn run_pending_work<P: LbPolicy + ?Sized>(
 /// `expect_*` methods consume events from the appropriate source.  Methods to
 /// actually control the policy are available if `P` implements [`LbPolicy`].
 /// Others can still use this type for assertions, but call the policy manually.
-pub(crate) struct TestEnv<P> {
-    pub(crate) policy: P,
-    pub(crate) tcc: TestChannelController,
-    pub(crate) rx_events: mpsc::Receiver<TestEvent>,
-    pub(crate) rx_work: mpsc::Receiver<Option<WorkData>>,
+pub struct TestEnv<P> {
+    pub policy: P,
+    pub tcc: TestChannelController,
+    pub rx_events: mpsc::Receiver<TestEvent>,
+    pub rx_work: mpsc::Receiver<Option<WorkData>>,
 }
 
 impl<P> TestEnv<P> {
     /// Creates the test environment using a LbPolicyBuilder-like closure for
     /// policies that don't implement LbPolicyBuilder.
-    pub(crate) fn new(build_policy: impl FnOnce(Arc<dyn WorkScheduler>) -> P) -> Self {
+    pub fn new(build_policy: impl FnOnce(Arc<dyn WorkScheduler>) -> P) -> Self {
         let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
         let (tx_work, rx_work) = mpsc::channel::<Option<WorkData>>();
         let work_scheduler = Arc::new(TestWorkScheduler { tx_work });
@@ -268,7 +268,7 @@ impl<P> TestEnv<P> {
     }
 
     /// Verifies that the policy created a subchannel, and returns it.
-    pub(crate) fn expect_new_subchannel(&mut self) -> Arc<dyn Subchannel> {
+    pub fn expect_new_subchannel(&mut self) -> Arc<dyn Subchannel> {
         match self.next_event() {
             TestEvent::NewSubchannel(sc) => sc,
             other => panic!("expected NewSubchannel event, got {other:?}"),
@@ -277,25 +277,41 @@ impl<P> TestEnv<P> {
 
     /// Calls [`Self::expect_new_subchannel`], verifies that the created
     /// subchannel's address equals `addr`, and returns the subchannel.
-    pub(crate) fn expect_new_subchannel_for(&mut self, addr: &str) -> Arc<dyn Subchannel> {
+    pub fn expect_new_subchannel_for(&mut self, addr: &str) -> Arc<dyn Subchannel> {
         let sc = self.expect_new_subchannel();
         assert_eq!(&*sc.address().address, addr);
         sc
     }
 
+    /// Calls [`Self::expect_new_subchannel_for`] for each address in `addrs`,
+    /// in order, and returns the created subchannels.
+    pub fn expect_new_subchannels(&mut self, addrs: &[&str]) -> Vec<Arc<dyn Subchannel>> {
+        addrs
+            .iter()
+            .map(|addr| self.expect_new_subchannel_for(addr))
+            .collect()
+    }
+
     /// Verifies that the policy asked a subchannel to connect, and returns that
     /// subchannel's address.
-    pub(crate) fn expect_connect(&mut self) -> Address {
+    pub fn expect_connect(&mut self) -> Address {
         match self.next_event() {
             TestEvent::Connect(addr) => addr,
             other => panic!("expected Connect event, got {other:?}"),
         }
     }
 
+    /// Calls [`Self::expect_connect`] and verifies that the connected address
+    /// equals `addr`.
+    pub fn expect_connect_to(&mut self, addr: &str) {
+        let got = self.expect_connect();
+        assert_eq!(&*got.address, addr);
+    }
+
     /// Verifies that the policy produced a new picker, and returns the
     /// [`LbState`] containing the connectivity state and picker without
     /// inspecting either.
-    pub(crate) fn expect_picker_update(&mut self) -> LbState {
+    pub fn expect_picker_update(&mut self) -> LbState {
         match self.next_event() {
             TestEvent::UpdatePicker(state) => state,
             other => panic!("expected UpdatePicker event, got {other:?}"),
@@ -314,7 +330,7 @@ impl<P> TestEnv<P> {
     /// - `want` is [`ConnectivityState::Ready`] with multiple subchannels and
     ///   the caller will perform its own multi-pick assertions; or
     /// - testing against a stub policy whose picker is a placeholder.
-    pub(crate) fn expect_picker_state(&mut self, want: ConnectivityState) -> Arc<dyn Picker> {
+    pub fn expect_picker_state(&mut self, want: ConnectivityState) -> Arc<dyn Picker> {
         let state = self.expect_picker_update();
         assert_eq!(state.connectivity_state, want);
         state.picker
@@ -324,7 +340,7 @@ impl<P> TestEnv<P> {
     /// [`ConnectivityState::Connecting`], verifies that [`Picker::pick`]
     /// returns [`PickResult::Queue`] per the [`Picker`] contract for
     /// `CONNECTING`, and returns the picker.
-    pub(crate) fn expect_queuing_picker(&mut self) -> Arc<dyn Picker> {
+    pub fn expect_queuing_picker(&mut self) -> Arc<dyn Picker> {
         let picker = self.expect_picker_state(ConnectivityState::Connecting);
         let res = picker.pick(PickOptions::new(
             &new_request_headers(),
@@ -338,10 +354,7 @@ impl<P> TestEnv<P> {
     /// Calls [`Self::expect_picker_state`] with [`ConnectivityState::Ready`],
     /// verifies that [`Picker::pick`] returns [`PickResult::Pick`] for the
     /// exact `subchannel` instance (pointer equality), and returns the picker.
-    pub(crate) fn expect_ready_picker(
-        &mut self,
-        subchannel: &Arc<dyn Subchannel>,
-    ) -> Arc<dyn Picker> {
+    pub fn expect_ready_picker(&mut self, subchannel: &Arc<dyn Subchannel>) -> Arc<dyn Picker> {
         let picker = self.expect_picker_state(ConnectivityState::Ready);
 
         let PickResult::Pick(pick) = picker.pick(PickOptions::new(
@@ -358,7 +371,7 @@ impl<P> TestEnv<P> {
     /// [`ConnectivityState::TransientFailure`], verifies that [`Picker::pick`]
     /// returns [`PickResult::Fail`] with [`StatusCodeError::Unavailable`] and
     /// exact message `error`, and returns the picker.
-    pub(crate) fn expect_failing_picker(&mut self, error: &str) -> Arc<dyn Picker> {
+    pub fn expect_failing_picker(&mut self, error: &str) -> Arc<dyn Picker> {
         let picker = self.expect_picker_state(ConnectivityState::TransientFailure);
         let PickResult::Fail(status) = picker.pick(PickOptions::new(
             &new_request_headers(),
@@ -372,7 +385,7 @@ impl<P> TestEnv<P> {
     }
 
     /// Verifies that the policy requested re-resolution.
-    pub(crate) fn expect_request_resolution(&mut self) {
+    pub fn expect_request_resolution(&mut self) {
         match self.next_event() {
             TestEvent::RequestResolution => {}
             other => panic!("expected RequestResolution event, got {other:?}"),
@@ -381,7 +394,7 @@ impl<P> TestEnv<P> {
 
     /// Verifies that the policy scheduled work, and returns the data it was
     /// scheduled with.
-    pub(crate) fn expect_schedule_work(&mut self) -> Option<WorkData> {
+    pub fn expect_schedule_work(&mut self) -> Option<WorkData> {
         match self.rx_work.try_recv() {
             Ok(data) => data,
             Err(e) => panic!("expected scheduled work, got error: {e:?}"),
@@ -390,7 +403,7 @@ impl<P> TestEnv<P> {
 
     /// Verifies that the policy has produced no further events and has not
     /// scheduled any further work.
-    pub(crate) fn expect_no_events(&mut self) {
+    pub fn expect_no_events(&mut self) {
         if let Ok(event) = self.rx_events.try_recv() {
             panic!("expected no events, got {event:?}");
         }
@@ -403,7 +416,7 @@ impl<P> TestEnv<P> {
 impl<P: LbPolicy> TestEnv<P> {
     /// Sends a resolver update containing `endpoints` and `config` to the
     /// policy.
-    pub(crate) fn send_resolver_update_with_config(
+    pub fn send_resolver_update_with_config(
         &mut self,
         endpoints: Vec<Endpoint>,
         config: &P::LbConfig,
@@ -417,7 +430,7 @@ impl<P: LbPolicy> TestEnv<P> {
 
     /// Sends a resolver update containing `endpoints` to the policy, using the
     /// policy's default config.
-    pub(crate) fn send_resolver_update(&mut self, endpoints: Vec<Endpoint>) -> Result<(), String>
+    pub fn send_resolver_update(&mut self, endpoints: Vec<Endpoint>) -> Result<(), String>
     where
         P::LbConfig: Default,
     {
@@ -425,7 +438,7 @@ impl<P: LbPolicy> TestEnv<P> {
     }
 
     /// Sends a resolver error to the policy, using the policy's default config.
-    pub(crate) fn send_resolver_error(&mut self, err: String) -> Result<(), String>
+    pub fn send_resolver_error(&mut self, err: String) -> Result<(), String>
     where
         P::LbConfig: Default,
     {
@@ -440,7 +453,7 @@ impl<P: LbPolicy> TestEnv<P> {
     /// Simulates a state change of `subchannel` and delivers it to the policy
     /// via the work scheduler.  Any follow-up work is not run; use
     /// [`TestEnv::run_work`] if this can trigger additional work items.
-    pub(crate) fn send_subchannel_update(
+    pub fn send_subchannel_update(
         &mut self,
         subchannel: &Arc<dyn Subchannel>,
         state: &SubchannelState,
@@ -453,7 +466,7 @@ impl<P: LbPolicy> TestEnv<P> {
 
     /// Delivers all work currently scheduled to the policy, and any work that
     /// results from it, until none is left.
-    pub(crate) fn run_work(&mut self) {
+    pub fn run_work(&mut self) {
         run_pending_work(&mut self.policy, &self.rx_work, &mut self.tcc);
     }
 }
@@ -478,7 +491,7 @@ type WorkFn =
 /// This struct holds `LbPolicy` trait stub functions that tests are expected to
 /// implement.
 #[derive(Clone, Default)]
-pub(crate) struct StubPolicyFuncs {
+pub struct StubPolicyFuncs {
     pub resolver_update: Option<ResolverUpdateFn>,
     pub exit_idle: Option<ExitIdleFn>,
     pub work: Option<WorkFn>,
@@ -492,7 +505,7 @@ impl Debug for StubPolicyFuncs {
 
 /// Data holds test data that will be passed all to functions in PolicyFuncs
 #[derive(Debug)]
-pub(crate) struct StubPolicyData {
+pub struct StubPolicyData {
     pub lb_policy_options: LbPolicyOptions,
     pub test_data: Option<Box<dyn Any + Send + Sync>>,
 }
@@ -509,7 +522,7 @@ impl StubPolicyData {
 
 /// The stub `LbPolicy` that calls the provided functions.
 #[derive(Debug)]
-pub(crate) struct StubPolicy {
+pub struct StubPolicy {
     funcs: StubPolicyFuncs,
     data: StubPolicyData,
 }
@@ -543,7 +556,7 @@ impl LbPolicy for StubPolicy {
 }
 
 impl StubPolicy {
-    pub(crate) fn new(funcs: StubPolicyFuncs, options: LbPolicyOptions) -> Self {
+    pub fn new(funcs: StubPolicyFuncs, options: LbPolicyOptions) -> Self {
         Self {
             funcs,
             data: StubPolicyData::new(options),
@@ -553,7 +566,7 @@ impl StubPolicy {
 
 /// StubPolicyBuilder builds a StubLbPolicy.
 #[derive(Debug)]
-pub(crate) struct StubPolicyBuilder {
+pub struct StubPolicyBuilder {
     name: &'static str,
     funcs: StubPolicyFuncs,
 }
@@ -590,6 +603,12 @@ impl LbPolicyBuilder for StubPolicyBuilder {
     }
 }
 
-pub(crate) fn reg_stub_policy(name: &'static str, funcs: StubPolicyFuncs) {
+pub fn reg_stub_policy(name: &'static str, funcs: StubPolicyFuncs) {
     super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }));
+}
+
+/// Registers the LB policies that a channel registers by default, for tests
+/// that build policies without a channel.
+pub fn register_default_policies() {
+    super::register();
 }

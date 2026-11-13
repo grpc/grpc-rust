@@ -23,18 +23,13 @@
  */
 
 use crate::client::{InteropTest, InteropTestUnimplemented};
-use crate::{
-    TestAssertion, pb::test_service_client::*, pb::unimplemented_service_client::*, pb::*,
-    test_assert,
-};
+pub use crate::pb::test_service_client::TestServiceClient;
+pub use crate::pb::unimplemented_service_client::UnimplementedServiceClient;
+use crate::{TestAssertion, pb::*, test_assert};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::async_trait;
-use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status, metadata::MetadataValue};
-
-pub type TestClient = TestServiceClient<Channel>;
-pub type UnimplementedClient = UnimplementedServiceClient<Channel>;
 
 const LARGE_REQ_SIZE: usize = 271_828;
 const LARGE_RSP_SIZE: i32 = 314_159;
@@ -45,7 +40,14 @@ const SPECIAL_TEST_STATUS_MESSAGE: &str =
     "\t\ntest with whitespace\r\nand Unicode BMP ☺ and non-BMP 😈\t\n";
 
 #[async_trait]
-impl InteropTest for TestClient {
+impl<T> InteropTest for TestServiceClient<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Send + Sync,
+    T::Future: Send,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
     async fn empty_unary(&mut self, assertions: &mut Vec<TestAssertion>) {
         let result = self.empty_call(Request::new(Empty {})).await;
 
@@ -411,7 +413,14 @@ impl InteropTest for TestClient {
 }
 
 #[async_trait]
-impl InteropTestUnimplemented for UnimplementedClient {
+impl<T> InteropTestUnimplemented for UnimplementedServiceClient<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Send + Sync,
+    T::Future: Send,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
     async fn unimplemented_service(&mut self, assertions: &mut Vec<TestAssertion>) {
         let result = self.unimplemented_call(Request::new(Empty {})).await;
         assertions.push(test_assert!(

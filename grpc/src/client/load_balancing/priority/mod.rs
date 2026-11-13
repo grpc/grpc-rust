@@ -225,8 +225,15 @@ struct CreatedChild {
     /// via [`Child::state`].
     policy: Child<GracefulSwitchPolicy>,
     /// The lifecycle state of the child, derived from the connectivity states
-    /// reported by `policy` and the timers.
+    /// reported by `policy` and the failover timer.
+    ///
+    /// This continues to be updated while the child is deactivated, so that
+    /// a reactivated child resumes with its failover timer and failure
+    /// history intact.
     state: ChildState,
+    /// The 15-minute deactivation timer, present only while the child is
+    /// deactivated.
+    deactivation_timer: Option<Timer>,
 }
 
 /// Internal work item scheduled by [`PriorityPolicy`] timers upon expiration.
@@ -245,8 +252,8 @@ struct PriorityTimerWork;
 /// observed as expired whenever the work it schedules runs.
 ///
 /// If dropped before expiration (e.g., when a child transitions out of
-/// `Connecting` or is reactivated from `Deactivated`), the spawned task is
-/// aborted via its task handle, preventing stale timer wakeups.
+/// `Connecting` or is reactivated), the spawned task is aborted via its task
+/// handle, preventing stale timer wakeups.
 struct Timer {
     /// Set by the background task once the sleep completes, before work is
     /// scheduled.
@@ -293,14 +300,12 @@ impl Timer {
     }
 }
 
-/// Lifecycle and connectivity states of a child policy under
-/// `priority_experimental`.
+/// Connectivity states of a child policy, as tracked for failover.
 ///
 /// The child's most recently reported [`LbState`] is not stored here; it is
-/// available via [`Child::state`].
+/// available via [`Child::state`].  Whether the child is deactivated is
+/// tracked separately by [`CreatedChild::deactivation_timer`].
 ///
-/// [gRFC A56 (Section Child Lifetime Management)]:
-///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
 /// [gRFC A56 (Section Child Connectivity State Tracking)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-connectivity-state-tracking
 #[derive(Debug)]
@@ -332,22 +337,6 @@ enum ChildState {
     /// When a child reaches this state, it is selected as the active priority
     /// and lower-priority children are deactivated (with a 15-minute timer).
     ReadyOrIdle,
-
-    /// The child was previously active, but has been superseded by a
-    /// higher-priority child reaching `ReadyOrIdle` state.
-    ///
-    /// A 15-minute deactivation timer is running ([`DEACTIVATION_TIMEOUT`]).
-    /// If higher priorities fail before this timer expires, the child will be
-    /// reactivated immediately without connection churn. If the timer expires,
-    /// the child is destroyed (see
-    /// [gRFC A56 (Section Child Lifetime Management)]).
-    ///
-    /// Per [gRFC A115], only children still configured in `PriorityConfig`
-    /// enter this state; unconfigured children are removed immediately.
-    ///
-    /// [gRFC A115]:
-    ///   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
-    Deactivated(Timer),
 }
 
 impl ChildState {
@@ -380,9 +369,6 @@ impl ChildState {
         rt: &GrpcRuntime,
     ) {
         match (&*self, connectivity_state) {
-            // While deactivated, retain the 15-minute deactivation timer (see
-            // gRFC A56 (Section Child Lifetime Management)).
-            (ChildState::Deactivated(_), _) => {}
             // Keep the failover timer that is already running, unless it has
             // expired.
             (ChildState::Connecting(timer), ConnectivityState::Connecting) => {
@@ -626,7 +612,7 @@ impl PriorityPolicy {
     fn handle_deactivation_timer(&mut self) {
         for child_data in &mut self.children {
             if let Some(CreatedChild {
-                state: ChildState::Deactivated(timer),
+                deactivation_timer: Some(timer),
                 ..
             }) = &child_data.child
                 && timer.expired()
@@ -677,14 +663,10 @@ impl PriorityPolicy {
 
             let child = match &mut child_data.child {
                 Some(child) => {
-                    // Reactivate child if previously deactivated.
-                    if let ChildState::Deactivated(_) = child.state {
-                        child.state = ChildState::from_connectivity_state(
-                            child.policy.state().connectivity_state,
-                            &self.work_scheduler,
-                            &self.rt,
-                        );
-                    }
+                    // Reactivate child if previously deactivated.  Its state
+                    // (including any pending failover timer) was kept up to
+                    // date while deactivated, so it is used as is.
+                    child.deactivation_timer = None;
                     child
                 }
                 // Lazily create and initialize the child if uninitialized.
@@ -714,7 +696,11 @@ impl PriorityPolicy {
                         &self.work_scheduler,
                         &self.rt,
                     );
-                    child_data.child.insert(CreatedChild { policy, state })
+                    child_data.child.insert(CreatedChild {
+                        policy,
+                        state,
+                        deactivation_timer: None,
+                    })
                 }
             };
 
@@ -733,9 +719,6 @@ impl PriorityPolicy {
                 ChildState::ReadyOrIdle => {
                     self.set_current_priority(channel_controller, idx, true);
                     return;
-                }
-                ChildState::Deactivated(_) => {
-                    unreachable!("child was reactivated and cannot remain in Deactivated state")
                 }
             }
         }
@@ -770,13 +753,14 @@ impl PriorityPolicy {
                 let Some(child) = &mut child_data.child else {
                     continue;
                 };
-                if !matches!(child.state, ChildState::Deactivated(_)) {
-                    child.state = ChildState::Deactivated(Timer::new(
+                // Keep the existing timer if the child is already deactivated.
+                child.deactivation_timer.get_or_insert_with(|| {
+                    Timer::new(
                         DEACTIVATION_TIMEOUT,
                         self.work_scheduler.clone(),
                         self.rt.clone(),
-                    ));
-                }
+                    )
+                });
             }
         }
 

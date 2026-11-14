@@ -70,12 +70,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Creates recorders for loads reported to one LRS server.
-///
-/// Cheap to clone. Getting a recorder briefly locks a registry shared with the
-/// LRS worker. Recording call counts and uncategorized drops is lock-free;
-/// categorized drops take a short lock, shared by the recorders for the same
-/// cluster.
+/// Creates recorders for loads reported to one LRS server. Cheap to clone.
 #[derive(Clone)]
 pub struct LoadStore {
     inner: Arc<LoadStoreInner>,
@@ -91,10 +86,13 @@ impl fmt::Debug for LoadStore {
 pub(super) struct LoadStoreInner {
     /// Shared with the worker's `LoadReporter`.
     registry: Arc<Mutex<Registry>>,
+    // TODO: Add a worker handle that stops the worker when dropped.
 }
 
 impl LoadStore {
     /// Returns a recorder for cluster-level stats, such as dropped calls.
+    ///
+    /// Briefly locks a registry shared with the LRS worker.
     pub fn cluster_level_stats(
         &self,
         cluster_name: &str,
@@ -109,6 +107,8 @@ impl LoadStore {
     }
 
     /// Returns a recorder for calls sent to endpoints in `locality`.
+    ///
+    /// Briefly locks a registry shared with the LRS worker.
     pub fn locality_stats(
         &self,
         cluster_name: &str,
@@ -146,6 +146,8 @@ impl fmt::Debug for ClusterLevelStats {
 
 impl ClusterLevelStats {
     /// Records a call dropped because of the EDS drop_overload `category`.
+    ///
+    /// Takes a short lock, shared by the recorders for the same cluster.
     pub fn record_drop(&self, category: &str) {
         let mut drops = lock(&self.counters.categorized_drops);
         if let Some(count) = drops.get_mut(category) {
@@ -157,6 +159,8 @@ impl ClusterLevelStats {
 
     /// Records a call dropped for a reason without a category, such as
     /// circuit breaking. Counted only in the total.
+    ///
+    /// Lock-free.
     pub fn record_uncategorized_drop(&self) {
         self.counters.uncategorized_drops.fetch_add(1, Relaxed);
     }
@@ -177,6 +181,8 @@ impl fmt::Debug for ClusterLocalityStats {
 
 impl ClusterLocalityStats {
     /// Records a call start, and returns a tracker to record its end.
+    ///
+    /// Lock-free.
     pub fn start_call(&self) -> CallTracker {
         let counters = &self.recorder.counters;
         counters.issued.fetch_add(1, Relaxed);
@@ -215,6 +221,8 @@ impl fmt::Debug for CallTracker {
 
 impl CallTracker {
     /// Records the end of the call.
+    ///
+    /// Lock-free.
     pub fn finish(mut self, outcome: CallOutcome) {
         if let Some(recorder) = self.recorder.take() {
             recorder.counters.record_finish(outcome);
@@ -251,7 +259,7 @@ struct ClusterLevelCounters {
 impl ClusterLevelCounters {
     /// Returns the total number of drops and the drops per category since the
     /// previous snapshot, and resets them.
-    fn snapshot_and_reset(&self) -> (u64, Vec<DroppedRequests>) {
+    fn take_drops(&self) -> (u64, Vec<DroppedRequests>) {
         let uncategorized = self.uncategorized_drops.swap(0, Relaxed);
         let categorized = mem::take(&mut *lock(&self.categorized_drops));
         let mut total = uncategorized;
@@ -291,7 +299,7 @@ impl LocalityCounters {
     /// Returns the stats since the previous snapshot, and resets them, except
     /// for the number of calls in progress. Returns `None` if there is nothing
     /// to report.
-    fn snapshot_and_reset(&self, locality: &Locality) -> Option<UpstreamLocalityStats> {
+    fn take_stats(&self, locality: &Locality) -> Option<UpstreamLocalityStats> {
         // The counters are read one at a time, not as a whole: a call recorded
         // concurrently may have its start and end in different reports. Each
         // start and end is still reported exactly once.
@@ -337,8 +345,8 @@ impl Registry {
             .or_insert_with(|| ClusterEntry::new(clock()))
     }
 
-    /// See [`LoadReporter::snapshot`].
-    fn snapshot(&mut self, selection: &ClusterSelection) -> Vec<ClusterStats> {
+    /// See [`LoadReporter::take_reports`].
+    fn take_reports(&mut self, selection: &ClusterSelection) -> Vec<ClusterStats> {
         let now = (self.clock)();
         let mut reports = Vec::new();
         self.clusters.retain(|key, entry| {
@@ -346,7 +354,7 @@ impl Registry {
             // the stats aren't reported.
             let interval = now.saturating_duration_since(entry.last_report_at);
             entry.last_report_at = now;
-            let stats = entry.snapshot_and_prune(key, interval);
+            let stats = entry.take_report_and_prune(key, interval);
             let is_selected = match selection {
                 ClusterSelection::All => true,
                 ClusterSelection::Only(names) => names.contains(&key.cluster_name),
@@ -387,19 +395,24 @@ impl ClusterEntry {
         self.cluster_level.is_none() && self.localities.is_empty()
     }
 
-    /// Snapshots and resets all the counters of this entry, and removes those
+    /// Takes the stats of all the counters of this entry, and removes those
     /// with no recorders left. Returns `None` if there is nothing to report.
     ///
-    /// Must be called with the registry locked, so that no recorder can be
-    /// created for counters found to have none.
-    fn snapshot_and_prune(&mut self, key: &ClusterKey, interval: Duration) -> Option<ClusterStats> {
+    /// Counters are removed only if this entry holds their only reference.
+    /// New recorders are created only through the entry, which `&mut self`
+    /// excludes, so nothing can be recorded on them after the final snapshot.
+    fn take_report_and_prune(
+        &mut self,
+        key: &ClusterKey,
+        interval: Duration,
+    ) -> Option<ClusterStats> {
         let mut total_dropped_requests = 0;
         let mut dropped_requests = Vec::new();
         if let Some(counters) = &mut self.cluster_level {
             // Check for remaining recorders before the final snapshot: if
             // there are none, nothing can be recorded after the snapshot.
             let unique = Arc::get_mut(counters).is_some();
-            (total_dropped_requests, dropped_requests) = counters.snapshot_and_reset();
+            (total_dropped_requests, dropped_requests) = counters.take_drops();
             if unique {
                 self.cluster_level = None;
             }
@@ -408,7 +421,7 @@ impl ClusterEntry {
         self.localities.retain(|locality, counters| {
             // Same order as above: check, snapshot, prune.
             let unique = Arc::get_mut(counters).is_some();
-            if let Some(stats) = counters.snapshot_and_reset(locality) {
+            if let Some(stats) = counters.take_stats(locality) {
                 upstream_locality_stats.push(stats);
             }
             !unique
@@ -463,14 +476,14 @@ impl LoadReporter {
         (Self { registry }, load_store)
     }
 
-    /// Snapshots, resets and prunes every entry, and returns the stats of the
-    /// selected clusters that have something to report.
+    /// Takes the stats of every entry, and prunes them. Returns the stats of
+    /// the selected clusters that have something to report.
     ///
     /// The stats of unselected clusters are discarded, so that if the LRS
     /// server asks for them later, their first report doesn't include loads
     /// from previous intervals.
-    pub(super) fn snapshot(&mut self, selection: &ClusterSelection) -> Vec<ClusterStats> {
-        lock(&self.registry).snapshot(selection)
+    pub(super) fn take_reports(&mut self, selection: &ClusterSelection) -> Vec<ClusterStats> {
+        lock(&self.registry).take_reports(selection)
     }
 }
 
@@ -550,7 +563,7 @@ mod tests {
         clone.start_call().finish(CallOutcome::Failed);
         let in_flight = stats.start_call();
 
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         assert_eq!(reports.len(), 1);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 3);
@@ -559,13 +572,13 @@ mod tests {
         assert_eq!(got.total_requests_in_progress, 1);
 
         // The in-progress count isn't reset, so it's reported again.
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 0);
         assert_eq!(got.total_requests_in_progress, 1);
 
         in_flight.finish(CallOutcome::Succeeded);
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_successful_requests, 1);
         assert_eq!(got.total_requests_in_progress, 0);
@@ -577,7 +590,7 @@ mod tests {
         let stats = store.locality_stats("cluster", "eds", &locality("r1"));
         drop(stats.start_call());
 
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 1);
         assert_eq!(got.total_error_requests, 1);
@@ -595,7 +608,7 @@ mod tests {
         stats.record_drop("");
         stats.record_uncategorized_drop();
 
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(got.total_dropped_requests, 5);
         // Reports aren't in any particular order.
@@ -621,7 +634,7 @@ mod tests {
         assert!(got.upstream_locality_stats.is_empty());
 
         // Drops are reset by snapshots.
-        assert!(reporter.snapshot(&ClusterSelection::All).is_empty());
+        assert!(reporter.take_reports(&ClusterSelection::All).is_empty());
     }
 
     #[test]
@@ -638,7 +651,7 @@ mod tests {
         d1.record_uncategorized_drop();
         d2.record_uncategorized_drop();
 
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         assert_eq!(reports.len(), 1);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(got.upstream_locality_stats.len(), 2);
@@ -659,12 +672,12 @@ mod tests {
         assert_eq!(num_entries(&reporter), 1);
 
         // The final counts are reported once, and the entry is pruned.
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(locality_stats(got, "r1").total_successful_requests, 1);
         assert_eq!(got.total_dropped_requests, 1);
         assert_eq!(num_entries(&reporter), 0);
-        assert!(reporter.snapshot(&ClusterSelection::All).is_empty());
+        assert!(reporter.take_reports(&ClusterSelection::All).is_empty());
     }
 
     #[test]
@@ -674,13 +687,13 @@ mod tests {
         let tracker = stats.start_call();
         drop(stats);
 
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_requests_in_progress, 1);
         assert_eq!(num_entries(&reporter), 1);
 
         tracker.finish(CallOutcome::Succeeded);
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_successful_requests, 1);
         assert_eq!(got.total_requests_in_progress, 0);
@@ -693,12 +706,12 @@ mod tests {
         let stats = store.locality_stats("cluster", "eds", &locality("r1"));
         stats.start_call().finish(CallOutcome::Succeeded);
         drop(stats);
-        reporter.snapshot(&ClusterSelection::All);
+        reporter.take_reports(&ClusterSelection::All);
         assert_eq!(num_entries(&reporter), 0);
 
         let stats = store.locality_stats("cluster", "eds", &locality("r1"));
         stats.start_call().finish(CallOutcome::Failed);
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 1);
         assert_eq!(got.total_error_requests, 1);
@@ -731,14 +744,14 @@ mod tests {
             stats.start_call().finish(CallOutcome::Succeeded);
         }
 
-        let reports = reporter.snapshot(&only(&["a"]));
+        let reports = reporter.take_reports(&only(&["a"]));
         assert_eq!(reports.len(), 2);
         cluster(&reports, "a", "eds1");
         cluster(&reports, "a", "eds2");
 
         // The loads of "b" were discarded, rather than carried over.
         b.start_call().finish(CallOutcome::Failed);
-        let reports = reporter.snapshot(&only(&["b"]));
+        let reports = reporter.take_reports(&only(&["b"]));
         assert_eq!(reports.len(), 1);
         let got = locality_stats(cluster(&reports, "b", "eds1"), "r1");
         assert_eq!(got.total_issued_requests, 1);
@@ -747,7 +760,7 @@ mod tests {
 
         // Entries of unselected clusters are pruned too.
         drop(b);
-        reporter.snapshot(&only(&["a"]));
+        reporter.take_reports(&only(&["a"]));
         assert_eq!(num_entries(&reporter), 2);
     }
 
@@ -760,7 +773,7 @@ mod tests {
         let busy_idle = store.locality_stats("busy", "eds", &locality("idle"));
         let _tracker = busy.start_call();
 
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         assert_eq!(reports.len(), 1);
         let got = cluster(&reports, "busy", "eds");
         assert_eq!(got.upstream_locality_stats.len(), 1);
@@ -784,7 +797,7 @@ mod tests {
         clock.advance(Duration::from_secs(2));
         record(&a);
         record(&b);
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         assert_eq!(
             cluster(&reports, "a", "eds").load_report_interval,
             Duration::from_secs(2)
@@ -795,14 +808,14 @@ mod tests {
         clock.advance(Duration::from_secs(3));
         record(&a);
         record(&b);
-        let reports = reporter.snapshot(&only(&["a"]));
+        let reports = reporter.take_reports(&only(&["a"]));
         assert_eq!(
             cluster(&reports, "a", "eds").load_report_interval,
             Duration::from_secs(3)
         );
         clock.advance(Duration::from_secs(4));
         record(&b);
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         assert_eq!(
             cluster(&reports, "b", "eds").load_report_interval,
             Duration::from_secs(4)
@@ -813,7 +826,7 @@ mod tests {
         clock.advance(Duration::from_secs(5));
         record(&a);
         drop(a);
-        let reports = reporter.snapshot(&ClusterSelection::All);
+        let reports = reporter.take_reports(&ClusterSelection::All);
         assert_eq!(
             cluster(&reports, "a", "eds").load_report_interval,
             Duration::from_secs(5)
@@ -861,10 +874,10 @@ mod tests {
                 })
                 .collect();
             while !workers.iter().all(|w| w.is_finished()) {
-                add(reporter.snapshot(&ClusterSelection::All));
+                add(reporter.take_reports(&ClusterSelection::All));
             }
         });
-        add(reporter.snapshot(&ClusterSelection::All));
+        add(reporter.take_reports(&ClusterSelection::All));
 
         assert_eq!(issued, THREADS * ITERATIONS);
         assert_eq!(succeeded, THREADS * ITERATIONS);

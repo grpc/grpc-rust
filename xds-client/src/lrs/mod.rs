@@ -31,7 +31,21 @@ use crate::error::Result;
 use crate::lrs::message::LoadStatsRequest;
 use crate::lrs::message::LoadStatsResponse;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the reporting side is used by the LRS worker, added in a follow-up"
+    )
+)]
+mod load_store;
 pub mod message;
+
+pub use load_store::CallOutcome;
+pub use load_store::CallTracker;
+pub use load_store::ClusterLevelStats;
+pub use load_store::ClusterLocalityStats;
+pub use load_store::LoadStore;
 
 /// Trait for encoding/decoding LRS (Load Reporting Service) messages.
 ///

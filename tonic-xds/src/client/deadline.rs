@@ -379,6 +379,7 @@ mod tests {
                 request_hash: None,
                 retry_config: None,
                 max_stream_duration: self.max_stream_duration,
+                cluster_ref: None,
             })
         }
     }

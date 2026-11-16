@@ -54,7 +54,7 @@
 #![doc(issue_tracker_base_url = "https://github.com/grpc/grpc-rust/issues/")]
 
 use proc_macro2::TokenStream;
-use prost_build::{Method, Service};
+use prost_build::{Comments, Method, Service};
 use quote::{ToTokens, quote};
 use std::cell::RefCell;
 use std::{
@@ -387,8 +387,29 @@ impl ServiceGenerator {
     }
 }
 
+/// Rewrites the leading comments the same way prost-build does for messages and
+/// fields, so that bare URLs and stray square brackets don't trip rustdoc lints
+/// in the generated service code.
+fn sanitize_comments(comments: &mut Comments) {
+    let mut buf = String::new();
+    Comments {
+        leading: std::mem::take(&mut comments.leading),
+        ..Default::default()
+    }
+    .append_with_indent(0, &mut buf);
+    comments.leading = buf
+        .lines()
+        .map(|line| line.strip_prefix("///").unwrap_or(line).to_string())
+        .collect();
+}
+
 impl prost_build::ServiceGenerator for ServiceGenerator {
-    fn generate(&mut self, service: Service, buf: &mut String) {
+    fn generate(&mut self, mut service: Service, buf: &mut String) {
+        sanitize_comments(&mut service.comments);
+        for method in &mut service.methods {
+            sanitize_comments(&mut method.comments);
+        }
+
         let tonic_service = TonicBuildService::new(service, self.codec_path.clone());
 
         let mut builder = CodeGenBuilder::new();

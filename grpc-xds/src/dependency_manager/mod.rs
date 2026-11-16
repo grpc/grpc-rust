@@ -192,7 +192,6 @@ mod tests {
     use xds_client::ClientConfig;
     use xds_client::Node;
     use xds_client::ProstCodec;
-    use xds_client::TokioRuntime;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config::AdsTypeUrl;
     use xds_test_util::config::build_cla;
@@ -206,6 +205,7 @@ mod tests {
     use crate::resource::ListenerResource;
     use crate::resource::RouteConfigResource;
     use crate::transport::GrpcTransportBuilder;
+    use crate::xds_client_runtime::XdsRuntime;
 
     const LISTENER: &str = "listener";
     const ROUTES: &str = "routes";
@@ -264,8 +264,9 @@ mod tests {
             Node::new("test", "0"),
             format!("dns:///{}", control_plane.addr()),
         );
-        let transport = GrpcTransportBuilder::new(GrpcRuntime::default());
-        XdsClient::builder(config, transport, ProstCodec, TokioRuntime).build()
+        let runtime = GrpcRuntime::default();
+        let transport = GrpcTransportBuilder::new(runtime.clone());
+        XdsClient::builder(config, transport, ProstCodec, XdsRuntime::new(runtime)).build()
     }
 
     fn start(

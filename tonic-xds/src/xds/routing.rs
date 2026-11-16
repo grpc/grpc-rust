@@ -45,7 +45,7 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use tokio::sync::watch;
 
-use crate::client::cluster::{ClusterProvisioner, ClusterRef};
+use crate::client::cluster::ClusterRef;
 use crate::client::retry::RetryClassifierFactory;
 use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
 use crate::common::async_util::AbortOnDrop;
@@ -84,24 +84,27 @@ pub(crate) struct XdsRouter {
 }
 
 impl XdsRouter {
-    /// Creates a router that watches route config from `cache`, building a client
-    /// with `provisioner` for each cluster the route config references.
-    /// `retry_factory` compiles per-route retry policies, letting a non-gRPC
-    /// transport interpret `retry_on` for that transport.
+    /// Creates a router that watches route config from `cache`, calling
+    /// `provision` to build a client for each cluster the route config
+    /// references. `retry_factory` compiles per-route retry policies, letting a
+    /// non-gRPC transport interpret `retry_on` for that transport.
     ///
     /// Spawns a background task that updates the local route config whenever
     /// the cache publishes a new one. The task is aborted when this router
     /// is dropped.
-    pub(crate) fn new(
+    pub(crate) fn new<F>(
         cache: Arc<XdsCache>,
         retry_factory: Arc<dyn RetryClassifierFactory>,
-        provisioner: Arc<dyn ClusterProvisioner>,
-    ) -> Self {
+        provision: F,
+    ) -> Self
+    where
+        F: FnMut(&str) -> ClusterRef + Send + 'static,
+    {
         let route_config = Arc::new(ArcSwapOption::empty());
         let (ready_tx, ready_rx) = watch::channel(false);
         let rc = route_config.clone();
         let mut watcher = cache.watch_route_config();
-        let mut clusters = ClusterSet::new(cache, provisioner);
+        let mut clusters = ClusterSet::new(cache, provision);
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
@@ -134,9 +137,9 @@ impl XdsRouter {
 /// referencing it, and the set drops the client when a route config stops
 /// referencing it. Requests already routed to a dropped client keep it alive
 /// until they complete.
-struct ClusterSet {
+struct ClusterSet<F> {
     cache: Arc<XdsCache>,
-    provisioner: Arc<dyn ClusterProvisioner>,
+    provision: F,
     clusters: HashMap<String, OwnedCluster>,
 }
 
@@ -161,11 +164,14 @@ impl OwnedCluster {
     }
 }
 
-impl ClusterSet {
-    fn new(cache: Arc<XdsCache>, provisioner: Arc<dyn ClusterProvisioner>) -> Self {
+impl<F> ClusterSet<F>
+where
+    F: FnMut(&str) -> ClusterRef,
+{
+    fn new(cache: Arc<XdsCache>, provision: F) -> Self {
         Self {
             cache,
-            provisioner,
+            provision,
             clusters: HashMap::new(),
         }
     }
@@ -189,7 +195,7 @@ impl ClusterSet {
                 // config snapshots in gRFC A74.
                 let cluster_entry = self.cache.watch_cluster(entry.key());
                 let endpoints_entry = self.cache.watch_endpoints(entry.key());
-                let cluster = self.provisioner.provision(entry.key());
+                let cluster = (self.provision)(entry.key());
                 entry.insert(OwnedCluster {
                     cluster,
                     cluster_entry,
@@ -1301,52 +1307,53 @@ mod tests {
         assert_eq!(decision.cluster, "cluster-b");
     }
 
-    /// Records each cluster it builds a (no-op) client for.
-    #[derive(Default)]
-    struct RecordingProvisioner {
-        provisioned: std::sync::Mutex<Vec<String>>,
+    /// Builds a no-op cluster client handle for routing tests.
+    fn noop_cluster_client(cluster_name: &str) -> ClusterRef {
+        use crate::client::cluster::ClusterChannel;
+        use crate::common::async_util::BoxFuture;
+
+        let svc = tower::service_fn(|_: ()| -> BoxFuture<Result<(), tower::BoxError>> {
+            Box::pin(async { Ok(()) })
+        });
+        ClusterRef::from_channel(cluster_name, ClusterChannel::from_service(svc))
     }
 
-    impl RecordingProvisioner {
-        fn provisioned(&self) -> Vec<String> {
-            self.provisioned.lock().unwrap().clone()
-        }
+    /// Returns a provisioning closure that records each cluster it builds a
+    /// (no-op) client for.
+    fn recording_provisioner() -> (
+        impl FnMut(&str) -> ClusterRef + Send + 'static,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let provisioned = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = provisioned.clone();
+        let provision = move |cluster_name: &str| {
+            recorded.lock().unwrap().push(cluster_name.to_string());
+            noop_cluster_client(cluster_name)
+        };
+        (provision, provisioned)
     }
 
-    impl ClusterProvisioner for RecordingProvisioner {
-        fn provision(&self, cluster_name: &str) -> ClusterRef {
-            use crate::client::cluster::{ClusterChannel, ClusterClient};
-            use crate::common::async_util::BoxFuture;
-
-            self.provisioned
-                .lock()
-                .unwrap()
-                .push(cluster_name.to_string());
-            let svc = tower::service_fn(|_: ()| -> BoxFuture<Result<(), tower::BoxError>> {
-                Box::pin(async { Ok(()) })
-            });
-            ClusterRef::new(ClusterClient::from_channel(
-                cluster_name.to_string(),
-                ClusterChannel::from_service(svc),
-            ))
-        }
-    }
-
-    fn router_with_clusters(cache: &Arc<XdsCache>) -> (XdsRouter, Arc<RecordingProvisioner>) {
-        let provisioner = Arc::new(RecordingProvisioner::default());
+    fn router_with_clusters(
+        cache: &Arc<XdsCache>,
+    ) -> (XdsRouter, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (provision, provisioned) = recording_provisioner();
         let router = XdsRouter::new(
             cache.clone(),
             Arc::new(GrpcRetryClassifierFactory),
-            provisioner.clone(),
+            provision,
         );
-        (router, provisioner)
+        (router, provisioned)
     }
 
     impl XdsRouter {
         /// A router for tests that only check route matching: it compiles gRPC
         /// retry policies, and its cluster clients are no-ops.
         pub(crate) fn for_test(cache: &Arc<XdsCache>) -> Self {
-            router_with_clusters(cache).0
+            Self::new(
+                cache.clone(),
+                Arc::new(GrpcRetryClassifierFactory),
+                noop_cluster_client,
+            )
         }
     }
 
@@ -1369,7 +1376,7 @@ mod tests {
     async fn xds_router_owns_clients_of_referenced_clusters() {
         let cache = Arc::new(XdsCache::new());
         cache.update_route_config(make_route_config("cluster-a"));
-        let (router, provisioner) = router_with_clusters(&cache);
+        let (router, provisioned) = router_with_clusters(&cache);
         tokio::task::yield_now().await;
         let first_a = routed_client(&router);
 
@@ -1392,7 +1399,7 @@ mod tests {
         assert!(router.snapshot().unwrap().cluster("cluster-b").is_none());
 
         assert_eq!(
-            provisioner.provisioned(),
+            *provisioned.lock().unwrap(),
             ["cluster-a", "cluster-b", "cluster-a"]
         );
     }
@@ -1401,7 +1408,7 @@ mod tests {
     async fn xds_router_rebuilds_client_when_cache_entry_is_removed() {
         let cache = Arc::new(XdsCache::new());
         cache.update_route_config(make_route_config("cluster-a"));
-        let (router, provisioner) = router_with_clusters(&cache);
+        let (router, provisioned) = router_with_clusters(&cache);
         tokio::task::yield_now().await;
         let first = routed_client(&router);
 
@@ -1414,7 +1421,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(!routed_client(&router).same_client(&first));
-        assert_eq!(provisioner.provisioned(), ["cluster-a", "cluster-a"]);
+        assert_eq!(*provisioned.lock().unwrap(), ["cluster-a", "cluster-a"]);
     }
 
     /// The resource manager removes a cluster's cache entries one after the
@@ -1423,8 +1430,8 @@ mod tests {
     #[tokio::test]
     async fn cluster_set_rebuilds_client_built_between_entry_removals() {
         let cache = Arc::new(XdsCache::new());
-        let provisioner = Arc::new(RecordingProvisioner::default());
-        let mut clusters = ClusterSet::new(cache.clone(), provisioner.clone());
+        let (provision, provisioned) = recording_provisioner();
+        let mut clusters = ClusterSet::new(cache.clone(), provision);
         let config = make_route_config("cluster-a");
 
         cache.remove_cluster("cluster-a");
@@ -1434,7 +1441,7 @@ mod tests {
         // The cluster rejoins, and the router sees only the new route config.
         let second = clusters.reconcile(&config)["cluster-a"].clone();
         assert!(!second.same_client(&first));
-        assert_eq!(provisioner.provisioned(), ["cluster-a", "cluster-a"]);
+        assert_eq!(*provisioned.lock().unwrap(), ["cluster-a", "cluster-a"]);
     }
 
     #[tokio::test(start_paused = true)]

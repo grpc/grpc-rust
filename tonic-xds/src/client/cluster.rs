@@ -154,9 +154,9 @@ where
 /// Builds the load-balancing channel for a cluster when the route config starts
 /// referencing it.
 ///
-/// The seam between the router and the balancer: the router owns a channel for
-/// each cluster in the route config (built through a [`FactoryProvisioner`]),
-/// without knowing how endpoints are discovered or balanced.
+/// The seam between the router and the balancer: the router owns a client for
+/// each cluster in the route config, without knowing how endpoints are
+/// discovered or balanced.
 pub(crate) trait ClusterChannelFactory<Req, Resp>: Send + Sync + 'static
 where
     Req: Send + 'static,
@@ -250,6 +250,18 @@ impl ClusterRef {
         Self(Arc::new(client))
     }
 
+    /// Wraps `channel` in a [`ClusterClient`] for `name` and erases its type.
+    pub(crate) fn from_channel<Req, Resp>(
+        name: impl Into<String>,
+        channel: ClusterChannel<Req, Resp>,
+    ) -> Self
+    where
+        Req: Send + 'static,
+        Resp: 'static,
+    {
+        Self::new(ClusterClient::from_channel(name.into(), channel))
+    }
+
     /// The client, or `None` if it serves other request or response types.
     pub(crate) fn client<Req, Resp>(&self) -> Option<&ClusterClient<Req, Resp>>
     where
@@ -269,38 +281,5 @@ impl ClusterRef {
 impl Debug for ClusterRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClusterRef").finish_non_exhaustive()
-    }
-}
-
-/// Builds the client for a cluster that the route config references.
-///
-/// The router calls this when a route config starts referencing a cluster, and
-/// keeps the client until a route config stops referencing it.
-pub(crate) trait ClusterProvisioner: Send + Sync + 'static {
-    fn provision(&self, cluster_name: &str) -> ClusterRef;
-}
-
-/// A [`ClusterProvisioner`] that builds each cluster's channel with a
-/// [`ClusterChannelFactory`].
-pub(crate) struct FactoryProvisioner<Req, Resp> {
-    factory: Arc<dyn ClusterChannelFactory<Req, Resp>>,
-}
-
-impl<Req, Resp> FactoryProvisioner<Req, Resp> {
-    pub(crate) fn new(factory: Arc<dyn ClusterChannelFactory<Req, Resp>>) -> Self {
-        Self { factory }
-    }
-}
-
-impl<Req, Resp> ClusterProvisioner for FactoryProvisioner<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
-    fn provision(&self, cluster_name: &str) -> ClusterRef {
-        ClusterRef::new(ClusterClient::from_channel(
-            cluster_name.to_string(),
-            self.factory.make(cluster_name),
-        ))
     }
 }

@@ -25,7 +25,7 @@
 use crate::client::circuit_breaking::{
     CircuitBreakingMakeConnector, ClusterCircuitBreakerRegistry,
 };
-use crate::client::cluster::{ClusterChannelFactory, FactoryProvisioner};
+use crate::client::cluster::{ClusterChannelFactory, ClusterRef};
 use crate::client::deadline::{DeadlinePolicy, set_grpc_timeout_header};
 use crate::client::endpoint::{EndpointAddress, MakeConnector};
 use crate::client::lb::{ClusterDiscovery, TowerP2cClusterChannelFactory, XdsLbService};
@@ -623,7 +623,7 @@ impl XdsChannelBuilder {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(
             parts.cache.clone(),
             retry_factory,
-            Arc::new(FactoryProvisioner::new(cluster_factory)),
+            move |name| ClusterRef::from_channel(name, cluster_factory.make(name)),
         ));
 
         // Fallback retry config for requests that carry no per-route config
@@ -1053,9 +1053,7 @@ mod tests {
     use crate::XdsUri;
     use crate::client::channel::XdsChannelGrpc;
     use crate::client::channel::{GrpcClusterChannelFactory, LB_BACKENDS, LbBackend};
-    use crate::client::cluster::{
-        ClusterChannel, ClusterChannelFactory, ClusterProvisioner, ClusterRef, FactoryProvisioner,
-    };
+    use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ClusterRef};
     use crate::client::deadline::DeadlinePolicy;
     use crate::client::endpoint::EndpointAddress;
     use crate::client::endpoint::EndpointChannel;
@@ -1102,7 +1100,9 @@ mod tests {
             let factory: GrpcClusterChannelFactory =
                 Arc::new(TowerP2cClusterChannelFactory::new(discovery));
             self.build_grpc_channel_from_router(
-                LazyClusters::wrap(router, Arc::new(FactoryProvisioner::new(factory))),
+                LazyClusters::wrap(router, move |name| {
+                    ClusterRef::from_channel(name, factory.make(name))
+                }),
                 retry,
                 interceptor,
             )
@@ -1139,26 +1139,29 @@ mod tests {
     /// Gives decisions from a router that provisions no cluster clients (the
     /// mock routers below) a client for their cluster, built when a cluster is
     /// first routed to and kept for the adapter's lifetime.
-    struct LazyClusters {
+    struct LazyClusters<F> {
         router: Arc<dyn Router>,
-        provisioner: Arc<dyn ClusterProvisioner>,
+        provision: F,
         clusters: Mutex<HashMap<String, ClusterRef>>,
     }
 
-    impl LazyClusters {
-        fn wrap(
-            router: Arc<dyn Router>,
-            provisioner: Arc<dyn ClusterProvisioner>,
-        ) -> Arc<dyn Router> {
+    impl<F> LazyClusters<F>
+    where
+        F: Fn(&str) -> ClusterRef + Send + Sync + 'static,
+    {
+        fn wrap(router: Arc<dyn Router>, provision: F) -> Arc<dyn Router> {
             Arc::new(Self {
                 router,
-                provisioner,
+                provision,
                 clusters: Mutex::default(),
             })
         }
     }
 
-    impl Router for LazyClusters {
+    impl<F> Router for LazyClusters<F>
+    where
+        F: Fn(&str) -> ClusterRef + Send + Sync + 'static,
+    {
         fn acquire(&self) -> crate::client::route::AcquiredConfig {
             self.router.acquire()
         }
@@ -1173,7 +1176,7 @@ mod tests {
                 let mut clusters = self.clusters.lock().unwrap();
                 let cluster = clusters
                     .entry(decision.cluster.clone())
-                    .or_insert_with_key(|name| self.provisioner.provision(name));
+                    .or_insert_with_key(|name| (self.provision)(name));
                 decision.cluster_ref = Some(cluster.clone());
             }
             Ok(decision)
@@ -1510,7 +1513,7 @@ mod tests {
         let router = XdsRouter::new(
             cache.clone(),
             Arc::new(GrpcRetryClassifierFactory),
-            Arc::new(FactoryProvisioner::new(factory)),
+            move |name| ClusterRef::from_channel(name, factory.make(name)),
         );
         XdsChannelBuilder::new(test_config()).build_grpc_channel_from_router(
             Arc::new(router),
@@ -2161,11 +2164,13 @@ mod tests {
         let builder = XdsChannelBuilder::new(test_config());
         let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<EchoEndpoint>>> =
             Arc::new(MockHttpDiscovery);
-        let provisioner = FactoryProvisioner::<
-            super::Request<shared_http_body::SharedBody<TestBody>>,
-            super::Response<TestBody>,
-        >::new(Arc::new(TowerP2cClusterChannelFactory::new(discovery)));
-        let router = LazyClusters::wrap(Arc::new(StaticRouter), Arc::new(provisioner));
+        let factory = TowerP2cClusterChannelFactory::new(discovery);
+        let router = LazyClusters::wrap(Arc::new(StaticRouter), move |name| {
+            ClusterRef::from_channel::<
+                super::Request<shared_http_body::SharedBody<TestBody>>,
+                super::Response<TestBody>,
+            >(name, factory.make(name))
+        });
         let routing_layer = XdsRoutingLayer::new(
             router,
             None,

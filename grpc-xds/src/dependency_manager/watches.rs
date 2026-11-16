@@ -28,7 +28,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
@@ -61,7 +60,7 @@ pub(super) struct Watches {
     /// The EDS watches, by EDS service name.
     endpoints: HashMap<String, Watch<EndpointsResource>>,
     /// The state of each DNS resolution, by LogicalDNS cluster target.
-    dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
+    dns: HashMap<DnsTarget, WatchState<[EndpointAddress]>>,
     /// DNS targets whose resolution hasn't been reported yet.
     unresolved_dns: Vec<DnsTarget>,
     /// Events that have been polled but not yet returned by
@@ -73,7 +72,7 @@ pub(super) struct Watches {
 #[derive(Debug)]
 struct Watch<T: Resource> {
     watcher: ResourceWatcher<T>,
-    state: WatchState<Arc<T>>,
+    state: WatchState<T>,
 }
 
 /// An event for one of the [`Watches`].
@@ -86,17 +85,17 @@ pub(super) enum ClusterGraphEvent {
 }
 
 impl CachedResources for Watches {
-    fn cluster(&self, name: &str) -> Option<&WatchState<Arc<ClusterResource>>> {
+    fn cluster(&self, name: &str) -> Option<&WatchState<ClusterResource>> {
         self.clusters.get(name).map(|watch| &watch.state)
     }
 
-    fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<Arc<EndpointsResource>>> {
+    fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<EndpointsResource>> {
         self.endpoints
             .get(eds_service_name)
             .map(|watch| &watch.state)
     }
 
-    fn dns(&self, target: &DnsTarget) -> Option<&WatchState<Arc<[EndpointAddress]>>> {
+    fn dns(&self, target: &DnsTarget) -> Option<&WatchState<[EndpointAddress]>> {
         self.dns.get(target)
     }
 }
@@ -108,9 +107,9 @@ impl Watches {
     /// returned yet.
     ///
     /// A new watch starts as [`WatchState::Pending`].
-    pub(super) async fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
-        reconcile(client, &mut self.clusters, &required.clusters).await;
-        reconcile(client, &mut self.endpoints, &required.eds_services).await;
+    pub(super) fn reconcile(&mut self, client: &XdsClient, required: &RequiredWatches) {
+        reconcile(client, &mut self.clusters, &required.clusters);
+        reconcile(client, &mut self.endpoints, &required.eds_services);
 
         let dns = &mut self.dns;
         dns.retain(|target, _| required.dns_targets.contains(target));
@@ -196,7 +195,7 @@ impl Watches {
 }
 
 /// Makes `watches` hold exactly the names in `required`.
-async fn reconcile<T: Resource>(
+fn reconcile<T: Resource>(
     client: &XdsClient,
     watches: &mut HashMap<String, Watch<T>>,
     required: &HashSet<String>,
@@ -265,18 +264,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reconcile_adds_and_drops_watches() {
+    #[test]
+    fn reconcile_adds_and_drops_watches() {
         let client = XdsClient::disconnected();
         let mut watches = Watches::default();
-        watches
-            .reconcile(&client, &required_clusters(&["a", "b"]))
-            .await;
+        watches.reconcile(&client, &required_clusters(&["a", "b"]));
         watches.clusters.get_mut("a").unwrap().state = WatchState::Failed("kept".into());
 
-        watches
-            .reconcile(&client, &required_clusters(&["a", "c"]))
-            .await;
+        watches.reconcile(&client, &required_clusters(&["a", "c"]));
 
         assert_eq!(names(&watches.clusters), ["a", "c"]);
         // An existing watch keeps its state; a new one starts pending.
@@ -287,8 +282,8 @@ mod tests {
         assert!(watches.cluster("b").is_none());
     }
 
-    #[tokio::test]
-    async fn dns_targets_resolve_as_unsupported() {
+    #[test]
+    fn dns_targets_resolve_as_unsupported() {
         let target = DnsTarget {
             host: "example.com".to_owned(),
             port: 443,
@@ -298,9 +293,7 @@ mod tests {
             ..Default::default()
         };
         let mut watches = Watches::default();
-        watches
-            .reconcile(&XdsClient::disconnected(), &required)
-            .await;
+        watches.reconcile(&XdsClient::disconnected(), &required);
         assert_eq!(watches.dns[&target], WatchState::Pending);
 
         // The failure arrives as an event, which starts the next batch.
@@ -315,14 +308,12 @@ mod tests {
         );
         assert!(watches.poll_next(&mut cx).is_pending());
 
-        watches
-            .reconcile(&XdsClient::disconnected(), &RequiredWatches::default())
-            .await;
+        watches.reconcile(&XdsClient::disconnected(), &RequiredWatches::default());
         assert!(watches.dns.is_empty());
     }
 
-    #[tokio::test]
-    async fn reconcile_drops_the_events_of_dropped_watches() {
+    #[test]
+    fn reconcile_drops_the_events_of_dropped_watches() {
         let client = XdsClient::disconnected();
         let two_targets = RequiredWatches {
             dns_targets: ["a.example.com", "b.example.com"]
@@ -338,24 +329,22 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
 
         // Results that haven't been polled yet.
-        watches.reconcile(&client, &two_targets).await;
-        watches.reconcile(&client, &none).await;
+        watches.reconcile(&client, &two_targets);
+        watches.reconcile(&client, &none);
         assert!(watches.poll_next(&mut cx).is_pending());
 
         // Events that have been polled but not yet returned.
-        watches.reconcile(&client, &two_targets).await;
+        watches.reconcile(&client, &two_targets);
         assert!(watches.poll_next(&mut cx).is_ready());
-        watches.reconcile(&client, &none).await;
+        watches.reconcile(&client, &none);
         assert!(watches.poll_next(&mut cx).is_pending());
     }
 
-    #[tokio::test]
-    async fn closed_watcher_ends_updates() {
+    #[test]
+    fn closed_watcher_ends_updates() {
         // A disconnected client's watchers are closed from the start.
         let mut watches = Watches::default();
-        watches
-            .reconcile(&XdsClient::disconnected(), &required_clusters(&["a"]))
-            .await;
+        watches.reconcile(&XdsClient::disconnected(), &required_clusters(&["a"]));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(matches!(watches.poll_next(&mut cx), Poll::Ready(None)));
     }

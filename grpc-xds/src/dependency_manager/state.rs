@@ -34,21 +34,65 @@ use xds_client::ResourceEvent;
 /// Follows gRFC A88: a *resource error* (the resource itself is bad) drops
 /// the cached value, while an *ambient error* (such as a broken stream) keeps
 /// it and only adds a note.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum WatchState<T> {
+///
+/// `T` may be unsized so that DNS watches can hold `[EndpointAddress]`
+/// (`Arc<[EndpointAddress]>`).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WatchState<T: ?Sized> {
     /// The watch has started but nothing has been received yet.
     Pending,
     /// A usable value. `note` holds the latest ambient error, if any; the next
     /// valid update clears it.
-    Ready { value: T, note: Option<Arc<str>> },
+    Ready {
+        value: Arc<T>,
+        note: Option<Arc<str>>,
+    },
     /// Nothing usable: the resource does not exist, is invalid, or an error
     /// arrived before the first valid value.
     Failed(Arc<str>),
 }
 
-impl<T> WatchState<T> {
+// Manual `Clone` avoids `#[derive(Clone)]`'s `T: Clone` bound, which unsized
+// values like `[EndpointAddress]` cannot satisfy even though `Arc<T>: Clone`.
+impl<T: ?Sized> Clone for WatchState<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Pending => Self::Pending,
+            Self::Ready { value, note } => Self::Ready {
+                value: Arc::clone(value),
+                note: note.clone(),
+            },
+            Self::Failed(reason) => Self::Failed(Arc::clone(reason)),
+        }
+    }
+}
+
+impl<T: ?Sized> WatchState<T> {
+    /// Applies an XdsClient event, and returns its flow-control token.
+    ///
+    /// `describe` turns the event's error into the reason or note to store.
+    pub(super) fn apply(
+        &mut self,
+        event: ResourceEvent<T>,
+        describe: impl FnOnce(xds_client::Error) -> Arc<str>,
+    ) -> ProcessingDone
+    where
+        T: Sized,
+    {
+        match event {
+            ResourceEvent::ResourceChanged { result, done } => {
+                self.on_changed(result.map_err(describe));
+                done
+            }
+            ResourceEvent::AmbientError { error, done } => {
+                self.on_ambient_error(describe(error));
+                done
+            }
+        }
+    }
+
     /// Applies a `ResourceChanged` event. An `Err` discards any cached value.
-    fn on_changed(&mut self, result: Result<T, Arc<str>>) {
+    fn on_changed(&mut self, result: Result<Arc<T>, Arc<str>>) {
         *self = match result {
             Ok(value) => Self::Ready { value, note: None },
             Err(reason) => Self::Failed(reason),
@@ -68,28 +112,6 @@ impl<T> WatchState<T> {
     }
 }
 
-impl<T> WatchState<Arc<T>> {
-    /// Applies an XdsClient event, and returns its flow-control token.
-    ///
-    /// `describe` turns the event's error into the reason or note to store.
-    pub(super) fn apply(
-        &mut self,
-        event: ResourceEvent<T>,
-        describe: impl FnOnce(xds_client::Error) -> Arc<str>,
-    ) -> ProcessingDone {
-        match event {
-            ResourceEvent::ResourceChanged { result, done } => {
-                self.on_changed(result.map_err(describe));
-                done
-            }
-            ResourceEvent::AmbientError { error, done } => {
-                self.on_ambient_error(describe(error));
-                done
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,7 +124,7 @@ mod tests {
 
     fn ready(value: u32, note: Option<&str>) -> WatchState<u32> {
         WatchState::Ready {
-            value,
+            value: Arc::new(value),
             note: note.map(Arc::from),
         }
     }
@@ -139,10 +161,26 @@ mod tests {
         ] {
             let mut state = start.clone();
             match &event {
-                Changed(result) => state.on_changed(result.map_err(Arc::from)),
+                Changed(result) => state.on_changed((*result).map(Arc::new).map_err(Arc::from)),
                 Ambient(reason) => state.on_ambient_error(Arc::from(*reason)),
             }
             assert_eq!(state, expected, "{start:?} after {event:?}");
         }
+    }
+
+    #[test]
+    fn supports_unsized_slice_values() {
+        let mut state: WatchState<[u32]> = WatchState::Pending;
+        state.on_changed(Ok(Arc::from([1, 2])));
+        state.on_ambient_error(Arc::from("stale"));
+
+        let cloned = state.clone();
+        assert_eq!(
+            cloned,
+            WatchState::Ready {
+                value: Arc::from([1, 2]),
+                note: Some(Arc::from("stale")),
+            }
+        );
     }
 }

@@ -61,11 +61,11 @@ const MAX_AGGREGATE_DEPTH: usize = 16;
 /// [`ClusterGraph::required_watches`], so the caller starts the watch.
 pub(super) trait CachedResources {
     /// The state of the CDS watch for cluster `name`.
-    fn cluster(&self, name: &str) -> Option<&WatchState<Arc<ClusterResource>>>;
+    fn cluster(&self, name: &str) -> Option<&WatchState<ClusterResource>>;
     /// The state of the EDS watch for `eds_service_name`.
-    fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<Arc<EndpointsResource>>>;
+    fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<EndpointsResource>>;
     /// The state of the DNS resolution for a LogicalDNS cluster's target.
-    fn dns(&self, target: &DnsTarget) -> Option<&WatchState<Arc<[EndpointAddress]>>>;
+    fn dns(&self, target: &DnsTarget) -> Option<&WatchState<[EndpointAddress]>>;
 }
 
 /// The `host:port` that a LogicalDNS cluster resolves.
@@ -332,17 +332,18 @@ impl<'a> GraphWalker<'a> {
     /// If its endpoints failed, the cluster still resolves, with no endpoints
     /// and the reason in its note: gRFC A74 reports endpoint problems through
     /// the resolution note rather than as a cluster error.
-    fn leaf<T: Clone>(
+    // `T` may be unsized because LogicalDNS endpoints are `[EndpointAddress]`.
+    fn leaf<T: ?Sized>(
         &mut self,
         name: &'a str,
         cluster: &Arc<ClusterResource>,
         cds_note: Option<&Arc<str>>,
         endpoints: Option<&WatchState<T>>,
-        to_source: fn(T) -> LeafEndpointSource,
+        to_source: fn(Arc<T>) -> LeafEndpointSource,
     ) -> Visited<'a> {
         let (endpoints, endpoints_note) = match endpoints {
             None | Some(WatchState::Pending) => return Visited::PENDING,
-            Some(WatchState::Ready { value, note }) => (Some(value.clone()), note.as_ref()),
+            Some(WatchState::Ready { value, note }) => (Some(Arc::clone(value)), note.as_ref()),
             Some(WatchState::Failed(reason)) => (None, Some(reason)),
         };
         let config = ClusterConfig {
@@ -486,14 +487,14 @@ mod tests {
     /// assert that each cluster is computed once.
     #[derive(Default)]
     struct MockCache {
-        clusters: HashMap<String, WatchState<Arc<ClusterResource>>>,
-        endpoints: HashMap<String, WatchState<Arc<EndpointsResource>>>,
-        dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
+        clusters: HashMap<String, WatchState<ClusterResource>>,
+        endpoints: HashMap<String, WatchState<EndpointsResource>>,
+        dns: HashMap<DnsTarget, WatchState<[EndpointAddress]>>,
         cluster_lookups: RefCell<HashMap<String, usize>>,
     }
 
     impl CachedResources for MockCache {
-        fn cluster(&self, name: &str) -> Option<&WatchState<Arc<ClusterResource>>> {
+        fn cluster(&self, name: &str) -> Option<&WatchState<ClusterResource>> {
             *self
                 .cluster_lookups
                 .borrow_mut()
@@ -502,32 +503,27 @@ mod tests {
             self.clusters.get(name)
         }
 
-        fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<Arc<EndpointsResource>>> {
+        fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<EndpointsResource>> {
             self.endpoints.get(eds_service_name)
         }
 
-        fn dns(&self, target: &DnsTarget) -> Option<&WatchState<Arc<[EndpointAddress]>>> {
+        fn dns(&self, target: &DnsTarget) -> Option<&WatchState<[EndpointAddress]>> {
             self.dns.get(target)
         }
     }
 
     impl MockCache {
-        fn with_cds(mut self, name: &str, state: WatchState<Arc<ClusterResource>>) -> Self {
+        fn with_cds(mut self, name: &str, state: WatchState<ClusterResource>) -> Self {
             self.clusters.insert(name.to_owned(), state);
             self
         }
 
-        fn with_eds(mut self, service: &str, state: WatchState<Arc<EndpointsResource>>) -> Self {
+        fn with_eds(mut self, service: &str, state: WatchState<EndpointsResource>) -> Self {
             self.endpoints.insert(service.to_owned(), state);
             self
         }
 
-        fn with_dns(
-            mut self,
-            host: &str,
-            port: u16,
-            state: WatchState<Arc<[EndpointAddress]>>,
-        ) -> Self {
+        fn with_dns(mut self, host: &str, port: u16, state: WatchState<[EndpointAddress]>) -> Self {
             self.dns.insert(dns_target(host, port), state);
             self
         }
@@ -577,18 +573,18 @@ mod tests {
         }
     }
 
-    fn ready<T>(value: T) -> WatchState<T> {
+    fn ready<T: ?Sized>(value: Arc<T>) -> WatchState<T> {
         WatchState::Ready { value, note: None }
     }
 
-    fn ready_with_note<T>(value: T, note: &str) -> WatchState<T> {
+    fn ready_with_note<T: ?Sized>(value: Arc<T>, note: &str) -> WatchState<T> {
         WatchState::Ready {
             value,
             note: Some(note.into()),
         }
     }
 
-    fn failed<T>(reason: &str) -> WatchState<T> {
+    fn failed<T: ?Sized>(reason: &str) -> WatchState<T> {
         WatchState::Failed(reason.into())
     }
 

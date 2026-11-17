@@ -49,7 +49,7 @@ use tokio::sync::watch;
 
 use crate::client::endpoint::{ClusterConfig, Connector, MakeConnector, XdsEndpoint};
 use crate::common::async_util::{AbortOnDrop, BoxFuture};
-use crate::xds::cache::{CacheWatch, XdsCache};
+use crate::xds::cache::CacheWatch;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::CertProviderRegistry;
 use crate::xds::resource::ClusterResource;
@@ -61,7 +61,7 @@ type SharedConnector<S> = Arc<dyn Connector<Service = S> + Send + Sync>;
 /// A [`Connector`] that tracks one cluster's CDS resource.
 ///
 /// Holds the receiving end of a [`watch`] channel fed by a spawned task; the
-/// task exits (dropping the sender) when the cluster leaves the cache, and is
+/// task exits (dropping the sender) when `cluster_watch` closes, and is
 /// aborted when the connector is dropped.
 pub(crate) struct ClusterConnector<S> {
     cluster_name: Arc<str>,
@@ -71,10 +71,10 @@ pub(crate) struct ClusterConnector<S> {
 }
 
 impl<S: Send + 'static> ClusterConnector<S> {
-    /// Spawns the CDS watch for `cluster_name` and returns a connector backed
-    /// by it.
+    /// Spawns a task consuming `cluster_watch` for `cluster_name` and returns
+    /// a connector backed by it.
     pub(crate) fn spawn<MC>(
-        cache: &XdsCache,
+        cluster_watch: CacheWatch<Arc<ClusterResource>>,
         cluster_name: String,
         make_connector: Arc<MC>,
         #[cfg(feature = "_tls-any")] registry: Arc<CertProviderRegistry>,
@@ -84,11 +84,6 @@ impl<S: Send + 'static> ClusterConnector<S> {
     {
         let (tx, rx) = watch::channel(None);
         let (outlier_tx, outlier_rx) = watch::channel(OutlierDetectionConfig::default());
-        // Subscribe here, not in the task: a subscription made after the
-        // resource manager removed the cluster would recreate its entry. The
-        // task also must not hold the cache, which would keep every entry,
-        // and so every watch, open.
-        let cluster_watch = cache.watch_cluster(&cluster_name);
         let task = tokio::spawn(publish_connectors(
             cluster_watch,
             cluster_name.clone(),
@@ -160,7 +155,7 @@ impl<S: Send + 'static> Connector for ClusterConnector<S> {
 /// Background task: applies every accepted CDS update by republishing the
 /// connector and the cluster's outlier-detection config.
 async fn publish_connectors<MC, S>(
-    mut cluster_watch: CacheWatch<ClusterResource>,
+    mut cluster_watch: CacheWatch<Arc<ClusterResource>>,
     cluster_name: String,
     make_connector: Arc<MC>,
     outlier_tx: watch::Sender<OutlierDetectionConfig>,
@@ -308,11 +303,11 @@ mod tests {
     }
 
     fn spawn_with<MC: MakeConnector<Service = String>>(
-        cache: &XdsCache,
+        cluster_watch: CacheWatch<Arc<ClusterResource>>,
         make_connector: Arc<MC>,
     ) -> ClusterConnector<String> {
         ClusterConnector::spawn(
-            cache,
+            cluster_watch,
             CLUSTER.to_string(),
             make_connector,
             #[cfg(feature = "_tls-any")]
@@ -325,9 +320,14 @@ mod tests {
 
     /// Spawns a connector for [`CLUSTER`], along with a receiver that
     /// resolves once the connector's CDS task stops.
-    fn spawn_connector(cache: &XdsCache) -> (ClusterConnector<String>, oneshot::Receiver<()>) {
+    fn spawn_connector(
+        cluster_watch: CacheWatch<Arc<ClusterResource>>,
+    ) -> (ClusterConnector<String>, oneshot::Receiver<()>) {
         let (dropped, task_stopped) = oneshot::channel();
-        let connector = spawn_with(cache, Arc::new(AddrMakeConnector { _dropped: dropped }));
+        let connector = spawn_with(
+            cluster_watch,
+            Arc::new(AddrMakeConnector { _dropped: dropped }),
+        );
         (connector, task_stopped)
     }
 
@@ -339,9 +339,8 @@ mod tests {
 
     #[tokio::test]
     async fn cds_updates_republish_the_outlier_detection_config() {
-        let cache = XdsCache::new();
-        cache.update_cluster(CLUSTER, cluster());
-        let (connector, _stopped) = spawn_connector(&cache);
+        let (tx, watch) = CacheWatch::channel(Some(cluster()));
+        let (connector, _stopped) = spawn_connector(watch);
         let live = connector.outlier_detection();
 
         // The config is sent right after the connector it belongs to, so a
@@ -350,25 +349,24 @@ mod tests {
         connector.connect(&endpoint).await;
         assert_eq!(*live.borrow(), OutlierDetectionConfig::default());
 
-        cache.update_cluster(CLUSTER, cluster_with_outlier_detection(enabled(7)));
+        tx.send(cluster_with_outlier_detection(enabled(7)));
         assert!(eventually(|| *live.borrow() == enabled(7)).await);
 
-        cache.update_cluster(CLUSTER, cluster());
+        tx.send(cluster());
         assert!(eventually(|| *live.borrow() == OutlierDetectionConfig::default()).await);
     }
 
     #[tokio::test]
     async fn outlier_detection_config_follows_the_connector_it_came_with() {
-        let cache = XdsCache::new();
-        cache.update_cluster(CLUSTER, cluster());
+        let (tx, watch) = CacheWatch::channel(Some(cluster()));
         let make = Arc::new(ScriptedMakeConnector::default());
-        let connector = spawn_with(&cache, make.clone());
+        let connector = spawn_with(watch, make.clone());
         let live = connector.outlier_detection();
         let endpoint = XdsEndpoint::new(EndpointAddress::new("10.0.0.1", 8080));
         connector.connect(&endpoint).await;
 
         make.fail.store(true, Ordering::SeqCst);
-        cache.update_cluster(CLUSTER, cluster_with_outlier_detection(enabled(7)));
+        tx.send(cluster_with_outlier_detection(enabled(7)));
         assert!(eventually(|| make.calls.load(Ordering::SeqCst) == 2).await);
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -379,16 +377,15 @@ mod tests {
         );
 
         make.fail.store(false, Ordering::SeqCst);
-        cache.update_cluster(CLUSTER, cluster_with_outlier_detection(enabled(8)));
+        tx.send(cluster_with_outlier_detection(enabled(8)));
         assert!(eventually(|| *live.borrow() == enabled(8)).await);
     }
 
     #[tokio::test]
     async fn an_unchanged_outlier_detection_config_does_not_wake_listeners() {
-        let cache = XdsCache::new();
-        cache.update_cluster(CLUSTER, cluster_with_outlier_detection(enabled(7)));
+        let (tx, watch) = CacheWatch::channel(Some(cluster_with_outlier_detection(enabled(7))));
         let make = Arc::new(ScriptedMakeConnector::default());
-        let connector = spawn_with(&cache, make.clone());
+        let connector = spawn_with(watch, make.clone());
         let mut live = connector.outlier_detection();
         let endpoint = XdsEndpoint::new(EndpointAddress::new("10.0.0.1", 8080));
         connector.connect(&endpoint).await;
@@ -397,7 +394,7 @@ mod tests {
         // Same outlier detection, different cluster.
         let mut next = (*cluster_with_outlier_detection(enabled(7))).clone();
         next.eds_service_name = Some("other".to_string());
-        cache.update_cluster(CLUSTER, Arc::new(next));
+        tx.send(Arc::new(next));
         assert!(eventually(|| make.calls.load(Ordering::SeqCst) == 2).await);
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -407,27 +404,24 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_connector_stops_its_task() {
-        let cache = XdsCache::new();
-        cache.update_cluster(CLUSTER, cluster());
-        let (connector, mut task_stopped) = spawn_connector(&cache);
+        let (_tx, watch) = CacheWatch::channel(Some(cluster()));
+        let (connector, mut task_stopped) = spawn_connector(watch);
         let endpoint = XdsEndpoint::new(EndpointAddress::new("10.0.0.1", 8080));
         assert_eq!(connector.connect(&endpoint).await, "10.0.0.1:8080");
         assert_eq!(task_stopped.try_recv(), Err(TryRecvError::Empty));
 
-        // The cluster is still in the cache, so only the drop can stop it.
+        // `_tx` stays open, so only dropping `connector` can stop the task.
         drop(connector);
         assert!(stops_within_a_second(task_stopped).await);
     }
 
     #[tokio::test]
-    async fn cluster_removed_before_task_runs_stops_task() {
-        let cache = XdsCache::new();
-        cache.update_cluster(CLUSTER, cluster());
-        let (_connector, task_stopped) = spawn_connector(&cache);
+    async fn cluster_watch_closed_before_task_runs_stops_task() {
+        let (tx, watch) = CacheWatch::channel(Some(cluster()));
+        let (_connector, task_stopped) = spawn_connector(watch);
 
-        // The task has not run yet. Had it subscribed only now, it would
-        // recreate the entry and wait on it forever.
-        cache.remove_cluster(CLUSTER);
+        // Dropping the sender before the task runs closes `watch` immediately.
+        drop(tx);
         assert!(stops_within_a_second(task_stopped).await);
     }
 }

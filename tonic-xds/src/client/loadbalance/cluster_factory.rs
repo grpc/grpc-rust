@@ -44,15 +44,14 @@ use crate::client::loadbalance::loadbalancer::LoadBalancer;
 use crate::client::loadbalance::outcome::{OutcomeClassifier, OutcomeSource};
 use crate::client::loadbalance::pickers::ChannelPicker;
 use crate::client::loadbalance::pickers::p2c::P2cPicker;
-use crate::xds::cache::XdsCache;
+use crate::xds::cache::ClusterWatches;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::CertProviderRegistry;
 use crate::xds::connector::ClusterConnector;
 use crate::xds::endpoint_manager::discover_addresses;
 
-/// Builds one [`LoadBalancer`] per cluster, fed by the xDS cache.
+/// Builds one [`LoadBalancer`] per cluster, fed by per-cluster [`ClusterWatches`].
 pub(crate) struct XdsLbClusterChannelFactory<MC> {
-    cache: Arc<XdsCache>,
     make_connector: Arc<MC>,
     /// Transport-specific mapping of call results to outlier-detection
     /// verdicts; gRPC and plain-HTTP channels supply different ones.
@@ -64,13 +63,11 @@ pub(crate) struct XdsLbClusterChannelFactory<MC> {
 impl<MC> XdsLbClusterChannelFactory<MC> {
     #[cfg(feature = "_tls-any")]
     pub(crate) fn new(
-        cache: Arc<XdsCache>,
         make_connector: MC,
         outcome_classifier: Arc<dyn OutcomeClassifier>,
         cert_registry: Arc<CertProviderRegistry>,
     ) -> Self {
         Self {
-            cache,
             make_connector: Arc::new(make_connector),
             outcome_classifier,
             cert_registry,
@@ -78,13 +75,8 @@ impl<MC> XdsLbClusterChannelFactory<MC> {
     }
 
     #[cfg(not(feature = "_tls-any"))]
-    pub(crate) fn new(
-        cache: Arc<XdsCache>,
-        make_connector: MC,
-        outcome_classifier: Arc<dyn OutcomeClassifier>,
-    ) -> Self {
+    pub(crate) fn new(make_connector: MC, outcome_classifier: Arc<dyn OutcomeClassifier>) -> Self {
         Self {
-            cache,
             make_connector: Arc::new(make_connector),
             outcome_classifier,
         }
@@ -105,16 +97,17 @@ where
     fn make(
         &self,
         cluster_name: &str,
+        watches: ClusterWatches,
     ) -> ClusterChannel<Req, <MC::Service as Service<Req>>::Response> {
         let connector = Arc::new(ClusterConnector::spawn(
-            &self.cache,
+            watches.cluster,
             cluster_name.to_string(),
             self.make_connector.clone(),
             #[cfg(feature = "_tls-any")]
             self.cert_registry.clone(),
         ));
         let outlier_detection = connector.outlier_detection();
-        let discovery = discover_addresses(self.cache.watch_endpoints(cluster_name));
+        let discovery = discover_addresses(watches.endpoints);
 
         // TODO: apply CDS updates in place rather than rebuilding this channel.
         // The balancer owns the live connections, and the ejection counters are
@@ -190,9 +183,8 @@ mod tests {
         })
     }
 
-    fn grpc_factory(cache: Arc<XdsCache>) -> XdsLbClusterChannelFactory<GrpcMakeConnector> {
+    fn grpc_factory() -> XdsLbClusterChannelFactory<GrpcMakeConnector> {
         XdsLbClusterChannelFactory::new(
-            cache,
             GrpcMakeConnector::new(),
             Arc::new(GrpcOutcomeClassifier),
             #[cfg(feature = "_tls-any")]
@@ -233,13 +225,12 @@ mod tests {
             spawn_greeter_server("server-1", None, None).await.unwrap(),
         ];
 
-        let cache = Arc::new(XdsCache::new());
-        cache.update_cluster(CLUSTER, plaintext_cluster());
-        cache.update_endpoints(CLUSTER, endpoints_for(&servers));
+        let (_cluster_tx, _endpoints_tx, watches) =
+            ClusterWatches::channel(Some(plaintext_cluster()), Some(endpoints_for(&servers)));
 
-        let factory = grpc_factory(cache);
+        let factory = grpc_factory();
         let channel: ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> =
-            factory.make(CLUSTER);
+            factory.make(CLUSTER, watches);
 
         let seen = call_servers(&channel, 50).await;
         assert_eq!(
@@ -255,13 +246,13 @@ mod tests {
     async fn serves_once_cds_arrives_after_construction() {
         let servers = vec![spawn_greeter_server("late", None, None).await.unwrap()];
 
-        let cache = Arc::new(XdsCache::new());
-        let factory = grpc_factory(cache.clone());
+        let (cluster_tx, endpoints_tx, watches) = ClusterWatches::channel(None, None);
+        let factory = grpc_factory();
         let mut channel: ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> =
-            factory.make(CLUSTER);
+            factory.make(CLUSTER, watches);
 
-        cache.update_cluster(CLUSTER, plaintext_cluster());
-        cache.update_endpoints(CLUSTER, endpoints_for(&servers));
+        cluster_tx.send(plaintext_cluster());
+        endpoints_tx.send(endpoints_for(&servers));
 
         channel.ready().await.expect("channel becomes ready");
         let seen = call_servers(&channel, 1).await;

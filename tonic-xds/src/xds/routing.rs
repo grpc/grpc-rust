@@ -49,7 +49,7 @@ use crate::client::cluster::ClusterRef;
 use crate::client::retry::RetryClassifierFactory;
 use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
 use crate::common::async_util::AbortOnDrop;
-use crate::xds::cache::{CacheWatch, XdsCache};
+use crate::xds::cache::{CacheWatch, ClusterWatches, XdsCache};
 use crate::xds::resource::hash_policy::HashPolicyConfig;
 use crate::xds::resource::route_config::{
     HeaderMatchSpecifierConfig, HeaderMatcherConfig, PathSpecifierConfig, RouteConfig,
@@ -101,7 +101,7 @@ impl XdsRouter {
         provision: F,
     ) -> Self
     where
-        F: FnMut(&str) -> ClusterRef + Send + 'static,
+        F: FnMut(&str, ClusterWatches) -> ClusterRef + Send + 'static,
     {
         let route_config = Arc::new(ArcSwapOption::empty());
         let (ready_tx, ready_rx) = watch::channel(false);
@@ -158,8 +158,8 @@ struct OwnedCluster {
     /// that the client is stale. Both are checked because the two entries are
     /// removed one after the other, so a client built in between reads a new
     /// cluster entry but a removed endpoints entry.
-    cluster_entry: CacheWatch<ClusterResource>,
-    endpoints_entry: CacheWatch<EndpointsResource>,
+    cluster_entry: CacheWatch<Arc<ClusterResource>>,
+    endpoints_entry: CacheWatch<Arc<EndpointsResource>>,
 }
 
 impl OwnedCluster {
@@ -170,7 +170,7 @@ impl OwnedCluster {
 
 impl<F> ClusterSet<F>
 where
-    F: FnMut(&str) -> ClusterRef,
+    F: FnMut(&str, ClusterWatches) -> ClusterRef,
 {
     fn new(cache: Arc<XdsCache>, provision: F) -> Self {
         Self {
@@ -199,7 +199,11 @@ where
                 // config snapshots in gRFC A74.
                 let cluster_entry = self.cache.watch_cluster(entry.key());
                 let endpoints_entry = self.cache.watch_endpoints(entry.key());
-                let cluster = (self.provision)(entry.key());
+                let watches = ClusterWatches {
+                    cluster: cluster_entry.resubscribe(),
+                    endpoints: endpoints_entry.resubscribe(),
+                };
+                let cluster = (self.provision)(entry.key(), watches);
                 entry.insert(OwnedCluster {
                     cluster,
                     cluster_entry,
@@ -1323,7 +1327,7 @@ mod tests {
     }
 
     /// Builds a no-op cluster client handle for routing tests.
-    fn noop_cluster_client(cluster_name: &str) -> ClusterRef {
+    fn noop_cluster_client(cluster_name: &str, _watches: ClusterWatches) -> ClusterRef {
         use crate::client::cluster::ClusterChannel;
         use crate::common::async_util::BoxFuture;
 
@@ -1333,24 +1337,24 @@ mod tests {
         ClusterRef::from_channel(cluster_name, ClusterChannel::from_service(svc))
     }
 
+    type ProvisionedClusters = Arc<std::sync::Mutex<Vec<String>>>;
+
     /// Returns a provisioning closure that records each cluster it builds a
     /// (no-op) client for.
     fn recording_provisioner() -> (
-        impl FnMut(&str) -> ClusterRef + Send + 'static,
-        Arc<std::sync::Mutex<Vec<String>>>,
+        impl FnMut(&str, ClusterWatches) -> ClusterRef + Send + 'static,
+        ProvisionedClusters,
     ) {
         let provisioned = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = provisioned.clone();
-        let provision = move |cluster_name: &str| {
+        let provision = move |cluster_name: &str, watches: ClusterWatches| {
             recorded.lock().unwrap().push(cluster_name.to_string());
-            noop_cluster_client(cluster_name)
+            noop_cluster_client(cluster_name, watches)
         };
         (provision, provisioned)
     }
 
-    fn router_with_clusters(
-        cache: &Arc<XdsCache>,
-    ) -> (XdsRouter, Arc<std::sync::Mutex<Vec<String>>>) {
+    fn router_with_clusters(cache: &Arc<XdsCache>) -> (XdsRouter, ProvisionedClusters) {
         let (provision, provisioned) = recording_provisioner();
         let router = XdsRouter::new(
             cache.clone(),

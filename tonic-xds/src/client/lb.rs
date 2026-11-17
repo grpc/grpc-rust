@@ -25,6 +25,7 @@
 use crate::client::cluster::{ClusterChannel, ClusterChannelFactory};
 use crate::client::route::RouteDecision;
 use crate::common::async_util::BoxFuture;
+use crate::xds::cache::ClusterWatches;
 use http::Request;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -41,11 +42,16 @@ pub(crate) type BoxDiscover<Endpoint, S> =
 
 /// Trait for discovering cluster endpoints.
 ///
-/// Implementations resolve a cluster name into a stream of endpoint changes
-/// (`Change::Insert` / `Change::Remove`). The xDS-backed implementation is
+/// Implementations resolve a cluster and its router-owned [`ClusterWatches`]
+/// into a stream of endpoint changes (`Change::Insert` / `Change::Remove`). The
+/// xDS-backed implementation is
 /// [`XdsClusterDiscovery`](crate::xds::cluster_discovery::XdsClusterDiscovery).
 pub(crate) trait ClusterDiscovery<Endpoint, S>: Send + Sync + 'static {
-    fn discover_cluster(&self, cluster_name: &str) -> BoxDiscover<Endpoint, S>;
+    fn discover_cluster(
+        &self,
+        cluster_name: &str,
+        watches: ClusterWatches,
+    ) -> BoxDiscover<Endpoint, S>;
 }
 
 /// Errors that can occur during load balancing.
@@ -146,7 +152,11 @@ where
     S::Future: Send + 'static,
     <S as Load>::Metric: std::fmt::Debug,
 {
-    fn make(&self, cluster_name: &str) -> ClusterChannel<Req, S::Response> {
-        ClusterChannel::from_discover(self.discovery.discover_cluster(cluster_name))
+    fn make(
+        &self,
+        cluster_name: &str,
+        watches: ClusterWatches,
+    ) -> ClusterChannel<Req, S::Response> {
+        ClusterChannel::from_discover(self.discovery.discover_cluster(cluster_name, watches))
     }
 }

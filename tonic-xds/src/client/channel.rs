@@ -1445,6 +1445,7 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             security: None,
             circuit_breaking,
+            outlier_detection: Default::default(),
         })
     }
 

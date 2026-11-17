@@ -25,7 +25,7 @@
 use crate::client::circuit_breaking::{
     CircuitBreakingMakeConnector, ClusterCircuitBreakerRegistry,
 };
-use crate::client::cluster::{ClusterChannelFactory, ClusterClientRegistry};
+use crate::client::cluster::{ClusterChannelFactory, ClusterRef};
 use crate::client::deadline::{DeadlinePolicy, set_grpc_timeout_header};
 use crate::client::endpoint::{EndpointAddress, MakeConnector};
 use crate::client::lb::{ClusterDiscovery, TowerP2cClusterChannelFactory, XdsLbService};
@@ -56,7 +56,9 @@ use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 use xds_client::{MetricsRecorder, XdsClient};
 
-use crate::client::retry::{RetryClassifierFactory, RetryLayer, RetrySharedConfig};
+use crate::client::retry::{
+    GrpcRetryClassifierFactory, RetryClassifierFactory, RetryLayer, RetrySharedConfig,
+};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -614,10 +616,15 @@ impl XdsChannelBuilder {
         ReqBody: Send + 'static,
         ResBody: Send + 'static,
     {
-        let router: Arc<dyn Router> = Arc::new(match self.retry_classifier_factory.clone() {
-            Some(factory) => XdsRouter::with_retry_factory(&parts.cache, factory),
-            None => XdsRouter::new(&parts.cache),
-        });
+        let retry_factory = self
+            .retry_classifier_factory
+            .clone()
+            .unwrap_or_else(|| Arc::new(GrpcRetryClassifierFactory));
+        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(
+            parts.cache.clone(),
+            retry_factory,
+            move |name| ClusterRef::from_channel(name, cluster_factory.make(name)),
+        ));
 
         // Fallback retry config for requests that carry no per-route config
         // (non-xDS callers, or a route with no retry policy). The caller supplies
@@ -637,7 +644,6 @@ impl XdsChannelBuilder {
         self.assemble_channel_stack::<B, ReqBody, ResBody, _>(
             routing_layer,
             retry_layer,
-            cluster_factory,
             to_endpoint_req,
             Some(resources),
         )
@@ -693,7 +699,7 @@ impl XdsChannelBuilder {
     /// route's config), a
     /// `map_request` that reconstructs the endpoint's request body from the
     /// buffered `SharedBody`, and the load balancer that dispatches to the
-    /// discovered endpoints.
+    /// cluster client carried by the request's `RouteDecision`.
     ///
     /// `to_endpoint_req` adapts `Request<SharedBody<B>>` to the endpoint's
     /// `Request<ReqBody>`: the built-in gRPC path rewraps into [`TonicBody`]
@@ -703,7 +709,6 @@ impl XdsChannelBuilder {
         &self,
         routing_layer: XdsRoutingLayer<ResBody>,
         retry_layer: RetryLayer,
-        cluster_factory: Arc<dyn ClusterChannelFactory<Request<ReqBody>, Response<ResBody>>>,
         to_endpoint_req: F,
         resources: Option<Arc<XdsChannelResources>>,
     ) -> XdsTransportChannel<B, ResBody>
@@ -715,9 +720,7 @@ impl XdsChannelBuilder {
         ReqBody: Send + 'static,
         ResBody: Send + 'static,
     {
-        let cluster_registry =
-            Arc::new(ClusterClientRegistry::<Request<ReqBody>, Response<ResBody>>::new());
-        let lb_service = XdsLbService::new(cluster_registry, cluster_factory);
+        let lb_service = XdsLbService::<Request<ReqBody>, Response<ResBody>>::new();
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
@@ -1050,6 +1053,7 @@ mod tests {
     use crate::XdsUri;
     use crate::client::channel::XdsChannelGrpc;
     use crate::client::channel::{GrpcClusterChannelFactory, LB_BACKENDS, LbBackend};
+    use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ClusterRef};
     use crate::client::deadline::DeadlinePolicy;
     use crate::client::endpoint::EndpointAddress;
     use crate::client::endpoint::EndpointChannel;
@@ -1065,6 +1069,7 @@ mod tests {
     use crate::client::route::RouteDecision;
     use crate::client::route::RouteInput;
     use crate::client::route::Router;
+    use crate::common::async_util::BoxFuture;
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
     use crate::testutil::grpc::TestServer;
@@ -1072,15 +1077,19 @@ mod tests {
     use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::route_config::RouteConfigResource;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot, watch};
+    use tonic::body::Body as TonicBody;
     use tonic::transport::Channel;
+    use tower::BoxError;
     use tower::discover::Change;
 
     impl super::XdsChannelBuilder {
         /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
-        /// config, and optional pre-route interceptor.
+        /// config, and optional pre-route interceptor. The router's decisions get a
+        /// P2C client over `discovery` for each cluster (see [`LazyClusters`]).
         pub(crate) fn build_grpc_channel_from_parts(
             &self,
             router: Arc<dyn Router>,
@@ -1088,21 +1097,22 @@ mod tests {
             retry: Arc<RetrySharedConfig>,
             interceptor: Option<Arc<dyn PreRouteInterceptor>>,
         ) -> XdsChannelGrpc {
-            self.build_grpc_channel_from_factory(
-                router,
-                Arc::new(TowerP2cClusterChannelFactory::new(discovery)),
+            let factory: GrpcClusterChannelFactory =
+                Arc::new(TowerP2cClusterChannelFactory::new(discovery));
+            self.build_grpc_channel_from_router(
+                LazyClusters::wrap(router, move |name| {
+                    ClusterRef::from_channel(name, factory.make(name))
+                }),
                 retry,
                 interceptor,
             )
         }
 
-        /// Builds an `XdsChannelGrpc` over a caller-chosen load-balancer
-        /// backend, bypassing the compile-time `cluster_factory` selection so a
-        /// single test run can cover both.
-        pub(crate) fn build_grpc_channel_from_factory(
+        /// Builds an `XdsChannelGrpc` that sends each request to the cluster
+        /// client its `router` attaches to the routing decision.
+        pub(crate) fn build_grpc_channel_from_router(
             &self,
             router: Arc<dyn Router>,
-            cluster_factory: GrpcClusterChannelFactory,
             retry: Arc<RetrySharedConfig>,
             interceptor: Option<Arc<dyn PreRouteInterceptor>>,
         ) -> XdsChannelGrpc {
@@ -1120,10 +1130,56 @@ mod tests {
             self.assemble_channel_stack::<TonicBody, TonicBody, TonicBody, _>(
                 routing_layer,
                 retry_layer,
-                cluster_factory,
                 super::grpc_endpoint_request,
                 None,
             )
+        }
+    }
+
+    /// Gives decisions from a router that provisions no cluster clients (the
+    /// mock routers below) a client for their cluster, built when a cluster is
+    /// first routed to and kept for the adapter's lifetime.
+    struct LazyClusters<F> {
+        router: Arc<dyn Router>,
+        provision: F,
+        clusters: Mutex<HashMap<String, ClusterRef>>,
+    }
+
+    impl<F> LazyClusters<F>
+    where
+        F: Fn(&str) -> ClusterRef + Send + Sync + 'static,
+    {
+        fn wrap(router: Arc<dyn Router>, provision: F) -> Arc<dyn Router> {
+            Arc::new(Self {
+                router,
+                provision,
+                clusters: Mutex::default(),
+            })
+        }
+    }
+
+    impl<F> Router for LazyClusters<F>
+    where
+        F: Fn(&str) -> ClusterRef + Send + Sync + 'static,
+    {
+        fn acquire(&self) -> crate::client::route::AcquiredConfig {
+            self.router.acquire()
+        }
+
+        fn route(
+            &self,
+            input: &RouteInput<'_>,
+            config: &crate::client::route::RoutingSnapshot,
+        ) -> Result<RouteDecision, crate::xds::routing::RoutingError> {
+            let mut decision = self.router.route(input, config)?;
+            if decision.cluster_ref.is_none() {
+                let mut clusters = self.clusters.lock().unwrap();
+                let cluster = clusters
+                    .entry(decision.cluster.clone())
+                    .or_insert_with_key(|name| (self.provision)(name));
+                decision.cluster_ref = Some(cluster.clone());
+            }
+            Ok(decision)
         }
     }
 
@@ -1195,6 +1251,7 @@ mod tests {
                 request_hash: None,
                 retry_config: None,
                 max_stream_duration: None,
+                cluster_ref: None,
             })
         }
     }
@@ -1441,12 +1498,25 @@ mod tests {
     /// Builds an XdsChannelGrpc using a real XdsRouter over the given cache,
     /// load-balanced by `backend`.
     fn build_xds_channel_from_cache(cache: &Arc<XdsCache>, backend: LbBackend) -> XdsChannelGrpc {
+        build_xds_channel_from_factory(cache, grpc_cluster_factory(cache, backend))
+    }
+
+    /// Builds an XdsChannelGrpc using a real XdsRouter over the given cache,
+    /// whose cluster channels `factory` builds.
+    fn build_xds_channel_from_factory(
+        cache: &Arc<XdsCache>,
+        factory: GrpcClusterChannelFactory,
+    ) -> XdsChannelGrpc {
+        use crate::client::retry::GrpcRetryClassifierFactory;
         use crate::xds::routing::XdsRouter;
 
-        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(cache));
-        XdsChannelBuilder::new(test_config()).build_grpc_channel_from_factory(
-            router,
-            grpc_cluster_factory(cache, backend),
+        let router = XdsRouter::new(
+            cache.clone(),
+            Arc::new(GrpcRetryClassifierFactory),
+            move |name| ClusterRef::from_channel(name, factory.make(name)),
+        );
+        XdsChannelBuilder::new(test_config()).build_grpc_channel_from_router(
+            Arc::new(router),
             Arc::new(RetrySharedConfig::grpc_default()),
             None,
         )
@@ -1602,6 +1672,156 @@ mod tests {
         assert!(released.is_ok(), "{backend:?}: cache outlived the channel");
 
         shutdown(servers).await;
+    }
+
+    /// A cluster that leaves the route config and later rejoins it is served
+    /// from its new resources, whether or not the router saw the route config
+    /// without it.
+    #[tokio::test]
+    async fn test_xds_channel_serves_readded_cluster() {
+        for backend in LB_BACKENDS {
+            for coalesced in [false, true] {
+                serves_readded_cluster(backend, coalesced).await;
+            }
+        }
+    }
+
+    async fn serves_readded_cluster(backend: LbBackend, coalesced: bool) {
+        let settle = || async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        };
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(2).await;
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(
+            cluster_name,
+            make_test_endpoints(cluster_name, &servers[..1]),
+        );
+        let channel = build_xds_channel_from_cache(&cache, backend);
+
+        let (successful, error_types, server_counts) =
+            send_grpc_requests(GreeterClient::new(channel.clone()), 20).await;
+        assert_eq!(successful, 20, "{backend:?}: {error_types:?}");
+        assert_eq!(
+            server_counts.keys().collect::<Vec<_>>(),
+            ["server-0"],
+            "{backend:?}"
+        );
+
+        // The cluster leaves the route config, and the resource manager drops
+        // its resources. It then rejoins, served by the other server.
+        cache.update_route_config(make_test_route_config("other-cluster"));
+        if !coalesced {
+            settle().await;
+        }
+        cache.remove_cluster(cluster_name);
+        cache.remove_endpoints(cluster_name);
+        if !coalesced {
+            settle().await;
+        }
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(
+            cluster_name,
+            make_test_endpoints(cluster_name, &servers[1..]),
+        );
+        settle().await;
+
+        let (successful, error_types, server_counts) =
+            send_grpc_requests(GreeterClient::new(channel), 20).await;
+        assert_eq!(
+            successful, 20,
+            "{backend:?}, coalesced={coalesced}: {error_types:?}"
+        );
+        assert_eq!(
+            server_counts.keys().collect::<Vec<_>>(),
+            ["server-1"],
+            "{backend:?}, coalesced={coalesced}"
+        );
+
+        shutdown(servers).await;
+    }
+
+    /// Builds cluster channels that hold each call until `released`, and reports
+    /// each channel it builds with a receiver that closes when the channel is gone.
+    struct HeldClusters {
+        built: mpsc::UnboundedSender<(String, oneshot::Receiver<()>)>,
+        called: mpsc::UnboundedSender<String>,
+        released: watch::Receiver<bool>,
+    }
+
+    impl ClusterChannelFactory<http::Request<TonicBody>, http::Response<TonicBody>> for HeldClusters {
+        fn make(
+            &self,
+            cluster_name: &str,
+        ) -> ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> {
+            let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+            let _ = self.built.send((cluster_name.to_string(), dropped_rx));
+            let name = cluster_name.to_string();
+            let called = self.called.clone();
+            let released = self.released.clone();
+            ClusterChannel::from_service(tower::service_fn(
+                move |_| -> BoxFuture<Result<http::Response<TonicBody>, BoxError>> {
+                    // Owned by the service, so it closes once the channel is gone.
+                    let _ = &dropped_tx;
+                    let _ = called.send(name.clone());
+                    let mut released = released.clone();
+                    Box::pin(async move {
+                        let _ = released.wait_for(|released| *released).await;
+                        Err("released".into())
+                    })
+                },
+            ))
+        }
+    }
+
+    /// A cluster's client outlives the route config that references it only
+    /// for as long as RPCs routed to it are in flight.
+    #[tokio::test]
+    async fn test_xds_channel_drops_client_of_removed_cluster() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let (built_tx, mut built) = mpsc::unbounded_channel();
+        let (called_tx, mut called) = mpsc::unbounded_channel();
+        let (release, released) = watch::channel(false);
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config("cluster-a"));
+        let factory = HeldClusters {
+            built: built_tx,
+            called: called_tx,
+            released,
+        };
+        let channel = build_xds_channel_from_factory(&cache, Arc::new(factory));
+        let (name, mut a_dropped) = built.recv().await.unwrap();
+        assert_eq!(name, "cluster-a");
+
+        let mut client = GreeterClient::new(channel.clone());
+        let mut rpc = std::pin::pin!(client.say_hello(HelloRequest::default()));
+        tokio::select! {
+            _ = &mut rpc => panic!("the RPC completed before it was released"),
+            name = called.recv() => assert_eq!(name.unwrap(), "cluster-a"),
+        }
+
+        // The cluster leaves the route config while the RPC is in flight, which
+        // keeps the client alive.
+        cache.update_route_config(make_test_route_config("cluster-b"));
+        let (name, mut b_dropped) = built.recv().await.unwrap();
+        assert_eq!(name, "cluster-b");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(a_dropped.try_recv(), Err(TryRecvError::Empty));
+
+        // Once the RPC completes, the client is dropped, though the channel and
+        // the other cluster's client remain.
+        release.send_replace(true);
+        assert!(rpc.await.is_err());
+        let dropped =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), &mut a_dropped).await;
+        assert!(dropped.is_ok(), "cluster-a's client outlived its RPC");
+        assert_eq!(b_dropped.try_recv(), Err(TryRecvError::Empty));
+        drop(channel);
     }
 
     /// The CDS `max_requests` limit is enforced on the request path.
@@ -1928,6 +2148,7 @@ mod tests {
                 request_hash: None,
                 retry_config: None,
                 max_stream_duration: None,
+                cluster_ref: None,
             })
         }
     }
@@ -1941,9 +2162,15 @@ mod tests {
         use tower::{Service, ServiceExt};
 
         let builder = XdsChannelBuilder::new(test_config());
-        let router: Arc<dyn Router> = Arc::new(StaticRouter);
         let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<EchoEndpoint>>> =
             Arc::new(MockHttpDiscovery);
+        let factory = TowerP2cClusterChannelFactory::new(discovery);
+        let router = LazyClusters::wrap(Arc::new(StaticRouter), move |name| {
+            ClusterRef::from_channel::<
+                super::Request<shared_http_body::SharedBody<TestBody>>,
+                super::Response<TestBody>,
+            >(name, factory.make(name))
+        });
         let routing_layer = XdsRoutingLayer::new(
             router,
             None,
@@ -1960,7 +2187,6 @@ mod tests {
         >(
             routing_layer,
             retry_layer,
-            Arc::new(TowerP2cClusterChannelFactory::new(discovery)),
             |req| req,
             None,
         );
@@ -2059,7 +2285,6 @@ mod tests {
     async fn dials_endpoint_hostname(backend: LbBackend) {
         use crate::client::endpoint::XdsEndpoint;
         use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
-        use crate::xds::routing::XdsRouter;
         use tonic::body::Body as TonicBody;
 
         let cluster_name = "test-cluster";
@@ -2097,12 +2322,7 @@ mod tests {
             LbBackend::empty_cert_registry(),
             Arc::new(super::GrpcOutcomeClassifier),
         );
-        let channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_factory(
-            Arc::new(XdsRouter::new(&cache)),
-            factory,
-            Arc::new(RetrySharedConfig::grpc_default()),
-            None,
-        );
+        let channel = build_xds_channel_from_factory(&cache, factory);
 
         let num_requests = 10;
         let (successful, error_types, _) =

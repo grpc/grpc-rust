@@ -547,8 +547,13 @@ impl PickFirstPolicy {
                 self.subchannel_drop(channel_controller);
             }
             (false, _) if self.selected.is_some() => {
-                // Another subchannel is selected; keep using it. This update
-                // is only recorded in the cache above.
+                // Another subchannel is selected; keep using it. Record a
+                // failure's error, as for any unselected subchannel.
+                if state.connectivity_state == ConnectivityState::TransientFailure
+                    && let Some(err) = &state.last_connection_error
+                {
+                    self.last_connection_error = Some(err.clone());
+                }
             }
             (false, ConnectivityState::Ready) => {
                 // The updating subchannel is READY; activate it.
@@ -1021,6 +1026,31 @@ mod test {
 
         // addr1 failing does not make the policy report TRANSIENT_FAILURE.
         env.send_subchannel_update(&sc1, &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_no_events();
+    }
+
+    // While a subchannel is selected, a failure from another subchannel still
+    // records its error: a later pass that finds that subchannel in
+    // TRANSIENT_FAILURE reports it.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_records_error_when_another_fails() {
+        let mut env = new_env();
+        env.simulate_successful_connection(&["addr1", "addr2"]);
+
+        // An update while addr1 is selected creates a new addr2 subchannel,
+        // which fails.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
+            .unwrap();
+        let sc2 = env.expect_new_subchannel_for("addr2");
+        env.send_subchannel_update(&sc2, &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_no_events();
+
+        // Without addr1, the new pass finds only addr2, in TRANSIENT_FAILURE,
+        // and reports its error.
+        env.send_resolver_update(create_endpoints(&["addr2"]))
+            .unwrap();
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
         env.expect_no_events();
     }
 

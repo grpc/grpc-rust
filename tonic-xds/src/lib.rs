@@ -322,7 +322,7 @@ pub use xds::uri::{XdsUri, XdsUriError};
 /// [`ClusterSecurityConfig::from_cluster_bytes`], so callers can name it
 /// without a direct `xds-client` dependency.
 pub use xds_client::Error as XdsError;
-pub use xds_client::{ServerConfig, TonicCallCredentials};
+pub use xds_client::{RetryPolicy, ServerConfig, TonicCallCredentials};
 
 #[cfg(feature = "_tls-any")]
 pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};

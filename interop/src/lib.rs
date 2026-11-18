@@ -122,11 +122,18 @@ pub enum TestAssertion {
         expression: &'static str,
         why: Option<String>,
     },
+    /// For marking tests that cover unimplemented features. Counts as a failure.
+    NotImplemented {
+        reason: &'static str,
+    },
 }
 
 impl TestAssertion {
     pub fn is_failed(&self) -> bool {
-        matches!(self, TestAssertion::Failed { .. })
+        matches!(
+            self,
+            TestAssertion::Failed { .. } | TestAssertion::NotImplemented { .. }
+        )
     }
 }
 
@@ -162,6 +169,13 @@ impl fmt::Display for TestAssertion {
                 check = style(Emoji("✖", "x")).red(),
                 desc = style(description).red(),
                 exp = style(expression).red(),
+            ),
+            TestAssertion::NotImplemented { ref reason } => write!(
+                f,
+                "{check} {desc}: {reason}",
+                check = style(Emoji("✖", "x")).red(),
+                desc = style("not implemented").red(),
+                reason = style(reason).red(),
             ),
         }
     }

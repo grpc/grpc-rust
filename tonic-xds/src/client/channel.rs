@@ -209,7 +209,8 @@ impl XdsChannelConfig {
     /// Defaults to `Some(1024)` per gRFC A32. Pass `None` to disable fallback
     /// circuit breaking for clusters that do not specify `max_requests` in CDS;
     /// an explicit `max_requests` configured on a CDS `Cluster` (including
-    /// `0`) is still enforced.
+    /// `0`) is still enforced, and in-flight requests are still counted toward
+    /// the process-wide cluster counter.
     ///
     /// [gRFC A32]: https://github.com/grpc/proposal/blob/master/A32-xds-circuit-breaking.md
     #[must_use]

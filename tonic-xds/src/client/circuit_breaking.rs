@@ -41,7 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll, ready};
 
@@ -112,13 +112,7 @@ impl ClusterCircuitBreakerRegistry {
         eds_service_name: &str,
         config: CircuitBreakingConfig,
     ) {
-        let Some(max_requests) = config.max_requests.or(self.inner.default_max_requests) else {
-            let state = self.inner.configs.get(cluster).map(|state| state.clone());
-            if let Some(state) = state {
-                self.clear_state(&state);
-            }
-            return;
-        };
+        let max_requests = config.max_requests.or(self.inner.default_max_requests);
         let counter_key = CounterKey::new(cluster, eds_service_name);
         let counter = self.inner.counters.counter(&counter_key);
         let state = self.ensure_state(cluster);
@@ -181,6 +175,7 @@ impl ClusterCircuitBreakerRegistry {
         }
     }
 
+    #[cfg(test)]
     fn clear_state(&self, state: &ClusterCircuitBreakerState) {
         let _update_guard = state
             .update_lock
@@ -204,7 +199,7 @@ impl ClusterCircuitBreakerRegistry {
     }
 
     #[cfg(test)]
-    fn in_flight(&self, cluster: &str) -> u32 {
+    fn in_flight(&self, cluster: &str) -> u64 {
         let breaker = self.cluster_breaker(cluster);
         breaker
             .state
@@ -255,7 +250,7 @@ struct CircuitBreakerLimit {
 
 #[derive(Clone, Debug)]
 struct CircuitBreakerRuntimeConfig {
-    max_requests: u32,
+    max_requests: Option<u32>,
     counter_key: CounterKey,
     counter: Arc<InFlightCounter>,
 }
@@ -337,18 +332,21 @@ impl ClusterCircuitBreaker {
             return Ok(None);
         };
 
-        if config.counter.try_acquire(config.max_requests) {
-            return Ok(Some(CircuitBreakerPermit {
-                config: Some(config),
-                counters: self.counters.clone(),
-            }));
+        if let Some(max_requests) = config.max_requests {
+            if !config.counter.try_acquire(max_requests) {
+                let limit = CircuitBreakerLimit { max_requests };
+                self.counters.drop_config(config);
+                self.state.record_drop();
+                return Err(limit);
+            }
+        } else {
+            config.counter.acquire_unbounded();
         }
-        let limit = CircuitBreakerLimit {
-            max_requests: config.max_requests,
-        };
-        self.counters.drop_config(config);
-        self.state.record_drop();
-        Err(limit)
+
+        Ok(Some(CircuitBreakerPermit {
+            config: Some(config),
+            counters: self.counters.clone(),
+        }))
     }
 }
 
@@ -411,7 +409,7 @@ impl ClusterRequestCounters {
     }
 
     #[cfg(test)]
-    fn in_flight(&self, counter_key: &CounterKey) -> u32 {
+    fn in_flight(&self, counter_key: &CounterKey) -> u64 {
         self.inner
             .counters
             .get(counter_key)
@@ -427,7 +425,7 @@ impl ClusterRequestCounters {
 
 #[derive(Debug, Default)]
 struct InFlightCounter {
-    in_flight: AtomicU32,
+    in_flight: AtomicU64,
     active_refs: AtomicUsize,
 }
 
@@ -450,7 +448,12 @@ impl InFlightCounter {
         );
     }
 
+    fn acquire_unbounded(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn try_acquire(&self, limit: u32) -> bool {
+        let limit = u64::from(limit);
         loop {
             let current = self.in_flight.load(Ordering::Acquire);
             if current >= limit {
@@ -467,7 +470,7 @@ impl InFlightCounter {
         }
     }
 
-    fn in_flight(&self) -> u32 {
+    fn in_flight(&self) -> u64 {
         self.in_flight.load(Ordering::Acquire)
     }
 
@@ -616,8 +619,8 @@ pin_project! {
     /// The response future of a [`CircuitBreakingEndpointService`].
     #[project = ResponseFutureProj]
     pub(crate) enum ResponseFuture<F> {
-        /// The call reached the endpoint, holding a slot if its cluster has a
-        /// limit.
+        /// The call reached the endpoint, holding a slot if its cluster has an
+        /// active counter.
         Called {
             #[pin]
             response: F,
@@ -1264,19 +1267,17 @@ mod tests {
     }
 
     #[test]
-    fn disabling_default_max_requests_leaves_unconfigured_cluster_unlimited_until_cds_sets_one() {
+    fn disabling_default_max_requests_counts_in_flight_until_cds_sets_limit() {
         let counters = ClusterRequestCounters::isolated();
         let breakers = ClusterCircuitBreakerRegistry::with_counters(counters.clone(), None);
         breakers.set_cluster_config(CLUSTER, EDS_SERVICE_NAME, CircuitBreakingConfig::default());
 
-        assert!(breakers.acquire(CLUSTER).unwrap().is_none());
-        assert_eq!(
-            counters.counter_count(),
-            0,
-            "unconfigured cluster should not allocate request counters when fallback is None"
-        );
+        let first = breakers.acquire(CLUSTER).unwrap().unwrap();
+        let second = breakers.acquire(CLUSTER).unwrap().unwrap();
+        assert_eq!(breakers.in_flight(CLUSTER), 2);
+        assert_eq!(counters.counter_count(), 1);
 
-        // Explicit CDS max_requests still enforces circuit breaking even when fallback is None.
+        // Live CDS update adding max_requests observes requests that started while unlimited.
         breakers.set_cluster_config(
             CLUSTER,
             EDS_SERVICE_NAME,
@@ -1284,14 +1285,65 @@ mod tests {
                 max_requests: Some(1),
             },
         );
-        let permit = breakers.acquire(CLUSTER).unwrap().unwrap();
         assert_eq!(breakers.acquire(CLUSTER).unwrap_err().max_requests, 1);
-        assert_eq!(counters.counter_count(), 1);
 
-        // Subsequent CDS update omitting circuit_breakers clears the active breaker back to unlimited.
+        drop(first);
+        assert_eq!(breakers.in_flight(CLUSTER), 1);
+        assert_eq!(breakers.acquire(CLUSTER).unwrap_err().max_requests, 1);
+
+        // Subsequent CDS update omitting circuit_breakers lifts the cap without losing count.
         breakers.set_cluster_config(CLUSTER, EDS_SERVICE_NAME, CircuitBreakingConfig::default());
-        assert!(breakers.acquire(CLUSTER).unwrap().is_none());
-        drop(permit);
+        let third = breakers.acquire(CLUSTER).unwrap().unwrap();
+        assert_eq!(breakers.in_flight(CLUSTER), 2);
+
+        drop(second);
+        drop(third);
+        assert_eq!(breakers.in_flight(CLUSTER), 0);
+        drop(breakers);
+        assert_eq!(counters.counter_count(), 0);
+    }
+
+    #[test]
+    fn disabled_default_max_requests_counts_toward_shared_process_counter() {
+        let counters = ClusterRequestCounters::isolated();
+        let unlimited_breakers =
+            ClusterCircuitBreakerRegistry::with_counters(counters.clone(), None);
+        let fallback_breakers =
+            ClusterCircuitBreakerRegistry::with_counters(counters.clone(), Some(1));
+        unlimited_breakers.set_cluster_config(
+            CLUSTER,
+            EDS_SERVICE_NAME,
+            CircuitBreakingConfig::default(),
+        );
+        fallback_breakers.set_cluster_config(
+            CLUSTER,
+            EDS_SERVICE_NAME,
+            CircuitBreakingConfig::default(),
+        );
+
+        let first = unlimited_breakers.acquire(CLUSTER).unwrap().unwrap();
+        let second = unlimited_breakers.acquire(CLUSTER).unwrap().unwrap();
+        assert_eq!(fallback_breakers.in_flight(CLUSTER), 2);
+        assert_eq!(
+            fallback_breakers.acquire(CLUSTER).unwrap_err().max_requests,
+            1
+        );
+        assert_eq!(unlimited_breakers.dropped_requests(CLUSTER), 0);
+        assert_eq!(fallback_breakers.dropped_requests(CLUSTER), 1);
+
+        drop(first);
+        assert_eq!(
+            fallback_breakers.acquire(CLUSTER).unwrap_err().max_requests,
+            1
+        );
+
+        drop(second);
+        let third = fallback_breakers.acquire(CLUSTER).unwrap().unwrap();
+        assert_eq!(unlimited_breakers.in_flight(CLUSTER), 1);
+
+        drop(third);
+        drop(unlimited_breakers);
+        drop(fallback_breakers);
         assert_eq!(counters.counter_count(), 0);
     }
 

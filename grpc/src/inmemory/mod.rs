@@ -44,8 +44,6 @@ use crate::StatusError;
 use crate::attributes::Attributes;
 use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
-use crate::client::DynRecvStream as ClientDynRecvStream;
-use crate::client::DynSendStream as ClientDynSendStream;
 use crate::client::Invoke;
 use crate::client::RecvStream as ClientRecvStream;
 use crate::client::RequestHeaders as ClientRequestHeaders;
@@ -298,8 +296,8 @@ pub struct InMemoryConnection {
 }
 
 impl Invoke for InMemoryConnection {
-    type SendStream = Box<dyn ClientDynSendStream>;
-    type RecvStream = Box<dyn ClientDynRecvStream>;
+    type SendStream = InMemoryClientSendStream;
+    type RecvStream = InMemoryClientRecvStream;
 
     async fn invoke(
         &self,
@@ -324,12 +322,12 @@ impl Invoke for InMemoryConnection {
         let _ = self.s.send(call).await;
 
         (
-            Box::new(InMemoryClientSendStream { tx: Some(req_tx) }),
-            Box::new(InMemoryClientRecvStream {
+            InMemoryClientSendStream { tx: Some(req_tx) },
+            InMemoryClientRecvStream {
                 rx: resp_rx,
                 trailer_rx: Some(trailer_rx),
                 connection_info: Some(self.connection_info.clone()),
-            }),
+            },
         )
     }
 }

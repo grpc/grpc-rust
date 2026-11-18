@@ -22,6 +22,9 @@
  *
  */
 
+use std::ffi::OsString;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,6 +44,7 @@ use tonic::transport::ServerTlsConfig as TonicServerTlsConfig;
 
 #[derive(Debug)]
 struct Opts {
+    port: u16,
     use_tls: bool,
     codec: Codec,
 }
@@ -65,9 +69,19 @@ impl FromStr for Codec {
 
 impl Opts {
     fn parse() -> Result<Self, pico_args::Error> {
-        let mut pargs = pico_args::Arguments::from_env();
+        // interop/test.sh passes `--use_tls` bare; gRPC's interop harness
+        // passes it with a value (`--use_tls=true`).
+        let args: Vec<OsString> = std::env::args_os()
+            .skip(1)
+            .map(|arg| match arg.to_str() {
+                Some("--use_tls") => OsString::from("--use_tls=true"),
+                _ => arg,
+            })
+            .collect();
+        let mut pargs = pico_args::Arguments::from_vec(args);
         Ok(Self {
-            use_tls: pargs.contains("--use_tls"),
+            port: pargs.opt_value_from_str("--port")?.unwrap_or(10000),
+            use_tls: pargs.opt_value_from_str("--use_tls")?.unwrap_or(false),
             codec: pargs.value_from_str("--codec")?,
         })
     }
@@ -79,7 +93,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let matches = Opts::parse()?;
 
-    let addr = "127.0.0.1:10000".parse().unwrap();
+    let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, matches.port));
 
     match matches.codec {
         Codec::Prost => {

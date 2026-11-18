@@ -62,6 +62,14 @@ impl<T> CacheWatch<T> {
             }
         }
     }
+
+    /// Whether the watched entry has been removed from the cache.
+    ///
+    /// A later update for the same key creates a new entry, which this watch
+    /// does not follow.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.rx.has_changed().is_err()
+    }
 }
 
 /// A keyed collection of [`watch`] channels for a single xDS resource type.
@@ -225,6 +233,7 @@ mod tests {
             lb_policy: lb,
             security: None,
             circuit_breaking: CircuitBreakingConfig::default(),
+            outlier_detection: Default::default(),
         })
     }
 

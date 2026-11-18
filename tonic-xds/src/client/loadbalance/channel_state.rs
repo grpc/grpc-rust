@@ -225,6 +225,12 @@ impl OutlierChannelState {
             });
     }
 
+    /// Clear the multiplier. Only meant for the sweep task, which is the sole
+    /// writer that raises it, so the plain store can't lose an ejection.
+    pub(crate) fn reset_multiplier(&self) {
+        self.ejection_multiplier.store(0, Ordering::Relaxed);
+    }
+
     /// Test-only multiplier setter for driving housekeeping without
     /// going through `try_eject`.
     #[cfg(test)]
@@ -543,15 +549,11 @@ mod tests {
     }
 
     /// Throwaway registry for tests that don't observe ejection
-    /// state — defaults to the disabled config, so the housekeeping
-    /// actor would never run anyway.
+    /// state; defaults to the disabled config.
     fn test_registry() -> Arc<OutlierStatsRegistry> {
         use crate::xds::resource::outlier_detection::OutlierDetectionConfig;
-        use arc_swap::ArcSwap;
-        OutlierStatsRegistry::new(Arc::new(ArcSwap::from_pointee(
-            OutlierDetectionConfig::default(),
-        )))
-        .0
+        let (_tx, rx) = tokio::sync::watch::channel(OutlierDetectionConfig::default());
+        OutlierStatsRegistry::new(rx).0
     }
 
     #[tokio::test]

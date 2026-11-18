@@ -1285,6 +1285,7 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             security: None,
             circuit_breaking: CircuitBreakingConfig { max_requests },
+            outlier_detection: Default::default(),
         };
         #[cfg(feature = "_tls-any")]
         let registry = crate::xds::cert_provider::CertProviderRegistry::from_bootstrap(

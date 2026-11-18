@@ -294,6 +294,9 @@ impl PickFirstPolicy {
                 .is_none()
                 .then(|| "all addresses in transient failure".to_string());
             _ = self.set_transient_failure(channel_controller, error);
+            // Nothing is left to attempt, so the first pass is complete. Enter
+            // steady state.
+            self.steady_state = Some(SteadyState::new(self.subchannels.len()));
         }
     }
 
@@ -1411,6 +1414,29 @@ mod test {
             .unwrap();
         env.expect_failing_picker("steady state network drop");
         env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // A pass that starts with every subchannel already in TRANSIENT_FAILURE
+    // enters steady state: a subchannel that then finishes its backoff is
+    // reconnected, without TRANSIENT_FAILURE being reported again.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_pass_starting_in_transient_failure_enters_steady_state() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // addr1 is reused and still in TRANSIENT_FAILURE, so the new pass has
+        // nothing to attempt.
+        env.send_resolver_update(create_endpoints(&["addr1"]))
+            .unwrap();
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // In steady state, addr1 finishing its backoff only reconnects it.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
         env.expect_no_events();
     }
 

@@ -54,49 +54,48 @@ use crate::xds_config::LeafEndpoints;
 /// Roots are at depth 0, so a cluster reached at this depth is too deep.
 const MAX_AGGREGATE_DEPTH: usize = 16;
 
-/// The cached state of every watch.
+/// Read-only access to the cached state of every watch.
 ///
-/// A name with no entry is not being watched yet. The walk treats it like
-/// [`WatchState::Pending`] and adds the name to
+/// `None` means that nothing is watching that name yet. The walk treats it
+/// like [`WatchState::Pending`] and adds the name to
 /// [`ClusterGraph::required_watches`], so the caller starts the watch.
-#[derive(Debug, Default)]
-struct CachedResources {
-    /// The state of each CDS watch, by cluster name.
-    clusters: HashMap<String, WatchState<Arc<ClusterResource>>>,
-    /// The state of each EDS watch, by EDS service name.
-    endpoints: HashMap<String, WatchState<Arc<EndpointsResource>>>,
-    /// The state of each DNS resolution, by LogicalDNS cluster target.
-    dns: HashMap<DnsTarget, WatchState<Arc<[EndpointAddress]>>>,
+pub(super) trait CachedResources {
+    /// The state of the CDS watch for cluster `name`.
+    fn cluster(&self, name: &str) -> Option<&WatchState<ClusterResource>>;
+    /// The state of the EDS watch for `eds_service_name`.
+    fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<EndpointsResource>>;
+    /// The state of the DNS resolution for a LogicalDNS cluster's target.
+    fn dns(&self, target: &DnsTarget) -> Option<&WatchState<[EndpointAddress]>>;
 }
 
 /// The `host:port` that a LogicalDNS cluster resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DnsTarget {
-    host: String,
-    port: u16,
+pub(super) struct DnsTarget {
+    pub(super) host: String,
+    pub(super) port: u16,
 }
 
 /// The result of a [`walk`].
 #[derive(Debug, Default)]
-struct ClusterGraph {
+pub(super) struct ClusterGraph {
     /// Every reachable cluster that has resolved, successfully or not.
     /// A cluster is left out exactly while it, or something below it, is
     /// still pending, so the caller can tell whether its roots are ready.
-    cluster_configs: HashMap<String, ClusterResult>,
+    pub(super) cluster_configs: HashMap<String, ClusterResult>,
     /// The watches that should exist, including those below pending clusters,
     /// so that independent parts of the graph are fetched in parallel.
-    required_watches: RequiredWatches,
+    pub(super) required_watches: RequiredWatches,
 }
 
 /// The watches that a walk needs.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct RequiredWatches {
+pub(super) struct RequiredWatches {
     /// CDS resource names.
-    clusters: HashSet<String>,
+    pub(super) clusters: HashSet<String>,
     /// EDS resource names.
-    eds_services: HashSet<String>,
+    pub(super) eds_services: HashSet<String>,
     /// LogicalDNS targets.
-    dns_targets: HashSet<DnsTarget>,
+    pub(super) dns_targets: HashSet<DnsTarget>,
 }
 
 /// Walks the cluster graph from `roots`: the clusters named by the selected
@@ -108,8 +107,8 @@ struct RequiredWatches {
 /// leaf cluster's resolution note. If a leaf has no notes at all, its note is
 /// the xDS node ID instead, so that the client can be found in control plane
 /// logs.
-fn walk<'a>(
-    cache: &'a CachedResources,
+pub(super) fn walk<'a>(
+    cache: &'a dyn CachedResources,
     roots: impl IntoIterator<Item = &'a str>,
     base_notes: &'a [Arc<str>],
     node_id: Option<&str>,
@@ -224,7 +223,7 @@ enum Mark<'a> {
 /// [`Self::visit`] does the search bookkeeping, and [`Self::visit_uncached`]
 /// does the xDS work for a single cluster.
 struct GraphWalker<'a> {
-    cache: &'a CachedResources,
+    cache: &'a dyn CachedResources,
     base_notes: &'a [Arc<str>],
     /// The note for a leaf that has no other notes.
     node_id_note: Option<Arc<str>>,
@@ -285,7 +284,7 @@ impl<'a> GraphWalker<'a> {
     ) -> Result<Visited<'a>, DepthExceeded> {
         self.graph.required_watches.clusters.insert(name.to_owned());
         let cache = self.cache;
-        let (cluster, cds_note) = match cache.clusters.get(name) {
+        let (cluster, cds_note) = match cache.cluster(name) {
             None | Some(WatchState::Pending) => return Ok(Visited::PENDING),
             Some(WatchState::Failed(reason)) => {
                 self.graph.cluster_configs.insert(
@@ -302,7 +301,7 @@ impl<'a> GraphWalker<'a> {
             ClusterDiscovery::Eds {
                 eds_service_name, ..
             } => {
-                let endpoints = cache.endpoints.get(eds_service_name);
+                let endpoints = cache.endpoints(eds_service_name);
                 self.graph
                     .required_watches
                     .eds_services
@@ -314,7 +313,7 @@ impl<'a> GraphWalker<'a> {
                     host: hostname.clone(),
                     port: *port,
                 };
-                let addresses = cache.dns.get(&target);
+                let addresses = cache.dns(&target);
                 self.graph.required_watches.dns_targets.insert(target);
                 Ok(self.leaf(
                     name,
@@ -335,17 +334,18 @@ impl<'a> GraphWalker<'a> {
     /// If its endpoints failed, the cluster still resolves, with no endpoints
     /// and the reason in its note: gRFC A74 reports endpoint problems through
     /// the resolution note rather than as a cluster error.
-    fn leaf<T: Clone>(
+    // `T` may be unsized because LogicalDNS endpoints are `[EndpointAddress]`.
+    fn leaf<T: ?Sized>(
         &mut self,
         name: &'a str,
         cluster: &Arc<ClusterResource>,
         cds_note: Option<&Arc<str>>,
         endpoints: Option<&WatchState<T>>,
-        to_source: fn(T) -> LeafEndpointSource,
+        to_source: fn(Arc<T>) -> LeafEndpointSource,
     ) -> Visited<'a> {
         let (endpoints, endpoints_note) = match endpoints {
             None | Some(WatchState::Pending) => return Visited::PENDING,
-            Some(WatchState::Ready { value, note }) => (Some(value.clone()), note.as_ref()),
+            Some(WatchState::Ready { value, note }) => (Some(Arc::clone(value)), note.as_ref()),
             Some(WatchState::Failed(reason)) => (None, Some(reason)),
         };
         let config = ClusterConfig {
@@ -479,29 +479,54 @@ fn join_notes<'n>(notes: impl IntoIterator<Item = &'n Arc<str>>) -> Option<Arc<s
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::resource::DEFAULT_MAX_CONCURRENT_REQUESTS;
 
     // ----- Fixtures -----
 
-    /// Builders for the cached states of a test.
-    impl CachedResources {
-        fn with_cds(mut self, name: &str, state: WatchState<Arc<ClusterResource>>) -> Self {
+    /// Cached states held in plain maps. Counts cluster lookups so tests can
+    /// assert that each cluster is computed once.
+    #[derive(Default)]
+    struct MockCache {
+        clusters: HashMap<String, WatchState<ClusterResource>>,
+        endpoints: HashMap<String, WatchState<EndpointsResource>>,
+        dns: HashMap<DnsTarget, WatchState<[EndpointAddress]>>,
+        cluster_lookups: RefCell<HashMap<String, usize>>,
+    }
+
+    impl CachedResources for MockCache {
+        fn cluster(&self, name: &str) -> Option<&WatchState<ClusterResource>> {
+            *self
+                .cluster_lookups
+                .borrow_mut()
+                .entry(name.to_owned())
+                .or_default() += 1;
+            self.clusters.get(name)
+        }
+
+        fn endpoints(&self, eds_service_name: &str) -> Option<&WatchState<EndpointsResource>> {
+            self.endpoints.get(eds_service_name)
+        }
+
+        fn dns(&self, target: &DnsTarget) -> Option<&WatchState<[EndpointAddress]>> {
+            self.dns.get(target)
+        }
+    }
+
+    impl MockCache {
+        fn with_cds(mut self, name: &str, state: WatchState<ClusterResource>) -> Self {
             self.clusters.insert(name.to_owned(), state);
             self
         }
 
-        fn with_eds(mut self, service: &str, state: WatchState<Arc<EndpointsResource>>) -> Self {
+        fn with_eds(mut self, service: &str, state: WatchState<EndpointsResource>) -> Self {
             self.endpoints.insert(service.to_owned(), state);
             self
         }
 
-        fn with_dns(
-            mut self,
-            host: &str,
-            port: u16,
-            state: WatchState<Arc<[EndpointAddress]>>,
-        ) -> Self {
+        fn with_dns(mut self, host: &str, port: u16, state: WatchState<[EndpointAddress]>) -> Self {
             self.dns.insert(dns_target(host, port), state);
             self
         }
@@ -541,20 +566,28 @@ mod tests {
                     .with_aggregate(&format!("R{i}"), [&next])
             })
         }
+
+        fn lookups(&self, name: &str) -> usize {
+            self.cluster_lookups
+                .borrow()
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
-    fn ready<T>(value: T) -> WatchState<T> {
+    fn ready<T: ?Sized>(value: Arc<T>) -> WatchState<T> {
         WatchState::Ready { value, note: None }
     }
 
-    fn ready_with_note<T>(value: T, note: &str) -> WatchState<T> {
+    fn ready_with_note<T: ?Sized>(value: Arc<T>, note: &str) -> WatchState<T> {
         WatchState::Ready {
             value,
             note: Some(note.into()),
         }
     }
 
-    fn failed<T>(reason: &str) -> WatchState<T> {
+    fn failed<T: ?Sized>(reason: &str) -> WatchState<T> {
         WatchState::Failed(reason.into())
     }
 
@@ -612,7 +645,7 @@ mod tests {
         }
     }
 
-    fn walk_roots(cache: &CachedResources, roots: &[&str]) -> ClusterGraph {
+    fn walk_roots(cache: &MockCache, roots: &[&str]) -> ClusterGraph {
         walk(cache, roots.iter().copied(), &[], None)
     }
 
@@ -729,7 +762,7 @@ mod tests {
                 },
             ),
         ] {
-            let mut cache = CachedResources::default().with_cds("A", ready(eds_cluster("A", "a")));
+            let mut cache = MockCache::default().with_cds("A", ready(eds_cluster("A", "a")));
             if let Some(state) = endpoints_state {
                 cache = cache.with_eds("a", state);
             }
@@ -772,8 +805,8 @@ mod tests {
                 },
             ),
         ] {
-            let mut cache = CachedResources::default()
-                .with_cds("D", ready(dns_cluster("D", "d.example.com", 443)));
+            let mut cache =
+                MockCache::default().with_cds("D", ready(dns_cluster("D", "d.example.com", 443)));
             if let Some(state) = dns_state {
                 cache = cache.with_dns("d.example.com", 443, state);
             }
@@ -794,21 +827,21 @@ mod tests {
 
     #[test]
     fn missing_or_failed_cds_resource() {
-        let graph = walk_roots(&CachedResources::default(), &["A"]);
+        let graph = walk_roots(&MockCache::default(), &["A"]);
         assert!(graph.cluster_configs.is_empty());
         assert_eq!(graph.required_watches.clusters, names(&["A"]));
 
-        let cache = CachedResources::default().with_cds("A", WatchState::Pending);
+        let cache = MockCache::default().with_cds("A", WatchState::Pending);
         assert!(walk_roots(&cache, &["A"]).cluster_configs.is_empty());
 
-        let cache = CachedResources::default().with_cds("A", failed("CDS A: does not exist"));
+        let cache = MockCache::default().with_cds("A", failed("CDS A: does not exist"));
         let graph = walk_roots(&cache, &["A"]);
         assert_eq!(error(&graph, "A"), "CDS A: does not exist");
     }
 
     #[test]
     fn leaf_note_joins_lds_rds_cds_and_endpoint_notes_in_order() {
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_cds("A", ready_with_note(eds_cluster("A", "a"), "cds"))
             .with_eds("a", ready_with_note(endpoints("a"), "eds"));
         let base_notes: [Arc<str>; 3] = ["lds".into(), "".into(), "rds".into()];
@@ -821,7 +854,7 @@ mod tests {
 
     #[test]
     fn leaf_note_falls_back_to_node_id() {
-        let cache = CachedResources::default().with_leaf("A");
+        let cache = MockCache::default().with_leaf("A");
         let graph = walk(&cache, ["A"], &[], Some("node-1"));
         assert_eq!(
             leaf(&graph, "A").resolution_note.as_deref(),
@@ -837,7 +870,7 @@ mod tests {
     #[test]
     fn aggregate_flattens_children_in_priority_order_without_duplicates() {
         // X = [A, Y], Y = [B, A]: A keeps its first position in X.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("A")
             .with_leaf("B")
             .with_aggregate("X", ["A", "Y"])
@@ -854,7 +887,7 @@ mod tests {
 
     #[test]
     fn aggregate_skips_failed_children() {
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("A")
             .with_cds("B", failed("CDS B: does not exist"))
             .with_aggregate("X", ["A", "B"]);
@@ -870,7 +903,7 @@ mod tests {
 
     #[test]
     fn aggregate_without_leaves_fails_with_the_reasons() {
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_cds("A", failed("CDS A: does not exist"))
             .with_cds("B", failed("CDS B: invalid"))
             .with_aggregate("X", ["A", "B"]);
@@ -882,7 +915,7 @@ mod tests {
              CDS A: does not exist; CDS B: invalid"
         );
 
-        let cache = CachedResources::default().with_aggregate("X", []);
+        let cache = MockCache::default().with_aggregate("X", []);
         let graph = walk_roots(&cache, &["X"]);
         assert_eq!(
             error(&graph, "X"),
@@ -894,7 +927,7 @@ mod tests {
     fn aggregate_note_collects_own_note_skipped_children_and_child_aggregates() {
         // X (with its own CDS note) = [Y, B], Y = [C, A]; B and C fail. A's
         // own note stays on A.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_cds(
                 "X",
                 ready_with_note(aggregate_cluster("X", ["Y", "B"]), "CDS X: stale"),
@@ -921,7 +954,7 @@ mod tests {
 
     #[test]
     fn child_aggregate_without_leaves_is_skipped_with_its_notes() {
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("A")
             .with_aggregate("X", ["Y", "A"])
             .with_aggregate("Y", ["B"])
@@ -943,7 +976,7 @@ mod tests {
     #[test]
     fn pending_child_blocks_aggregate_but_siblings_are_still_watched() {
         // B has no CDS watch yet, and C's endpoints haven't arrived.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("A")
             .with_cds("C", ready(eds_cluster("C", "c")))
             .with_aggregate("X", ["A", "B", "C"]);
@@ -964,7 +997,7 @@ mod tests {
     fn shared_leaf_is_not_stolen_from_aggregate() {
         // Routes to [L, X], X = [L]. Being referenced by X
         // shouldn't prevent L from being a leaf.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("L")
             .with_aggregate("X", ["L"]);
         let graph = walk_roots(&cache, &["L", "X"]);
@@ -974,19 +1007,21 @@ mod tests {
     }
 
     #[test]
-    fn leaf_reached_through_several_paths_appears_once() {
-        // D0 reaches D7 through 2^7 paths.
-        let cache = CachedResources::default().with_diamonds(7).with_leaf("D7");
+    fn each_cluster_is_computed_once() {
+        // Without memoization, D7 would be visited 2^7 times.
+        let cache = MockCache::default().with_diamonds(7).with_leaf("D7");
         let graph = walk_roots(&cache, &["D0"]);
 
         assert_eq!(leaves(&graph, "D0"), ["D7"]);
+        assert_eq!(cache.lookups("D7"), 1);
+        assert_eq!(cache.lookups("D4"), 1);
     }
 
     #[test]
     fn notes_reached_through_several_paths_appear_once() {
         // Every path from D0 reaches D7's failure. Repeating it once per path
         // would put it in D0's error 2^7 times.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_diamonds(7)
             .with_cds("D7", failed("CDS D7: does not exist"));
         let graph = walk_roots(&cache, &["D0"]);
@@ -998,7 +1033,7 @@ mod tests {
 
         // The same goes for the ambient note of a shared aggregate that still
         // has leaves.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_diamonds(1)
             .with_cds(
                 "D1",
@@ -1017,7 +1052,7 @@ mod tests {
 
     #[test]
     fn self_cycle_has_no_leaves() {
-        let cache = CachedResources::default().with_aggregate("X", ["X"]);
+        let cache = MockCache::default().with_aggregate("X", ["X"]);
         let graph = walk_roots(&cache, &["X"]);
 
         assert_eq!(
@@ -1030,7 +1065,7 @@ mod tests {
     #[test]
     fn cycle_is_cut_where_it_is_entered() {
         // X = [Y, L], Y = [X].
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("L")
             .with_aggregate("X", ["Y", "L"])
             .with_aggregate("Y", ["X"]);
@@ -1071,17 +1106,13 @@ mod tests {
     #[test]
     fn depth_limit_is_16_aggregate_levels() {
         // 15 levels of aggregates put the leaf at depth 15: allowed.
-        let cache = CachedResources::default()
-            .with_leaf("L")
-            .with_chain("A", 15, "L");
+        let cache = MockCache::default().with_leaf("L").with_chain("A", 15, "L");
         let graph = walk_roots(&cache, &["A0"]);
         assert_eq!(leaves(&graph, "A0"), ["L"]);
 
         // 16 levels put the leaf at depth 16: every aggregate above it fails,
         // and the leaf isn't watched.
-        let cache = CachedResources::default()
-            .with_leaf("L")
-            .with_chain("A", 16, "L");
+        let cache = MockCache::default().with_leaf("L").with_chain("A", 16, "L");
         let graph = walk_roots(&cache, &["A0"]);
         for i in 0..16 {
             assert_depth_exceeded(&graph, &format!("A{i}"));
@@ -1098,7 +1129,7 @@ mod tests {
         // The roots are named so that each order is tried.
         for (short, deep) in [("a", "z"), ("z", "a")] {
             let deep1 = format!("{deep}1");
-            let cache = CachedResources::default()
+            let cache = MockCache::default()
                 .with_leaf("L")
                 .with_chain("M", 14, "L")
                 .with_aggregate(short, ["M0"])
@@ -1119,7 +1150,7 @@ mod tests {
         // K = [L]. Through a0, m is at depth 15, so K is too deep and m fails.
         // Reached again as a root, m is recomputed and must not keep that
         // error.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_chain("a", 15, "m")
             .with_aggregate("m", ["K", "P"])
             .with_aggregate("K", ["L"])
@@ -1145,7 +1176,7 @@ mod tests {
         // The caller decides whether to publish by checking its route
         // clusters against `cluster_configs`, so this must hold however a root
         // is reached. Roots are sorted, so Y is first reached as X's child.
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_leaf("A")
             .with_aggregate("X", ["Y"])
             .with_aggregate("Y", ["B"]);
@@ -1167,7 +1198,7 @@ mod tests {
 
     #[test]
     fn required_watches_cover_every_kind_of_cluster() {
-        let cache = CachedResources::default()
+        let cache = MockCache::default()
             .with_aggregate("X", ["A", "D"])
             .with_cds("A", ready(eds_cluster("A", "a-service")))
             .with_cds("D", ready(dns_cluster("D", "d.example.com", 8080)));

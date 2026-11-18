@@ -38,22 +38,23 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::async_trait;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
-use crate::client::DynInvoke;
-use crate::client::DynRecvStream;
-use crate::client::DynSendStream;
+use crate::client::Invoke;
 use crate::client::RequestHeaders;
+use crate::client::boxed::BoxInvoker;
+use crate::client::boxed::BoxRecvStream;
+use crate::client::boxed::BoxSendStream;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::load_balancing::subchannel::private::Sealed;
 use crate::client::stream_util::FailingRecvStream;
-use crate::client::transport::DynTransport;
+use crate::client::transport::ArcTransport;
 use crate::client::transport::ProxyOptions;
 use crate::client::transport::SecurityOpts;
+use crate::client::transport::Transport as _;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::Address;
@@ -63,8 +64,6 @@ use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnecti
 use crate::credentials::common::Authority;
 use crate::private;
 use crate::rt::GrpcRuntime;
-
-type SharedInvoke = Arc<dyn DynInvoke>;
 
 pub trait Backoff: Send + Sync {
     fn backoff_until(&self) -> Instant;
@@ -87,7 +86,7 @@ impl Backoff for NopBackoff {
 }
 
 struct ReadyState {
-    service: Box<dyn DynInvoke>,
+    service: BoxInvoker,
     connection_info: ConnectionInfo,
     authority: Authority,
 }
@@ -172,13 +171,15 @@ impl PartialEq for InternalSubchannelState {
     }
 }
 
-#[async_trait]
-impl DynInvoke for InternalSubchannel {
-    async fn dyn_invoke(
+impl Invoke for InternalSubchannel {
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
+
+    async fn invoke(
         &self,
         mut headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+    ) -> (Self::SendStream, Self::RecvStream) {
         let (state, call_creds) = {
             let data = self.data.lock().unwrap();
 
@@ -196,7 +197,7 @@ impl DynInvoke for InternalSubchannel {
             (state, creds)
         };
 
-        let fail_with = |status| -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        let fail_with = |status| -> (BoxSendStream, BoxRecvStream) {
             FailingRecvStream::new_stream_pair(status, Some(state.connection_info.clone()))
         };
 
@@ -238,7 +239,7 @@ impl DynInvoke for InternalSubchannel {
             }
         }
 
-        state.service.dyn_invoke(headers, options).await
+        state.service.invoke(headers, options).await
     }
 }
 
@@ -253,7 +254,7 @@ struct InternalSubchannelData {
     state: InternalSubchannelState,
     work_scheduler: Arc<dyn WorkScheduler>,
     on_drop: Arc<Notify>,
-    transport_builder: Arc<dyn DynTransport>,
+    transport_builder: ArcTransport,
     backoff: Arc<dyn Backoff>,
     runtime: GrpcRuntime,
     transport_options: TransportOptions,
@@ -309,7 +310,7 @@ impl PartialEq for InternalSubchannel {
 impl InternalSubchannel {
     pub(super) fn new_arc(
         address: Address,
-        transport: Arc<dyn DynTransport>,
+        transport: ArcTransport,
         backoff: Arc<dyn Backoff>,
         runtime: GrpcRuntime,
         mut security_opts: SecurityOpts,
@@ -379,7 +380,7 @@ fn begin_connecting_if_idle(data: Arc<Mutex<InternalSubchannelData>>) {
             }
             _ = on_drop.notified() => {
             }
-            result = transport_builder.dyn_connect(&address, runtime, &security_opts, &transport_opts) => {
+            result = transport_builder.connect(&address, runtime, &security_opts, &transport_opts) => {
                     match result {
                         Ok((service, connection_info, disconnection_listener)) => {
                             move_to_ready(data, Arc::new(ReadyState{

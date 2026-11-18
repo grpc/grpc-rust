@@ -179,7 +179,17 @@ impl PickFirstPolicy {
                 // Get a new subchannel handle from the controller if we don't
                 // have an existing one.  Updates for it are delivered to our
                 // work method via our work scheduler.
-                channel_controller.new_subchannel(&addr, self.work_scheduler.clone())
+                let (sc, state) =
+                    channel_controller.new_subchannel(&addr, self.work_scheduler.clone());
+                // A shared subchannel may already be failing; its error is the
+                // latest one. Reused subchannels' errors were recorded when
+                // they arrived.
+                if state.connectivity_state == ConnectivityState::TransientFailure
+                    && let Some(err) = &state.last_connection_error
+                {
+                    self.last_connection_error = Some(err.clone());
+                }
+                (sc, state)
             };
 
             // Track the best candidate for immediate activation:
@@ -276,23 +286,13 @@ impl PickFirstPolicy {
             );
         } else {
             // Otherwise all addresses are in transient failure: update picker.
-            // TODO: set the last connection error?  Is it correct to do so,
-            // e.g. if the address it came from was removed from the address
-            // list and a name resolver update triggered this connection pass?
-            //
-            // If no connection error has been recorded yet, use the last
-            // subchannel error in address order.
-            let error = self.last_connection_error.is_none().then(|| {
-                self.subchannels
-                    .iter()
-                    .rev()
-                    .find_map(|sc| {
-                        self.subchannel_states
-                            .get(&sc.address())
-                            .and_then(|state| state.last_connection_error.clone())
-                    })
-                    .unwrap_or_else(|| "all addresses in transient failure".to_string())
-            });
+
+            // Errors are recorded as they arrive. If none has been, report a
+            // generic one.
+            let error = self
+                .last_connection_error
+                .is_none()
+                .then(|| "all addresses in transient failure".to_string());
             _ = self.set_transient_failure(channel_controller, error);
         }
     }
@@ -541,7 +541,12 @@ impl PickFirstPolicy {
             }
             (true, _) => {
                 // The selected subchannel has failed (is no longer READY);
-                // drop the connection.
+                // record its connection error, if any, and drop the connection.
+                if state.connectivity_state == ConnectivityState::TransientFailure
+                    && let Some(err) = &state.last_connection_error
+                {
+                    self.last_connection_error = Some(err.clone());
+                }
                 self.subchannel_drop(channel_controller);
             }
             (false, ConnectivityState::Ready) => {
@@ -791,6 +796,7 @@ mod test {
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
+    use crate::client::load_balancing::test_utils::TestEvent;
     use crate::rt::default_runtime;
 
     // A ChannelController wrapper that delegates to TestChannelController,
@@ -941,6 +947,24 @@ mod test {
             tokio::time::advance(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
             self.run_work();
+        }
+
+        // Expects the IDLE picker the policy reports after its selected
+        // subchannel disconnects, and returns it. A re-resolution request may
+        // come before or after the picker; whether one comes is not checked.
+        fn expect_idle_picker_after_disconnect(&mut self) -> Arc<dyn Picker> {
+            let mut picker = None;
+            while let Ok(event) = self.rx_events.try_recv() {
+                match event {
+                    TestEvent::RequestResolution => {}
+                    TestEvent::UpdatePicker(update) if picker.is_none() => {
+                        assert_eq!(update.connectivity_state, ConnectivityState::Idle);
+                        picker = Some(update.picker);
+                    }
+                    other => panic!("unexpected event after disconnect: {other:?}"),
+                }
+            }
+            picker.expect("expected an IDLE picker after the disconnect")
         }
     }
 
@@ -1267,6 +1291,93 @@ mod test {
         env.expect_new_subchannels(&["addr1", "addr2"]);
         // Nothing is attempted. With no error recorded yet, the reported error
         // comes from the subchannels' own states.
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // When a new address list brings a subchannel that is already in
+    // TRANSIENT_FAILURE, its error is newer than the recorded one, so the pass
+    // that ends at once reports it.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_failing_subchannel_error_is_latest() {
+        let mut env = new_env();
+        env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        env.send_resolver_update_with_initial_states(
+            &["addr2"],
+            &[("addr2", SubchannelState::transient_failure("addr2 failed"))],
+        )
+        .unwrap();
+        env.expect_new_subchannels(&["addr2"]);
+        // addr2's error replaces addr1's older one.
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // When the selected subchannel fails, its error is the latest one, so a
+    // pass that then finds every subchannel in TRANSIENT_FAILURE reports it.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_selected_subchannel_error_is_latest() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+        // addr1 finishes its backoff, is reconnected, and is selected.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+
+        env.send_subchannel_update(
+            &scs[0],
+            &SubchannelState::transient_failure("addr1 failed again"),
+        );
+        env.expect_idle_picker_after_disconnect();
+        env.policy.exit_idle(&mut env.tcc);
+        // The selected subchannel's error replaces the older one.
+        env.expect_failing_picker("addr1 failed again");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // When a pass finds every subchannel in TRANSIENT_FAILURE and no
+    // connection error has been recorded, the policy reports a generic one.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_all_subchannels_failing_without_errors() {
+        let mut env = new_env();
+        let failing = SubchannelState {
+            connectivity_state: ConnectivityState::TransientFailure,
+            last_connection_error: None,
+        };
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[("addr1", failing.clone()), ("addr2", failing)],
+        )
+        .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_failing_picker("all addresses in transient failure");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // A new address list that reorders failing subchannels keeps the latest
+    // error, not the error of the subchannel that is now last.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_reordered_failing_subchannels_keep_latest_error() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+
+        env.send_resolver_update(create_endpoints(&["addr2", "addr1"]))
+            .unwrap();
+        // addr1 is now last, but its error is older.
         env.expect_failing_picker("addr2 failed");
         env.expect_request_resolution();
         env.expect_no_events();

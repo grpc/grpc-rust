@@ -279,7 +279,21 @@ impl PickFirstPolicy {
             // TODO: set the last connection error?  Is it correct to do so,
             // e.g. if the address it came from was removed from the address
             // list and a name resolver update triggered this connection pass?
-            _ = self.set_transient_failure(channel_controller, None);
+            //
+            // If no connection error has been recorded yet, use the last
+            // subchannel error in address order.
+            let error = self.last_connection_error.is_none().then(|| {
+                self.subchannels
+                    .iter()
+                    .rev()
+                    .find_map(|sc| {
+                        self.subchannel_states
+                            .get(&sc.address())
+                            .and_then(|state| state.last_connection_error.clone())
+                    })
+                    .unwrap_or_else(|| "all addresses in transient failure".to_string())
+            });
+            _ = self.set_transient_failure(channel_controller, error);
         }
     }
 
@@ -769,13 +783,47 @@ impl SteadyState {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::*;
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils;
+    use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::rt::default_runtime;
+
+    // A ChannelController wrapper that delegates to TestChannelController,
+    // overriding the initial SubchannelState returned by new_subchannel for
+    // configured addresses.
+    struct InitialStateController<'a> {
+        tcc: &'a mut TestChannelController,
+        initial_states: HashMap<&'a str, SubchannelState>,
+    }
+
+    impl ChannelController for InitialStateController<'_> {
+        fn new_subchannel(
+            &mut self,
+            address: &Address,
+            work_scheduler: Arc<dyn WorkScheduler>,
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let (sc, state) = self.tcc.new_subchannel(address, work_scheduler);
+            let state = self
+                .initial_states
+                .get(&*address.address)
+                .cloned()
+                .unwrap_or(state);
+            (sc, state)
+        }
+
+        fn update_picker(&mut self, update: LbState) {
+            self.tcc.update_picker(update);
+        }
+
+        fn request_resolution(&mut self) {
+            self.tcc.request_resolution();
+        }
+    }
 
     // Creates an endpoint containing `addrs`, in order.
     fn endpoint(addrs: &[&str]) -> Endpoint {
@@ -862,6 +910,26 @@ mod test {
             };
             self.policy
                 .resolver_update(update, &PickFirstConfig::default(), &mut self.tcc)
+        }
+
+        // Sends a resolver update for `addrs` while overriding the initial
+        // SubchannelState returned by new_subchannel for entries in
+        // `initial_states`.
+        fn send_resolver_update_with_initial_states(
+            &mut self,
+            addrs: &[&str],
+            initial_states: &[(&str, SubchannelState)],
+        ) -> Result<(), String> {
+            let update = ResolverUpdate {
+                endpoints: Ok(create_endpoints(addrs)),
+                ..Default::default()
+            };
+            let mut controller = InitialStateController {
+                tcc: &mut self.tcc,
+                initial_states: initial_states.iter().cloned().collect(),
+            };
+            self.policy
+                .resolver_update(update, &PickFirstConfig::default(), &mut controller)
         }
 
         // Lets the Connection Attempt Delay timer fire, and delivers the
@@ -1178,6 +1246,28 @@ mod test {
         env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
 
         env.expect_failing_picker("addr1 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // When every subchannel starts in TRANSIENT_FAILURE, before any connection
+    // error has been recorded, the pass ends at once: the policy reports the
+    // last of their errors in address order, and requests re-resolution.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_all_subchannels_start_in_transient_failure() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[
+                ("addr1", SubchannelState::transient_failure("addr1 failed")),
+                ("addr2", SubchannelState::transient_failure("addr2 failed")),
+            ],
+        )
+        .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr2"]);
+        // Nothing is attempted. With no error recorded yet, the reported error
+        // comes from the subchannels' own states.
+        env.expect_failing_picker("addr2 failed");
         env.expect_request_resolution();
         env.expect_no_events();
     }

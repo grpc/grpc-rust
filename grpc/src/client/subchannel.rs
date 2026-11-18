@@ -186,7 +186,15 @@ impl Invoke for InternalSubchannel {
 
             let state = match &data.state {
                 InternalSubchannelState::Ready(state) => state.clone(),
-                _ => todo!("handle non-READY subchannel"),
+                _ => {
+                    return FailingRecvStream::new_stream_pair(
+                        StatusError::new(
+                            StatusCodeError::Unavailable,
+                            format!("subchannel for {} is not READY", self.address),
+                        ),
+                        None,
+                    );
+                }
             };
 
             let creds = data

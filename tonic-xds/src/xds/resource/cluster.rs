@@ -266,7 +266,9 @@ mod tests {
         let validated = ClusterResource::validate(cluster).unwrap();
         assert_eq!(
             validated.circuit_breaking,
-            CircuitBreakingConfig { max_requests: 7 },
+            CircuitBreakingConfig {
+                max_requests: Some(7),
+            },
         );
     }
 

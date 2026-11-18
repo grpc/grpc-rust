@@ -40,8 +40,9 @@ use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
+use crate::xds::resource::circuit_breaking::DEFAULT_MAX_REQUESTS;
 use crate::xds::resource_manager::XdsResourceManager;
-use crate::xds::routing::XdsRouter;
+use crate::xds::routing::{DEFAULT_READY_TIMEOUT, XdsRouter};
 use crate::{ControlPlaneConnector, TonicCallCredentials, XdsUri};
 use http::{Request, Response};
 use http_body::Body;
@@ -54,7 +55,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tonic::{body::Body as TonicBody, client::GrpcService};
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
-use xds_client::{MetricsRecorder, XdsClient};
+use xds_client::{MetricsRecorder, RetryPolicy, XdsClient};
 
 use crate::client::retry::{
     GrpcRetryClassifierFactory, RetryClassifierFactory, RetryLayer, RetrySharedConfig,
@@ -67,6 +68,8 @@ pub struct XdsChannelConfig {
     /// Settings for the pool the channel gets of its own when it is built
     /// without an [`XdsClientPool`]. `None` until one is set.
     xds_client: Option<XdsClientPoolBuilder>,
+    default_max_requests: Option<u32>,
+    route_ready_timeout: Option<Duration>,
 }
 
 impl XdsChannelConfig {
@@ -76,6 +79,8 @@ impl XdsChannelConfig {
         Self {
             target_uri,
             xds_client: None,
+            default_max_requests: Some(DEFAULT_MAX_REQUESTS),
+            route_ready_timeout: Some(DEFAULT_READY_TIMEOUT),
         }
     }
 
@@ -149,6 +154,68 @@ impl XdsChannelConfig {
     /// it cannot support the requested setting.
     pub fn with_ads_keep_alive(self, interval: Option<Duration>, timeout: Duration) -> Self {
         self.update_xds_client(|settings| settings.with_ads_keep_alive(interval, timeout))
+    }
+
+    /// Sets the timeout waiting for the initial response to an uncached xDS
+    /// resource subscription ([gRFC A57]).
+    ///
+    /// Defaults to `Some(Duration::from_secs(15))` when unset. Pass `None` to
+    /// disable initial-resource timeouts so subscriptions wait indefinitely
+    /// while the ADS stream stays open.
+    ///
+    /// Because this configures the ADS client, setting it alongside
+    /// [`XdsChannelBuilder::with_xds_client_pool`] fails channel construction
+    /// with [`BuildError::ConflictsWithXdsClientPool`]; configure it on
+    /// [`XdsClientPoolBuilder::with_resource_initial_timeout`] instead.
+    ///
+    /// [gRFC A57]: https://github.com/grpc/proposal/blob/master/A57-xds-client-failure-mode-behavior.md
+    #[must_use]
+    pub fn with_resource_initial_timeout(self, timeout: Option<Duration>) -> Self {
+        self.update_xds_client(|settings| settings.with_resource_initial_timeout(timeout))
+    }
+
+    /// Sets the exponential backoff [`RetryPolicy`] used when reconnecting a
+    /// broken ADS stream.
+    ///
+    /// Defaults to [`RetryPolicy::default()`] (1s initial backoff, 2x
+    /// multiplier, 30s max, 0.2 jitter).
+    ///
+    /// Because this configures the ADS client, setting it alongside
+    /// [`XdsChannelBuilder::with_xds_client_pool`] fails channel construction
+    /// with [`BuildError::ConflictsWithXdsClientPool`]; configure it on
+    /// [`XdsClientPoolBuilder::with_ads_retry_policy`] instead.
+    #[must_use]
+    pub fn with_ads_retry_policy(self, policy: RetryPolicy) -> Self {
+        self.update_xds_client(|settings| settings.with_ads_retry_policy(policy))
+    }
+
+    /// Sets how long an RPC waits on a cold channel for the initial LDS/RDS
+    /// route configuration before failing with `UNAVAILABLE`.
+    ///
+    /// Defaults to `Some(Duration::from_secs(30))`. Pass `None` to disable the
+    /// router's internal cold-start timer so RPCs wait until route
+    /// configuration arrives or the caller's per-RPC deadline (`grpc-timeout`)
+    /// expires.
+    #[must_use]
+    pub fn with_route_ready_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.route_ready_timeout = timeout;
+        self
+    }
+
+    /// Sets the fallback per-cluster `max_requests` circuit-breaking limit
+    /// ([gRFC A32]) applied when a CDS `Cluster` omits `circuit_breakers` (or
+    /// omits a `DEFAULT`-priority `max_requests` threshold).
+    ///
+    /// Defaults to `Some(1024)` per gRFC A32. Pass `None` to disable fallback
+    /// circuit breaking for clusters that do not specify `max_requests` in CDS;
+    /// an explicit `max_requests` configured on a CDS `Cluster` (including
+    /// `0`) is still enforced.
+    ///
+    /// [gRFC A32]: https://github.com/grpc/proposal/blob/master/A32-xds-circuit-breaking.md
+    #[must_use]
+    pub fn with_default_max_requests(mut self, max_requests: Option<u32>) -> Self {
+        self.default_max_requests = max_requests;
+        self
     }
 }
 
@@ -411,9 +478,13 @@ impl XdsChannelBuilder {
     /// The pool supplies the bootstrap and ADS settings, so the build fails
     /// with [`BuildError::ConflictsWithXdsClientPool`] if the channel also sets
     /// any of them: [`XdsChannelConfig::with_bootstrap`], the
-    /// `XdsChannelConfig` call-credential, message-size, or ADS keepalive
-    /// settings, [`with_control_plane_connector`](Self::with_control_plane_connector),
-    /// or [`with_metrics_recorder`](Self::with_metrics_recorder).
+    /// `XdsChannelConfig` call-credential, message-size, ADS keepalive,
+    /// resource-initial-timeout, or ADS retry-policy settings,
+    /// [`with_control_plane_connector`](Self::with_control_plane_connector),
+    /// or [`with_metrics_recorder`](Self::with_metrics_recorder). Per-channel
+    /// data-plane settings such as
+    /// [`XdsChannelConfig::with_route_ready_timeout`] and
+    /// [`XdsChannelConfig::with_default_max_requests`] remain allowed.
     #[must_use]
     pub fn with_xds_client_pool(mut self, pool: XdsClientPool) -> Self {
         self.xds_client_pool = Some(pool);
@@ -623,6 +694,7 @@ impl XdsChannelBuilder {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(
             parts.cache.clone(),
             retry_factory,
+            self.config.route_ready_timeout,
             move |name| ClusterRef::from_channel(name, cluster_factory.make(name)),
         ));
 
@@ -681,7 +753,12 @@ impl XdsChannelBuilder {
     {
         self.build_channel::<_, TonicBody, TonicBody, TonicBody, _>(
             parts,
-            grpc_make_connector(make_connector, ClusterCircuitBreakerRegistry::new()),
+            grpc_make_connector(
+                make_connector,
+                ClusterCircuitBreakerRegistry::with_default_max_requests(
+                    self.config.default_max_requests,
+                ),
+            ),
             grpc_endpoint_request,
             Arc::new(RetrySharedConfig::grpc_default()),
             DeadlinePolicy::grpc(),
@@ -1509,11 +1586,12 @@ mod tests {
         factory: GrpcClusterChannelFactory,
     ) -> XdsChannelGrpc {
         use crate::client::retry::GrpcRetryClassifierFactory;
-        use crate::xds::routing::XdsRouter;
+        use crate::xds::routing::{DEFAULT_READY_TIMEOUT, XdsRouter};
 
         let router = XdsRouter::new(
             cache.clone(),
             Arc::new(GrpcRetryClassifierFactory),
+            Some(DEFAULT_READY_TIMEOUT),
             move |name| ClusterRef::from_channel(name, factory.make(name)),
         );
         XdsChannelBuilder::new(test_config()).build_grpc_channel_from_router(
@@ -1842,7 +1920,9 @@ mod tests {
             cluster_name,
             make_test_cluster_with_circuit_breaking(
                 cluster_name,
-                CircuitBreakingConfig { max_requests: 0 },
+                CircuitBreakingConfig {
+                    max_requests: Some(0),
+                },
             ),
         );
         cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
@@ -1887,7 +1967,9 @@ mod tests {
             cluster_name,
             make_test_cluster_with_circuit_breaking(
                 cluster_name,
-                CircuitBreakingConfig { max_requests: 0 },
+                CircuitBreakingConfig {
+                    max_requests: Some(0),
+                },
             ),
         );
         let error = tokio::time::timeout(tokio::time::Duration::from_secs(2), request)
@@ -1932,8 +2014,8 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn xds_client_pool_rejects_channel_client_settings() {
+    #[tokio::test]
+    async fn xds_client_pool_rejects_channel_client_settings() {
         use super::BuildError;
 
         struct NoopRecorder;
@@ -1975,6 +2057,10 @@ mod tests {
             XdsChannelBuilder::new(
                 test_config().with_ads_keep_alive(None, std::time::Duration::from_secs(1)),
             ),
+            XdsChannelBuilder::new(test_config().with_resource_initial_timeout(None)),
+            XdsChannelBuilder::new(
+                test_config().with_ads_retry_policy(xds_client::RetryPolicy::default()),
+            ),
             XdsChannelBuilder::new(test_config()).with_control_plane_connector(
                 crate::client::pool::GrpcControlPlaneConnector::new(&test_bootstrap()).unwrap(),
             ),
@@ -1990,6 +2076,16 @@ mod tests {
                 "{error}"
             );
         }
+
+        // Per-channel data-plane settings do not conflict with a shared XdsClientPool.
+        XdsChannelBuilder::new(
+            test_config()
+                .with_default_max_requests(None)
+                .with_route_ready_timeout(None),
+        )
+        .with_xds_client_pool(pool)
+        .build_grpc_channel()
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2076,6 +2172,151 @@ mod tests {
         };
         let _channel = builder.build_grpc_channel_from_runtime(parts);
         // Construction should succeed without panicking.
+    }
+
+    fn test_runtime_parts(cache: Arc<XdsCache>) -> super::XdsRuntimeParts {
+        use crate::xds::resource_manager::XdsResourceManager;
+
+        let xds_client = xds_client::XdsClient::disconnected();
+        let resource_manager =
+            XdsResourceManager::new(xds_client.clone(), cache.clone(), "test-listener".into());
+        let xds_client = Arc::new(xds_client);
+
+        #[cfg(feature = "_tls-any")]
+        {
+            use crate::xds::cert_provider::CertProviderRegistry;
+            let cert_provider_registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
+            super::XdsRuntimeParts {
+                cache,
+                xds_client,
+                resource_manager,
+                cert_provider_registry,
+            }
+        }
+        #[cfg(not(feature = "_tls-any"))]
+        {
+            super::XdsRuntimeParts {
+                cache,
+                xds_client,
+                resource_manager,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_respects_default_max_requests_knob() {
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(1).await;
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        // CDS omits circuit_breakers (`max_requests: None`).
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(cluster_name, CircuitBreakingConfig::default()),
+        );
+        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+
+        // 1. Custom fallback limit `Some(0)` drops requests when CDS omits circuit_breakers.
+        let zero_channel = XdsChannelBuilder::new(test_config().with_default_max_requests(Some(0)))
+            .build_grpc_channel_from_runtime(test_runtime_parts(cache.clone()));
+        let error = GreeterClient::new(zero_channel)
+            .say_hello(HelloRequest {
+                name: "zero-fallback".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_circuit_breaker_drop(&error, 0);
+
+        // 2. Disabling fallback (`None`) lets unconfigured clusters pass through,
+        //    while still enforcing explicit CDS `max_requests`.
+        let unlimited_channel =
+            XdsChannelBuilder::new(test_config().with_default_max_requests(None))
+                .build_grpc_channel_from_runtime(test_runtime_parts(cache.clone()));
+        let mut client = GreeterClient::new(unlimited_channel);
+        client
+            .say_hello(HelloRequest {
+                name: "unconfigured-ok".to_string(),
+            })
+            .await
+            .expect("unconfigured cluster should not be limited when default_max_requests is None");
+
+        cache.update_cluster(
+            cluster_name,
+            make_test_cluster_with_circuit_breaking(
+                cluster_name,
+                CircuitBreakingConfig {
+                    max_requests: Some(0),
+                },
+            ),
+        );
+        let error = client
+            .say_hello(HelloRequest {
+                name: "explicit-cds-zero".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_circuit_breaker_drop(&error, 0);
+
+        shutdown(servers).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_respects_route_ready_timeout_knob() {
+        // 1. Custom short route_ready_timeout fires after 2s instead of 30s.
+        let short_cache = Arc::new(XdsCache::new());
+        let short_channel = XdsChannelBuilder::new(
+            test_config().with_route_ready_timeout(Some(std::time::Duration::from_secs(2))),
+        )
+        .build_grpc_channel_from_runtime(test_runtime_parts(short_cache));
+        let mut short_client = GreeterClient::new(short_channel);
+        let mut call = Box::pin(short_client.say_hello(HelloRequest {
+            name: "short-wait".to_string(),
+        }));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(1_900)).await;
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        let status = call.await.unwrap_err();
+        let routing_err = std::error::Error::source(&status)
+            .and_then(|err| err.downcast_ref::<crate::xds::routing::RoutingError>());
+        assert!(
+            matches!(
+                routing_err,
+                Some(crate::xds::routing::RoutingError::NotReady)
+            ),
+            "expected RoutingError::NotReady, got status={status:?}, source={routing_err:?}"
+        );
+
+        // 2. Disabling route_ready_timeout (`None`) waits past the 30s default,
+        //    while per-RPC deadlines (`grpc-timeout`) still cancel the call.
+        let disabled_cache = Arc::new(XdsCache::new());
+        let disabled_channel = XdsChannelBuilder::new(test_config().with_route_ready_timeout(None))
+            .build_grpc_channel_from_runtime(test_runtime_parts(disabled_cache));
+        let mut no_deadline_client = GreeterClient::new(disabled_channel.clone());
+        let mut no_deadline_call = Box::pin(no_deadline_client.say_hello(HelloRequest {
+            name: "wait-indefinitely".to_string(),
+        }));
+        assert!(futures_util::poll!(no_deadline_call.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert!(
+            futures_util::poll!(no_deadline_call.as_mut()).is_pending(),
+            "call without deadline should stay pending past 30s when route_ready_timeout is None"
+        );
+
+        let mut deadline_client = GreeterClient::new(disabled_channel);
+        let mut req = tonic::Request::new(HelloRequest {
+            name: "per-rpc-deadline".to_string(),
+        });
+        req.set_timeout(std::time::Duration::from_secs(5));
+        let mut deadline_call = Box::pin(deadline_client.say_hello(req));
+        assert!(futures_util::poll!(deadline_call.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        let status = deadline_call.await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
     }
 
     /// Minimal body whose `Clone` `Data`/`Error` satisfy `SharedBody`'s bounds.

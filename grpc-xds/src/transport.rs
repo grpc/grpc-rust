@@ -217,7 +217,6 @@ mod tests {
     use xds_client::Node;
     use xds_client::ProstCodec;
     use xds_client::ResourceEvent;
-    use xds_client::TokioRuntime;
     use xds_client::XdsClient;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config::AdsTypeUrl;
@@ -227,6 +226,7 @@ mod tests {
     use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryRequest;
     use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryResponse;
     use crate::resource::ListenerResource;
+    use crate::xds_client_runtime::XdsRuntime;
 
     #[test]
     fn test_raw_bytes_encode_decode() {
@@ -295,7 +295,7 @@ mod tests {
             config,
             GrpcTransportBuilder::new(GrpcRuntime::default()),
             ProstCodec,
-            TokioRuntime,
+            XdsRuntime::new(GrpcRuntime::default()),
         )
         .build();
 

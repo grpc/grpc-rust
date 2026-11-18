@@ -81,6 +81,9 @@ pub mod __unstable {
         pub use crate::rt::*;
     }
     pub mod client {
+        pub mod boxed {
+            pub use crate::client::boxed::*;
+        }
         pub mod load_balancing {
             pub use crate::client::load_balancing::*;
         }

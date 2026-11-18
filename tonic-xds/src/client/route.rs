@@ -22,6 +22,7 @@
  *
  */
 
+use crate::client::cluster::ClusterRef;
 use crate::client::deadline::DeadlinePolicy;
 use crate::client::retry::{RetryClassifierFactory, RetrySharedConfig};
 use crate::common::async_util::BoxFuture;
@@ -67,6 +68,11 @@ pub(crate) struct RouteDecision {
     /// The matched route's xDS max stream duration (gRFC A31), with the
     /// listener's default already applied. `None` when there is no limit.
     pub max_stream_duration: Option<Duration>,
+    /// The client for `cluster`, shared with the [`RoutingSnapshot`] this
+    /// decision was made on. The request and its retries use this client even if
+    /// the cluster leaves the route config while they are in flight. `None` when
+    /// the router provisions no cluster clients.
+    pub cluster_ref: Option<ClusterRef>,
 }
 
 /// A hook that runs before xDS route selection.
@@ -81,13 +87,15 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
-/// The validated [`RouteConfigResource`] bundled with the retry configs
-/// compiled from it, one per RDS update.
+/// The validated [`RouteConfigResource`], bundled with the retry configs
+/// compiled from it (one per RDS update) and the clients of the clusters it
+/// references.
 ///
-/// Bundling both behind one `Arc` lets routing resolve a route and its retry
-/// config from a single consistent RDS version, and keeps the request path to a
-/// map lookup plus a pointer clone. Compiling here, rather than in the xDS
-/// resource layer, keeps the resource types free of client-side retry types.
+/// Bundling them behind one `Arc` lets routing resolve a route, its retry config
+/// and its cluster client from a single consistent RDS version. It also keeps
+/// the request path to map lookups plus pointer clones. Compiling here, rather
+/// than in the xDS resource layer, keeps the resource types free of client-side
+/// types.
 #[derive(Debug, Default)]
 pub(crate) struct RoutingSnapshot {
     resource: Arc<RouteConfigResource>,
@@ -95,6 +103,9 @@ pub(crate) struct RoutingSnapshot {
     /// route's [`RouteRetryConfig`]. Routes that inherit a vhost policy share one
     /// entry; a route whose `retry_on` the factory maps to no classifier has none.
     retry: HashMap<usize, Arc<RetrySharedConfig>>,
+    /// Client of each cluster the route config references, keyed by cluster
+    /// name. Empty when the router provisions no cluster clients.
+    clusters: HashMap<String, ClusterRef>,
 }
 
 impl RoutingSnapshot {
@@ -103,6 +114,7 @@ impl RoutingSnapshot {
     pub(crate) fn new(
         resource: Arc<RouteConfigResource>,
         factory: &dyn RetryClassifierFactory,
+        clusters: HashMap<String, ClusterRef>,
     ) -> Self {
         let mut retry: HashMap<usize, Arc<RetrySharedConfig>> = HashMap::new();
         for vhost in &resource.virtual_hosts {
@@ -117,7 +129,16 @@ impl RoutingSnapshot {
                 }
             }
         }
-        Self { resource, retry }
+        Self {
+            resource,
+            retry,
+            clusters,
+        }
+    }
+
+    /// The client of `cluster_name`, if one is attached.
+    pub(crate) fn cluster(&self, cluster_name: &str) -> Option<&ClusterRef> {
+        self.clusters.get(cluster_name)
     }
 
     /// The compiled retry config for a route's [`RouteRetryConfig`], if any.
@@ -341,6 +362,7 @@ mod tests {
                 request_hash: None,
                 retry_config: None,
                 max_stream_duration: None,
+                cluster_ref: None,
             })
         }
     }
@@ -368,7 +390,7 @@ mod tests {
             }
         }
 
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         cache.update_route_config(Arc::new(RouteConfigResource {
             name: "rc".into(),
             virtual_hosts: vec![VirtualHostConfig {
@@ -383,7 +405,7 @@ mod tests {
             }],
             metadata: Default::default(),
         }));
-        let xds_router = XdsRouter::new(&cache);
+        let xds_router = XdsRouter::for_test(&cache);
         while xds_router.snapshot().is_none() {
             tokio::task::yield_now().await;
         }
@@ -446,8 +468,8 @@ mod tests {
         }
 
         // Start with no route config at all.
-        let cache = XdsCache::new();
-        let xds_router = XdsRouter::new(&cache);
+        let cache = Arc::new(XdsCache::new());
+        let xds_router = XdsRouter::for_test(&cache);
         assert!(
             xds_router.snapshot().is_none(),
             "precondition: no config yet"
@@ -539,6 +561,7 @@ mod tests {
                     request_hash: None,
                     retry_config: None,
                     max_stream_duration: None,
+                    cluster_ref: None,
                 })
             }
         }
@@ -675,7 +698,7 @@ mod tests {
             typed_filter_metadata,
         });
 
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         cache.update_route_config(Arc::new(RouteConfigResource {
             name: "rc".into(),
             virtual_hosts: vec![VirtualHostConfig {
@@ -688,7 +711,7 @@ mod tests {
             }],
             metadata,
         }));
-        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
+        let router: Arc<dyn Router> = Arc::new(XdsRouter::for_test(&cache));
         tokio::task::yield_now().await;
 
         /// Reads the `hint` header, verifies metadata delivery, and injects the

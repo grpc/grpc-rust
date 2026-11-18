@@ -544,7 +544,12 @@ impl PickFirstPolicy {
 
                 // Track progress based on whether we are in a connection pass.
                 if let Some(steady) = self.steady_state.as_mut() {
-                    steady.subchannel_nonready(channel_controller, subchannel, state);
+                    if steady.subchannel_nonready(subchannel, state) {
+                        // Report the latest error and request re-resolution.
+                        // gRFC A61 requires only the re-resolution; reporting
+                        // the error follows C++ and Go.
+                        _ = self.set_transient_failure(channel_controller, None);
+                    }
                 } else {
                     self.update_first_pass(subchannel, state, channel_controller);
                 }
@@ -720,7 +725,8 @@ fn build_shuffler() -> Arc<ShufflerFn> {
 
 /// Tracks a the 'steady state' pass of subchannels when looking for a ready
 /// connection. If the number of reported subchannel failures reaches the
-/// failure threshold, this will ask the Name Resolver to re-resolve.
+/// failure threshold, the policy reports the latest error and asks the Name
+/// Resolver to re-resolve.
 #[derive(Debug)]
 struct SteadyState {
     /// The number of failures before triggering a re-resolution of addresses.
@@ -741,29 +747,30 @@ impl SteadyState {
     }
 
     /// Handles non-ready subchannel updates when the LB is in 'steady state'
-    /// connection mode.
+    /// connection mode. Returns true each time the number of failures reaches
+    /// the failure threshold; the count then starts over.
     fn subchannel_nonready(
         &mut self,
-        channel_controller: &mut dyn ChannelController,
         subchannel: Arc<dyn Subchannel>,
         state: &SubchannelState,
-    ) {
+    ) -> bool {
         match state.connectivity_state {
             ConnectivityState::Idle => {
                 // Subchannel backoff expired: trigger reconnection attempt.
                 subchannel.connect();
             }
             ConnectivityState::TransientFailure => {
-                // Track failures. If all known subchannels have failed,
-                // request new addresses.
+                // Track failures, and report when all known subchannels have
+                // failed.
                 self.failure_count += 1;
                 if self.failure_count >= self.failure_threshold {
                     self.failure_count = 0;
-                    channel_controller.request_resolution();
+                    return true;
                 }
             }
             _ => {}
         }
+        false
     }
 }
 
@@ -1019,6 +1026,16 @@ mod test {
 
         env.expect_failing_picker("connection refused (note)");
         env.expect_request_resolution();
+
+        // A failure in steady state is reported with the note too.
+        env.send_subchannel_update(&sc1, &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(
+            &sc1,
+            &SubchannelState::transient_failure("connection refused again"),
+        );
+        env.expect_failing_picker("connection refused again (note)");
+        env.expect_request_resolution();
         env.expect_no_events();
     }
 
@@ -1102,6 +1119,46 @@ mod test {
 
         // The policy should switch to it immediately (enter READY state).
         env.expect_ready_picker(&scs[0]);
+        env.expect_no_events();
+    }
+
+    // In steady state the policy reports the latest error and requests
+    // re-resolution (gRFC A61) after N (subchannel count) failures.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_steady_state_reresolves_every_n_failures() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+
+        // The first failure in steady state is counted, without re-resolving.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 again"));
+        env.expect_no_events();
+
+        // The second failure reaches N.
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 again"));
+        env.expect_failing_picker("addr2 again");
+        env.expect_request_resolution();
+        env.expect_no_events();
+
+        // The count starts over.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 third"));
+        env.expect_no_events();
+
+        // Another N failures request re-resolution again.
+        env.send_subchannel_update(&scs[1], &SubchannelState::idle());
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 third"));
+        env.expect_failing_picker("addr2 third");
+        env.expect_request_resolution();
         env.expect_no_events();
     }
 
@@ -1201,6 +1258,7 @@ mod test {
             &scs[0],
             &SubchannelState::transient_failure("steady state network drop"),
         );
+        env.expect_failing_picker("steady state network drop");
         env.expect_request_resolution();
 
         // Verify policy caches the freshest error: a new pass over the same

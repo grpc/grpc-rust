@@ -108,7 +108,7 @@ pub fn schedule_subchannel_update(subchannel: &Arc<dyn Subchannel>, state: Subch
         .work_scheduler
         .as_ref()
         .expect("subchannel has no work scheduler");
-    work_scheduler.schedule_work(Some(Box::new(SubchannelUpdate::new(
+    work_scheduler.schedule_work(Some(WorkData::new(SubchannelUpdate::new(
         subchannel.clone(),
         state,
     ))));

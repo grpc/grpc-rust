@@ -488,13 +488,17 @@ struct FirstPassState {
 
 impl FirstPassState {
     fn fresh_enter(ctx: &mut PickFirstContext<'_>, addresses: Vec<Address>) -> PickFirstState {
-        Self::enter(ctx, addresses, Vec::new())
+        Self::enter(ctx, addresses, Vec::new(), None)
     }
 
+    /// Starts a first pass over `addresses`, reusing the subchannels in
+    /// `existing` whose addresses are still listed. `last_connection_error`
+    /// is the latest connection error recorded before this pass, if any.
     fn enter(
         ctx: &mut PickFirstContext<'_>,
         addresses: Vec<Address>,
         mut existing: Vec<SubchannelEntry>,
+        mut last_connection_error: Option<String>,
     ) -> PickFirstState {
         let mut new_subchannels = Vec::with_capacity(addresses.len());
 
@@ -513,6 +517,14 @@ impl FirstPassState {
                 let (subchannel, state) = ctx
                     .controller
                     .new_subchannel(addr, ctx.work_scheduler.clone());
+                // A shared subchannel may already be failing; its error is the
+                // latest one. Reused subchannels' errors were recorded when
+                // they arrived.
+                if state.connectivity_state == ConnectivityState::TransientFailure
+                    && let Some(err) = &state.last_connection_error
+                {
+                    last_connection_error = Some(err.clone());
+                }
                 SubchannelEntry {
                     subchannel,
                     state,
@@ -526,16 +538,6 @@ impl FirstPassState {
 
             new_subchannels.push(entry);
         }
-
-        // Subchannels already in TRANSIENT_FAILURE count as failed in this
-        // pass. Start from the last of their errors in list order, so that the
-        // pass reports a real connection error even if no subchannel fails
-        // again.
-        let last_connection_error = new_subchannels
-            .iter()
-            .rev()
-            .filter(|e| e.state.connectivity_state == ConnectivityState::TransientFailure)
-            .find_map(|e| e.state.last_connection_error.clone());
 
         let mut first_pass = FirstPassState {
             subchannels: new_subchannels,
@@ -612,7 +614,7 @@ impl FirstPassState {
         ctx: &mut PickFirstContext<'_>,
         addresses: Vec<Address>,
     ) -> PickFirstState {
-        FirstPassState::enter(ctx, addresses, self.subchannels)
+        FirstPassState::enter(ctx, addresses, self.subchannels, self.last_connection_error)
     }
 
     fn subchannel_update(
@@ -717,7 +719,12 @@ impl SteadyState {
         ctx: &mut PickFirstContext<'_>,
         addresses: Vec<Address>,
     ) -> PickFirstState {
-        FirstPassState::enter(ctx, addresses, self.subchannels)
+        FirstPassState::enter(
+            ctx,
+            addresses,
+            self.subchannels,
+            Some(self.last_connection_error),
+        )
     }
 
     fn subchannel_update(
@@ -2096,6 +2103,48 @@ mod test {
         env.expect_no_events();
     }
 
+    // When a new address list brings a subchannel that is already in
+    // TRANSIENT_FAILURE, its error is newer than the recorded one, so the pass
+    // that ends at once reports it.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_failing_subchannel_error_is_latest() {
+        let mut env = new_env();
+        env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        env.send_resolver_update_with_initial_states(
+            &["addr2"],
+            &[("addr2", SubchannelState::transient_failure("addr2 failed"))],
+        )
+        .unwrap();
+        env.expect_new_subchannels(&["addr2"]);
+        // addr2's error replaces addr1's older one.
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // When a pass finds every subchannel in TRANSIENT_FAILURE and no
+    // connection error has been recorded, the policy reports a generic one.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_all_subchannels_failing_without_errors() {
+        let mut env = new_env();
+        let failing = SubchannelState {
+            connectivity_state: ConnectivityState::TransientFailure,
+            last_connection_error: None,
+        };
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[("addr1", failing.clone()), ("addr2", failing)],
+        )
+        .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_failing_picker("all addresses in transient failure");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
     // Freshest Error Caching (Steady State)
     // Ensures background failures during Steady State continuously overwrite
     // stale connection errors.
@@ -2204,7 +2253,7 @@ mod test {
     }
 
     // A pass that starts with every subchannel already in TRANSIENT_FAILURE
-    // ends at once, and reports the last of their errors in address order.
+    // ends at once, and reports the latest connection error.
     #[tokio::test(start_paused = true)]
     async fn test_pick_first_pass_starting_in_transient_failure_reports_connection_error() {
         let mut env = new_env();
@@ -2221,11 +2270,11 @@ mod test {
         env.expect_no_events();
 
         // Both subchannels are reused and still in TRANSIENT_FAILURE, so the
-        // new pass has nothing to attempt. It reports addr2's error, the last
-        // in address order, rather than the newest.
+        // new pass has nothing to attempt. It reports the newest error, though
+        // addr2 is last in address order.
         env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
             .unwrap();
-        env.expect_failing_picker("addr2 failed");
+        env.expect_failing_picker("addr1 newest");
         env.expect_request_resolution();
         env.expect_no_events();
     }

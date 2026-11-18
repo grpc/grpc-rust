@@ -524,10 +524,11 @@ impl Invoke for LbInvoker {
                 }
                 PickResult::Queue => {}
                 PickResult::Fail(status) => {
+                    // TODO: Check wait-for-ready and queue instead.
                     return FailingRecvStream::new_stream_pair(status, None);
                 }
                 PickResult::Drop(status) => {
-                    todo!("dropped pick: {:?}", status);
+                    return FailingRecvStream::new_stream_pair(status, None);
                 }
             }
             // Queued: wait for this snapshot to be superseded, then retry the

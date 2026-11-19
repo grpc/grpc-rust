@@ -41,7 +41,9 @@ struct PickedCluster {
     /// Name of the cluster.
     name: String,
     /// Keeps the cluster in use, i.e. subscribed and in the resolver's
-    /// service config, while this pick is alive.
+    /// service config, while this pick is alive. Shared by every pick of the
+    /// cluster, so that the cluster stays in use until the last one is
+    /// dropped.
     // TODO: Get this from the Dependency Manager.
     _cluster_ref: Arc<()>,
 }

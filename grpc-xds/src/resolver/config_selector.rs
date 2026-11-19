@@ -57,6 +57,9 @@ use crate::sampling::WeightedSampler;
 /// cluster in use.
 #[derive(Debug)]
 pub(super) struct ClusterInterceptor {
+    /// In an `Arc` so that storing it in each RPC's `CallOptions` only bumps a
+    /// refcount. Storing a `PickedCluster` by value would clone its name, a
+    /// heap allocation, for every RPC.
     picked: Arc<PickedCluster>,
 }
 
@@ -101,6 +104,11 @@ pub(super) struct SelectorRoute {
     pub(super) route_match: RouteMatch,
     /// The clusters the route sends the RPCs that match it to, by weight. A
     /// route to a single cluster has one entry.
+    ///
+    /// The interceptors are stored in `Arc`s because `select_config` must
+    /// return the RPC's interceptor in one: converting an existing `Arc` into
+    /// an `ArcInterceptor` doesn't allocate, whereas creating an interceptor
+    /// for each RPC would allocate a new `Arc` per RPC.
     pub(super) clusters: WeightedSampler<Arc<ClusterInterceptor>>,
 }
 
@@ -132,6 +140,7 @@ impl ConfigSelector for XdsConfigSelector {
                 "route has no cluster with a non-zero weight",
             )
         })?;
+        // Reuses the cluster's `Arc` rather than allocating per RPC.
         Ok(RpcConfig::default().with_interceptor(ArcInterceptor::from_arc(cluster.clone())))
     }
 }

@@ -272,22 +272,6 @@ impl PickFirstPolicy {
     fn start_connection_pass(&mut self, channel_controller: &mut dyn ChannelController) {
         self.selected = None;
 
-        // A subchannel that already reported READY (e.g. while another one was
-        // selected) won't report it again, so select it now.
-        let ready = self
-            .subchannels
-            .iter()
-            .find(|sc| {
-                self.subchannel_states
-                    .get(&sc.address())
-                    .is_some_and(|s| s.connectivity_state == ConnectivityState::Ready)
-            })
-            .cloned();
-        if let Some(sc) = ready {
-            self.subchannel_activate(sc, channel_controller);
-            return;
-        }
-
         // If there is a viable subchannel at the frontier, connect to it and
         // update picker to CONNECTING.
         if let Some(sc) = self.advance_frontier(true) {
@@ -559,15 +543,6 @@ impl PickFirstPolicy {
                 // drop the connection.
                 self.subchannel_drop(channel_controller);
             }
-            (false, _) if self.selected.is_some() => {
-                // Another subchannel is selected; keep using it. Record a
-                // failure's error, as for any unselected subchannel.
-                if state.connectivity_state == ConnectivityState::TransientFailure
-                    && let Some(err) = &state.last_connection_error
-                {
-                    self.last_connection_error = Some(err.clone());
-                }
-            }
             (false, ConnectivityState::Ready) => {
                 // The updating subchannel is READY; activate it.
                 self.subchannel_activate(subchannel, channel_controller);
@@ -628,6 +603,17 @@ impl LbPolicy for PickFirstPolicy {
                 // (see pick_first in gRPC's load-balancing doc). 'exit_idle()'
                 // connects using this list.
                 if idle_after_disconnect {
+                    return Ok(());
+                }
+
+                // A selected subchannel that is still listed stays selected,
+                // with no subchannels for the other addresses. The list is
+                // kept for exit_idle.
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|sel| new_addresses.contains(&sel.address()))
+                {
                     return Ok(());
                 }
 
@@ -1043,10 +1029,6 @@ mod test {
         let endpoints_new = create_endpoints(&["addr2", "addr1", "addr3"]);
         env.send_resolver_update(endpoints_new).unwrap();
 
-        // Should create new subchannels for addr2 (was cleared by cleanup) and
-        // addr3 (was not in previous list).
-        env.expect_new_subchannels(&["addr2", "addr3"]);
-
         // Should NOT have any more events (no Connect, no UpdatePicker),
         // because it stuck to the original selected subchannel.
         env.expect_no_events();
@@ -1056,98 +1038,6 @@ mod test {
         env.send_subchannel_update(&scs[0], &SubchannelState::idle());
         env.expect_request_resolution();
         env.expect_picker_state(ConnectivityState::Idle);
-        env.expect_no_events();
-    }
-
-    // While a subchannel is selected, another subchannel becoming READY does
-    // not replace it.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_keeps_selected_subchannel_when_another_becomes_ready() {
-        let mut env = new_env();
-        env.simulate_successful_connection(&["addr1", "addr2"]);
-
-        // An update while addr1 is selected creates a new addr2 subchannel.
-        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
-            .unwrap();
-        let sc2 = env.expect_new_subchannel_for("addr2");
-        env.expect_no_events();
-
-        // addr2 becoming READY does not replace addr1.
-        env.send_subchannel_update(&sc2, &SubchannelState::ready());
-        env.expect_no_events();
-    }
-
-    // A subchannel that reported READY while another was selected is selected
-    // as soon as a new connection pass starts, without asking any subchannel
-    // to connect.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_new_pass_selects_subchannel_already_ready() {
-        let mut env = new_env();
-        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
-        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
-            .unwrap();
-        let sc2 = env.expect_new_subchannel_for("addr2");
-        env.send_subchannel_update(&sc2, &SubchannelState::ready());
-        env.expect_no_events();
-
-        // addr1 disconnects, and a pick starts a new pass.
-        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
-        let idle_picker = env.expect_idle_picker_after_disconnect();
-        let _ = idle_picker.pick(PickOptions::new(
-            &test_utils::new_request_headers(),
-            &CallOptions::new(),
-        ));
-        env.run_work();
-
-        // The pass selects the already-READY addr2 without asking addr1 or
-        // addr2 to connect.
-        env.expect_ready_picker(&sc2);
-        env.expect_no_events();
-    }
-
-    // While a subchannel is selected, a failure from another subchannel does
-    // not change what the policy reports.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_keeps_selected_subchannel_when_another_fails() {
-        let mut env = new_env();
-        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
-        env.expect_connect_to("addr2");
-        env.send_subchannel_update(&scs[1], &SubchannelState::ready());
-        env.expect_ready_picker(&scs[1]);
-
-        // An update while addr2 is selected creates a new addr1 subchannel.
-        env.send_resolver_update(create_endpoints(&["addr2", "addr1"]))
-            .unwrap();
-        let sc1 = env.expect_new_subchannel_for("addr1");
-        env.expect_no_events();
-
-        // addr1 failing does not make the policy report TRANSIENT_FAILURE.
-        env.send_subchannel_update(&sc1, &SubchannelState::transient_failure("addr1 failed"));
-        env.expect_no_events();
-    }
-
-    // While a subchannel is selected, a failure from another subchannel still
-    // records its error: a later pass that finds that subchannel in
-    // TRANSIENT_FAILURE reports it.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_records_error_when_another_fails() {
-        let mut env = new_env();
-        env.simulate_successful_connection(&["addr1", "addr2"]);
-
-        // An update while addr1 is selected creates a new addr2 subchannel,
-        // which fails.
-        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
-            .unwrap();
-        let sc2 = env.expect_new_subchannel_for("addr2");
-        env.send_subchannel_update(&sc2, &SubchannelState::transient_failure("addr2 failed"));
-        env.expect_no_events();
-
-        // Without addr1, the new pass finds only addr2, in TRANSIENT_FAILURE,
-        // and reports its error.
-        env.send_resolver_update(create_endpoints(&["addr2"]))
-            .unwrap();
-        env.expect_failing_picker("addr2 failed");
-        env.expect_request_resolution();
         env.expect_no_events();
     }
 

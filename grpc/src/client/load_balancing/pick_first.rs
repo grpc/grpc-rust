@@ -188,19 +188,9 @@ impl PickFirstPolicy {
                 channel_controller.new_subchannel(&addr, self.work_scheduler.clone())
             };
 
-            // Track the best candidate for immediate activation:
-            // 1. Priority: The currently selected subchannel if still READY.
-            // 2. Fallback: The first generic READY subchannel encountered.
-            if state.connectivity_state == ConnectivityState::Ready {
-                if self.subchannel_is_selected(&sc) {
-                    // Sticky channel wins immediately and overrides any
-                    // fallback candidates.
-                    ready_subchannel = Some(sc.clone());
-                } else if ready_subchannel.is_none() {
-                    // Capture fallback candidate, but does not overwrite if a
-                    //sticky channel was already found.
-                    ready_subchannel = Some(sc.clone());
-                }
+            // The first READY subchannel is returned, for immediate activation.
+            if state.connectivity_state == ConnectivityState::Ready && ready_subchannel.is_none() {
+                ready_subchannel = Some(sc.clone());
             }
 
             new_subchannels.push(sc);
@@ -251,10 +241,6 @@ impl PickFirstPolicy {
         subchannel: Arc<dyn Subchannel>,
         channel_controller: &mut dyn ChannelController,
     ) {
-        if self.subchannel_is_selected(&subchannel) {
-            // Already selected; skip activation.
-            return;
-        }
         self.selected = Some(subchannel.clone());
         self.subchannels = vec![subchannel.clone()]; // Keep only the winner.
         self.steady_state = None; // Reset mode to First Pass.

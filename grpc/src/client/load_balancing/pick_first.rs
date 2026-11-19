@@ -851,6 +851,22 @@ mod test {
             subchannels
         }
 
+        // Advances virtual time by `duration` on the paused Tokio runtime,
+        // yielding before and after so spawned timer tasks can register on the
+        // timer wheel and schedule their completion work.
+        async fn advance_time(&mut self, duration: Duration) {
+            tokio::task::yield_now().await;
+            tokio::time::advance(duration).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Advances the paused clock past the Connection Attempt Delay, letting
+        // any pending timer fire.
+        async fn advance_past_timer(&mut self) {
+            self.advance_time(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1))
+                .await;
+        }
+
         /// Sends a resolver update with `endpoints` and resolution note
         /// `note`, using the default config.
         fn send_resolver_update_with_note(
@@ -872,9 +888,7 @@ mod test {
         // and after advancing the clock, so that the timer task can register
         // its sleep, and then schedule its work.
         async fn fire_timer(&mut self) {
-            tokio::task::yield_now().await;
-            tokio::time::advance(CONNECTION_ATTEMPT_DELAY + Duration::from_millis(1)).await;
-            tokio::task::yield_now().await;
+            self.advance_past_timer().await;
             self.run_work();
         }
     }
@@ -1305,6 +1319,82 @@ mod test {
         env.expect_ready_picker(&scs[0]);
 
         env.policy.exit_idle(&mut env.tcc);
+        env.expect_no_events();
+    }
+
+    // An earlier connection attempt that succeeds after the timer moved the
+    // pass on is selected, and the running timer is cancelled (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_earlier_attempt_ready_cancels_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3", "addr4"]);
+
+        // Each timer moves the pass on and starts the next attempt's timer: the
+        // second timer fires only because the first one started it.
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.fire_timer().await;
+        env.expect_connect_to("addr3");
+
+        // addr1's attempt, from two timers back, succeeds and is selected.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[0]);
+
+        // No timer fires: the timer for addr3's attempt was cancelled.
+        env.advance_past_timer().await;
+        env.expect_no_events();
+    }
+
+    // When the current connection attempt fails, the next attempt starts at
+    // once with its own Connection Attempt Delay timer; the failed attempt's
+    // timer is cancelled (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_attempt_failure_restarts_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        // addr1 fails partway through its delay; addr2 is attempted at once.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY / 2).await;
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+
+        // Past addr1's original deadline, but before addr2's: nothing fires.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY * 3 / 4).await;
+        env.expect_no_events();
+
+        // addr2's own timer fires 250ms after its attempt started, moving the
+        // pass on to addr3.
+        env.advance_time(CONNECTION_ATTEMPT_DELAY / 4 + Duration::from_millis(1))
+            .await;
+        env.run_work();
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+    }
+
+    // Timer work from an earlier first pass, delivered after a resolver update
+    // started a new pass, does not move the new pass on.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_stale_timer_work_ignored_in_new_pass() {
+        let mut env = new_env();
+        env.simulate_connection(&["addr1", "addr2"]);
+
+        // Hold the timer's work, as if the resolver update was handled before
+        // it. The new pass reuses the subchannels and starts over at addr1.
+        env.advance_past_timer().await;
+        let timer_work = env.expect_schedule_work();
+        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
+            .unwrap();
+        env.expect_connect_to("addr1");
+        env.expect_no_events();
+
+        // The stale work does not move the new pass on to addr2.
+        env.policy.work(timer_work, &mut env.tcc);
+        env.expect_no_events();
+
+        // The new pass's own timer moves it on to addr2.
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
         env.expect_no_events();
     }
 }

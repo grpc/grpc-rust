@@ -60,9 +60,8 @@ use crate::xds::resource::string_matcher::{
 };
 use crate::xds::resource::{ClusterResource, EndpointsResource};
 
-/// Default timeout for waiting for the initial route config (matches gRFC A57
-/// resource initial timeout).
-const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for waiting for the initial route config on cold start.
+pub(crate) const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// xDS-backed [`Router`] that resolves requests to clusters.
 ///
@@ -74,12 +73,15 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// references (see [`ClusterSet`]). Each [`RouteDecision`] carries the client of
 /// its cluster.
 ///
-/// The first RPC blocks (up to [`DEFAULT_READY_TIMEOUT`]) until the initial route
-/// config is available, matching standard gRPC behavior where RPCs wait for the
-/// resolver's first update. Subsequent RPCs read the config lock-free.
+/// The first RPC blocks (up to `ready_timeout`, defaulting to
+/// [`DEFAULT_READY_TIMEOUT`], or without an internal timeout when `None`) until
+/// the initial route config is available, matching standard gRPC behavior where
+/// RPCs wait for the resolver's first update. Subsequent RPCs read the config
+/// lock-free.
 pub(crate) struct XdsRouter {
     route_config: Arc<ArcSwapOption<RoutingSnapshot>>,
     ready_rx: watch::Receiver<bool>,
+    ready_timeout: Option<Duration>,
     _watch_task: AbortOnDrop,
 }
 
@@ -95,6 +97,7 @@ impl XdsRouter {
     pub(crate) fn new<F>(
         cache: Arc<XdsCache>,
         retry_factory: Arc<dyn RetryClassifierFactory>,
+        ready_timeout: Option<Duration>,
         provision: F,
     ) -> Self
     where
@@ -120,6 +123,7 @@ impl XdsRouter {
         Self {
             route_config,
             ready_rx,
+            ready_timeout,
             _watch_task: AbortOnDrop(handle),
         }
     }
@@ -219,11 +223,22 @@ impl Router for XdsRouter {
         // where RPCs block until the resolver provides the first update.
         let route_config_ref = self.route_config.clone();
         let mut ready_rx = self.ready_rx.clone();
+        let ready_timeout = self.ready_timeout;
         AcquiredConfig::Pending(Box::pin(async move {
-            tokio::time::timeout(DEFAULT_READY_TIMEOUT, ready_rx.wait_for(|ready| *ready))
-                .await
-                .map_err(|_| RoutingError::NotReady)?
-                .map_err(|_| RoutingError::NotReady)?;
+            match ready_timeout {
+                Some(timeout) => {
+                    tokio::time::timeout(timeout, ready_rx.wait_for(|ready| *ready))
+                        .await
+                        .map_err(|_| RoutingError::NotReady)?
+                        .map_err(|_| RoutingError::NotReady)?;
+                }
+                None => {
+                    ready_rx
+                        .wait_for(|ready| *ready)
+                        .await
+                        .map_err(|_| RoutingError::NotReady)?;
+                }
+            }
             route_config_ref.load_full().ok_or(RoutingError::NotReady)
         }))
     }
@@ -1340,6 +1355,7 @@ mod tests {
         let router = XdsRouter::new(
             cache.clone(),
             Arc::new(GrpcRetryClassifierFactory),
+            Some(DEFAULT_READY_TIMEOUT),
             provision,
         );
         (router, provisioned)
@@ -1352,6 +1368,7 @@ mod tests {
             Self::new(
                 cache.clone(),
                 Arc::new(GrpcRetryClassifierFactory),
+                Some(DEFAULT_READY_TIMEOUT),
                 noop_cluster_client,
             )
         }
@@ -1466,6 +1483,64 @@ mod tests {
             "expected the wait to span the full ready timeout, took {:?}",
             start.elapsed(),
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xds_router_respects_custom_ready_timeout() {
+        let cache = Arc::new(XdsCache::new());
+        let custom_timeout = Duration::from_secs(2);
+        let router = XdsRouter::new(
+            cache,
+            Arc::new(GrpcRetryClassifierFactory),
+            Some(custom_timeout),
+            noop_cluster_client,
+        );
+
+        let start = tokio::time::Instant::now();
+        let result = router.acquire().get().await;
+
+        assert!(
+            matches!(result, Err(RoutingError::NotReady)),
+            "expected NotReady, got {result:?}",
+        );
+        assert_eq!(start.elapsed(), custom_timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xds_router_without_ready_timeout_waits_past_default_until_config_arrives() {
+        let cache = Arc::new(XdsCache::new());
+        let router = XdsRouter::new(
+            cache.clone(),
+            Arc::new(GrpcRetryClassifierFactory),
+            None,
+            noop_cluster_client,
+        );
+
+        let fut = router.acquire().get();
+        let mut fut = std::pin::pin!(fut);
+
+        // Advance well beyond DEFAULT_READY_TIMEOUT (30s): with ready_timeout = None,
+        // the router must remain pending until a route config arrives.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(120), &mut fut)
+                .await
+                .is_err(),
+            "acquire with None ready_timeout should not expire on its own",
+        );
+
+        cache.update_route_config(make_route_config("late-cluster"));
+
+        let snapshot = fut
+            .await
+            .expect("should resolve once route config arrives after >30s");
+        let headers = http::HeaderMap::new();
+        let input = RouteInput {
+            authority: "svc",
+            path: "/",
+            headers: &headers,
+        };
+        let decision = router.route(&input, &snapshot).unwrap();
+        assert_eq!(decision.cluster, "late-cluster");
     }
 
     #[test]

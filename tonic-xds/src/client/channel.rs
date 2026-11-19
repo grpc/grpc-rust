@@ -245,9 +245,8 @@ pub enum BuildError {
 /// Holds owned resources whose background tasks must live as long as the channel.
 ///
 /// Stored as `Option<Arc<...>>` on [`XdsChannel`] so clones share ownership
-/// cheaply. When the last clone drops, the resource manager cascade task and
-/// ADS worker are aborted. The `XdsCache` is kept alive separately by
-/// `XdsRouter` in the service stack.
+/// cheaply. When the last clone drops, the resource manager cascade task
+/// (which owns the [`XdsCache`] writer) and ADS worker are aborted.
 ///
 /// A pooled client is shared with other channels and stops only once all of
 /// them have dropped it.
@@ -696,7 +695,7 @@ impl XdsChannelBuilder {
             .clone()
             .unwrap_or_else(|| Arc::new(GrpcRetryClassifierFactory));
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(
-            parts.cache,
+            &parts.cache,
             retry_factory,
             self.config.route_ready_timeout,
             move |name, watches| {
@@ -1151,7 +1150,9 @@ mod tests {
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
     use crate::testutil::grpc::TestServer;
-    use crate::xds::cache::{ClusterWatches, XdsCache};
+    use crate::xds::cache::{
+        ClusterError, ClusterSnapshot, ClusterWatches, XdsCache, XdsConfig, XdsConfigError,
+    };
     use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::route_config::RouteConfigResource;
@@ -1571,6 +1572,28 @@ mod tests {
         })
     }
 
+    /// Publishes a single-cluster `XdsConfig` snapshot routing all traffic to
+    /// `cluster_name`.
+    fn publish_single_cluster_config(
+        cache: &XdsCache,
+        cluster_name: &str,
+        cluster: Arc<crate::xds::resource::ClusterResource>,
+        endpoints: Arc<EndpointsResource>,
+    ) {
+        cache.publish(Arc::new(XdsConfig {
+            route_config: make_test_route_config(cluster_name),
+            virtual_host_index: 0,
+            clusters: HashMap::from([(
+                cluster_name.to_string(),
+                Ok(ClusterSnapshot {
+                    cluster,
+                    endpoints: Some(endpoints),
+                    resolution_note: None,
+                }),
+            )]),
+        }));
+    }
+
     /// Builds an XdsChannelGrpc using a real XdsRouter over the given cache,
     /// load-balanced by `backend`.
     fn build_xds_channel_from_cache(cache: &Arc<XdsCache>, backend: LbBackend) -> XdsChannelGrpc {
@@ -1587,7 +1610,7 @@ mod tests {
         use crate::xds::routing::{DEFAULT_READY_TIMEOUT, XdsRouter};
 
         let router = XdsRouter::new(
-            cache.clone(),
+            cache,
             Arc::new(GrpcRetryClassifierFactory),
             Some(DEFAULT_READY_TIMEOUT),
             move |name, watches| ClusterRef::from_channel(name, factory.make(name, watches)),
@@ -1616,9 +1639,12 @@ mod tests {
         let (_, servers) = setup_grpc_servers(num_servers).await;
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
-        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+        publish_single_cluster_config(
+            &cache,
+            cluster_name,
+            make_test_cluster(cluster_name),
+            make_test_endpoints(cluster_name, &servers),
+        );
 
         let channel = build_xds_channel_from_cache(&cache, backend);
         let client = GreeterClient::new(channel);
@@ -1657,11 +1683,12 @@ mod tests {
         let (_, servers) = setup_grpc_servers(2).await;
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        let cluster = make_test_cluster(cluster_name);
         // Start with only the first server.
-        cache.update_endpoints(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
+            cluster.clone(),
             make_test_endpoints(cluster_name, &servers[..1]),
         );
 
@@ -1679,7 +1706,12 @@ mod tests {
         );
 
         // Add second server.
-        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+        publish_single_cluster_config(
+            &cache,
+            cluster_name,
+            cluster,
+            make_test_endpoints(cluster_name, &servers),
+        );
         // Give the endpoint diff loop time to process the update.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
@@ -1725,28 +1757,90 @@ mod tests {
     }
 
     async fn releases_cache_on_drop(backend: LbBackend) {
+        use crate::client::endpoint::{ClusterConfig, Connector, MakeConnector, XdsEndpoint};
+
+        /// Wraps the production gRPC connector factory with a shared token so
+        /// tests can observe when the router and all per-cluster CDS/EDS/LB
+        /// background tasks have released their connector state.
+        struct TrackedMakeConnector<MC>(MC, Arc<()>);
+        struct TrackedConnector<S>(
+            Arc<dyn Connector<Service = S> + Send + Sync>,
+            #[allow(dead_code)] Arc<()>,
+        );
+
+        impl<S> Connector for TrackedConnector<S> {
+            type Service = S;
+            fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+                self.0.connect(endpoint)
+            }
+        }
+
+        impl<MC: MakeConnector> MakeConnector for TrackedMakeConnector<MC> {
+            type Service = MC::Service;
+            fn make_connector(
+                &self,
+                cluster: ClusterConfig<'_>,
+            ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError>
+            {
+                Ok(Arc::new(TrackedConnector(
+                    self.0.make_connector(cluster)?,
+                    self.1.clone(),
+                )))
+            }
+        }
+
         let cluster_name = "test-cluster";
         let (_, servers) = setup_grpc_servers(1).await;
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
-        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
+        publish_single_cluster_config(
+            &cache,
+            cluster_name,
+            make_test_cluster(cluster_name),
+            make_test_endpoints(cluster_name, &servers),
+        );
 
-        let channel = build_xds_channel_from_cache(&cache, backend);
+        let token = Arc::new(());
+        let weak_token = Arc::downgrade(&token);
+        let factory = backend.cluster_factory::<_, TonicBody, TonicBody>(
+            TrackedMakeConnector(
+                super::grpc_make_connector(
+                    crate::GrpcMakeConnector::new(),
+                    super::ClusterCircuitBreakerRegistry::new_for_test(),
+                ),
+                token,
+            ),
+            #[cfg(feature = "_tls-any")]
+            LbBackend::empty_cert_registry(),
+            Arc::new(super::GrpcOutcomeClassifier),
+        );
+
+        let channel = build_xds_channel_from_factory(&cache, factory);
         let (successful, error_types, _) =
             send_grpc_requests(GreeterClient::new(channel.clone()), 5).await;
         assert_eq!(successful, 5, "{backend:?}: {error_types:?}");
+        assert!(weak_token.strong_count() > 0);
 
-        let weak_cache = Arc::downgrade(&cache);
-        drop(cache);
+        // Dropping the channel while `cache` stays alive must stop the router
+        // watch task and every per-cluster CDS/EDS/LB background task.
         drop(channel);
-        let released = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
-            while weak_cache.strong_count() > 0 {
+        let tasks_stopped = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            while weak_token.strong_count() > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
             }
         })
         .await;
-        assert!(released.is_ok(), "{backend:?}: cache outlived the channel");
+        assert!(
+            tasks_stopped.is_ok(),
+            "{backend:?}: router or cluster tasks outlived the channel",
+        );
+
+        let weak_cache = Arc::downgrade(&cache);
+        drop(cache);
+        assert_eq!(
+            weak_cache.strong_count(),
+            0,
+            "{backend:?}: cache retained outside XdsResourceManager",
+        );
 
         shutdown(servers).await;
     }
@@ -1771,10 +1865,10 @@ mod tests {
         let (_, servers) = setup_grpc_servers(2).await;
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
-        cache.update_endpoints(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
+            make_test_cluster(cluster_name),
             make_test_endpoints(cluster_name, &servers[..1]),
         );
         let channel = build_xds_channel_from_cache(&cache, backend);
@@ -1788,21 +1882,21 @@ mod tests {
             "{backend:?}"
         );
 
-        // The cluster leaves the route config, and the resource manager drops
-        // its resources. It then rejoins, served by the other server.
-        cache.update_route_config(make_test_route_config("other-cluster"));
+        // The cluster leaves the route config and then rejoins with complete
+        // resources pointing at the second server.
+        publish_single_cluster_config(
+            &cache,
+            "other-cluster",
+            make_test_cluster("other-cluster"),
+            make_test_endpoints("other-cluster", &[]),
+        );
         if !coalesced {
             settle().await;
         }
-        cache.remove_cluster(cluster_name);
-        cache.remove_endpoints(cluster_name);
-        if !coalesced {
-            settle().await;
-        }
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
-        cache.update_endpoints(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
+            make_test_cluster(cluster_name),
             make_test_endpoints(cluster_name, &servers[1..]),
         );
         settle().await;
@@ -1866,7 +1960,7 @@ mod tests {
         let (called_tx, mut called) = mpsc::unbounded_channel();
         let (release, released) = watch::channel(false);
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config("cluster-a"));
+        cache.publish_route_config_for_test(make_test_route_config("cluster-a"));
         let factory = HeldClusters {
             built: built_tx,
             called: called_tx,
@@ -1885,7 +1979,7 @@ mod tests {
 
         // The cluster leaves the route config while the RPC is in flight, which
         // keeps the client alive.
-        cache.update_route_config(make_test_route_config("cluster-b"));
+        cache.publish_route_config_for_test(make_test_route_config("cluster-b"));
         let (name, mut b_dropped) = built.recv().await.unwrap();
         assert_eq!(name, "cluster-b");
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1914,8 +2008,8 @@ mod tests {
         let cluster_name = "test-cluster";
         let (_, servers) = setup_grpc_servers(1).await;
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
             make_test_cluster_with_circuit_breaking(
                 cluster_name,
@@ -1923,8 +2017,8 @@ mod tests {
                     max_requests: Some(0),
                 },
             ),
+            make_test_endpoints(cluster_name, &servers),
         );
-        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
 
         let error = GreeterClient::new(build_xds_channel_from_cache(&cache, backend))
             .say_hello(HelloRequest {
@@ -1937,8 +2031,8 @@ mod tests {
         shutdown(servers).await;
     }
 
-    /// Endpoints are only connected once CDS arrives, so the first request
-    /// waits for the cluster and then sees its limit.
+    /// Before the initial CDS-completed snapshot publishes, requests wait
+    /// rather than slipping past or failing early, then see the cluster limit.
     #[tokio::test]
     async fn test_xds_channel_waits_for_cds_before_circuit_breaking() {
         for backend in LB_BACKENDS {
@@ -1951,9 +2045,6 @@ mod tests {
         let (_, servers) = setup_grpc_servers(1).await;
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
-
         let mut client = GreeterClient::new(build_xds_channel_from_cache(&cache, backend));
         let mut request = Box::pin(client.say_hello(HelloRequest {
             name: "wait-for-cds".to_string(),
@@ -1962,7 +2053,8 @@ mod tests {
             tokio::time::timeout(tokio::time::Duration::from_millis(20), request.as_mut()).await;
         assert!(early.is_err(), "{backend:?}: request should wait for CDS");
 
-        cache.update_cluster(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
             make_test_cluster_with_circuit_breaking(
                 cluster_name,
@@ -1970,12 +2062,95 @@ mod tests {
                     max_requests: Some(0),
                 },
             ),
+            make_test_endpoints(cluster_name, &servers),
         );
         let error = tokio::time::timeout(tokio::time::Duration::from_secs(2), request)
             .await
             .expect("request should complete after CDS update")
             .unwrap_err();
         assert_circuit_breaker_drop(&error, 0);
+
+        shutdown(servers).await;
+    }
+
+    /// Top-level `XdsConfigError` and per-cluster `ClusterError` both surface
+    /// `tonic::Code::Unavailable` to gRPC callers, and a subsequent valid
+    /// snapshot recovers cleanly.
+    #[tokio::test]
+    async fn test_xds_channel_surfaces_unavailable_on_config_and_cluster_errors() {
+        for backend in LB_BACKENDS {
+            surfaces_unavailable_on_config_and_cluster_errors(backend).await;
+        }
+    }
+
+    async fn surfaces_unavailable_on_config_and_cluster_errors(backend: LbBackend) {
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(1).await;
+        let cache = Arc::new(XdsCache::new());
+        let channel = build_xds_channel_from_cache(&cache, backend);
+        let mut client = GreeterClient::new(channel);
+
+        // 1. Per-cluster CDS/EDS failure surfaces UNAVAILABLE.
+        cache.publish(Arc::new(XdsConfig {
+            route_config: make_test_route_config(cluster_name),
+            virtual_host_index: 0,
+            clusters: HashMap::from([(
+                cluster_name.to_string(),
+                Err(ClusterError(
+                    "CDS resource 'test-cluster': does not exist".into(),
+                )),
+            )]),
+        }));
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let status = client
+            .say_hello(HelloRequest {
+                name: "cluster-err".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{backend:?}");
+        assert!(
+            status.message().contains("CDS resource 'test-cluster'"),
+            "{backend:?}: {}",
+            status.message()
+        );
+
+        // 2. Top-level LDS/RDS failure surfaces UNAVAILABLE.
+        cache.publish_error(XdsConfigError(
+            "LDS resource 'test-service': does not exist".into(),
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let status = client
+            .say_hello(HelloRequest {
+                name: "config-err".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{backend:?}");
+        assert!(
+            status.message().contains("LDS resource 'test-service'"),
+            "{backend:?}: {}",
+            status.message()
+        );
+
+        // 3. Subsequent valid snapshot recovers RPCs cleanly.
+        publish_single_cluster_config(
+            &cache,
+            cluster_name,
+            make_test_cluster(cluster_name),
+            make_test_endpoints(cluster_name, &servers),
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let resp = client
+            .say_hello(HelloRequest {
+                name: "recovered".into(),
+            })
+            .await
+            .expect("RPC succeeds after valid snapshot");
+        assert!(resp.into_inner().message.contains("recovered"));
 
         shutdown(servers).await;
     }
@@ -2177,7 +2352,7 @@ mod tests {
         // Construction should succeed without panicking.
     }
 
-    fn test_runtime_parts(cache: Arc<XdsCache>) -> super::XdsRuntimeParts {
+    fn test_runtime_parts(cache: &Arc<XdsCache>) -> super::XdsRuntimeParts {
         use crate::xds::resource_manager::XdsResourceManager;
 
         let xds_client = xds_client::XdsClient::disconnected();
@@ -2197,7 +2372,7 @@ mod tests {
                     .unwrap(),
             );
             super::XdsRuntimeParts {
-                cache,
+                cache: cache.clone(),
                 xds_client,
                 resource_manager,
                 cert_provider_registry,
@@ -2206,7 +2381,7 @@ mod tests {
         #[cfg(not(feature = "_tls-any"))]
         {
             super::XdsRuntimeParts {
-                cache,
+                cache: cache.clone(),
                 xds_client,
                 resource_manager,
             }
@@ -2219,17 +2394,17 @@ mod tests {
         let (_, servers) = setup_grpc_servers(1).await;
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
         // CDS omits circuit_breakers (`max_requests: None`).
-        cache.update_cluster(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
             make_test_cluster_with_circuit_breaking(cluster_name, CircuitBreakingConfig::default()),
+            make_test_endpoints(cluster_name, &servers),
         );
-        cache.update_endpoints(cluster_name, make_test_endpoints(cluster_name, &servers));
 
         // 1. Custom fallback limit `Some(0)` drops requests when CDS omits circuit_breakers.
         let zero_channel = XdsChannelBuilder::new(test_config().with_default_max_requests(Some(0)))
-            .build_grpc_channel_from_runtime(test_runtime_parts(cache.clone()));
+            .build_grpc_channel_from_runtime(test_runtime_parts(&cache));
         let error = GreeterClient::new(zero_channel)
             .say_hello(HelloRequest {
                 name: "zero-fallback".to_string(),
@@ -2242,7 +2417,7 @@ mod tests {
         //    while still enforcing explicit CDS `max_requests`.
         let unlimited_channel =
             XdsChannelBuilder::new(test_config().with_default_max_requests(None))
-                .build_grpc_channel_from_runtime(test_runtime_parts(cache.clone()));
+                .build_grpc_channel_from_runtime(test_runtime_parts(&cache));
         let mut client = GreeterClient::new(unlimited_channel);
         client
             .say_hello(HelloRequest {
@@ -2251,7 +2426,8 @@ mod tests {
             .await
             .expect("unconfigured cluster should not be limited when default_max_requests is None");
 
-        cache.update_cluster(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
             make_test_cluster_with_circuit_breaking(
                 cluster_name,
@@ -2259,7 +2435,10 @@ mod tests {
                     max_requests: Some(0),
                 },
             ),
+            make_test_endpoints(cluster_name, &servers),
         );
+        // Give the router watch task time to forward the CDS update.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         let error = client
             .say_hello(HelloRequest {
                 name: "explicit-cds-zero".to_string(),
@@ -2278,7 +2457,7 @@ mod tests {
         let short_channel = XdsChannelBuilder::new(
             test_config().with_route_ready_timeout(Some(std::time::Duration::from_secs(2))),
         )
-        .build_grpc_channel_from_runtime(test_runtime_parts(short_cache));
+        .build_grpc_channel_from_runtime(test_runtime_parts(&short_cache));
         let mut short_client = GreeterClient::new(short_channel);
         let mut call = Box::pin(short_client.say_hello(HelloRequest {
             name: "short-wait".to_string(),
@@ -2302,7 +2481,7 @@ mod tests {
         //    while per-RPC deadlines (`grpc-timeout`) still cancel the call.
         let disabled_cache = Arc::new(XdsCache::new());
         let disabled_channel = XdsChannelBuilder::new(test_config().with_route_ready_timeout(None))
-            .build_grpc_channel_from_runtime(test_runtime_parts(disabled_cache));
+            .build_grpc_channel_from_runtime(test_runtime_parts(&disabled_cache));
         let mut no_deadline_client = GreeterClient::new(disabled_channel.clone());
         let mut no_deadline_call = Box::pin(no_deadline_client.say_hello(HelloRequest {
             name: "wait-indefinitely".to_string(),
@@ -2542,10 +2721,10 @@ mod tests {
         let port = servers[0].addr.port();
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(make_test_route_config(cluster_name));
-        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
-        cache.update_endpoints(
+        publish_single_cluster_config(
+            &cache,
             cluster_name,
+            make_test_cluster(cluster_name),
             Arc::new(EndpointsResource {
                 cluster_name: cluster_name.to_string(),
                 localities: vec![LocalityEndpoints {

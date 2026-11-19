@@ -627,15 +627,6 @@ fn validate_route_action(
 }
 
 impl RouteConfigResource {
-    /// Returns cluster names referenced across all virtual hosts in this route configuration.
-    pub(crate) fn cluster_names(&self) -> HashSet<String> {
-        self.virtual_hosts
-            .iter()
-            .flat_map(VirtualHostConfig::cluster_names)
-            .map(str::to_owned)
-            .collect()
-    }
-
     /// Applies the listener's `HttpConnectionManager` max stream duration to
     /// every route that sets none of its own (gRFC A31).
     pub(crate) fn with_default_max_stream_duration(mut self, default: Duration) -> Self {

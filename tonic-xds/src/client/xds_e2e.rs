@@ -304,8 +304,9 @@ mod test {
 
         let (control_plane, cp_addr) = start_control_plane().await;
 
-        // LDS -> RDS "route-config"; both clusters and their endpoints are configured
-        // up front, and the route initially targets cluster-a.
+        // LDS -> RDS "route-config"; both clusters are in CDS, but only
+        // cluster-a has EDS initially so a route switch to cluster-b exercises
+        // completeness-gated snapshot holding before cluster-b's EDS arrives.
         control_plane.get_service().set_xds_config(
             &config::AdsTypeUrl::Lds,
             HashMap::from([(
@@ -327,16 +328,48 @@ mod test {
                 ("cluster-b".to_string(), config::build_cluster("cluster-b")),
             ]),
         );
+        let cla_a = config::build_cla(
+            "cluster-a",
+            &[(backend_a.addr.ip().to_string(), backend_a.addr.port())],
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([("cluster-a".to_string(), cla_a.clone())]),
+        );
+
+        let mut client = GreeterClient::new(build_channel_with_backend(cp_addr, "my-service", lb));
+
+        // Initially routed to cluster-a -> backend-a.
+        let reply = say_hello_until_prefix(&mut client, "backend-a:").await;
+        assert_eq!(reply, "backend-a: world", "{lb:?}");
+
+        // Switch RDS to cluster-b while cluster-b still has no EDS resource:
+        // XdsResourceManager must hold the previous snapshot so RPCs continue
+        // succeeding on backend-a until cluster-b's EDS arrives.
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Rds,
+            HashMap::from([(
+                "route-config".to_string(),
+                config::build_route_config("route-config", "cluster-b"),
+            )]),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..5 {
+            let resp = client
+                .say_hello(HelloRequest {
+                    name: "world".into(),
+                })
+                .await
+                .expect("RPC must continue on held cluster-a snapshot");
+            assert_eq!(resp.into_inner().message, "backend-a: world", "{lb:?}");
+        }
+
+        // Now publish cluster-b's EDS; the new snapshot completes and traffic
+        // shifts to backend-b.
         control_plane.get_service().set_xds_config(
             &config::AdsTypeUrl::Eds,
             HashMap::from([
-                (
-                    "cluster-a".to_string(),
-                    config::build_cla(
-                        "cluster-a",
-                        &[(backend_a.addr.ip().to_string(), backend_a.addr.port())],
-                    ),
-                ),
+                ("cluster-a".to_string(), cla_a),
                 (
                     "cluster-b".to_string(),
                     config::build_cla(
@@ -347,23 +380,6 @@ mod test {
             ]),
         );
 
-        let mut client = GreeterClient::new(build_channel_with_backend(cp_addr, "my-service", lb));
-
-        // Initially routed to cluster-a -> backend-a.
-        let reply = say_hello_until_prefix(&mut client, "backend-a:").await;
-        assert_eq!(reply, "backend-a: world", "{lb:?}");
-
-        // Update the RDS route to target cluster-b; the control plane pushes the new
-        // RouteConfiguration to the connected client.
-        control_plane.get_service().set_xds_config(
-            &config::AdsTypeUrl::Rds,
-            HashMap::from([(
-                "route-config".to_string(),
-                config::build_route_config("route-config", "cluster-b"),
-            )]),
-        );
-
-        // Traffic shifts to cluster-b -> backend-b.
         let reply = say_hello_until_prefix(&mut client, "backend-b:").await;
         assert_eq!(reply, "backend-b: world", "{lb:?}");
 

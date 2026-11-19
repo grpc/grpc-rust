@@ -605,8 +605,12 @@ impl XdsChannelBuilder {
         let xds_client = pool.get_or_create(key)?;
 
         let cache = Arc::new(XdsCache::new());
-        let resource_manager =
-            XdsResourceManager::new((*xds_client).clone(), cache.clone(), listener_name);
+        let resource_manager = XdsResourceManager::new(
+            (*xds_client).clone(),
+            cache.clone(),
+            listener_name,
+            self.authority(),
+        );
 
         Ok(XdsRuntimeParts {
             cache,
@@ -2139,8 +2143,12 @@ mod tests {
 
         let cache = Arc::new(XdsCache::new());
         let xds_client = xds_client::XdsClient::disconnected();
-        let resource_manager =
-            XdsResourceManager::new(xds_client.clone(), cache.clone(), "test-listener".into());
+        let resource_manager = XdsResourceManager::new(
+            xds_client.clone(),
+            cache.clone(),
+            "test-listener".into(),
+            "test-listener",
+        );
         let xds_client = Arc::new(xds_client);
 
         let builder = XdsChannelBuilder::new(test_config());
@@ -2173,8 +2181,12 @@ mod tests {
         use crate::xds::resource_manager::XdsResourceManager;
 
         let xds_client = xds_client::XdsClient::disconnected();
-        let resource_manager =
-            XdsResourceManager::new(xds_client.clone(), cache.clone(), "test-listener".into());
+        let resource_manager = XdsResourceManager::new(
+            xds_client.clone(),
+            cache.clone(),
+            "test-listener".into(),
+            "test-listener",
+        );
         let xds_client = Arc::new(xds_client);
 
         #[cfg(feature = "_tls-any")]

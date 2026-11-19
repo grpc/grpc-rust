@@ -338,10 +338,10 @@ impl RouteConfigResource {
         path: &str,
         headers: &http::HeaderMap,
     ) -> Result<&RouteConfig, RoutingError> {
-        let vh = find_best_matching_virtual_host(authority, &self.virtual_hosts)
+        let idx = find_best_matching_virtual_host_index(authority, &self.virtual_hosts)
             .ok_or_else(|| RoutingError::NoMatchingVirtualHost(authority.to_string()))?;
 
-        for route in &vh.routes {
+        for route in &self.virtual_hosts[idx].routes {
             if route_matches(route, path, headers) {
                 return Ok(route);
             }
@@ -353,23 +353,24 @@ impl RouteConfigResource {
 
 const WILDCARD: &str = "*";
 
-/// Finds the best-matching virtual host for the given authority.
-fn find_best_matching_virtual_host<'a>(
+/// Finds the index of the best-matching virtual host for the given authority.
+pub(crate) fn find_best_matching_virtual_host_index(
     authority: &str,
-    virtual_hosts: &'a [VirtualHostConfig],
-) -> Option<&'a VirtualHostConfig> {
+    virtual_hosts: &[VirtualHostConfig],
+) -> Option<usize> {
     virtual_hosts
         .iter()
-        .filter_map(|vh| {
+        .enumerate()
+        .filter_map(|(idx, vh)| {
             let best_score = vh
                 .domains
                 .iter()
                 .filter_map(|d| match_domain(authority, d))
                 .min()?;
-            Some((best_score, vh))
+            Some((best_score, idx))
         })
         .min_by_key(|(score, _)| *score)
-        .map(|(_, vh)| vh)
+        .map(|(_, idx)| idx)
 }
 
 /// How well a domain pattern matched an authority.

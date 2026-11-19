@@ -155,9 +155,9 @@ where
 /// Builds the load-balancing channel for a cluster when the route config starts
 /// referencing it.
 ///
-/// The seam between the router and the balancer: the router owns a client and
-/// CDS/EDS watch feeds for each cluster in the route config, without knowing
-/// how endpoints are connected or balanced.
+/// The seam between the router and the balancer: the router owns a client for
+/// each cluster in the route config, built from the cluster's CDS/EDS watches,
+/// without knowing how endpoints are connected or balanced.
 pub(crate) trait ClusterChannelFactory<Req, Resp>: Send + Sync + 'static
 where
     Req: Send + 'static,

@@ -42,7 +42,7 @@ pub(crate) type BoxDiscover<Endpoint, S> =
 
 /// Trait for discovering cluster endpoints.
 ///
-/// Implementations resolve a cluster and its router-owned [`ClusterWatches`]
+/// Implementations resolve a cluster and its router-supplied [`ClusterWatches`]
 /// into a stream of endpoint changes (`Change::Insert` / `Change::Remove`). The
 /// xDS-backed implementation is
 /// [`XdsClusterDiscovery`](crate::xds::cluster_discovery::XdsClusterDiscovery).

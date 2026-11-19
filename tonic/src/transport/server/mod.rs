@@ -377,8 +377,9 @@ impl<L> Server<L> {
     }
 
     /// Sets whether to use an adaptive flow control. Defaults to false.
-    /// Enabling this will override the limits set in http2_initial_stream_window_size and
-    /// http2_initial_connection_window_size.
+    /// Enabling this will override the limits set in
+    /// [`Server::initial_stream_window_size`] and
+    /// [`Server::initial_connection_window_size`].
     #[must_use]
     pub fn http2_adaptive_window(self, enabled: Option<bool>) -> Self {
         Server {

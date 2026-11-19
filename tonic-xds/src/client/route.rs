@@ -26,8 +26,9 @@ use crate::client::cluster::ClusterRef;
 use crate::client::deadline::DeadlinePolicy;
 use crate::client::retry::{RetryClassifierFactory, RetrySharedConfig};
 use crate::common::async_util::BoxFuture;
+use crate::xds::cache::{ClusterError, XdsConfig};
 use crate::xds::resource::route_config::{
-    RouteConfigMetadata, RouteConfigResource, RouteRetryConfig,
+    RouteConfigMetadata, RouteConfigResource, VirtualHostConfig,
 };
 use crate::xds::routing::RoutingError;
 use http::{Request, Response};
@@ -99,54 +100,97 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub(crate) struct RoutingSnapshot {
     resource: Arc<RouteConfigResource>,
-    /// Compiled retry config, keyed by the identity (`Arc` address) of the
-    /// route's [`RouteRetryConfig`]. Routes that inherit a vhost policy share one
-    /// entry; a route whose `retry_on` the factory maps to no classifier has none.
-    retry: HashMap<usize, Arc<RetrySharedConfig>>,
-    /// Client of each cluster the route config references, keyed by cluster
-    /// name. Empty when the router provisions no cluster clients.
-    clusters: HashMap<String, ClusterRef>,
+    /// Index of the matched [`VirtualHostConfig`] for this channel's authority,
+    /// pre-selected when [`XdsConfig`] was assembled.
+    virtual_host_index: usize,
+    /// Pre-compiled retry policy for each route in the matched virtual host,
+    /// indexed by route position (`O(1)` lookup on the hot path). Routes that
+    /// inherit a virtual-host policy share one `Arc<RetrySharedConfig>`.
+    retry_policies: Vec<Option<Arc<RetrySharedConfig>>>,
+    /// Resolution outcome for each cluster the matched virtual host references,
+    /// keyed by cluster name: a provisioned [`ClusterRef`] when CDS + EDS
+    /// resolved, or the [`ClusterError`] surfaced when a route targets a failed
+    /// cluster. Empty when the router provisions no cluster clients.
+    clusters: HashMap<String, Result<ClusterRef, ClusterError>>,
 }
 
 impl RoutingSnapshot {
-    /// Compiles each distinct route retry config once, using `factory` to build
-    /// the transport classifier for each route's `retry_on`.
+    /// Compiles each distinct route retry config in the matched virtual host
+    /// once, using `factory` to build the transport classifier for `retry_on`.
     pub(crate) fn new(
         resource: Arc<RouteConfigResource>,
+        virtual_host_index: usize,
         factory: &dyn RetryClassifierFactory,
-        clusters: HashMap<String, ClusterRef>,
+        clusters: HashMap<String, Result<ClusterRef, ClusterError>>,
     ) -> Self {
-        let mut retry: HashMap<usize, Arc<RetrySharedConfig>> = HashMap::new();
-        for vhost in &resource.virtual_hosts {
-            for route in &vhost.routes {
-                if let Some(config) = &route.retry_config {
-                    let key = Arc::as_ptr(config) as usize;
-                    if let std::collections::hash_map::Entry::Vacant(entry) = retry.entry(key)
-                        && let Some(shared) = RetrySharedConfig::from_route_retry(config, factory)
-                    {
-                        entry.insert(Arc::new(shared));
-                    }
-                }
-            }
-        }
+        let mut compiled: HashMap<usize, Option<Arc<RetrySharedConfig>>> = HashMap::new();
+        let retry_policies = resource
+            .virtual_hosts
+            .get(virtual_host_index)
+            .map(|vhost| {
+                vhost
+                    .routes
+                    .iter()
+                    .map(|route| {
+                        let config = route.retry_config.as_ref()?;
+                        let key = Arc::as_ptr(config) as usize;
+                        compiled
+                            .entry(key)
+                            .or_insert_with(|| {
+                                RetrySharedConfig::from_route_retry(config, factory).map(Arc::new)
+                            })
+                            .clone()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             resource,
-            retry,
+            virtual_host_index,
+            retry_policies,
             clusters,
         }
     }
 
-    /// The client of `cluster_name`, if one is attached.
-    pub(crate) fn cluster(&self, cluster_name: &str) -> Option<&ClusterRef> {
-        self.clusters.get(cluster_name)
+    /// The pre-selected [`VirtualHostConfig`] for this channel's authority.
+    pub(crate) fn virtual_host(&self) -> Option<&VirtualHostConfig> {
+        self.resource.virtual_hosts.get(self.virtual_host_index)
     }
 
-    /// The compiled retry config for a route's [`RouteRetryConfig`], if any.
-    pub(crate) fn retry_for(
+    /// The compiled retry config for `route_idx` within [`Self::virtual_host`].
+    pub(crate) fn retry_policy(&self, route_idx: usize) -> Option<Arc<RetrySharedConfig>> {
+        self.retry_policies.get(route_idx).and_then(Clone::clone)
+    }
+
+    /// The resolution outcome for `cluster_name`, if the snapshot tracks clusters.
+    pub(crate) fn cluster_outcome(
         &self,
-        config: Option<&Arc<RouteRetryConfig>>,
-    ) -> Option<Arc<RetrySharedConfig>> {
-        config.and_then(|config| self.retry.get(&(Arc::as_ptr(config) as usize)).cloned())
+        cluster_name: &str,
+    ) -> Option<Result<&ClusterRef, &ClusterError>> {
+        self.clusters.get(cluster_name).map(Result::as_ref)
+    }
+
+    /// The healthy client of `cluster_name`, if one is attached.
+    #[cfg(test)]
+    pub(crate) fn cluster(&self, cluster_name: &str) -> Option<&ClusterRef> {
+        self.clusters.get(cluster_name)?.as_ref().ok()
+    }
+
+    /// Returns `true` when `self` already reflects `config`'s route resource,
+    /// matched virtual host, and per-cluster error entries (assuming healthy
+    /// `ClusterRef` handles did not change).
+    pub(crate) fn matches_config(&self, config: &XdsConfig) -> bool {
+        Arc::ptr_eq(&self.resource, &config.route_config)
+            && self.virtual_host_index == config.virtual_host_index
+            && self.clusters.len() == config.clusters.len()
+            && config
+                .clusters
+                .iter()
+                .all(|(name, res)| match (self.clusters.get(name), res) {
+                    (Some(Ok(_)), Ok(_)) => true,
+                    (Some(Err(a)), Err(b)) => a == b,
+                    _ => false,
+                })
     }
 }
 
@@ -159,12 +203,14 @@ impl Deref for RoutingSnapshot {
 
 /// A route config obtained in one step, to serve a single request with.
 ///
-/// Two cases so the common one -- a config is already in effect -- costs
-/// neither an allocation nor an await, while a request racing startup can still
-/// wait for the first config.
+/// Steady-state resolutions ([`Self::Ready`] and [`Self::Failed`]) cost neither
+/// an allocation nor an await, while a request racing startup can still wait
+/// for the first resolution.
 pub(crate) enum AcquiredConfig {
     /// A config is already in effect.
     Ready(Arc<RoutingSnapshot>),
+    /// Top-level xDS configuration failed (LDS or RDS resource error).
+    Failed(RoutingError),
     /// None has arrived yet; await this for the first one, bounded by an
     /// implementation-defined timeout.
     Pending(BoxFuture<Result<Arc<RoutingSnapshot>, RoutingError>>),
@@ -175,6 +221,7 @@ impl AcquiredConfig {
     pub(crate) async fn get(self) -> Result<Arc<RoutingSnapshot>, RoutingError> {
         match self {
             Self::Ready(config) => Ok(config),
+            Self::Failed(err) => Err(err),
             Self::Pending(wait) => wait.await,
         }
     }
@@ -391,7 +438,7 @@ mod tests {
         }
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(Arc::new(RouteConfigResource {
+        cache.publish_route_config_for_test(Arc::new(RouteConfigResource {
             name: "rc".into(),
             virtual_hosts: vec![VirtualHostConfig {
                 name: "vh".into(),
@@ -507,7 +554,7 @@ mod tests {
 
         let mut filter_metadata = std::collections::HashMap::new();
         filter_metadata.insert("partition".to_string(), bytes::Bytes::from_static(b"7"));
-        cache.update_route_config(Arc::new(RouteConfigResource {
+        cache.publish_route_config_for_test(Arc::new(RouteConfigResource {
             name: "rc".into(),
             virtual_hosts: vec![VirtualHostConfig {
                 name: "vh".into(),
@@ -699,7 +746,7 @@ mod tests {
         });
 
         let cache = Arc::new(XdsCache::new());
-        cache.update_route_config(Arc::new(RouteConfigResource {
+        cache.publish_route_config_for_test(Arc::new(RouteConfigResource {
             name: "rc".into(),
             virtual_hosts: vec![VirtualHostConfig {
                 name: "vh".into(),

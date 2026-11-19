@@ -58,8 +58,9 @@ pub(crate) struct XdsConfig {
     /// authority. Kept as an index so it can safely refer into the immutable
     /// `route_config` without a self-referential borrow.
     virtual_host_index: usize,
-    /// Every cluster transitively reachable from [`Self::virtual_host`], keyed
-    /// by cluster name. Includes aggregate clusters' descendants.
+    /// Every cluster transitively reachable from [`Self::virtual_host`] or
+    /// held by a dynamic cluster subscription, keyed by cluster name. Includes
+    /// aggregate clusters' descendants.
     ///
     /// A cluster that failed to resolve (CDS/EDS validation failure, NACK,
     /// DNS lookup failure, cyclic aggregate reference, ...) is still present
@@ -100,6 +101,30 @@ impl XdsConfig {
             .virtual_hosts
             .get(self.virtual_host_index)
             .expect("XdsConfig constructor validates virtual_host_index")
+    }
+
+    /// Reports whether `self` and `other` carry the exact same resolved
+    /// resource allocations, selected virtual host, cluster outcomes, and
+    /// resolution notes.
+    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.listener, &other.listener)
+            && Arc::ptr_eq(&self.route_config, &other.route_config)
+            && self.virtual_host_index == other.virtual_host_index
+            && self.clusters.len() == other.clusters.len()
+            && self.clusters.iter().all(|(name, result)| {
+                other
+                    .clusters
+                    .get(name)
+                    .is_some_and(|other_result| same_cluster_result(result, other_result))
+            })
+    }
+}
+
+fn same_cluster_result(a: &ClusterResult, b: &ClusterResult) -> bool {
+    match (a, b) {
+        (Ok(a), Ok(b)) => a.same_snapshot(b),
+        (Err(a), Err(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -145,6 +170,12 @@ pub(crate) struct ClusterConfig {
     pub(crate) children: ClusterChildren,
 }
 
+impl ClusterConfig {
+    fn same_snapshot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cluster, &other.cluster) && self.children.same_snapshot(&other.children)
+    }
+}
+
 /// A cluster's dynamically resolved children.
 #[derive(Debug, Clone)]
 pub(crate) enum ClusterChildren {
@@ -155,8 +186,18 @@ pub(crate) enum ClusterChildren {
     Aggregate(AggregateClusters),
 }
 
+impl ClusterChildren {
+    fn same_snapshot(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Leaf(a), Self::Leaf(b)) => a.same_snapshot(b),
+            (Self::Aggregate(a), Self::Aggregate(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Resolved aggregate-cluster dependencies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct AggregateClusters {
     pub(crate) leaf_clusters: Vec<String>,
@@ -178,6 +219,23 @@ pub(crate) struct LeafEndpoints {
     /// Unlike the `Err` side of [`ClusterResult`], a note does not mean the
     /// cluster failed: `source` may still hold stale but valid endpoints.
     pub(crate) resolution_note: Option<Arc<str>>,
+}
+
+impl LeafEndpoints {
+    fn same_snapshot(&self, other: &Self) -> bool {
+        self.resolution_note == other.resolution_note
+            && match (&self.source, &other.source) {
+                (None, None) => true,
+                (Some(LeafEndpointSource::Eds(a)), Some(LeafEndpointSource::Eds(b))) => {
+                    Arc::ptr_eq(a, b)
+                }
+                (
+                    Some(LeafEndpointSource::LogicalDns(a)),
+                    Some(LeafEndpointSource::LogicalDns(b)),
+                ) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
 }
 
 /// The origin of a leaf cluster's endpoints.
@@ -271,5 +329,70 @@ mod tests {
             route_source: RouteSource::Rds("other-routes".into()),
         });
         assert!(XdsConfig::try_new(listener, route_config, 0, HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn same_snapshot_compares_resource_allocations_and_notes() {
+        use crate::resource::ClusterDiscovery;
+
+        let routes = route_config();
+        let listener = inline_listener(Arc::clone(&routes));
+        let cluster = Arc::new(ClusterResource {
+            name: "a".into(),
+            discovery: ClusterDiscovery::Eds {
+                eds_service_name: "a-eds".into(),
+            },
+        });
+        let endpoints = Arc::new(EndpointsResource {
+            cluster_name: "a-eds".into(),
+            localities: Vec::new(),
+        });
+        let make_leaf = |endpoints: &Arc<EndpointsResource>, note: Option<&str>| {
+            Arc::new(ClusterConfig {
+                cluster: Arc::clone(&cluster),
+                children: ClusterChildren::Leaf(LeafEndpoints {
+                    source: Some(LeafEndpointSource::Eds(Arc::clone(endpoints))),
+                    resolution_note: note.map(Arc::from),
+                }),
+            })
+        };
+
+        let first = XdsConfig::try_new(
+            Arc::clone(&listener),
+            Arc::clone(&routes),
+            0,
+            HashMap::from([("a".into(), Ok(make_leaf(&endpoints, Some("note-1"))))]),
+        )
+        .unwrap();
+        let identical = XdsConfig::try_new(
+            Arc::clone(&listener),
+            Arc::clone(&routes),
+            0,
+            HashMap::from([("a".into(), Ok(make_leaf(&endpoints, Some("note-1"))))]),
+        )
+        .unwrap();
+        assert!(first.same_snapshot(&identical));
+
+        let different_note = XdsConfig::try_new(
+            Arc::clone(&listener),
+            Arc::clone(&routes),
+            0,
+            HashMap::from([("a".into(), Ok(make_leaf(&endpoints, Some("note-2"))))]),
+        )
+        .unwrap();
+        assert!(!first.same_snapshot(&different_note));
+
+        let fresh_endpoints = Arc::new(EndpointsResource {
+            cluster_name: "a-eds".into(),
+            localities: Vec::new(),
+        });
+        let different_endpoints_arc = XdsConfig::try_new(
+            Arc::clone(&listener),
+            Arc::clone(&routes),
+            0,
+            HashMap::from([("a".into(), Ok(make_leaf(&fresh_endpoints, Some("note-1"))))]),
+        )
+        .unwrap();
+        assert!(!first.same_snapshot(&different_endpoints_arc));
     }
 }

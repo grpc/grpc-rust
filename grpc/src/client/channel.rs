@@ -88,7 +88,6 @@ use crate::client::subchannel::NopBackoff;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
-#[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
 use crate::core::RecvMessage;
@@ -869,7 +868,6 @@ fn setup_registeries() {
     name_resolution::unix::reg();
     #[cfg(target_os = "linux")]
     name_resolution::unix_abstract::reg();
-    #[cfg(feature = "_runtime-tokio")]
     tonic_transport::reg();
 }
 

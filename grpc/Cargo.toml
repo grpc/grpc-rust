@@ -33,18 +33,12 @@ default = ["dns", "_runtime-tokio"]
 dns = ["dep:hickory-resolver", "_runtime-tokio"]
 # The following feature is used to ensure all modules use the runtime
 # abstraction instead of using tokio directly.
-# Using tower/buffer enables tokio's rt feature even though it's possible to
-# create Buffers with a user provided executor.
 _runtime-tokio = [
     "tokio/rt",
     "tokio/net",
     "tokio/time",
     "dep:socket2",
-    "dep:tower",
 ]
-# Used for testing with udeps as it wants this feature to exist
-# to be able to do its checks.
-tower = ["_runtime-tokio"]
 __unstable = []
 __internal = []
 __internal-test-utils = []
@@ -77,12 +71,6 @@ tonic = { version = "0.14.9", path = "../tonic", default-features = false, featu
     "codegen",
     "h2",
 ] }
-tower = { version = "0.5.2", features = [
-    "limit",
-    "util",
-    "buffer",
-], optional = true }
-tower-service = "0.3.3"
 trait-variant = "0.1.2"
 url = "2.5.0"
 

@@ -31,8 +31,8 @@ use crate::private::SealedToken;
 use crate::rt::EndpointListener;
 use crate::rt::GrpcRuntime;
 use crate::rt::UnixSocketOptions;
-use crate::rt::address::ListenerAddress;
 use crate::server::Listener;
+use crate::server::ListenerAddress;
 use crate::server::http2_config::Http2Config;
 
 use super::connection::HyperTransport;
@@ -135,10 +135,10 @@ mod tests {
     use crate::rt::EndpointListener;
     use crate::rt::TcpOptions;
     use crate::rt::UnixSocketOptions;
-    use crate::rt::address::ListenerAddress;
-    use crate::rt::address::TcpAddress;
     use crate::rt::default_runtime;
     use crate::server::Listener;
+    use crate::server::ListenerAddress;
+    use crate::server::TcpAddress;
     use crate::server::http2_config::Http2Config;
 
     const FAKE_ACCEPT_ERROR: &str = "fake accept error";

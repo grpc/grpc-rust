@@ -31,13 +31,14 @@ use tokio::net::UnixStream;
 use tokio::net::unix::SocketAddr;
 
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
+use crate::private::UnstableToken;
 use crate::rt::EndpointListener;
 use crate::rt::GrpcEndpoint;
 use crate::rt::StreamEndpoint;
-use crate::rt::address::ListenerAddress;
-use crate::rt::address::UnixListenerAddress;
 use crate::rt::tokio::TOKIO_ACCEPT_RETRY_POLICY;
 use crate::rt::tokio::accept_with_retry;
+use crate::server::ListenerAddress;
+use crate::server::UnixListenerAddress;
 
 /// Connects to the Unix socket at `path`.
 pub async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, String> {
@@ -51,7 +52,7 @@ pub async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, String> {
 pub fn bind(path: PathBuf) -> Result<Box<dyn EndpointListener>, String> {
     let listener = UnixListener::bind(&path).map_err(|e| e.to_string())?;
     let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let local_addr = UnixListenerAddress::new(address_string(&local_addr));
+    let local_addr = UnixListenerAddress::new(address_string(&local_addr), UnstableToken);
     Ok(Box::new(TokioUnixListener {
         listener,
         local_addr,

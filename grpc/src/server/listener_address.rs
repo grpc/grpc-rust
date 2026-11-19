@@ -25,12 +25,14 @@
 use std::any::Any;
 use std::fmt;
 
+use crate::private::UnstableToken;
+
 /// The address a [`Listener`](super::Listener) is bound to.
 ///
-/// All implementations provide a human-readable string via [`Display`].
+/// All implementations provide a human-readable string via [`Display`](std::fmt::Display).
 /// Callers needing structured data (e.g. `TcpAddress` or `std::net::SocketAddr`) can
 /// downcast via stable trait upcasting coercion (`let any: &dyn Any = addr;`)
-/// and [`downcast_ref`](Any::downcast_ref).
+/// and [`downcast_ref`](std::any::Any#method.downcast_ref).
 ///
 /// This is analogous to Go's `net.Addr` interface.
 pub trait ListenerAddress: fmt::Debug + Any + Send + Sync + 'static {
@@ -59,18 +61,18 @@ impl ListenerAddress for TcpAddress {
 
 /// Address for a Unix socket listener.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UnixListenerAddress {
+pub struct UnixListenerAddress {
     path: String,
 }
 
 impl UnixListenerAddress {
     /// Creates a new Unix listener address.
-    pub(crate) fn new(path: String) -> Self {
+    pub fn new(path: String, _: UnstableToken) -> Self {
         Self { path }
     }
 
     /// Returns the socket path.
-    pub(crate) fn path(&self) -> &str {
+    pub fn path(&self) -> &str {
         &self.path
     }
 }
@@ -119,25 +121,25 @@ mod tests {
 
     #[test]
     fn unix_address_path() {
-        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string());
+        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string(), UnstableToken);
         assert_eq!(addr.path(), "/tmp/grpc.sock");
     }
 
     #[test]
     fn unix_address_network_is_unix() {
-        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string());
+        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string(), UnstableToken);
         assert_eq!(addr.network(), "unix");
     }
 
     #[test]
     fn unix_address_debug_contains_path() {
-        let addr = UnixListenerAddress::new("/var/run/server.sock".to_string());
+        let addr = UnixListenerAddress::new("/var/run/server.sock".to_string(), UnstableToken);
         assert!(format!("{addr:?}").contains("/var/run/server.sock"));
     }
 
     #[test]
     fn unix_address_downcast_via_any_supertrait() {
-        let addr = UnixListenerAddress::new("/tmp/test.sock".to_string());
+        let addr = UnixListenerAddress::new("/tmp/test.sock".to_string(), UnstableToken);
         let trait_obj: &dyn ListenerAddress = &addr;
         let any_ref: &dyn Any = trait_obj;
         let downcasted = any_ref

@@ -61,13 +61,13 @@ use crate::metadata::AsciiMetadataValue;
 use crate::metadata::MetadataMap;
 use crate::private::SealedToken;
 use crate::rt::GrpcRuntime;
-use crate::rt::address::ListenerAddress;
 use crate::send_future::SendFuture;
 
 pub mod builder;
 pub mod descriptor;
 pub(crate) mod http2_config;
 pub mod interceptor;
+mod listener_address;
 pub(crate) mod router;
 pub mod service;
 pub(crate) mod transport;
@@ -75,6 +75,9 @@ pub(crate) mod transport;
 use builder::ServerBuilder;
 pub use http2_config::Http2Config;
 use interceptor::Identity;
+pub use listener_address::ListenerAddress;
+pub use listener_address::TcpAddress;
+pub use listener_address::UnixListenerAddress;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -725,7 +728,7 @@ mod tests {
     use crate::core::test_connection_info;
     use crate::credentials::LocalServerCredentials;
     use crate::credentials::ServerCredentials;
-    use crate::rt::address::TcpAddress;
+    use crate::server::TcpAddress;
     /// A mock connection with one RPC in flight. It finishes only when the test
     /// sends on its finish sender, even after [`graceful_shutdown`], which it
     /// reports on its shutdown receiver.

@@ -45,8 +45,8 @@ use crate::rt::Sleep;
 use crate::rt::StreamEndpoint;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
-use crate::rt::address::ListenerAddress;
-use crate::rt::address::TcpAddress;
+use crate::server::ListenerAddress;
+use crate::server::TcpAddress;
 
 #[cfg(feature = "dns")]
 mod hickory_resolver;

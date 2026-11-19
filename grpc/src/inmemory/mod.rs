@@ -111,7 +111,7 @@ struct InMemoryListenerAddress {
     id: String,
 }
 
-impl crate::rt::address::ListenerAddress for InMemoryListenerAddress {
+impl crate::server::ListenerAddress for InMemoryListenerAddress {
     fn network(&self) -> &str {
         "inmemory"
     }
@@ -198,7 +198,7 @@ impl Listener for InMemoryListener {
         }
     }
 
-    fn local_addr(&self) -> &dyn crate::rt::address::ListenerAddress {
+    fn local_addr(&self) -> &dyn crate::server::ListenerAddress {
         &self.inner.addr
     }
 }

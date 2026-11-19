@@ -1143,6 +1143,103 @@ mod test {
         env.expect_no_events();
     }
 
+    // When an update removes the selected address, the policy starts a new
+    // first pass from the start of the new list and reports CONNECTING.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_without_selected_address_starts_first_pass() {
+        let mut env = new_env();
+
+        // Select addr2, so the old pass ended past the start of the list.
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::ready());
+        env.expect_ready_picker(&scs[1]);
+
+        // The update drops addr2. addr1 gets a new subchannel: its old one was
+        // discarded when addr2 was selected.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr3"]))
+            .unwrap();
+        env.expect_new_subchannels(&["addr1", "addr3"]);
+        // The new pass starts at the head of the new list, not where the old
+        // pass left off.
+        env.expect_connect_to("addr1");
+        // The policy reports CONNECTING rather than going IDLE.
+        env.expect_queuing_picker();
+        env.expect_no_events();
+    }
+
+    // When a resolver update arrives during the first pass, subchannels that
+    // already failed keep their TRANSIENT_FAILURE state, so the new pass skips
+    // them instead of attempting them again (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_preserves_subchannel_failure_state() {
+        let mut env = new_env();
+
+        // addr1 fails. The pass moves on to addr2.
+        env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+
+        // The new list keeps addr1, which already failed, and adds addr3.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr3"]))
+            .unwrap();
+        // addr1's subchannel is reused; only addr3 gets a new one.
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        // The new pass skips addr1, though it is first in the list.
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+
+        // When addr3 fails too, the pass is over.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+        // addr1 still counts as failed, so it is not retried. Had it been reset
+        // to IDLE, the end of the pass would connect it here.
+        env.expect_no_events();
+    }
+
+    // Updates from subchannels whose addresses were removed by a resolver
+    // update are ignored, both during the first pass and in steady state.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_removed_subchannel_updates() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2"]);
+
+        // Replace the address list with [addr3].
+        env.send_resolver_update(create_endpoints(&["addr3"]))
+            .unwrap();
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        env.expect_connect_to("addr3");
+
+        // In the first pass, READY from a removed subchannel does not select
+        // it.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // addr3 fails, ending the first pass.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+
+        // In steady state, a subchannel going IDLE is asked to connect, but
+        // not a removed one.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_no_events();
+        // With one address left, every failure in steady state requests
+        // re-resolution, but not a removed subchannel's failure.
+        env.send_subchannel_update(
+            &scs[1],
+            &SubchannelState::transient_failure("connection refused"),
+        );
+        env.expect_no_events();
+
+        // addr3 is still the only address in use.
+        env.send_subchannel_update(&sc3, &SubchannelState::idle());
+        env.expect_connect_to("addr3");
+        env.send_subchannel_update(&sc3, &SubchannelState::ready());
+        env.expect_ready_picker(&sc3);
+        env.expect_no_events();
+    }
+
     // If a resolver error is received while the LB is in the process of
     // connecting to addresses, it should not abort the connection attempt or
     // clear the existing addresses, as long as there are still valid addresses

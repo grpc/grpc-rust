@@ -22,11 +22,12 @@
  *
  */
 
-use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ClusterClientRegistry};
+use crate::client::cluster::{ClusterChannel, ClusterChannelFactory};
 use crate::client::route::RouteDecision;
 use crate::common::async_util::BoxFuture;
 use http::Request;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -52,45 +53,30 @@ pub(crate) trait ClusterDiscovery<Endpoint, S>: Send + Sync + 'static {
 pub(crate) enum LoadBalancingError {
     #[error("No routing decision extension from the routing layer available")]
     NoRoutingDecision,
+    /// The routing decision carries no client for its cluster. The xDS router
+    /// attaches one for every cluster in the route config, so this indicates a
+    /// router that provisions no clients.
+    #[error("routing decision carries no client for cluster '{0}'")]
+    NoClusterClient(String),
 }
 
-/// A Tower Service that performs load balancing based on routing decisions.
-pub(crate) struct XdsLbService<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
-    cluster_registry: Arc<ClusterClientRegistry<Req, Resp>>,
-    cluster_factory: Arc<dyn ClusterChannelFactory<Req, Resp>>,
+/// A Tower Service that sends each request to the cluster client carried by its
+/// [`RouteDecision`].
+pub(crate) struct XdsLbService<Req, Resp> {
+    _types: PhantomData<fn(Req) -> Resp>,
 }
 
-impl<Req, Resp> XdsLbService<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
-    /// Creates a new `XdsLbService` with the given cluster client registry and cluster factory.
-    pub(crate) fn new(
-        cluster_registry: Arc<ClusterClientRegistry<Req, Resp>>,
-        cluster_factory: Arc<dyn ClusterChannelFactory<Req, Resp>>,
-    ) -> Self {
+impl<Req, Resp> XdsLbService<Req, Resp> {
+    pub(crate) fn new() -> Self {
         Self {
-            cluster_registry,
-            cluster_factory,
+            _types: PhantomData,
         }
     }
 }
 
-impl<Req, Resp> Clone for XdsLbService<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
+impl<Req, Resp> Clone for XdsLbService<Req, Resp> {
     fn clone(&self) -> Self {
-        Self {
-            cluster_registry: self.cluster_registry.clone(),
-            cluster_factory: self.cluster_factory.clone(),
-        }
+        Self::new()
     }
 }
 
@@ -110,20 +96,22 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<B>) -> Self::Future {
-        // Extract the routing decision from the request extensions.
-        let Some(routing_decision) = request.extensions().get::<RouteDecision>().cloned() else {
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        let Some(decision) = request.extensions_mut().get_mut::<RouteDecision>() else {
             return Box::pin(async move { Err(LoadBalancingError::NoRoutingDecision.into()) });
         };
+        // Taken rather than cloned so the request, once queued in the cluster's
+        // channel, does not keep that channel's client alive. Each retry attempt
+        // starts from the retry layer's copy of the request, which still has it.
+        let cluster_ref = decision.cluster_ref.take();
+        let Some(cluster_client) = cluster_ref
+            .as_ref()
+            .and_then(|cluster| cluster.client::<Request<B>, Resp>())
+        else {
+            let err = LoadBalancingError::NoClusterClient(decision.cluster.clone());
+            return Box::pin(async move { Err(err.into()) });
+        };
 
-        // Get or create the cluster client for the target xDS cluster.
-        let cluster_client = self
-            .cluster_registry
-            .get_cluster(&routing_decision.cluster, || {
-                self.cluster_factory.make(&routing_decision.cluster)
-            });
-
-        // Get the transport channel for the target xDS cluster.
         // The actual load-balancing will be performed by the cluster's balancer.
         let mut channel = cluster_client.channel();
 

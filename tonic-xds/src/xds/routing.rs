@@ -37,16 +37,19 @@
 //! Within each category, the most specific (longest non-wildcard part) wins.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use tokio::sync::watch;
 
-use crate::client::retry::{GrpcRetryClassifierFactory, RetryClassifierFactory};
+use crate::client::cluster::ClusterRef;
+use crate::client::retry::RetryClassifierFactory;
 use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
 use crate::common::async_util::AbortOnDrop;
-use crate::xds::cache::XdsCache;
+use crate::xds::cache::{CacheWatch, XdsCache};
 use crate::xds::resource::hash_policy::HashPolicyConfig;
 use crate::xds::resource::route_config::{
     HeaderMatchSpecifierConfig, HeaderMatcherConfig, PathSpecifierConfig, RouteConfig,
@@ -55,56 +58,62 @@ use crate::xds::resource::route_config::{
 use crate::xds::resource::string_matcher::{
     ends_with_ignore_ascii_case, starts_with_ignore_ascii_case,
 };
+use crate::xds::resource::{ClusterResource, EndpointsResource};
 
-/// Default timeout for waiting for the initial route config (matches gRFC A57
-/// resource initial timeout).
-const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for waiting for the initial route config on cold start.
+pub(crate) const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// xDS-backed [`Router`] that resolves requests to cluster names.
+/// xDS-backed [`Router`] that resolves requests to clusters.
 ///
 /// Subscribes to route config changes from [`XdsCache`] via a background watch task
 /// and maintains a shared [`ArcSwapOption`] for lock-free reads on the hot path.
 /// The watch task is aborted when the router is dropped.
 ///
-/// The first RPC blocks (up to [`DEFAULT_READY_TIMEOUT`]) until the initial route
-/// config is available, matching standard gRPC behavior where RPCs wait for the
-/// resolver's first update. Subsequent RPCs read the config lock-free.
+/// The watch task also owns a client for each cluster the route config
+/// references (see [`ClusterSet`]). Each [`RouteDecision`] carries the client of
+/// its cluster.
+///
+/// The first RPC blocks (up to `ready_timeout`, defaulting to
+/// [`DEFAULT_READY_TIMEOUT`], or without an internal timeout when `None`) until
+/// the initial route config is available, matching standard gRPC behavior where
+/// RPCs wait for the resolver's first update. Subsequent RPCs read the config
+/// lock-free.
 pub(crate) struct XdsRouter {
     route_config: Arc<ArcSwapOption<RoutingSnapshot>>,
     ready_rx: watch::Receiver<bool>,
+    ready_timeout: Option<Duration>,
     _watch_task: AbortOnDrop,
 }
 
 impl XdsRouter {
-    /// Creates a new `XdsRouter` that watches route config from the given cache,
-    /// compiling per-route retry policies with the default
-    /// [`GrpcRetryClassifierFactory`].
+    /// Creates a router that watches route config from `cache`, calling
+    /// `provision` to build a client for each cluster the route config
+    /// references. `retry_factory` compiles per-route retry policies, letting a
+    /// non-gRPC transport interpret `retry_on` for that transport.
     ///
     /// Spawns a background task that updates the local route config whenever
     /// the cache publishes a new one. The task is aborted when this router
     /// is dropped.
-    pub(crate) fn new(cache: &XdsCache) -> Self {
-        Self::with_retry_factory(cache, Arc::new(GrpcRetryClassifierFactory))
-    }
-
-    /// Like [`new`](Self::new) but compiles per-route retry policies with a custom
-    /// [`RetryClassifierFactory`], letting a non-gRPC transport interpret
-    /// `retry_on` for that transport.
-    pub(crate) fn with_retry_factory(
-        cache: &XdsCache,
+    pub(crate) fn new<F>(
+        cache: Arc<XdsCache>,
         retry_factory: Arc<dyn RetryClassifierFactory>,
-    ) -> Self {
+        ready_timeout: Option<Duration>,
+        provision: F,
+    ) -> Self
+    where
+        F: FnMut(&str) -> ClusterRef + Send + 'static,
+    {
         let route_config = Arc::new(ArcSwapOption::empty());
         let (ready_tx, ready_rx) = watch::channel(false);
         let rc = route_config.clone();
         let mut watcher = cache.watch_route_config();
+        let mut clusters = ClusterSet::new(cache, provision);
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
-                rc.store(Some(Arc::new(RoutingSnapshot::new(
-                    config,
-                    retry_factory.as_ref(),
-                ))));
+                let refs = clusters.reconcile(&config);
+                let snapshot = RoutingSnapshot::new(config, retry_factory.as_ref(), refs);
+                rc.store(Some(Arc::new(snapshot)));
                 // Signal readiness on the first config, then drop the sender.
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(true);
@@ -114,6 +123,7 @@ impl XdsRouter {
         Self {
             route_config,
             ready_rx,
+            ready_timeout,
             _watch_task: AbortOnDrop(handle),
         }
     }
@@ -121,6 +131,86 @@ impl XdsRouter {
     /// The route config currently in effect, or `None` if none has arrived yet.
     pub(crate) fn snapshot(&self) -> Option<Arc<RoutingSnapshot>> {
         self.route_config.load_full()
+    }
+}
+
+/// The clients of the clusters the active route config references.
+///
+/// The router's watch task reconciles this set against each route config before
+/// publishing that config. A cluster gets a client when a route config starts
+/// referencing it, and the set drops the client when a route config stops
+/// referencing it. Requests already routed to a dropped client keep it alive
+/// until they complete.
+struct ClusterSet<F> {
+    cache: Arc<XdsCache>,
+    provision: F,
+    clusters: HashMap<String, OwnedCluster>,
+}
+
+struct OwnedCluster {
+    cluster: ClusterRef,
+    /// Watch the cache entries that the client was built against.
+    ///
+    /// The resource manager removes a cluster's cache entries when the cluster
+    /// leaves its route config, which ends the client's discovery. If the router
+    /// never saw a route config without the cluster (the removal and re-add
+    /// coalesced into one update), one of these watches closing is how it learns
+    /// that the client is stale. Both are checked because the two entries are
+    /// removed one after the other, so a client built in between reads a new
+    /// cluster entry but a removed endpoints entry.
+    cluster_entry: CacheWatch<ClusterResource>,
+    endpoints_entry: CacheWatch<EndpointsResource>,
+}
+
+impl OwnedCluster {
+    fn is_stale(&self) -> bool {
+        self.cluster_entry.is_closed() || self.endpoints_entry.is_closed()
+    }
+}
+
+impl<F> ClusterSet<F>
+where
+    F: FnMut(&str) -> ClusterRef,
+{
+    fn new(cache: Arc<XdsCache>, provision: F) -> Self {
+        Self {
+            cache,
+            provision,
+            clusters: HashMap::new(),
+        }
+    }
+
+    /// Brings the set in line with `config`, and returns the client of each
+    /// cluster it references.
+    fn reconcile(&mut self, config: &RouteConfigResource) -> HashMap<String, ClusterRef> {
+        let referenced = config.cluster_names();
+        self.clusters
+            .retain(|name, owned| referenced.contains(name) && !owned.is_stale());
+        for name in referenced {
+            if let Entry::Vacant(entry) = self.clusters.entry(name) {
+                // Watch before building, so a removal that races the build closes
+                // a watch and the next route config rebuilds the client.
+                //
+                // TODO: If this task lags and reconciles a superseded
+                // RouteConfig after XdsResourceManager already removed
+                // `entry.key()`, `watch_*` will re-insert an empty `None` entry
+                // into `XdsCache` (all tasks/channels still drop on the next
+                // config). Eliminate consumer `XdsCache` lookups with atomic
+                // config snapshots in gRFC A74.
+                let cluster_entry = self.cache.watch_cluster(entry.key());
+                let endpoints_entry = self.cache.watch_endpoints(entry.key());
+                let cluster = (self.provision)(entry.key());
+                entry.insert(OwnedCluster {
+                    cluster,
+                    cluster_entry,
+                    endpoints_entry,
+                });
+            }
+        }
+        self.clusters
+            .iter()
+            .map(|(name, owned)| (name.clone(), owned.cluster.clone()))
+            .collect()
     }
 }
 
@@ -133,11 +223,22 @@ impl Router for XdsRouter {
         // where RPCs block until the resolver provides the first update.
         let route_config_ref = self.route_config.clone();
         let mut ready_rx = self.ready_rx.clone();
+        let ready_timeout = self.ready_timeout;
         AcquiredConfig::Pending(Box::pin(async move {
-            tokio::time::timeout(DEFAULT_READY_TIMEOUT, ready_rx.wait_for(|ready| *ready))
-                .await
-                .map_err(|_| RoutingError::NotReady)?
-                .map_err(|_| RoutingError::NotReady)?;
+            match ready_timeout {
+                Some(timeout) => {
+                    tokio::time::timeout(timeout, ready_rx.wait_for(|ready| *ready))
+                        .await
+                        .map_err(|_| RoutingError::NotReady)?
+                        .map_err(|_| RoutingError::NotReady)?;
+                }
+                None => {
+                    ready_rx
+                        .wait_for(|ready| *ready)
+                        .await
+                        .map_err(|_| RoutingError::NotReady)?;
+                }
+            }
             route_config_ref.load_full().ok_or(RoutingError::NotReady)
         }))
     }
@@ -183,6 +284,7 @@ fn resolve_route(
     let request_hash = HashPolicyConfig::request_hash(headers, policies);
 
     Ok(RouteDecision {
+        cluster_ref: rc.cluster(&cluster).cloned(),
         cluster,
         request_hash,
         retry_config,
@@ -419,6 +521,7 @@ fn match_header(hm: &HeaderMatcherConfig, headers: &http::HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::retry::GrpcRetryClassifierFactory;
     use crate::xds::cache::XdsCache;
     use crate::xds::resource::route_config::{
         RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
@@ -1175,10 +1278,10 @@ mod tests {
 
     #[tokio::test]
     async fn xds_router_routes_to_correct_cluster() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         cache.update_route_config(make_route_config("my-cluster"));
 
-        let router = XdsRouter::new(&cache);
+        let router = XdsRouter::for_test(&cache);
         tokio::task::yield_now().await; // let watch task propagate
 
         let headers = http::HeaderMap::new();
@@ -1194,10 +1297,10 @@ mod tests {
 
     #[tokio::test]
     async fn xds_router_updates_on_config_change() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         cache.update_route_config(make_route_config("cluster-a"));
 
-        let router = XdsRouter::new(&cache);
+        let router = XdsRouter::for_test(&cache);
         tokio::task::yield_now().await;
 
         let headers = http::HeaderMap::new();
@@ -1219,10 +1322,149 @@ mod tests {
         assert_eq!(decision.cluster, "cluster-b");
     }
 
+    /// Builds a no-op cluster client handle for routing tests.
+    fn noop_cluster_client(cluster_name: &str) -> ClusterRef {
+        use crate::client::cluster::ClusterChannel;
+        use crate::common::async_util::BoxFuture;
+
+        let svc = tower::service_fn(|_: ()| -> BoxFuture<Result<(), tower::BoxError>> {
+            Box::pin(async { Ok(()) })
+        });
+        ClusterRef::from_channel(cluster_name, ClusterChannel::from_service(svc))
+    }
+
+    /// Returns a provisioning closure that records each cluster it builds a
+    /// (no-op) client for.
+    fn recording_provisioner() -> (
+        impl FnMut(&str) -> ClusterRef + Send + 'static,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let provisioned = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = provisioned.clone();
+        let provision = move |cluster_name: &str| {
+            recorded.lock().unwrap().push(cluster_name.to_string());
+            noop_cluster_client(cluster_name)
+        };
+        (provision, provisioned)
+    }
+
+    fn router_with_clusters(
+        cache: &Arc<XdsCache>,
+    ) -> (XdsRouter, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (provision, provisioned) = recording_provisioner();
+        let router = XdsRouter::new(
+            cache.clone(),
+            Arc::new(GrpcRetryClassifierFactory),
+            Some(DEFAULT_READY_TIMEOUT),
+            provision,
+        );
+        (router, provisioned)
+    }
+
+    impl XdsRouter {
+        /// A router for tests that only check route matching: it compiles gRPC
+        /// retry policies, and its cluster clients are no-ops.
+        pub(crate) fn for_test(cache: &Arc<XdsCache>) -> Self {
+            Self::new(
+                cache.clone(),
+                Arc::new(GrpcRetryClassifierFactory),
+                Some(DEFAULT_READY_TIMEOUT),
+                noop_cluster_client,
+            )
+        }
+    }
+
+    /// Routes a request and returns the cluster client its decision carries.
+    fn routed_client(router: &XdsRouter) -> ClusterRef {
+        let headers = http::HeaderMap::new();
+        let input = RouteInput {
+            authority: "svc",
+            path: "/",
+            headers: &headers,
+        };
+        let config = router.snapshot().expect("config");
+        let decision = router.route(&input, &config).unwrap();
+        let client = decision.cluster_ref.expect("decision carries a client");
+        assert!(client.same_client(config.cluster(&decision.cluster).unwrap()));
+        client
+    }
+
+    #[tokio::test]
+    async fn xds_router_owns_clients_of_referenced_clusters() {
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_route_config("cluster-a"));
+        let (router, provisioned) = router_with_clusters(&cache);
+        tokio::task::yield_now().await;
+        let first_a = routed_client(&router);
+
+        // A new route config that still references the cluster keeps its client.
+        cache.update_route_config(make_route_config("cluster-a"));
+        tokio::task::yield_now().await;
+        assert!(routed_client(&router).same_client(&first_a));
+
+        // A route config that stops referencing the cluster drops its client.
+        cache.update_route_config(make_route_config("cluster-b"));
+        tokio::task::yield_now().await;
+        routed_client(&router);
+        let config = router.snapshot().unwrap();
+        assert!(config.cluster("cluster-a").is_none());
+
+        // Re-adding the cluster builds a fresh client.
+        cache.update_route_config(make_route_config("cluster-a"));
+        tokio::task::yield_now().await;
+        assert!(!routed_client(&router).same_client(&first_a));
+        assert!(router.snapshot().unwrap().cluster("cluster-b").is_none());
+
+        assert_eq!(
+            *provisioned.lock().unwrap(),
+            ["cluster-a", "cluster-b", "cluster-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn xds_router_rebuilds_client_when_cache_entry_is_removed() {
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_route_config("cluster-a"));
+        let (router, provisioned) = router_with_clusters(&cache);
+        tokio::task::yield_now().await;
+        let first = routed_client(&router);
+
+        // The cluster leaves and rejoins the route config before the router
+        // wakes, so it only sees the second config. The removed cache entry
+        // still marks the old client as stale.
+        cache.update_route_config(make_route_config("cluster-b"));
+        cache.remove_cluster("cluster-a");
+        cache.update_route_config(make_route_config("cluster-a"));
+        tokio::task::yield_now().await;
+
+        assert!(!routed_client(&router).same_client(&first));
+        assert_eq!(*provisioned.lock().unwrap(), ["cluster-a", "cluster-a"]);
+    }
+
+    /// The resource manager removes a cluster's cache entries one after the
+    /// other. A client built between the two removals reads a new cluster entry
+    /// but the removed endpoints entry, so it must be rebuilt as well.
+    #[tokio::test]
+    async fn cluster_set_rebuilds_client_built_between_entry_removals() {
+        let cache = Arc::new(XdsCache::new());
+        let (provision, provisioned) = recording_provisioner();
+        let mut clusters = ClusterSet::new(cache.clone(), provision);
+        let config = make_route_config("cluster-a");
+
+        cache.remove_cluster("cluster-a");
+        let first = clusters.reconcile(&config)["cluster-a"].clone();
+        cache.remove_endpoints("cluster-a");
+
+        // The cluster rejoins, and the router sees only the new route config.
+        let second = clusters.reconcile(&config)["cluster-a"].clone();
+        assert!(!second.same_client(&first));
+        assert_eq!(*provisioned.lock().unwrap(), ["cluster-a", "cluster-a"]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn xds_router_returns_not_ready_without_config() {
-        let cache = XdsCache::new();
-        let router = XdsRouter::new(&cache);
+        let cache = Arc::new(XdsCache::new());
+        let router = XdsRouter::for_test(&cache);
 
         // With no config yet, `acquire` yields the waiting variant, which
         // blocks and then reports NotReady.
@@ -1243,6 +1485,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn xds_router_respects_custom_ready_timeout() {
+        let cache = Arc::new(XdsCache::new());
+        let custom_timeout = Duration::from_secs(2);
+        let router = XdsRouter::new(
+            cache,
+            Arc::new(GrpcRetryClassifierFactory),
+            Some(custom_timeout),
+            noop_cluster_client,
+        );
+
+        let start = tokio::time::Instant::now();
+        let result = router.acquire().get().await;
+
+        assert!(
+            matches!(result, Err(RoutingError::NotReady)),
+            "expected NotReady, got {result:?}",
+        );
+        assert_eq!(start.elapsed(), custom_timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xds_router_without_ready_timeout_waits_past_default_until_config_arrives() {
+        let cache = Arc::new(XdsCache::new());
+        let router = XdsRouter::new(
+            cache.clone(),
+            Arc::new(GrpcRetryClassifierFactory),
+            None,
+            noop_cluster_client,
+        );
+
+        let fut = router.acquire().get();
+        let mut fut = std::pin::pin!(fut);
+
+        // Advance well beyond DEFAULT_READY_TIMEOUT (30s): with ready_timeout = None,
+        // the router must remain pending until a route config arrives.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(120), &mut fut)
+                .await
+                .is_err(),
+            "acquire with None ready_timeout should not expire on its own",
+        );
+
+        cache.update_route_config(make_route_config("late-cluster"));
+
+        let snapshot = fut
+            .await
+            .expect("should resolve once route config arrives after >30s");
+        let headers = http::HeaderMap::new();
+        let input = RouteInput {
+            authority: "svc",
+            path: "/",
+            headers: &headers,
+        };
+        let decision = router.route(&input, &snapshot).unwrap();
+        assert_eq!(decision.cluster, "late-cluster");
+    }
+
     #[test]
     fn max_stream_duration_resolution() {
         // (route value, decision); zero means no limit.
@@ -1258,7 +1558,7 @@ mod tests {
                 domains: vec!["*".into()],
                 routes: vec![route],
             }]));
-            let snapshot = RoutingSnapshot::new(rc, &GrpcRetryClassifierFactory);
+            let snapshot = RoutingSnapshot::new(rc, &GrpcRetryClassifierFactory, HashMap::new());
             let decision = resolve_route(&snapshot, "svc", "/", &http::HeaderMap::new()).unwrap();
             assert_eq!(decision.max_stream_duration, want, "{route_msd:?}");
         }

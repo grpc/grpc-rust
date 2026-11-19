@@ -108,7 +108,7 @@ pub fn schedule_subchannel_update(subchannel: &Arc<dyn Subchannel>, state: Subch
         .work_scheduler
         .as_ref()
         .expect("subchannel has no work scheduler");
-    work_scheduler.schedule_work(Some(Box::new(SubchannelUpdate::new(
+    work_scheduler.schedule_work(Some(WorkData::new(SubchannelUpdate::new(
         subchannel.clone(),
         state,
     ))));
@@ -605,4 +605,10 @@ impl LbPolicyBuilder for StubPolicyBuilder {
 
 pub fn reg_stub_policy(name: &'static str, funcs: StubPolicyFuncs) {
     super::GLOBAL_LB_REGISTRY.add_dyn_builder(Arc::new(StubPolicyBuilder { name, funcs }));
+}
+
+/// Registers the LB policies that a channel registers by default, for tests
+/// that build policies without a channel.
+pub fn register_default_policies() {
+    super::register();
 }

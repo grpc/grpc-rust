@@ -45,6 +45,7 @@ use crate::client::RequestHeaders;
 use crate::client::boxed::BoxInvoker;
 use crate::client::boxed::BoxRecvStream;
 use crate::client::boxed::BoxSendStream;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
@@ -273,7 +274,9 @@ impl InternalSubchannelData {
 
         // Send the update directly to the subchannel's work scheduler.
         self.work_scheduler
-            .schedule_work(Some(Box::new(SubchannelUpdate::new(subchannel, state))));
+            .schedule_work(Some(WorkData::new(SubchannelUpdate::new(
+                subchannel, state,
+            ))));
     }
 }
 

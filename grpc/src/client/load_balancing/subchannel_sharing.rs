@@ -89,7 +89,7 @@ impl<T> SubchannelSharing<T> {
             let Some(ext_subchannel) = weak.upgrade() else {
                 continue;
             };
-            work_scheduler.schedule_work(Some(Box::new(SubchannelUpdate::new(
+            work_scheduler.schedule_work(Some(WorkData::new(SubchannelUpdate::new(
                 ext_subchannel,
                 update.state.clone(),
             ))));
@@ -172,7 +172,7 @@ impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
         // is only ever touched from the channel's work loop.
         let data = match data.map(|d| d.downcast::<SharingWork>()) {
             Some(Ok(work)) => {
-                return match *work {
+                return match work {
                     SharingWork::InternalUpdate(u) => self.deliver_subchannel_update(u),
                     SharingWork::Released(sc) => self.release_subchannel(&sc),
                 };
@@ -235,7 +235,9 @@ impl Drop for SharedSubchannel {
         // instead.  The cloned delegate identifies the entry to clean up, and
         // keeps the internal subchannel alive until that happens.
         self.work_scheduler
-            .schedule_work(Some(Box::new(SharingWork::Released(self.delegate.clone()))));
+            .schedule_work(Some(WorkData::new(SharingWork::Released(
+                self.delegate.clone(),
+            ))));
     }
 }
 
@@ -264,7 +266,7 @@ impl WorkScheduler for SubchannelUpdateForwarder {
             }
         };
         self.work_scheduler
-            .schedule_work(Some(Box::new(SharingWork::InternalUpdate(*update))));
+            .schedule_work(Some(WorkData::new(SharingWork::InternalUpdate(update))));
     }
 }
 
@@ -921,7 +923,7 @@ mod tests {
                 .send(TestEvent::NewSubchannel(subchannel.clone()))
                 .unwrap();
             // Report the initial state before returning.
-            work_scheduler.schedule_work(Some(Box::new(SubchannelUpdate::new(
+            work_scheduler.schedule_work(Some(WorkData::new(SubchannelUpdate::new(
                 subchannel.clone(),
                 SubchannelState::idle(),
             ))));

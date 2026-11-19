@@ -23,6 +23,7 @@
  */
 
 use hyper_util::rt::TokioIo;
+use tokio_stream::StreamExt;
 use tonic::{
     Request, Response, Status,
     transport::{Endpoint, Server, Uri},
@@ -42,13 +43,19 @@ use hello_world::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (client, server) = tokio::io::duplex(1024);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     let greeter = MyGreeter::default();
 
-    tokio::spawn(async move {
+    // The server shuts down when the incoming stream ends, so chain
+    // `pending()` to keep the stream open until `shutdown_tx` fires.
+    let server_task = tokio::spawn(async move {
         Server::builder()
             .add_service(GreeterServer::new(greeter))
-            .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server)))
+            .serve_with_incoming_shutdown(
+                tokio_stream::once(Ok::<_, std::io::Error>(server)).chain(tokio_stream::pending()),
+                async { drop(shutdown_rx.await) },
+            )
             .await
     });
 
@@ -78,6 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = client.say_hello(request).await?;
 
     println!("RESPONSE={response:?}");
+
+    shutdown_tx.send(()).unwrap();
+    server_task.await??;
 
     Ok(())
 }

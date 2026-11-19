@@ -81,6 +81,7 @@ use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
 use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
+use crate::client::stream_util::CompletionRecvStream;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::subchannel::InternalSubchannel;
 use crate::client::subchannel::NopBackoff;
@@ -504,14 +505,23 @@ impl Invoke for LbInvoker {
                 .picker
                 .pick(PickOptions::new(&headers, &options))
             {
-                PickResult::Pick(pr) => {
-                    if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
-                        return sc.invoke(headers, options).await;
-                    } else {
+                PickResult::Pick(mut pr) => {
+                    let on_complete = pr.on_complete.take();
+                    let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"
                         );
-                    }
+                    };
+                    let (tx, rx) = sc.invoke(headers, options).await;
+                    // Notify the LB policy when the RPC completes (or is
+                    // abandoned) so it can release any per-call state.
+                    let rx = match on_complete {
+                        Some(on_complete) => {
+                            BoxRecvStream::new(CompletionRecvStream::new(rx, on_complete))
+                        }
+                        None => rx,
+                    };
+                    return (tx, rx);
                 }
                 PickResult::Queue => {}
                 PickResult::Fail(status) => {

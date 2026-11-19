@@ -23,15 +23,13 @@
  */
 
 use crate::common::async_util::BoxFuture;
-use dashmap::DashMap;
-use http::{Request, Response};
+use std::any::Any;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::body::Body as TonicBody;
 use tower::{
     BoxError, Service, balance::p2c::Balance, buffer::Buffer, discover::Discover, load::Load,
 };
@@ -153,14 +151,12 @@ where
     }
 }
 
-/// Builds the load-balancing channel for a cluster, on first use.
+/// Builds the load-balancing channel for a cluster when the route config starts
+/// referencing it.
 ///
-/// The seam between the LB dispatch layer ([`XdsLbService`]) and the balancer
-/// behind it: the layer resolves a request to a cluster name and asks the
-/// factory for that cluster's channel, without knowing how endpoints are
+/// The seam between the router and the balancer: the router owns a client for
+/// each cluster in the route config, without knowing how endpoints are
 /// discovered or balanced.
-///
-/// [`XdsLbService`]: crate::client::lb::XdsLbService
 pub(crate) trait ClusterChannelFactory<Req, Resp>: Send + Sync + 'static
 where
     Req: Send + 'static,
@@ -229,53 +225,61 @@ where
     }
 }
 
-/// `ClusterRegistry` is the client registry for all xDS clusters.
-/// The xDS Tower service implementations uses this to get the client for a specific cluster.
-pub(crate) struct ClusterClientRegistry<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
-    registry: DashMap<String, Arc<ClusterClient<Req, Resp>>>,
-}
+/// A shared, type-erased handle to a cluster's [`ClusterClient`].
+///
+/// The router holds one for each cluster the active route config references,
+/// and attaches it to every [`RouteDecision`] for that cluster. A request
+/// therefore reaches the client it was routed with, even if the cluster leaves
+/// the route config while the request is in flight. The client is dropped once
+/// the router and every such request let go of it.
+///
+/// The type is erased because the router is transport-agnostic.
+/// [`XdsLbService`] recovers the typed client.
+///
+/// [`RouteDecision`]: crate::client::route::RouteDecision
+/// [`XdsLbService`]: crate::client::lb::XdsLbService
+#[derive(Clone)]
+pub(crate) struct ClusterRef(Arc<dyn Any + Send + Sync>);
 
-impl<Req, Resp> ClusterClientRegistry<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
-    /// Creates a new `ClusterClientRegistry`.
-    pub(crate) fn new() -> Self {
-        Self {
-            registry: DashMap::new(),
-        }
-    }
-    /// Get the client of a cluster, building its channel on first use.
-    pub(crate) fn get_cluster<F>(&self, key: &str, make_channel: F) -> Arc<ClusterClient<Req, Resp>>
+impl ClusterRef {
+    pub(crate) fn new<Req, Resp>(client: ClusterClient<Req, Resp>) -> Self
     where
-        F: FnOnce() -> ClusterChannel<Req, Resp>,
+        Req: Send + 'static,
+        Resp: 'static,
     {
-        self.registry
-            .entry(key.to_string())
-            .or_insert_with(|| {
-                Arc::new(ClusterClient::from_channel(key.to_string(), make_channel()))
-            })
-            .clone()
+        Self(Arc::new(client))
+    }
+
+    /// Wraps `channel` in a [`ClusterClient`] for `name` and erases its type.
+    pub(crate) fn from_channel<Req, Resp>(
+        name: impl Into<String>,
+        channel: ClusterChannel<Req, Resp>,
+    ) -> Self
+    where
+        Req: Send + 'static,
+        Resp: 'static,
+    {
+        Self::new(ClusterClient::from_channel(name.into(), channel))
+    }
+
+    /// The client, or `None` if it serves other request or response types.
+    pub(crate) fn client<Req, Resp>(&self) -> Option<&ClusterClient<Req, Resp>>
+    where
+        Req: Send + 'static,
+        Resp: 'static,
+    {
+        self.0.downcast_ref()
+    }
+
+    /// Whether `self` and `other` share one client.
+    #[cfg(test)]
+    pub(crate) fn same_client(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl<Req, Resp> Default for ClusterClientRegistry<Req, Resp>
-where
-    Req: Send + 'static,
-    Resp: 'static,
-{
-    fn default() -> Self {
-        Self::new()
+impl Debug for ClusterRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterRef").finish_non_exhaustive()
     }
 }
-
-/// A type erased registry for Tonic clients.
-/// This will be used by the xDS Tower Service implementations to get the client for a specific Tonic xDS cluster.
-#[allow(dead_code)]
-pub(crate) type ClusterClientRegistryGrpc =
-    ClusterClientRegistry<Request<TonicBody>, Response<TonicBody>>;

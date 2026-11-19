@@ -334,6 +334,7 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             security: None,
             circuit_breaking: CircuitBreakingConfig::default(),
+            outlier_detection: Default::default(),
         }
     }
 
@@ -345,6 +346,7 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             security: Some(security),
             circuit_breaking: CircuitBreakingConfig::default(),
+            outlier_detection: Default::default(),
         }
     }
 

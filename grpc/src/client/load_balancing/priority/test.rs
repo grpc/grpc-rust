@@ -879,7 +879,7 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
 
     // Deliver a PriorityTimerWork item: it should be consumed by PriorityPolicy
     // and NOT forwarded to the child policy.
-    let timer_work: WorkData = Box::new(PriorityTimerWork);
+    let timer_work = WorkData::new(PriorityTimerWork);
     env.policy.work(Some(timer_work), &mut env.tcc);
     assert!(
         !*child_work_called.lock().unwrap(),

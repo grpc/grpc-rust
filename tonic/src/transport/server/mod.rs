@@ -255,7 +255,8 @@ impl<L> Server<L> {
     /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
     /// stream-level flow control.
     ///
-    /// Default is 65,535
+    /// If unset, hyper's default is used (currently 1 MiB). Has no effect when
+    /// [`Server::http2_adaptive_window`] is enabled.
     ///
     /// [spec]: https://httpwg.org/specs/rfc9113.html#InitialWindowSize
     #[must_use]
@@ -268,7 +269,8 @@ impl<L> Server<L> {
 
     /// Sets the max connection-level flow control for HTTP2
     ///
-    /// Default is 65,535
+    /// If unset, hyper's default is used (currently 1 MiB). Has no effect when
+    /// [`Server::http2_adaptive_window`] is enabled.
     #[must_use]
     pub fn initial_connection_window_size(self, sz: impl Into<Option<u32>>) -> Self {
         Server {

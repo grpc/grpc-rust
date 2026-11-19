@@ -35,7 +35,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::Weak;
 
-use grpc::__unstable::rt::GrpcRuntime;
+use grpc::rt::GrpcRuntime;
 use xds_client::MetricsRecorder;
 use xds_client::ProstCodec;
 use xds_client::Resource;

@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
+use crate::private::UnstableTrait;
 use crate::rt::BoxEndpoint;
 use crate::rt::BoxFuture;
 use crate::rt::BoxedTaskHandle;
@@ -84,11 +85,15 @@ pub(crate) struct TokioRuntime {
     _priv: (),
 }
 
+impl UnstableTrait for JoinHandle<()> {}
+
 impl TaskHandle for JoinHandle<()> {
     fn abort(&self) {
         self.abort();
     }
 }
+
+impl UnstableTrait for tokio::time::Sleep {}
 
 impl Sleep for tokio::time::Sleep {}
 
@@ -202,20 +207,22 @@ impl TokioDefaultDnsResolver {
 
 impl StreamEndpoint<TcpStream> {
     pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
-        Ok(StreamEndpoint {
-            local_addr: stream
-                .local_addr()
-                .map_err(|err| err.to_string())?
-                .to_string()
-                .into_boxed_str(),
-            peer_addr: stream
-                .peer_addr()
-                .map_err(|err| err.to_string())?
-                .to_string()
-                .into_boxed_str(),
-            network_type: TCP_IP_NETWORK_TYPE,
-            inner: stream,
-        })
+        let local_addr = stream
+            .local_addr()
+            .map_err(|err| err.to_string())?
+            .to_string()
+            .into_boxed_str();
+        let peer_addr = stream
+            .peer_addr()
+            .map_err(|err| err.to_string())?
+            .to_string()
+            .into_boxed_str();
+        Ok(StreamEndpoint::new(
+            stream,
+            local_addr,
+            peer_addr,
+            TCP_IP_NETWORK_TYPE,
+        ))
     }
 
     /// Creates an endpoint for a stream returned by `accept`, which also
@@ -223,16 +230,17 @@ impl StreamEndpoint<TcpStream> {
     /// the client has already reset the connection. If the local address can't
     /// be read, it is left empty.
     fn new_from_accepted_tcp(stream: TcpStream, peer_addr: SocketAddr) -> Self {
-        StreamEndpoint {
-            local_addr: stream
-                .local_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_default()
-                .into_boxed_str(),
-            peer_addr: peer_addr.to_string().into_boxed_str(),
-            network_type: TCP_IP_NETWORK_TYPE,
-            inner: stream,
-        }
+        let local_addr = stream
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_default()
+            .into_boxed_str();
+        StreamEndpoint::new(
+            stream,
+            local_addr,
+            peer_addr.to_string().into_boxed_str(),
+            TCP_IP_NETWORK_TYPE,
+        )
     }
 }
 

@@ -28,7 +28,7 @@ use std::future::Future;
 use std::time::Duration;
 use std::time::Instant;
 
-use grpc::__unstable::rt::GrpcRuntime;
+use grpc::rt::GrpcRuntime;
 
 /// An [`xds_client::Runtime`] backed by a [`GrpcRuntime`].
 #[derive(Clone, Debug)]

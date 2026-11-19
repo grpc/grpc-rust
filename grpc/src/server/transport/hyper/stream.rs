@@ -371,12 +371,15 @@ mod tests {
     use crate::core::SendMessage;
     use crate::metadata::MetadataMap;
     use crate::metadata::MetadataValue;
+    use crate::private::UnstableTrait;
     use crate::rt::TaskHandle;
     use crate::server::transport::hyper::test::BytesCapture;
     use crate::server::transport::hyper::test::TestSendMessage;
     use crate::status::StatusError;
 
     struct TrackingTaskHandle(Arc<AtomicBool>);
+
+    impl UnstableTrait for TrackingTaskHandle {}
 
     impl TaskHandle for TrackingTaskHandle {
         fn abort(&self) {

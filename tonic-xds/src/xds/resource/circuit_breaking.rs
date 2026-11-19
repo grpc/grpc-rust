@@ -40,37 +40,32 @@ use envoy_types::pb::envoy::config::core::v3::RoutingPriority;
 pub(crate) const DEFAULT_MAX_REQUESTS: u32 = 1024;
 
 /// Validated A32 circuit-breaking configuration for a cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CircuitBreakingConfig {
-    /// Maximum number of in-flight requests allowed for the upstream cluster.
+    /// Maximum number of in-flight requests allowed for the upstream cluster,
+    /// when explicitly set on the CDS `DEFAULT`-priority threshold.
     ///
+    /// When `None`, the channel's configured fallback limit applies (1024 per
+    /// gRFC A32 unless overridden via
+    /// [`XdsChannelConfig::with_default_max_requests`](crate::XdsChannelConfig::with_default_max_requests)).
     /// The client-side limiter holds requests against this threshold for the
     /// full response-body lifetime.
-    pub(crate) max_requests: u32,
+    pub(crate) max_requests: Option<u32>,
 }
 
 impl CircuitBreakingConfig {
     /// Build circuit-breaking config from a CDS `CircuitBreakers` message.
     ///
     /// A32 uses the first threshold for `RoutingPriority::Default`. If no
-    /// applicable threshold or `max_requests` value is present, the gRPC default
-    /// of 1024 is used.
+    /// applicable threshold or `max_requests` value is present, `max_requests`
+    /// is `None` so the channel's configured fallback limit applies.
     pub(crate) fn from_proto(circuit_breakers: Option<&CircuitBreakers>) -> Self {
         let max_requests = circuit_breakers
             .and_then(first_default_threshold)
             .and_then(|threshold| threshold.max_requests.as_ref())
-            .map(|value| value.value)
-            .unwrap_or(DEFAULT_MAX_REQUESTS);
+            .map(|value| value.value);
 
         Self { max_requests }
-    }
-}
-
-impl Default for CircuitBreakingConfig {
-    fn default() -> Self {
-        Self {
-            max_requests: DEFAULT_MAX_REQUESTS,
-        }
     }
 }
 
@@ -94,17 +89,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_when_circuit_breakers_absent() {
+    fn none_when_circuit_breakers_absent() {
         assert_eq!(
             CircuitBreakingConfig::from_proto(None),
-            CircuitBreakingConfig {
-                max_requests: DEFAULT_MAX_REQUESTS,
-            }
+            CircuitBreakingConfig { max_requests: None }
         );
     }
 
     #[test]
-    fn defaults_when_default_threshold_absent() {
+    fn none_when_default_threshold_absent() {
         let circuit_breakers = CircuitBreakers {
             thresholds: vec![threshold(RoutingPriority::High, Some(7))],
             ..Default::default()
@@ -112,12 +105,12 @@ mod tests {
 
         assert_eq!(
             CircuitBreakingConfig::from_proto(Some(&circuit_breakers)).max_requests,
-            DEFAULT_MAX_REQUESTS
+            None
         );
     }
 
     #[test]
-    fn defaults_when_default_threshold_has_no_max_requests() {
+    fn none_when_default_threshold_has_no_max_requests() {
         let circuit_breakers = CircuitBreakers {
             thresholds: vec![threshold(RoutingPriority::Default, None)],
             ..Default::default()
@@ -125,7 +118,7 @@ mod tests {
 
         assert_eq!(
             CircuitBreakingConfig::from_proto(Some(&circuit_breakers)).max_requests,
-            DEFAULT_MAX_REQUESTS
+            None
         );
     }
 
@@ -142,7 +135,7 @@ mod tests {
 
         assert_eq!(
             CircuitBreakingConfig::from_proto(Some(&circuit_breakers)).max_requests,
-            11
+            Some(11)
         );
     }
 }

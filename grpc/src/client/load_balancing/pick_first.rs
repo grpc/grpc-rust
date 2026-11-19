@@ -88,6 +88,7 @@ impl LbPolicyBuilder for PickFirstBuilder {
             frontier_index: 0,
             last_connection_error: None,
             resolution_note: None,
+            pending_addresses: None,
             shuffler: build_shuffler(),
             timer: None,
             steady_state: None,
@@ -126,6 +127,10 @@ pub(crate) struct PickFirstPolicy {
     // status of every TRANSIENT_FAILURE this policy reports.
     resolution_note: Option<String>,
 
+    /// The latest address list, if it arrived while IDLE after a disconnect.
+    /// `exit_idle` connects using it.
+    pending_addresses: Option<Vec<Address>>,
+
     // Injectable shuffler for deterministic testing.
     shuffler: Arc<ShufflerFn>,
 
@@ -150,6 +155,7 @@ impl Debug for PickFirstPolicy {
             .field("connectivity_state", &self.connectivity_state)
             .field("last_connection_error", &self.last_connection_error)
             .field("resolution_note", &self.resolution_note)
+            .field("pending_addresses", &self.pending_addresses)
             .finish()
     }
 }
@@ -383,6 +389,12 @@ impl PickFirstPolicy {
             .any(|sc| sc.address() == subchannel.address())
     }
 
+    /// Returns whether the policy has a non-empty address list: the current
+    /// one, or one received while IDLE. The latter can leave no subchannels.
+    fn has_addresses(&self) -> bool {
+        !self.subchannels.is_empty() || self.pending_addresses.is_some()
+    }
+
     /// Triggers a connection on the subchannel, and starts the 250ms timer.
     /// If no connection succeeds before the timer expires, the frontier will
     /// advance to the next subchannel.
@@ -571,6 +583,11 @@ impl LbPolicy for PickFirstPolicy {
 
         match update.endpoints {
             Ok(endpoints) => {
+                // Whether this list arrives while IDLE after a disconnect.
+                let idle_after_disconnect =
+                    self.connectivity_state == ConnectivityState::Idle && self.has_addresses();
+                // This list replaces any list received while IDLE.
+                self.pending_addresses = None;
                 let new_addresses = self.compile_address(endpoints, config, channel_controller);
                 // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
                 if new_addresses.is_empty() {
@@ -580,6 +597,17 @@ impl LbPolicy for PickFirstPolicy {
                         channel_controller,
                         Some("empty address list".to_string()),
                     )?;
+                }
+
+                // While IDLE after a disconnect, don't connect until asked to
+                // (see pick_first in gRPC's load-balancing doc). Drop the
+                // subchannels of removed addresses now. 'exit_idle()' connects
+                // using this list.
+                if idle_after_disconnect {
+                    self.subchannels
+                        .retain(|sc| new_addresses.contains(&sc.address()));
+                    self.pending_addresses = Some(new_addresses);
+                    return Ok(());
                 }
 
                 if let Some(ready_subchannel) =
@@ -592,7 +620,7 @@ impl LbPolicy for PickFirstPolicy {
             }
             Err(e) => {
                 let error = e.to_string();
-                if self.subchannels.is_empty()
+                if !self.has_addresses()
                     || self.connectivity_state == ConnectivityState::TransientFailure
                 {
                     self.set_transient_failure(channel_controller, Some(error))?;
@@ -631,11 +659,18 @@ impl LbPolicy for PickFirstPolicy {
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
         // Only start a connection pass when in Idle and have already
-        // received a non-empty resolver update (`subchannels` is non-empty).
-        // Before the first resolver update, `connectivity_state` is Idle while
-        // `subchannels` is empty.
-        if self.connectivity_state == ConnectivityState::Idle && !self.subchannels.is_empty() {
-            self.start_connection_pass(channel_controller);
+        // received a non-empty resolver update. Before the first resolver
+        // update, `connectivity_state` is Idle with no address list.
+        if self.connectivity_state == ConnectivityState::Idle && self.has_addresses() {
+            // Switch to the address list received while IDLE, if any.
+            if let Some(addresses) = self.pending_addresses.take()
+                && let Some(ready_subchannel) =
+                    self.rebuild_subchannels(addresses, channel_controller)
+            {
+                self.subchannel_activate(ready_subchannel, channel_controller);
+            } else {
+                self.start_connection_pass(channel_controller);
+            }
         }
     }
 }
@@ -769,13 +804,48 @@ impl SteadyState {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::*;
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils;
+    use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
+    use crate::client::load_balancing::test_utils::TestEvent;
     use crate::rt::default_runtime;
+
+    // A ChannelController wrapper that delegates to TestChannelController,
+    // overriding the initial SubchannelState returned by new_subchannel for
+    // configured addresses.
+    struct InitialStateController<'a> {
+        tcc: &'a mut TestChannelController,
+        initial_states: HashMap<&'a str, SubchannelState>,
+    }
+
+    impl ChannelController for InitialStateController<'_> {
+        fn new_subchannel(
+            &mut self,
+            address: &Address,
+            work_scheduler: Arc<dyn WorkScheduler>,
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let (sc, state) = self.tcc.new_subchannel(address, work_scheduler);
+            let state = self
+                .initial_states
+                .get(&*address.address)
+                .cloned()
+                .unwrap_or(state);
+            (sc, state)
+        }
+
+        fn update_picker(&mut self, update: LbState) {
+            self.tcc.update_picker(update);
+        }
+
+        fn request_resolution(&mut self) {
+            self.tcc.request_resolution();
+        }
+    }
 
     // Creates an endpoint containing `addrs`, in order.
     fn endpoint(addrs: &[&str]) -> Endpoint {
@@ -887,6 +957,24 @@ mod test {
         async fn fire_timer(&mut self) {
             self.advance_past_timer().await;
             self.run_work();
+        }
+
+        // Expects the IDLE picker the policy reports after its selected
+        // subchannel disconnects, and returns it. A re-resolution request may
+        // come before or after the picker; whether one comes is not checked.
+        fn expect_idle_picker_after_disconnect(&mut self) -> Arc<dyn Picker> {
+            let mut picker = None;
+            while let Ok(event) = self.rx_events.try_recv() {
+                match event {
+                    TestEvent::RequestResolution => {}
+                    TestEvent::UpdatePicker(update) if picker.is_none() => {
+                        assert_eq!(update.connectivity_state, ConnectivityState::Idle);
+                        picker = Some(update.picker);
+                    }
+                    other => panic!("unexpected event after disconnect: {other:?}"),
+                }
+            }
+            picker.expect("expected an IDLE picker after the disconnect")
         }
     }
 
@@ -1261,6 +1349,87 @@ mod test {
         // picker goes to Connecting.
         env.expect_connect_to("addr1");
         env.expect_queuing_picker();
+        env.expect_no_events();
+    }
+
+    // After a disconnect, a resolver update leaves the policy IDLE without
+    // creating subchannels until exit_idle is called, which connects to the
+    // new address list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_update_after_disconnect_stays_idle() {
+        let mut env = new_env();
+        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_idle_picker_after_disconnect();
+
+        // The update creates no subchannels and connects nothing: the policy
+        // stays IDLE.
+        let endpoints = create_endpoints(&["addr3", "addr4"]);
+        env.send_resolver_update(endpoints).unwrap();
+        env.expect_no_events();
+
+        // exit_idle creates subchannels for the new list, connects to its first
+        // address, and reports CONNECTING.
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_new_subchannels(&["addr3", "addr4"]);
+        env.expect_connect_to("addr3");
+        env.expect_queuing_picker();
+        env.expect_no_events();
+    }
+
+    // While IDLE after a disconnect, a list that removes the old addresses
+    // drops their subchannels, so updates from them are ignored. A resolver
+    // error is ignored too, and a further list replaces the stored one, still
+    // without connecting. exit_idle connects to the latest list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_resolver_updates_while_idle_drop_removed_subchannels() {
+        let mut env = new_env();
+        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_idle_picker_after_disconnect();
+        env.send_resolver_update(create_endpoints(&["addr3"]))
+            .unwrap();
+        env.expect_no_events();
+
+        // addr1 is no longer listed: its READY report doesn't select it.
+        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // A resolver error changes nothing the policy reports.
+        _ = env.send_resolver_error("resolver unavailable".to_string());
+        env.expect_no_events();
+
+        env.send_resolver_update(create_endpoints(&["addr4"]))
+            .unwrap();
+        env.expect_no_events();
+
+        env.policy.exit_idle(&mut env.tcc);
+        env.expect_new_subchannels(&["addr4"]);
+        env.expect_connect_to("addr4");
+        env.expect_queuing_picker();
+        env.expect_no_events();
+    }
+
+    // When exit_idle switches to a list received while IDLE, a subchannel that
+    // is already READY is selected without asking any subchannel to connect.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_exit_idle_selects_ready_subchannel_from_new_list() {
+        let mut env = new_env();
+        let scs = env.simulate_successful_connection(&["addr1"]);
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_idle_picker_after_disconnect();
+        env.send_resolver_update(create_endpoints(&["addr2", "addr3"]))
+            .unwrap();
+        env.expect_no_events();
+
+        // addr3's new subchannel is already READY.
+        let mut controller = InitialStateController {
+            tcc: &mut env.tcc,
+            initial_states: HashMap::from([("addr3", SubchannelState::ready())]),
+        };
+        env.policy.exit_idle(&mut controller);
+        let scs = env.expect_new_subchannels(&["addr2", "addr3"]);
+        env.expect_ready_picker(&scs[1]);
         env.expect_no_events();
     }
 

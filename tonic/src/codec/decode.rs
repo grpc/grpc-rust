@@ -32,6 +32,7 @@ use http_body_util::BodyExt;
 use std::{
     fmt, future,
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::ready,
     task::{Context, Poll},
 };
@@ -57,6 +58,7 @@ struct StreamingInner {
     decompress_buf: BytesMut,
     encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
+    send_error: Option<Arc<OnceLock<Status>>>,
 }
 
 impl<T> Unpin for Streaming<T> {}
@@ -99,6 +101,30 @@ impl<T> Streaming<T> {
             Direction::Response(status_code),
             encoding,
             max_message_size,
+            None,
+        )
+    }
+
+    pub(crate) fn new_response_with_send_error<B, D>(
+        decoder: D,
+        body: B,
+        status_code: StatusCode,
+        encoding: Option<CompressionEncoding>,
+        max_message_size: Option<usize>,
+        send_error: Arc<OnceLock<Status>>,
+    ) -> Self
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<crate::BoxError>,
+        D: Decoder<Item = T, Error = Status> + Send + 'static,
+    {
+        Self::new(
+            decoder,
+            body,
+            Direction::Response(status_code),
+            encoding,
+            max_message_size,
+            Some(send_error),
         )
     }
 
@@ -109,7 +135,7 @@ impl<T> Streaming<T> {
         B::Error: Into<crate::BoxError>,
         D: Decoder<Item = T, Error = Status> + Send + 'static,
     {
-        Self::new(decoder, body, Direction::EmptyResponse, None, None)
+        Self::new(decoder, body, Direction::EmptyResponse, None, None, None)
     }
 
     /// Create a new streaming request in the grpc response format for decoding a request [Body]
@@ -131,6 +157,7 @@ impl<T> Streaming<T> {
             Direction::Request,
             encoding,
             max_message_size,
+            None,
         )
     }
 
@@ -140,6 +167,7 @@ impl<T> Streaming<T> {
         direction: Direction,
         encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
+        send_error: Option<Arc<OnceLock<Status>>>,
     ) -> Self
     where
         B: HttpBody + Send + 'static,
@@ -147,6 +175,7 @@ impl<T> Streaming<T> {
         D: Decoder<Item = T, Error = Status> + Send + 'static,
     {
         let buffer_size = decoder.buffer_settings().buffer_size;
+        let body_send_error = send_error.clone();
         Self {
             decoder: SyncWrapper::new(Box::new(decoder)),
             inner: StreamingInner {
@@ -154,7 +183,12 @@ impl<T> Streaming<T> {
                     body.map_frame(|frame| {
                         frame.map_data(|mut buf| buf.copy_to_bytes(buf.remaining()))
                     })
-                    .map_err(|err| Status::map_error(err.into())),
+                    .map_err(move |err| {
+                        body_send_error
+                            .as_ref()
+                            .and_then(|slot| slot.get().cloned())
+                            .unwrap_or_else(|| Status::map_error(err.into()))
+                    }),
                 )),
                 state: State::ReadHeader,
                 direction,
@@ -163,6 +197,7 @@ impl<T> Streaming<T> {
                 decompress_buf: BytesMut::new(),
                 encoding,
                 max_message_size,
+                send_error,
             },
         }
     }
@@ -321,6 +356,15 @@ impl StreamingInner {
         if let Direction::Response(status) = self.direction
             && let Err(Some(e)) = crate::status::infer_grpc_status(self.trailers.as_ref(), status)
         {
+            if self
+                .trailers
+                .as_ref()
+                .and_then(Status::from_header_map)
+                .is_none()
+                && let Some(send_err) = self.send_error.as_ref().and_then(|s| s.get())
+            {
+                return Err(send_err.clone());
+            }
             // If the trailers contain a grpc-status, then we should return that as the error
             // and otherwise stop the stream (by taking the error state)
             self.trailers.take();

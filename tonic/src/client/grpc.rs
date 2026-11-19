@@ -37,7 +37,11 @@ use http::{
     uri::{PathAndQuery, Uri},
 };
 use http_body::Body as HttpBody;
-use std::{fmt, future, pin::pin};
+use std::{
+    fmt, future,
+    pin::pin,
+    sync::{Arc, OnceLock},
+};
 use tokio_stream::{Stream, StreamExt};
 
 /// A gRPC client dispatcher.
@@ -319,30 +323,34 @@ impl<T> Grpc<T> {
         M2: Send + Sync + 'static,
     {
         let cancellation_token = request.remove_cancellation_handle().map(|c| c.into_token());
+        let send_error = Arc::new(OnceLock::new());
+        let body_send_error = Arc::clone(&send_error);
 
         let request = request
             .map(|s| {
-                EncodeBody::new_client_with_cancellation(
+                EncodeBody::new_client_inner(
                     codec.encoder(),
                     s.map(Ok),
                     self.config.send_compression_encodings,
                     self.config.max_encoding_message_size,
                     cancellation_token,
+                    Some(body_send_error),
                 )
             })
             .map(Body::new);
 
         let request = self.config.prepare_request(request, path);
 
-        let response = self
-            .inner
-            .call(request)
-            .await
-            .map_err(Status::from_error_generic)?;
+        let response = self.inner.call(request).await.map_err(|err| {
+            send_error
+                .get()
+                .cloned()
+                .unwrap_or_else(|| Status::from_error_generic(err))
+        })?;
 
         let decoder = codec.decoder();
 
-        self.create_response(decoder, response)
+        self.create_response(decoder, response, send_error)
     }
 
     // Keeping this code in a separate function from Self::streaming lets functions that return the
@@ -351,6 +359,7 @@ impl<T> Grpc<T> {
         &self,
         decoder: impl Decoder<Item = M2, Error = Status> + Send + 'static,
         response: http::Response<T::ResponseBody>,
+        send_error: Arc<OnceLock<Status>>,
     ) -> Result<Response<Streaming<M2>>, Status>
     where
         T: GrpcService<Body>,
@@ -379,12 +388,13 @@ impl<T> Grpc<T> {
 
         let response = response.map(|body| {
             if expect_additional_trailers {
-                Streaming::new_response(
+                Streaming::new_response_with_send_error(
                     decoder,
                     body,
                     status_code,
                     encoding,
                     self.config.max_decoding_message_size,
+                    send_error,
                 )
             } else {
                 Streaming::new_empty(decoder, body)

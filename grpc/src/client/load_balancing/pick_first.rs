@@ -367,15 +367,16 @@ impl PickFirstPolicy {
             .is_some_and(|sel| sel.address() == subchannel.address())
     }
 
-    /// Returns true if the subchannel's address is present in the most recently
-    /// received address list.
+    /// Returns true if the subchannel is in the current subchannel list. A
+    /// subchannel the policy discarded is not current, even if its address
+    /// is still in the address list.
     // This compares against the current list of subchannels the LB is
     // attempting to connect to. To see if the LB already connected to the
     // channel, use 'subchannel_is_selected'.
     fn subchannel_is_current(&self, subchannel: &Arc<dyn Subchannel>) -> bool {
         self.subchannels
             .iter()
-            .any(|sc| sc.address() == subchannel.address())
+            .any(|sc| Arc::ptr_eq(sc, subchannel))
     }
 
     /// Triggers a connection on the subchannel, and starts the 250ms timer.
@@ -507,7 +508,7 @@ impl PickFirstPolicy {
     ) {
         if !self.subchannel_is_current(&subchannel) {
             // This update is from an outdated subchannel that is no longer in
-            // the address list. Ignore it.
+            // the subchannel list. Ignore it.
             return;
         }
 
@@ -1235,6 +1236,66 @@ mod test {
         let sc = env.expect_new_subchannel_for(addr);
         assert_ne!(sc.address(), scs[0].address());
         env.expect_connect_to(addr);
+        env.expect_no_events();
+    }
+
+    // Tests that updates from a discarded subchannel are ignored during a
+    // first pass and in READY, even though its address is still in the
+    // address list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_stale_subchannel_with_current_address() {
+        let mut env = new_env();
+        // Selecting addr1 discards the addr2 subchannel.
+        let old = env.simulate_successful_connection(&["addr1", "addr2"]);
+
+        // A list without addr1 starts a new pass with a new addr2 subchannel.
+        env.send_resolver_update(create_endpoints(&["addr2"]))
+            .unwrap();
+        let new = env.expect_new_subchannel_for("addr2");
+        env.expect_connect_to("addr2");
+        env.expect_queuing_picker();
+
+        // A late READY from the discarded addr2 subchannel is ignored.
+        env.send_subchannel_update(&old[1], &SubchannelState::ready());
+        env.expect_no_events();
+
+        // The new addr2 subchannel is selected.
+        env.send_subchannel_update(&new, &SubchannelState::ready());
+        env.expect_ready_picker(&new);
+
+        // A late IDLE from the discarded addr2 subchannel does not disconnect
+        // the selected subchannel.
+        env.send_subchannel_update(&old[1], &SubchannelState::idle());
+        env.expect_no_events();
+    }
+
+    // Tests that in steady state, updates from a discarded subchannel are
+    // ignored, even though its address is still in the address list.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_ignores_stale_subchannel_with_current_address_in_steady_state() {
+        let mut env = new_env();
+        // Selecting addr1 discards the addr2 subchannel.
+        let old = env.simulate_successful_connection(&["addr1", "addr2"]);
+
+        // A list without addr1 starts a new pass with a new addr2 subchannel.
+        env.send_resolver_update(create_endpoints(&["addr2"]))
+            .unwrap();
+        let new = env.expect_new_subchannel_for("addr2");
+        env.expect_connect_to("addr2");
+        env.expect_queuing_picker();
+
+        // The new addr2 subchannel fails, entering steady state.
+        env.send_subchannel_update(
+            &new,
+            &SubchannelState::transient_failure("connection refused"),
+        );
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // Updates from the discarded addr2 subchannel do not select it or
+        // trigger a connection attempt.
+        env.send_subchannel_update(&old[1], &SubchannelState::ready());
+        env.send_subchannel_update(&old[1], &SubchannelState::idle());
         env.expect_no_events();
     }
 

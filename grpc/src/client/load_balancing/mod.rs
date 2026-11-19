@@ -144,45 +144,54 @@ pub struct LbPolicyOptions {
     pub runtime: GrpcRuntime,
 }
 
-/// A trait to add `Debug` to an `Any` for [`WorkData`] to allow debugging data
-/// to be printed more readily.  Blanket implemented on all types that are Any +
-/// Send + Debug.  `dyn WorkDataTrait` also implements downcast methods like
-/// [`Any`] for convenience.
-pub trait WorkDataTrait: Any + Send + Debug {}
+/// A dynamic payload passed between [`WorkScheduler::schedule_work`] and its
+/// associated policy's [`work`](crate::client::load_balancing::LbPolicy::work)
+/// method.
+pub struct WorkData(Box<dyn WorkDataTrait>);
+
+/// What a WorkData holds: `Any` for downcasting, `Send` for passing through a
+/// [`WorkScheduler`], and `Debug` for printing.
+trait WorkDataTrait: Any + Send + Debug {}
 
 impl<T: Any + Send + Debug> WorkDataTrait for T {}
 
-impl dyn WorkDataTrait {
-    /// Like [`Box<dyn Any>::downcast`] but for this wrapper trait.
-    pub fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
-        // If we directly call downcast then we can't return `Self` anymore
-        // (only a Box<dyn Any + Send>), so we first have to check `is` and only
-        // downcast when we know it will succeed.
-        if (&*self as &(dyn Any + Send)).is::<T>() {
-            Ok((self as Box<dyn Any + Send>).downcast().unwrap())
-        } else {
-            Err(self)
+impl WorkData {
+    /// Creates a WorkData holding `data`.
+    pub fn new<T: Any + Send + Debug>(data: T) -> Self {
+        Self(Box::new(data))
+    }
+
+    /// Returns true if this holds a `T`.
+    pub fn is<T: Any>(&self) -> bool {
+        (&*self.0 as &dyn Any).is::<T>()
+    }
+
+    /// Returns the `T` this holds, or this WorkData unchanged if it holds
+    /// something else.
+    pub fn downcast<T: Any>(self) -> Result<T, Self> {
+        if !self.is::<T>() {
+            return Err(self);
         }
+        let data = self.0 as Box<dyn Any>;
+        Ok(*data.downcast::<T>().expect("checked by is"))
     }
 
-    /// Like
-    /// [`downcast_ref`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_ref)
-    /// implemented on [`dyn Any`](Any), but for this wrapper trait.
+    /// Returns a reference to the `T` this holds, if it holds one.
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        (self as &(dyn Any + Send)).downcast_ref::<T>()
+        (&*self.0 as &dyn Any).downcast_ref::<T>()
     }
 
-    /// Like
-    /// [`downcast_mut`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_mut)
-    /// implemented on [`dyn Any`](Any), but for this wrapper trait.
+    /// Returns a mutable reference to the `T` this holds, if it holds one.
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
-        (self as &mut (dyn Any + Send)).downcast_mut::<T>()
+        (&mut *self.0 as &mut dyn Any).downcast_mut::<T>()
     }
 }
 
-/// A dynamic payload passed between [`WorkScheduler::schedule_work`] and its
-/// associated policy's [`work`](LbPolicy::work) method.
-pub type WorkData = Box<dyn WorkDataTrait>;
+impl Debug for WorkData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Used to asynchronously request a call into the LbPolicy's work method if
 /// the LbPolicy needs to provide an update without waiting for an update
@@ -498,8 +507,52 @@ impl LbState {
     }
 }
 
-/// Type alias for the completion callback function.
-pub type CompletionCallback = Box<dyn Fn() + Send + Sync>;
+/// Information about a finished RPC, passed to a [`CompletionCallback`].
+#[derive(Debug, Clone, Copy)]
+pub struct CallOutcome<'a> {
+    status: &'a crate::Result<()>,
+    trailing_metadata: Option<&'a MetadataMap>,
+}
+
+impl<'a> CallOutcome<'a> {
+    /// Creates a [`CallOutcome`] with the RPC's final status and no trailing
+    /// metadata.
+    pub fn new(status: &'a crate::Result<()>) -> Self {
+        Self {
+            status,
+            trailing_metadata: None,
+        }
+    }
+
+    /// Sets the trailing metadata received from the server.
+    pub fn with_trailing_metadata(mut self, trailing_metadata: &'a MetadataMap) -> Self {
+        self.trailing_metadata = Some(trailing_metadata);
+        self
+    }
+
+    /// Returns the RPC's final status.
+    ///
+    /// If the RPC was abandoned before completing (e.g. the application
+    /// dropped the stream), this is a `CANCELLED` error.
+    pub fn status(&self) -> &'a crate::Result<()> {
+        self.status
+    }
+
+    /// Returns the trailing metadata received from the server, if any. This
+    /// is `None` if the RPC did not receive trailers from the server (e.g. it
+    /// was abandoned).
+    ///
+    /// LB policies can use this to read per-call backend metrics (e.g. ORCA
+    /// load reports).
+    pub fn trailing_metadata(&self) -> Option<&'a MetadataMap> {
+        self.trailing_metadata
+    }
+}
+
+/// Callback invoked when an RPC that used a [`Pick`] completes.
+///
+/// See [`Pick::on_complete`] for when it is invoked.
+pub type CompletionCallback = Box<dyn for<'a> FnOnce(&CallOutcome<'a>) + Send + Sync>;
 
 /// A collection of data used by the channel for routing a request.
 pub struct Pick {
@@ -507,7 +560,16 @@ pub struct Pick {
     pub subchannel: Arc<dyn Subchannel>,
     // Metadata to be added to existing outgoing metadata.
     pub metadata: MetadataMap,
-    // Callback to be invoked once the RPC completes.
+    /// Callback to be invoked once the RPC completes.
+    ///
+    /// The channel invokes the callback when the RPC finishes (trailers are
+    /// received) or when it is abandoned before finishing (e.g. cancelled),
+    /// passing the RPC's [`CallOutcome`]. If the RPC never starts on the
+    /// subchannel, the callback is dropped without being invoked. This
+    /// includes the case where a parent LB policy discards this `Pick` (e.g.
+    /// a circuit breaker rejects it), so any per-call state acquired at pick
+    /// time must be released when the callback is dropped, not only when it
+    /// is invoked.
     pub on_complete: Option<CompletionCallback>,
 }
 
@@ -669,5 +731,20 @@ mod tests {
         let parsed: ParentConfig = parent_json.convert_to().unwrap();
         assert_eq!(parsed.child_policy.builder.name(), "round_robin");
         assert_eq!(parsed.fallback_policy.builder.name(), "pick_first");
+    }
+
+    #[test]
+    fn work_data_downcasts() {
+        let mut data = WorkData::new(5u32);
+        assert!(data.is::<u32>());
+        assert!(!data.is::<i32>());
+        assert_eq!(data.downcast_ref::<u32>(), Some(&5));
+        assert_eq!(data.downcast_ref::<i32>(), None);
+        *data.downcast_mut::<u32>().unwrap() = 6;
+        assert_eq!(format!("{data:?}"), "6");
+
+        // A failed downcast returns the data unchanged.
+        let data = data.downcast::<i32>().unwrap_err();
+        assert_eq!(data.downcast::<u32>().unwrap(), 6);
     }
 }

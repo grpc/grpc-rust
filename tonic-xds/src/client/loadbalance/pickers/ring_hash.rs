@@ -225,6 +225,7 @@ mod tests {
             request_hash: hash,
             retry_config: None,
             max_stream_duration: None,
+            cluster_ref: None,
         });
         r
     }

@@ -32,6 +32,10 @@ use std::future::Future;
 #[cfg(feature = "transport-tonic")]
 pub mod tonic;
 
+/// The gRPC method of the ADS stream.
+pub const ADS_METHOD: &str =
+    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
+
 /// Factory for creating xDS transport streams.
 ///
 /// This abstraction allows for different transport implementations:

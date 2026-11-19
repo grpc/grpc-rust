@@ -218,6 +218,7 @@ mod tests {
     use xds_client::ResourceEvent;
     use xds_client::TokioRuntime;
     use xds_client::XdsClient;
+    use xds_client::transport::ADS_METHOD;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config::AdsTypeUrl;
     use xds_test_util::config::build_inline_listener;
@@ -226,10 +227,6 @@ mod tests {
     use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryRequest;
     use crate::generated::envoy_service_discovery_v3_discovery_proto::DiscoveryResponse;
     use crate::resource::ListenerResource;
-
-    /// The gRPC path for the ADS StreamAggregatedResources RPC.
-    const ADS_PATH: &str =
-        "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
 
     #[test]
     fn test_raw_bytes_encode_decode() {
@@ -257,7 +254,7 @@ mod tests {
             .await
             .expect("build transport");
 
-        let (mut tx, mut rx) = transport.new_stream(ADS_PATH).await.expect("new stream");
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.expect("new stream");
 
         let mut request = DiscoveryRequest::new();
         request.set_type_url(AdsTypeUrl::Lds.to_string());

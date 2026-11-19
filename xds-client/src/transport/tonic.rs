@@ -601,7 +601,7 @@ impl TransportReceiver for TonicAdsReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::worker::ADS_METHOD;
+    use crate::transport::ADS_METHOD;
     use envoy_types::pb::envoy::service::discovery::v3::{
         DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
         aggregated_discovery_service_server::{

@@ -68,14 +68,11 @@ use crate::metrics::{self};
 use crate::resource::DecodedResource;
 use crate::resource::DecoderFn;
 use crate::runtime::Runtime;
+use crate::transport::ADS_METHOD;
 use crate::transport::Transport;
 use crate::transport::TransportBuilder;
 use crate::transport::TransportReceiver;
 use crate::transport::TransportSender;
-
-/// The gRPC method of the ADS stream.
-pub(crate) const ADS_METHOD: &str =
-    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
 
 /// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
 ///

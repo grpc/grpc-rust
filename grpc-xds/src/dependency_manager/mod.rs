@@ -33,6 +33,7 @@
 //! the state and sends each update to an [`XdsConfigWatcher`]. Inside:
 //!
 //! * `state` folds each watch's events into a cached state.
+//! * `subscriptions` tracks reference-counted dynamic cluster subscriptions.
 //! * `cluster_graph` walks from the root clusters through aggregate clusters,
 //!   and decides what to publish and what to watch.
 //! * `watches` owns the watches below the route configuration, and starts and
@@ -46,6 +47,7 @@
 mod actor;
 mod cluster_graph;
 mod state;
+mod subscriptions;
 mod watches;
 
 use std::fmt;
@@ -53,6 +55,10 @@ use std::sync::Arc;
 
 use grpc::rt::BoxedTaskHandle;
 use grpc::rt::GrpcRuntime;
+pub(crate) use subscriptions::ClusterSubscriber;
+// TODO: remove once the xds resolver / cds LB policy uses subscriptions.
+#[expect(unused_imports)]
+pub(crate) use subscriptions::ClusterSubscription;
 use xds_client::XdsClient;
 
 use crate::xds_config::XdsConfig;
@@ -63,7 +69,8 @@ pub(crate) type XdsConfigUpdate = Result<Arc<XdsConfig>, XdsConfigError>;
 
 /// Receives the dependency manager's updates.
 pub(crate) trait XdsConfigWatcher: Send + 'static {
-    /// Called with each update, in order.
+    /// Called with each update, in order. A snapshot may be identical to the
+    /// one before it.
     ///
     /// This runs on the dependency manager's task, so it must not block. It
     /// would typically store the update and schedule work to handle it.
@@ -100,6 +107,7 @@ impl fmt::Debug for DependencyManagerOptions {
 /// A running dependency manager. Dropping it stops the dependency manager,
 /// and with it every watch.
 pub(crate) struct XdsDependencyManager {
+    subscriber: ClusterSubscriber,
     task: BoxedTaskHandle,
 }
 
@@ -109,8 +117,18 @@ impl XdsDependencyManager {
     #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn start(options: DependencyManagerOptions) -> Self {
         let runtime = options.runtime.clone();
-        let task = runtime.spawn(Box::pin(actor::run(options)));
-        Self { task }
+        let (subscriber, subscriptions) = subscriptions::new();
+        let task = runtime.spawn(Box::pin(actor::run(options, subscriptions)));
+        Self { subscriber, task }
+    }
+
+    /// Returns a clonable handle for creating dynamic [`ClusterSubscription`]s
+    /// (gRFC A74), suitable for passing to LB policies in
+    /// [`grpc::attributes::Attributes`].
+    // TODO: remove once the xds resolver uses the dependency manager.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn subscriber(&self) -> ClusterSubscriber {
+        self.subscriber.clone()
     }
 }
 
@@ -185,6 +203,7 @@ impl std::error::Error for XdsConfigError {}
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::future::Future;
     use std::time::Duration;
 
@@ -248,7 +267,7 @@ mod tests {
             by_name(&[LISTENER], |name| build_rds_listener(name, ROUTES)),
         );
         set_route(service, clusters);
-        let all = ["a", "b"];
+        let all = ["a", "b", "c"];
         service.set_xds_config(&AdsTypeUrl::Cds, by_name(&all, build_cluster));
         service.set_xds_config(
             &AdsTypeUrl::Eds,
@@ -355,6 +374,68 @@ mod tests {
         .await;
         assert!(service.has_subscriber_for(&AdsTypeUrl::Cds, "b"));
         assert!(service.has_subscriber_for(&AdsTypeUrl::Eds, "b"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_subscription_fetches_and_unsubscribes_cluster() {
+        let control_plane = control_plane(&["a"]).await;
+        let (dependency_manager, mut rx) = start(xds_client(&control_plane));
+        snapshot(&mut rx, &["a"]).await;
+
+        let service = control_plane.get_service();
+        assert!(!service.has_subscriber_for(&AdsTypeUrl::Cds, "c"));
+
+        let subscriber = dependency_manager.subscriber();
+        let sub = subscriber.subscribe_to_cluster("c");
+        assert_eq!(sub.cluster_name(), "c");
+        snapshot(&mut rx, &["a", "c"]).await;
+        assert!(service.has_subscriber_for(&AdsTypeUrl::Cds, "c"));
+        assert!(service.has_subscriber_for(&AdsTypeUrl::Eds, "c"));
+
+        drop(sub);
+        snapshot(&mut rx, &["a"]).await;
+        eventually(|| {
+            !service.has_subscriber_for(&AdsTypeUrl::Cds, "c")
+                && !service.has_subscriber_for(&AdsTypeUrl::Eds, "c")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscription_retains_cluster_after_route_removal() {
+        let control_plane = control_plane(&["a", "b"]).await;
+        let (dependency_manager, mut rx) = start(xds_client(&control_plane));
+        snapshot(&mut rx, &["a", "b"]).await;
+
+        let sub_a = dependency_manager.subscriber().subscribe_to_cluster("a");
+
+        let service = control_plane.get_service();
+        set_route(service, &["b"]);
+        let config = with_timeout(async {
+            loop {
+                let config = rx
+                    .recv()
+                    .await
+                    .expect("dependency manager stopped")
+                    .expect("snapshot");
+                if config.virtual_host().cluster_names() == HashSet::from(["b".to_owned()]) {
+                    return config;
+                }
+            }
+        })
+        .await;
+        assert!(config.clusters.contains_key("a"));
+        assert!(config.clusters.contains_key("b"));
+        assert!(service.has_subscriber_for(&AdsTypeUrl::Cds, "a"));
+        assert!(service.has_subscriber_for(&AdsTypeUrl::Eds, "a"));
+
+        drop(sub_a);
+        snapshot(&mut rx, &["b"]).await;
+        eventually(|| {
+            !service.has_subscriber_for(&AdsTypeUrl::Cds, "a")
+                && !service.has_subscriber_for(&AdsTypeUrl::Eds, "a")
+        })
+        .await;
     }
 
     #[tokio::test]

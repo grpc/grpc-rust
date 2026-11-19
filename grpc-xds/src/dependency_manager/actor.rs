@@ -43,6 +43,7 @@ use super::XdsConfigErrorKind;
 use super::XdsConfigWatcher;
 use super::cluster_graph::walk;
 use super::state::WatchState;
+use super::subscriptions::SubscriptionWatch;
 use super::watches::ClusterGraphEvent;
 use super::watches::Watches;
 use crate::resource::ListenerResource;
@@ -52,8 +53,8 @@ use crate::routing::find_virtual_host_index;
 use crate::xds_config::XdsConfig;
 
 /// Runs a dependency manager until the XdsClient stops.
-pub(super) async fn run(options: DependencyManagerOptions) {
-    Actor::new(options).run_loop().await;
+pub(super) async fn run(options: DependencyManagerOptions, subscriptions: SubscriptionWatch) {
+    Actor::new(options, subscriptions).run_loop().await;
 }
 
 /// A watch on a Listener or RouteConfiguration, and its cached state.
@@ -117,6 +118,14 @@ struct Actor {
     /// that a Listener that recovers unchanged needs no new fetch.
     route_config: Option<Watched<RouteConfigResource>>,
     watches: Watches,
+    /// The clusters that the selected virtual host's routes use, as of the
+    /// last [`Actor::resolve`], or `None` while there is no selection.
+    route_clusters: Option<HashSet<String>>,
+    subscriptions: SubscriptionWatch,
+    /// Clusters currently held by live [`ClusterSubscription`] handles.
+    ///
+    /// [`ClusterSubscription`]: super::ClusterSubscription
+    subscribed_clusters: HashSet<Arc<str>>,
 }
 
 /// An event from one of the actor's watches.
@@ -179,7 +188,7 @@ impl Publisher {
 }
 
 impl Actor {
-    fn new(options: DependencyManagerOptions) -> Self {
+    fn new(options: DependencyManagerOptions, subscriptions: SubscriptionWatch) -> Self {
         let DependencyManagerOptions {
             xds_client,
             listener_name,
@@ -201,6 +210,9 @@ impl Actor {
             listener,
             route_config: None,
             watches: Watches::default(),
+            route_clusters: None,
+            subscriptions,
+            subscribed_clusters: HashSet::new(),
         }
     }
 
@@ -219,15 +231,23 @@ impl Actor {
     /// causes one update rather than one per resource. Batches are bounded,
     /// because the XdsClient doesn't read the next response until the batch
     /// releases its flow-control tokens.
+    ///
+    /// A dynamic subscription change is applied here, and yields a batch, even
+    /// an empty one, if it changed the roots of the cluster graph.
     fn poll_batch(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<WatchEvent>>> {
         let mut batch = Vec::new();
         loop {
             match self.poll_watch_event(cx) {
                 Poll::Ready(Some(event)) => batch.push(event),
                 Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending if batch.is_empty() => return Poll::Pending,
-                Poll::Pending => return Poll::Ready(Some(batch)),
+                Poll::Pending => break,
             }
+        }
+        let roots_changed = self.poll_subscriptions(cx);
+        if batch.is_empty() && !roots_changed {
+            Poll::Pending
+        } else {
+            Poll::Ready(Some(batch))
         }
     }
 
@@ -264,6 +284,23 @@ impl Actor {
         }
     }
 
+    /// Applies any change to the dynamically subscribed clusters, and reports
+    /// whether it changed the roots of the cluster graph: the union of the
+    /// selected virtual host's clusters and the subscribed clusters.
+    ///
+    /// While there is no selection, the cluster watches are kept as they are
+    /// (see [`Actor::resolve`]), so a subscription change needs no update.
+    fn poll_subscriptions(&mut self, cx: &mut Context<'_>) -> bool {
+        let Poll::Ready(clusters) = self.subscriptions.poll_changed(cx) else {
+            return false;
+        };
+        let prev = std::mem::replace(&mut self.subscribed_clusters, clusters);
+        self.route_clusters.as_ref().is_some_and(|route_clusters| {
+            prev.symmetric_difference(&self.subscribed_clusters)
+                .any(|cluster| !route_clusters.contains(cluster.as_ref()))
+        })
+    }
+
     /// Applies `events` to the cached states, then updates the watches to
     /// match and publishes the result.
     ///
@@ -291,7 +328,13 @@ impl Actor {
         // While there is no selection, the cluster watches are kept as they
         // are: they will likely be needed again once the Listener or
         // RouteConfiguration recovers.
-        let selection = self.select_route()?;
+        let selection = match self.select_route() {
+            Ok(selection) => selection,
+            Err(blocked) => {
+                self.route_clusters = None;
+                return Err(blocked);
+            }
+        };
         self.update_clusters(selection)
     }
 
@@ -356,13 +399,21 @@ impl Actor {
         })
     }
 
-    /// Walks the cluster graph from the selected virtual host, updates the
-    /// watches to match it, and returns the snapshot once every cluster has
-    /// resolved.
+    /// Walks the cluster graph from the selected virtual host and any active
+    /// dynamic cluster subscriptions, updates the watches to match it, and
+    /// returns the snapshot once every root cluster has resolved.
     fn update_clusters(&mut self, selection: Selection) -> Result<XdsConfig, Blocked> {
+        let route_clusters = self.route_clusters.insert(selection.clusters);
+        let subscribed_clusters = &self.subscribed_clusters;
+        let roots = || {
+            route_clusters
+                .iter()
+                .map(String::as_str)
+                .chain(subscribed_clusters.iter().map(Arc::as_ref))
+        };
         let graph = walk(
             &self.watches,
-            selection.clusters.iter().map(String::as_str),
+            roots(),
             &selection.notes,
             self.node_id.as_deref(),
         );
@@ -370,11 +421,7 @@ impl Actor {
             .reconcile(&self.client, &graph.required_watches);
 
         // A cluster is missing while it or anything below it is pending.
-        if !selection
-            .clusters
-            .iter()
-            .all(|name| graph.cluster_configs.contains_key(name))
-        {
+        if !roots().all(|name| graph.cluster_configs.contains_key(name)) {
             return Err(Blocked::Pending);
         }
         Ok(XdsConfig::try_new(
@@ -390,12 +437,15 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::task::Waker;
 
     use grpc::rt::GrpcRuntime;
 
     use super::*;
+    use crate::dependency_manager::ClusterSubscriber;
     use crate::dependency_manager::XdsConfigUpdate;
     use crate::dependency_manager::cluster_graph::DnsTarget;
+    use crate::dependency_manager::subscriptions;
     use crate::resource::ClusterDiscovery;
     use crate::resource::ClusterResource;
     use crate::resource::DomainMatcher;
@@ -422,14 +472,50 @@ mod tests {
     /// events to it directly.
     struct Harness {
         actor: Actor,
+        subscriber: ClusterSubscriber,
         updates: mpsc::Receiver<XdsConfigUpdate>,
     }
 
     impl Harness {
         fn new() -> Self {
             let (options, updates) = options();
-            let actor = Actor::new(options);
-            Self { actor, updates }
+            let (subscriber, subscriptions) = subscriptions::new();
+            let actor = Actor::new(options, subscriptions);
+            Self {
+                actor,
+                subscriber,
+                updates,
+            }
+        }
+
+        /// Flushes any pending subscription change into the actor, and returns
+        /// what it published.
+        fn sync_subscriptions(&mut self) -> Vec<XdsConfigUpdate> {
+            self.batch_with_subscriptions([])
+        }
+
+        /// Flushes a subscription change that must publish a snapshot.
+        fn sync_config(&mut self) -> Arc<XdsConfig> {
+            match <[_; 1]>::try_from(self.sync_subscriptions()) {
+                Ok([Ok(config)]) => config,
+                updates => panic!("expected one snapshot, got {updates:?}"),
+            }
+        }
+
+        /// Handles `events` alongside any pending subscription change in one
+        /// batch, and returns what it published.
+        fn batch_with_subscriptions(
+            &mut self,
+            events: impl IntoIterator<Item = WatchEvent>,
+        ) -> Vec<XdsConfigUpdate> {
+            let events: Vec<_> = events.into_iter().collect();
+            let roots_changed = self
+                .actor
+                .poll_subscriptions(&mut Context::from_waker(Waker::noop()));
+            if !events.is_empty() || roots_changed {
+                self.actor.handle_batch(events);
+            }
+            self.updates.try_iter().collect()
         }
 
         /// Handles `events` as one batch, and returns what it published.
@@ -790,11 +876,241 @@ mod tests {
         assert_eq!(error.message(), "CDS resource a: resource does not exist");
     }
 
+    #[test]
+    fn subscribe_adds_dynamic_cluster_and_waits_for_it_to_resolve() {
+        let mut harness = Harness::resolved(&["a"]);
+
+        let sub = harness.subscriber.subscribe_to_cluster("dyn");
+        assert!(harness.sync_subscriptions().is_empty());
+        assert_eq!(harness.watched_clusters(), ["a", "dyn"]);
+
+        assert!(harness.batch([cds_eds("dyn")]).is_empty());
+        assert_eq!(harness.watched_endpoints(), ["a-eds", "dyn-eds"]);
+
+        let config = harness.config([eds("dyn-eds")]);
+        assert_eq!(cluster_names(&config), ["a", "dyn"]);
+        assert!(config.clusters.values().all(Result::is_ok));
+
+        drop(sub);
+        let config = harness.sync_config();
+        assert_eq!(cluster_names(&config), ["a"]);
+        assert_eq!(harness.watched_clusters(), ["a"]);
+        assert_eq!(harness.watched_endpoints(), ["a-eds"]);
+    }
+
+    #[test]
+    fn subscribing_to_route_cluster_is_noop_until_route_drops_it() {
+        let mut harness = Harness::resolved(&["a", "b"]);
+
+        // Subscribing and unsubscribing while the route still references "b"
+        // does not change the root cluster set and must not re-publish.
+        let sub_b = harness.subscriber.subscribe_to_cluster("b");
+        assert!(harness.sync_subscriptions().is_empty());
+        drop(sub_b);
+        assert!(harness.sync_subscriptions().is_empty());
+
+        // Holding a subscription to "a" is initially a no-op, then keeps "a"
+        // alive when the route drops it (gRFC A31 cluster draining).
+        let sub_a = harness.subscriber.subscribe_to_cluster("a");
+        assert!(harness.sync_subscriptions().is_empty());
+
+        let config = harness.config([rds("routes", &["b"])]);
+        assert_eq!(cluster_names(&config), ["a", "b"]);
+        assert_eq!(harness.watched_clusters(), ["a", "b"]);
+
+        drop(sub_a);
+        let config = harness.sync_config();
+        assert_eq!(cluster_names(&config), ["b"]);
+        assert_eq!(harness.watched_clusters(), ["b"]);
+        assert_eq!(harness.watched_endpoints(), ["b-eds"]);
+    }
+
+    #[test]
+    fn multiple_subscriptions_refcount_until_last_drop() {
+        let mut harness = Harness::new();
+        harness.config([lds_inline(route_config("inline", &[]))]);
+
+        let sub1 = harness.subscriber.subscribe_to_cluster("dyn");
+        let sub2 = harness.subscriber.subscribe_to_cluster("dyn");
+        let sub3 = sub1.clone();
+        assert!(harness.sync_subscriptions().is_empty());
+        assert!(harness.batch([cds_eds("dyn")]).is_empty());
+        let config = harness.config([eds("dyn-eds")]);
+        assert_eq!(cluster_names(&config), ["dyn"]);
+
+        drop(sub1);
+        drop(sub2);
+        assert!(harness.sync_subscriptions().is_empty());
+        assert_eq!(harness.watched_clusters(), ["dyn"]);
+
+        drop(sub3);
+        let config = harness.sync_config();
+        assert!(config.clusters.is_empty());
+        assert!(harness.watched_clusters().is_empty());
+        assert!(harness.watched_endpoints().is_empty());
+    }
+
+    #[test]
+    fn subscribed_aggregate_cluster_walks_descendants() {
+        let mut harness = Harness::new();
+        harness.config([lds_inline(route_config("inline", &[]))]);
+
+        let sub = harness.subscriber.subscribe_to_cluster("agg");
+        assert!(harness.sync_subscriptions().is_empty());
+        assert_eq!(harness.watched_clusters(), ["agg"]);
+
+        let aggregate = ClusterDiscovery::Aggregate {
+            children: vec!["leaf-1".to_owned(), "leaf-2".to_owned()],
+        };
+        assert!(harness.batch([cds("agg", aggregate)]).is_empty());
+        assert_eq!(harness.watched_clusters(), ["agg", "leaf-1", "leaf-2"]);
+
+        assert!(
+            harness
+                .batch([cds_eds("leaf-1"), cds_eds("leaf-2")])
+                .is_empty()
+        );
+        assert!(harness.batch([eds("leaf-1-eds")]).is_empty());
+        let config = harness.config([eds("leaf-2-eds")]);
+        assert_eq!(cluster_names(&config), ["agg", "leaf-1", "leaf-2"]);
+
+        drop(sub);
+        let config = harness.sync_config();
+        assert!(config.clusters.is_empty());
+        assert!(harness.watched_clusters().is_empty());
+        assert!(harness.watched_endpoints().is_empty());
+    }
+
+    #[test]
+    fn subscribed_cluster_error_is_reported_in_the_snapshot() {
+        let mut harness = Harness::resolved(&["a"]);
+
+        let _sub = harness.subscriber.subscribe_to_cluster("missing");
+        assert!(harness.sync_subscriptions().is_empty());
+        assert_eq!(harness.watched_clusters(), ["a", "missing"]);
+
+        let failure = ClusterGraphEvent::Cluster("missing".to_owned(), does_not_exist());
+        let config = harness.config([WatchEvent::ClusterGraph(failure)]);
+        assert!(config.clusters["a"].is_ok());
+        let error = config.clusters["missing"].as_ref().unwrap_err();
+        assert_eq!(
+            error.message(),
+            "CDS resource missing: resource does not exist"
+        );
+    }
+
+    #[test]
+    fn subscription_before_listener_resolves_is_watched_once_ready() {
+        let mut harness = Harness::new();
+        let _sub = harness.subscriber.subscribe_to_cluster("dyn");
+        assert!(harness.sync_subscriptions().is_empty());
+        assert!(harness.watched_clusters().is_empty());
+
+        // Once LDS provides an inline route with no route clusters, the queued
+        // subscription becomes a root and blocks the first snapshot until ready.
+        assert!(
+            harness
+                .batch([lds_inline(route_config("inline", &[]))])
+                .is_empty()
+        );
+        assert_eq!(harness.watched_clusters(), ["dyn"]);
+
+        assert!(harness.batch([cds_eds("dyn")]).is_empty());
+        let config = harness.config([eds("dyn-eds")]);
+        assert_eq!(cluster_names(&config), ["dyn"]);
+    }
+
+    #[test]
+    fn dropping_pending_subscription_unblocks_route_update() {
+        let mut harness = Harness::resolved(&["a"]);
+
+        let slow_sub = harness.subscriber.subscribe_to_cluster("slow");
+        assert!(harness.sync_subscriptions().is_empty());
+        assert_eq!(harness.watched_clusters(), ["a", "slow"]);
+
+        // Route switches to "b" and "b" resolves, but "slow" is still pending.
+        assert!(harness.batch([rds("routes", &["b"])]).is_empty());
+        assert!(harness.batch([cds_eds("b")]).is_empty());
+        assert!(harness.batch([eds("b-eds")]).is_empty());
+
+        // Dropping the pending subscription drops its watch and unblocks "b".
+        drop(slow_sub);
+        let config = harness.sync_config();
+        assert_eq!(cluster_names(&config), ["b"]);
+        assert_eq!(harness.watched_clusters(), ["b"]);
+    }
+
+    #[test]
+    fn batched_lds_rds_and_subscription_change_does_not_panic() {
+        let mut harness = Harness::new();
+
+        // Initial LDS naming RDS "routes" arrives in the same batch as a
+        // dynamic subscription before `route_config` watch exists.
+        let sub_1 = harness.subscriber.subscribe_to_cluster("dyn-1");
+        assert!(
+            harness
+                .batch_with_subscriptions([lds_rds("routes")])
+                .is_empty()
+        );
+        assert_eq!(harness.route_config_watch(), Some("routes"));
+
+        assert!(harness.batch([rds("routes", &["a"])]).is_empty());
+        assert_eq!(harness.watched_clusters(), ["a", "dyn-1"]);
+        assert!(harness.batch([cds_eds("a"), cds_eds("dyn-1")]).is_empty());
+        let config = harness.config([eds("a-eds"), eds("dyn-1-eds")]);
+        assert_eq!(cluster_names(&config), ["a", "dyn-1"]);
+
+        // An LDS update switching to a new RDS name ("routes-2") batched
+        // together with a second subscription change also reconciles cleanly.
+        let _sub_2 = harness.subscriber.subscribe_to_cluster("dyn-2");
+        drop(sub_1);
+        assert!(
+            harness
+                .batch_with_subscriptions([lds_rds("routes-2")])
+                .is_empty()
+        );
+        assert_eq!(harness.route_config_watch(), Some("routes-2"));
+
+        assert!(harness.batch([rds("routes-2", &["a"])]).is_empty());
+        assert_eq!(harness.watched_clusters(), ["a", "dyn-2"]);
+        assert!(harness.batch([cds_eds("dyn-2")]).is_empty());
+        let config = harness.config([eds("dyn-2-eds")]);
+        assert_eq!(config.route_config.name, "routes-2");
+        assert_eq!(cluster_names(&config), ["a", "dyn-2"]);
+    }
+
+    #[test]
+    fn subscribed_leaf_stays_when_its_aggregate_drops_it() {
+        let mut harness = Harness::new();
+        harness.batch([lds_inline(route_config("inline", &["agg"]))]);
+        let aggregate = ClusterDiscovery::Aggregate {
+            children: vec!["leaf-1".to_owned(), "leaf-2".to_owned()],
+        };
+        harness.batch([cds("agg", aggregate)]);
+        harness.batch([cds_eds("leaf-1"), cds_eds("leaf-2")]);
+        let initial = harness.config([eds("leaf-1-eds"), eds("leaf-2-eds")]);
+        assert_eq!(cluster_names(&initial), ["agg", "leaf-1", "leaf-2"]);
+
+        // "leaf-1" is already reachable through "agg", but subscribing to it
+        // changes the roots, so the same clusters are published again.
+        let _sub_leaf = harness.subscriber.subscribe_to_cluster("leaf-1");
+        let config = harness.sync_config();
+        assert_eq!(cluster_names(&config), ["agg", "leaf-1", "leaf-2"]);
+
+        let shrunk = ClusterDiscovery::Aggregate {
+            children: vec!["leaf-2".to_owned()],
+        };
+        let config = harness.config([cds("agg", shrunk)]);
+        assert_eq!(cluster_names(&config), ["agg", "leaf-1", "leaf-2"]);
+        assert_eq!(harness.watched_clusters(), ["agg", "leaf-1", "leaf-2"]);
+    }
+
     #[tokio::test]
     async fn stops_once_the_xds_client_stops() {
         // A disconnected XdsClient's watches close straight away.
         let (options, updates) = options();
-        run(options).await;
+        let (_subscriber, subscriptions) = subscriptions::new();
+        run(options, subscriptions).await;
         let updates: Vec<_> = updates.try_iter().collect();
         let [Err(error)] = updates.as_slice() else {
             panic!("expected one error, got {updates:?}");

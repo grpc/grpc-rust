@@ -58,8 +58,9 @@ pub(crate) struct XdsConfig {
     /// authority. Kept as an index so it can safely refer into the immutable
     /// `route_config` without a self-referential borrow.
     virtual_host_index: usize,
-    /// Every cluster transitively reachable from [`Self::virtual_host`], keyed
-    /// by cluster name. Includes aggregate clusters' descendants.
+    /// Every cluster transitively reachable from [`Self::virtual_host`] or
+    /// held by a dynamic cluster subscription, keyed by cluster name. Includes
+    /// aggregate clusters' descendants.
     ///
     /// A cluster that failed to resolve (CDS/EDS validation failure, NACK,
     /// DNS lookup failure, cyclic aggregate reference, ...) is still present

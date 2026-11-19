@@ -34,7 +34,6 @@ use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::rt::EndpointListener;
 use crate::rt::GrpcEndpoint;
 use crate::rt::StreamEndpoint;
-use crate::rt::address::FailingSocketAddress;
 use crate::rt::address::ListenerAddress;
 use crate::rt::address::UnixListenerAddress;
 use crate::rt::tokio::TOKIO_ACCEPT_RETRY_POLICY;
@@ -51,7 +50,12 @@ pub async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, String> {
 /// Binds a listener to the Unix socket at `path`.
 pub fn bind(path: PathBuf) -> Result<Box<dyn EndpointListener>, String> {
     let listener = UnixListener::bind(&path).map_err(|e| e.to_string())?;
-    Ok(Box::new(TokioUnixListener { listener }))
+    let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let local_addr = UnixListenerAddress::new(address_string(&local_addr));
+    Ok(Box::new(TokioUnixListener {
+        listener,
+        local_addr,
+    }))
 }
 
 fn endpoint(stream: UnixStream) -> Result<Box<dyn GrpcEndpoint>, String> {
@@ -99,6 +103,8 @@ fn address_string(addr: &SocketAddr) -> String {
 /// Wraps `tokio::net::UnixListener` as an [`EndpointListener`].
 struct TokioUnixListener {
     listener: UnixListener,
+    /// Determined when binding, so that binding fails if it can't be read.
+    local_addr: UnixListenerAddress,
 }
 
 #[crate::async_trait]
@@ -109,12 +115,8 @@ impl EndpointListener for TokioUnixListener {
         Ok(accepted_endpoint(stream, peer_addr))
     }
 
-    fn local_addr(&self) -> Box<dyn ListenerAddress> {
-        // TODO: Should the API return result or a FailingAddress type?
-        match self.listener.local_addr().map_err(|e| e.to_string()) {
-            Ok(addr) => Box::new(UnixListenerAddress::new(address_string(&addr))),
-            Err(err) => Box::new(FailingSocketAddress::new("unix", err)),
-        }
+    fn local_addr(&self) -> &dyn ListenerAddress {
+        &self.local_addr
     }
 }
 

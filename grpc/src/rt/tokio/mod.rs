@@ -45,7 +45,6 @@ use crate::rt::Sleep;
 use crate::rt::StreamEndpoint;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
-use crate::rt::address::FailingSocketAddress;
 use crate::rt::address::ListenerAddress;
 use crate::rt::address::TcpAddress;
 
@@ -163,7 +162,11 @@ impl Runtime for TokioRuntime {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(Box::new(TokioTcpListener { listener }) as Box<dyn super::EndpointListener>)
+            let local_addr = TcpAddress(listener.local_addr().map_err(|e| e.to_string())?);
+            Ok(Box::new(TokioTcpListener {
+                listener,
+                local_addr,
+            }) as Box<dyn super::EndpointListener>)
         })
     }
 
@@ -295,6 +298,8 @@ where
 /// Wraps `tokio::net::TcpListener` as an [`EndpointListener`](super::EndpointListener).
 struct TokioTcpListener {
     listener: tokio::net::TcpListener,
+    /// Determined when binding, so that binding fails if it can't be read.
+    local_addr: TcpAddress,
 }
 
 #[crate::async_trait]
@@ -307,12 +312,8 @@ impl super::EndpointListener for TokioTcpListener {
         )))
     }
 
-    fn local_addr(&self) -> Box<dyn ListenerAddress> {
-        // TODO: Should the API return result or a FailingAddress type?
-        match self.listener.local_addr().map_err(|e| e.to_string()) {
-            Ok(addr) => Box::new(TcpAddress(addr)),
-            Err(err) => Box::new(FailingSocketAddress::new("tcp", err)),
-        }
+    fn local_addr(&self) -> &dyn ListenerAddress {
+        &self.local_addr
     }
 }
 

@@ -148,7 +148,7 @@ pub trait Listener: sealed::Sealed {
     async fn accept(&self, token: SealedToken) -> Result<Self::Transport, String>;
 
     /// Returns the address this listener is bound to.
-    fn local_addr(&self) -> Box<dyn ListenerAddress>;
+    fn local_addr(&self) -> &dyn ListenerAddress;
 }
 
 /// A connection accepted by a [`Listener`] that can serve RPCs.
@@ -997,8 +997,8 @@ mod tests {
                 .ok_or_else(|| "mock listener closed".to_string())
         }
 
-        fn local_addr(&self) -> Box<dyn ListenerAddress> {
-            Box::new(MockListenerAddress)
+        fn local_addr(&self) -> &dyn ListenerAddress {
+            &MockListenerAddress
         }
     }
 
@@ -1254,8 +1254,8 @@ mod tests {
                 Err("simulated listener accept error".to_string())
             }
 
-            fn local_addr(&self) -> Box<dyn ListenerAddress> {
-                Box::new(MockListenerAddress)
+            fn local_addr(&self) -> &dyn ListenerAddress {
+                &MockListenerAddress
             }
         }
 
@@ -1278,7 +1278,7 @@ mod tests {
             .unwrap();
 
         let local_addr = listener.local_addr();
-        let tcp_addr = (&*local_addr as &dyn Any)
+        let tcp_addr = (local_addr as &dyn Any)
             .downcast_ref::<TcpAddress>()
             .expect("expected TcpAddress");
         assert!(tcp_addr.0.port() > 0);

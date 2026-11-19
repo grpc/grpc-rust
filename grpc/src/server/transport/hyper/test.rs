@@ -219,8 +219,8 @@ impl EndpointListener for EndpointsListener {
         }
     }
 
-    fn local_addr(&self) -> Box<dyn ListenerAddress> {
-        Box::new(InMemoryAddress)
+    fn local_addr(&self) -> &dyn ListenerAddress {
+        &InMemoryAddress
     }
 }
 

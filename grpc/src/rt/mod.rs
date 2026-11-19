@@ -61,7 +61,7 @@ pub(crate) trait EndpointListener: Send + Sync + 'static {
     async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String>;
 
     /// Returns the local address this listener is bound to.
-    fn local_addr(&self) -> Box<dyn address::ListenerAddress>;
+    fn local_addr(&self) -> &dyn address::ListenerAddress;
 }
 
 /// An abstraction over an asynchronous runtime.

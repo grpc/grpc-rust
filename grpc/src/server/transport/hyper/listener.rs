@@ -111,7 +111,7 @@ impl Listener for HyperListener {
             .map(|endpoint| HyperTransport::new(endpoint, self.creds.clone(), self.config.clone()))
     }
 
-    fn local_addr(&self) -> Box<dyn ListenerAddress> {
+    fn local_addr(&self) -> &dyn ListenerAddress {
         self.listener.local_addr()
     }
 }
@@ -155,8 +155,8 @@ mod tests {
             Err(FAKE_ACCEPT_ERROR.to_string())
         }
 
-        fn local_addr(&self) -> Box<dyn ListenerAddress> {
-            Box::new(TcpAddress(FAKE_LOCAL_ADDR))
+        fn local_addr(&self) -> &dyn ListenerAddress {
+            &TcpAddress(FAKE_LOCAL_ADDR)
         }
     }
 
@@ -178,7 +178,7 @@ mod tests {
         .await
         .unwrap();
         let local_addr = listener.local_addr();
-        let addr = (&*local_addr as &dyn Any)
+        let addr = (local_addr as &dyn Any)
             .downcast_ref::<TcpAddress>()
             .unwrap()
             .0;
@@ -254,7 +254,7 @@ mod tests {
 
         let local_addr = listener.local_addr();
 
-        let addr = (&*local_addr as &dyn Any).downcast_ref::<TcpAddress>();
+        let addr = (local_addr as &dyn Any).downcast_ref::<TcpAddress>();
         assert_eq!(addr, Some(&TcpAddress(FAKE_LOCAL_ADDR)));
     }
 

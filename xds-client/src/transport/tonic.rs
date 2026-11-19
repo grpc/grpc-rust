@@ -62,7 +62,7 @@ pub trait TonicCallCredentials: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
-const ADS_CHANNEL_BUFFER_SIZE: usize = 16;
+const SEND_CHANNEL_BUFFER_SIZE: usize = 16;
 
 /// Default timeout for establishing the TCP/TLS connection to the xDS server.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -355,7 +355,7 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Create an ADS transport from a custom channel connection future.
+    /// Create a transport from a custom channel connection future.
     ///
     /// `secure = true` declares that the channel guarantees server authentication,
     /// confidentiality, and integrity. The declaration is trusted, not verified.
@@ -363,7 +363,7 @@ impl TonicTransportBuilder {
     /// the connection future is polled.
     ///
     /// The connection future owns URI handling, TLS, timeouts, and keepalives.
-    /// This builder applies call credentials and ADS message-size limits.
+    /// This builder applies call credentials and message-size limits.
     pub async fn build_with_channel<F>(&self, connect: F, secure: bool) -> Result<TonicTransport>
     where
         F: Future<Output = Result<Channel>> + Send,
@@ -413,7 +413,7 @@ impl TonicTransportBuilder {
     /// Applies this builder's URI/TLS validation, connection timeout, and
     /// HTTP/2 keepalive settings. A configured TLS factory is evaluated while
     /// preparing the channel. Call-credential security requirements are checked,
-    /// but no ADS stream is created and no call credentials are sent.
+    /// but no stream is created and no call credentials are sent.
     pub async fn connect_channel(&self, server: &ServerConfig) -> Result<Channel> {
         // With no TLS backend compiled in, `tls_configured` stays false.
         #[cfg(feature = "_tonic-tls-any")]
@@ -488,8 +488,8 @@ type StreamingFuture =
     Box<dyn Future<Output = std::result::Result<Streaming<Bytes>, Status>> + Send>;
 
 impl Transport for TonicTransport {
-    type Sender = TonicAdsSender;
-    type Receiver = TonicAdsReceiver;
+    type Sender = TonicSender;
+    type Receiver = TonicReceiver;
 
     async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
         // Validate the method path up front rather than panicking in
@@ -514,7 +514,7 @@ impl Transport for TonicTransport {
             .await
             .map_err(|error| Error::Connection(error.to_string()))?;
 
-        let (tx, rx) = mpsc::channel::<Bytes>(ADS_CHANNEL_BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel::<Bytes>(SEND_CHANNEL_BUFFER_SIZE);
         let channel_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let mut request = tonic::Request::new(channel_stream);
 
@@ -531,21 +531,21 @@ impl Transport for TonicTransport {
             Ok(response.into_inner())
         });
 
-        let receiver = TonicAdsReceiver {
+        let receiver = TonicReceiver {
             state: TonicReceiverState::Connecting(Some(connect_fut)),
         };
 
-        Ok((TonicAdsSender { sender: tx }, receiver))
+        Ok((TonicSender { sender: tx }, receiver))
     }
 }
 
 /// Sending half of a `TonicTransport` stream.
 #[derive(Debug)]
-pub struct TonicAdsSender {
+pub struct TonicSender {
     sender: mpsc::Sender<Bytes>,
 }
 
-impl TransportSender for TonicAdsSender {
+impl TransportSender for TonicSender {
     async fn send(&mut self, request: Bytes) -> Result<()> {
         self.sender
             .send(request)
@@ -571,11 +571,11 @@ impl std::fmt::Debug for TonicReceiverState {
 
 /// Receiving half of a `TonicTransport` stream.
 #[derive(Debug)]
-pub struct TonicAdsReceiver {
+pub struct TonicReceiver {
     state: TonicReceiverState,
 }
 
-impl TransportReceiver for TonicAdsReceiver {
+impl TransportReceiver for TonicReceiver {
     async fn recv(&mut self) -> Result<Option<Bytes>> {
         loop {
             match &mut self.state {
@@ -932,7 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_channel_carries_ads_stream_with_call_credentials() {
+    async fn custom_channel_carries_stream_with_call_credentials() {
         let addr = start_mock_server(Some("******")).await;
 
         let builder = TonicTransportBuilder::new().with_call_credentials(Arc::new(MockCreds {

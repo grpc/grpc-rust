@@ -33,8 +33,8 @@ use tonic::transport::Channel;
 #[cfg(feature = "_tls-any")]
 use xds_client::Error as XdsClientError;
 use xds_client::{
-    ClientConfig, MetricsRecorder, Node, ProstCodec, ServerConfig, TokioRuntime, TonicTransport,
-    TonicTransportBuilder, TransportBuilder, XdsClient,
+    ClientConfig, MetricsRecorder, Node, ProstCodec, RetryPolicy, ServerConfig, TokioRuntime,
+    TonicTransport, TonicTransportBuilder, TransportBuilder, XdsClient,
 };
 
 use crate::client::channel::BuildError;
@@ -118,8 +118,14 @@ impl Inner {
             require_secure: bootstrap.use_tls(),
         };
         let node = Node::try_from(bootstrap.node.clone())?;
-        let client_config =
+        let mut client_config =
             ClientConfig::new(node.clone(), bootstrap.server_uri()).with_target(key);
+        if let Some(timeout) = ads.resource_initial_timeout {
+            client_config = client_config.with_resource_initial_timeout(timeout);
+        }
+        if let Some(retry_policy) = ads.retry_policy.clone() {
+            client_config = client_config.with_retry_policy(retry_policy);
+        }
         let mut builder =
             XdsClient::builder(client_config, transport_builder, ProstCodec, TokioRuntime);
         if let Some(recorder) = self.recorder.clone() {
@@ -139,6 +145,8 @@ struct AdsClientSettings {
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
     keep_alive: Option<(Option<Duration>, Duration)>,
+    resource_initial_timeout: Option<Option<Duration>>,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl Debug for AdsClientSettings {
@@ -149,6 +157,8 @@ impl Debug for AdsClientSettings {
             .field("max_decoding_message_size", &self.max_decoding_message_size)
             .field("max_encoding_message_size", &self.max_encoding_message_size)
             .field("keep_alive", &self.keep_alive)
+            .field("resource_initial_timeout", &self.resource_initial_timeout)
+            .field("retry_policy", &self.retry_policy)
             .finish()
     }
 }
@@ -397,6 +407,31 @@ impl XdsClientPoolBuilder {
         self
     }
 
+    /// Sets the timeout waiting for the initial response to an uncached xDS
+    /// resource subscription ([gRFC A57]).
+    ///
+    /// Defaults to `Some(Duration::from_secs(15))` when unset. Pass `None` to
+    /// disable initial-resource timeouts so watchers wait indefinitely while
+    /// the ADS stream stays open.
+    ///
+    /// [gRFC A57]: https://github.com/grpc/proposal/blob/master/A57-xds-client-failure-mode-behavior.md
+    #[must_use]
+    pub fn with_resource_initial_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.ads.resource_initial_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the exponential backoff [`RetryPolicy`] used when reconnecting a
+    /// broken ADS stream.
+    ///
+    /// Defaults to [`RetryPolicy::default()`] (1s initial backoff, 2x
+    /// multiplier, 30s max, 0.2 jitter).
+    #[must_use]
+    pub fn with_ads_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.ads.retry_policy = Some(policy);
+        self
+    }
+
     /// Sets the [`MetricsRecorder`] that receives the gRFC A78 xDS client
     /// metrics. Each client reports its pool key as the `grpc.target` label.
     #[must_use]
@@ -460,6 +495,7 @@ mod tests {
         connects: AtomicUsize,
         configs: Mutex<Vec<RecordedConfig>>,
         reject_keep_alive: bool,
+        fail_connect: bool,
     }
 
     impl ControlPlaneConnector for TestControlPlaneConnector {
@@ -483,6 +519,11 @@ mod tests {
                 });
             }
             self.connects.fetch_add(1, Ordering::SeqCst);
+            if self.fail_connect {
+                return Box::pin(async {
+                    Err(xds_client::Error::Connection("connect failed".into()))
+                });
+            }
             Box::pin(async move { Ok(Channel::from_static("http://127.0.0.1:1").connect_lazy()) })
         }
     }
@@ -697,6 +738,125 @@ mod tests {
         let clients = pool.inner.clients.lock().unwrap();
         assert_eq!(clients.keys().collect::<Vec<_>>(), ["a"]);
         assert!(Arc::ptr_eq(&a, &clients["a"].upgrade().unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_forwards_ads_retry_policy_to_client() {
+        use crate::xds::resource::ListenerResource;
+
+        #[derive(Clone)]
+        struct SharedTestConnector(Arc<TestControlPlaneConnector>);
+
+        impl ControlPlaneConnector for SharedTestConnector {
+            fn is_secure(&self) -> bool {
+                self.0.is_secure()
+            }
+
+            fn connect(
+                &self,
+                config: ControlPlaneConfig<'_>,
+            ) -> BoxFuture<xds_client::Result<Channel>> {
+                self.0.connect(config)
+            }
+        }
+
+        let inner = Arc::new(TestControlPlaneConnector {
+            fail_connect: true,
+            ..Default::default()
+        });
+        let retry_policy = RetryPolicy::new(Duration::from_secs(5), Duration::from_secs(5), 2.0)
+            .unwrap()
+            .with_jitter(0.0)
+            .unwrap();
+        let pool = test_pool_builder()
+            .with_csds_registry(Arc::new(CsdsRegistry::default()))
+            .with_control_plane_connector(SharedTestConnector(inner.clone()))
+            .with_ads_retry_policy(retry_policy)
+            .build()
+            .unwrap();
+
+        let client = pool.get_or_create("retry-scope").unwrap();
+        let _watcher = client.watch::<ListenerResource>("lds");
+
+        // Let the worker execute the initial connect attempt at t=0.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(inner.connects.load(Ordering::SeqCst), 1);
+
+        // Default initial backoff is 1s; custom policy sets 5s (zero jitter).
+        tokio::time::advance(Duration::from_millis(4_900)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            inner.connects.load(Ordering::SeqCst),
+            1,
+            "should not reconnect before configured 5s initial backoff"
+        );
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(inner.connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pool_forwards_resource_initial_timeout_to_client() {
+        use crate::xds::resource::ListenerResource;
+        use xds_client::ResourceEvent;
+        use xds_test_util::XdsTestControlPlaneService;
+
+        let cp = XdsTestControlPlaneService::new()
+            .start()
+            .await
+            .expect("start control plane");
+        let bootstrap = BootstrapConfig::builder(format!("http://{}", cp.addr()))
+            .channel_creds([crate::ChannelCredentialType::Insecure])
+            .build()
+            .unwrap();
+
+        // Short initial timeout surfaces AmbientError::ResourceDoesNotExist when
+        // the control plane never responds for an unknown resource.
+        let short_pool = XdsClientPool::builder()
+            .with_bootstrap(bootstrap.clone())
+            .with_csds_registry(Arc::new(CsdsRegistry::default()))
+            .with_resource_initial_timeout(Some(Duration::from_millis(80)))
+            .build()
+            .unwrap();
+        let short_client = short_pool.get_or_create("short-timeout").unwrap();
+        let mut short_watcher = short_client.watch::<ListenerResource>("missing-lds");
+        let event = tokio::time::timeout(Duration::from_secs(2), short_watcher.next())
+            .await
+            .expect("initial resource timeout should fire")
+            .expect("watcher stream open");
+        assert!(
+            matches!(
+                event,
+                ResourceEvent::ResourceChanged {
+                    result: Err(xds_client::Error::ResourceDoesNotExist),
+                    ..
+                }
+            ),
+            "expected ResourceDoesNotExist, got {event:?}"
+        );
+
+        // Disabling resource_initial_timeout (`None`) prevents the timer from firing.
+        let disabled_pool = XdsClientPool::builder()
+            .with_bootstrap(bootstrap)
+            .with_csds_registry(Arc::new(CsdsRegistry::default()))
+            .with_resource_initial_timeout(None)
+            .build()
+            .unwrap();
+        let disabled_client = disabled_pool.get_or_create("disabled-timeout").unwrap();
+        let mut disabled_watcher = disabled_client.watch::<ListenerResource>("missing-lds");
+        let result =
+            tokio::time::timeout(Duration::from_millis(150), disabled_watcher.next()).await;
+        assert!(
+            result.is_err(),
+            "watcher should stay pending when resource_initial_timeout is None"
+        );
     }
 
     #[cfg(feature = "_tls-any")]

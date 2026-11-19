@@ -286,7 +286,7 @@ impl Timer {
         let task_handle = rt.spawn(Box::pin(async move {
             rt_clone.sleep(duration).await;
             expired_clone.store(true, Ordering::Release);
-            work_scheduler.schedule_work(Some(Box::new(PriorityTimerWork)));
+            work_scheduler.schedule_work(Some(WorkData::new(PriorityTimerWork)));
         }));
         Timer {
             expired,
@@ -527,7 +527,7 @@ impl LbPolicy for PriorityPolicy {
         // Work items scheduled by PriorityPolicy's own timers only trigger
         // reconciliation; all other work items belong to a child policy.
         if let Some(mut data) = data
-            && data.downcast_ref::<PriorityTimerWork>().is_none()
+            && !data.is::<PriorityTimerWork>()
         {
             // Offer the item to each child until one claims it.  Items
             // belonging to deleted children are dropped.

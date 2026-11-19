@@ -904,7 +904,7 @@ enum PickFirstWork {
 
 impl From<PickFirstWork> for Option<WorkData> {
     fn from(work: PickFirstWork) -> Self {
-        Some(Box::new(work))
+        Some(WorkData::new(work))
     }
 }
 
@@ -914,10 +914,10 @@ impl TryFrom<Option<WorkData>> for PickFirstWork {
     fn try_from(data: Option<WorkData>) -> Result<Self, Self::Error> {
         let data = data.ok_or(None)?;
         let data = match data.downcast::<SubchannelUpdate>() {
-            Ok(update) => return Ok(Self::Subchannel(*update)),
+            Ok(update) => return Ok(Self::Subchannel(update)),
             Err(data) => data,
         };
-        data.downcast::<Self>().map(|w| *w).map_err(Some)
+        data.downcast::<Self>().map_err(Some)
     }
 }
 
@@ -1204,7 +1204,9 @@ mod test {
         }
 
         // Lets the Connection Attempt Delay timer fire, and delivers the
-        // resulting work to the policy. Requires a paused clock.
+        // resulting work to the policy. Requires a paused clock. Yields before
+        // and after advancing the clock, so that the timer task can register
+        // its sleep, and then schedule its work.
         async fn fire_timer(&mut self) {
             self.advance_past_timer().await;
             self.run_work();

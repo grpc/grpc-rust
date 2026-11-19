@@ -40,6 +40,22 @@
 //!         .unwrap();
 //! }
 //! ```
+//!
+//! # Well-known types
+//!
+//! By default, generated code refers to Protobuf well-known types, such as
+//! `google.protobuf.Timestamp`, through the [`prost-types`] crate, so the crate
+//! that includes the generated code must depend on it:
+//!
+//! ```toml
+//! [dependencies]
+//! prost-types = "0.14"
+//! ```
+//!
+//! To generate these types from their `.proto` definitions instead, use
+//! [`Builder::compile_well_known_types`].
+//!
+//! [`prost-types`]: https://docs.rs/prost-types
 
 #![warn(
     missing_docs,
@@ -629,6 +645,11 @@ impl Builder {
     }
 
     /// Enable or disable directing Protobuf to compile well-known types.
+    ///
+    /// When disabled (the default), generated code uses the `prost-types` crate
+    /// for well-known types, and the crate that includes the generated code
+    /// must depend on `prost-types`. When enabled, those types are generated
+    /// from their `.proto` definitions instead.
     ///
     /// Passed directly to `prost_build::Config.compile_well_known_types`.
     pub fn compile_well_known_types(mut self, enable: bool) -> Self {

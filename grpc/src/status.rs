@@ -63,7 +63,7 @@ impl StatusError {
 
     /// Returns whether the status includes a code restricted for control
     /// plane usage as defined by gRFC A54.
-    pub(crate) fn is_restricted_control_plane_code(&self) -> bool {
+    fn is_restricted_control_plane_code(&self) -> bool {
         matches!(
             self.code,
             StatusCodeError::InvalidArgument
@@ -74,6 +74,18 @@ impl StatusError {
                 | StatusCodeError::OutOfRange
                 | StatusCodeError::DataLoss
         )
+    }
+
+    /// If the status includes a code restricted for control plane usage as
+    /// defined by gRFC A54, returns a new status with code `Internal` and a
+    /// message of the form `"{context}: {self}"`.  Otherwise, returns the
+    /// status unchanged.
+    pub(crate) fn sanitize_control_plane_status(self, context: &str) -> Self {
+        if self.is_restricted_control_plane_code() {
+            StatusError::new(StatusCodeError::Internal, format!("{context}: {self}"))
+        } else {
+            self
+        }
     }
 }
 
@@ -116,5 +128,21 @@ mod tests {
 
         let status = StatusError::new(StatusCodeError::Cancelled, "");
         assert_eq!(format!("{status}"), "Cancelled");
+    }
+
+    #[test]
+    fn test_sanitize_control_plane_status() {
+        let status = StatusError::new(StatusCodeError::NotFound, "not ok")
+            .sanitize_control_plane_status("picker returned illegal status");
+        assert_eq!(status.code(), StatusCodeError::Internal);
+        assert_eq!(
+            status.message(),
+            "picker returned illegal status: NotFound: not ok"
+        );
+
+        let status = StatusError::new(StatusCodeError::Unavailable, "not ok")
+            .sanitize_control_plane_status("picker returned illegal status");
+        assert_eq!(status.code(), StatusCodeError::Unavailable);
+        assert_eq!(status.message(), "not ok");
     }
 }

@@ -14,6 +14,7 @@ edition = "2024"
 # We do want to publish, but semver CI gets angry because it doesn't exist yet.
 # So we'll enable this just before we publish the first time.
 publish = false
+exclude = ["examples"]
 
 [dependencies]
 

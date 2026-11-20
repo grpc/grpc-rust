@@ -38,6 +38,7 @@ use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::private;
+use crate::private::UnstableToken;
 use crate::rt::EndpointIoStream;
 use crate::rt::GrpcRuntime;
 use crate::rt::StreamEndpoint;
@@ -62,7 +63,7 @@ async fn perform_handshake(
     let endpoint = StreamEndpoint::new_from_tcp(source).unwrap();
 
     let info = ClientHandshakeInfo::default();
-    let runtime = GrpcRuntime::new(TokioRuntime::default());
+    let runtime = GrpcRuntime::new(TokioRuntime::default(), UnstableToken);
     let authority = Authority::new("localhost".to_string(), Some(target_port));
 
     handshaker

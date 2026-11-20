@@ -266,6 +266,7 @@ mod tests {
     use crate::client::name_resolution::test_utils::TestChannelController;
     use crate::client::name_resolution::test_utils::TestWorkScheduler;
     use crate::core::Address;
+    use crate::private::UnstableToken;
     use crate::rt;
     use crate::rt::GrpcEndpoint;
     use crate::rt::GrpcRuntime;
@@ -385,7 +386,7 @@ mod tests {
         };
         let options = ResolverOptions {
             authority: target.authority_host_port(),
-            runtime: GrpcRuntime::new(runtime),
+            runtime: GrpcRuntime::new(runtime, UnstableToken),
             work_scheduler,
         };
 
@@ -507,7 +508,7 @@ mod tests {
         };
         let options = ResolverOptions {
             authority: target.authority_host_port(),
-            runtime: GrpcRuntime::new(runtime),
+            runtime: GrpcRuntime::new(runtime, UnstableToken),
             work_scheduler,
         };
 

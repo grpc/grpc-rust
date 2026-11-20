@@ -62,12 +62,12 @@ pub fn bind(path: PathBuf) -> Result<Box<dyn EndpointListener>, String> {
 fn endpoint(stream: UnixStream) -> Result<Box<dyn GrpcEndpoint>, String> {
     let peer_addr = stream.peer_addr().map_err(|e| e.to_string())?;
     let local_addr = stream.local_addr().map_err(|e| e.to_string())?;
-    Ok(Box::new(StreamEndpoint {
-        peer_addr: address_string(&peer_addr).into_boxed_str(),
-        local_addr: address_string(&local_addr).into_boxed_str(),
-        network_type: UNIX_NETWORK_TYPE,
-        inner: stream,
-    }))
+    Ok(Box::new(StreamEndpoint::new(
+        stream,
+        address_string(&local_addr).into_boxed_str(),
+        address_string(&peer_addr).into_boxed_str(),
+        UNIX_NETWORK_TYPE,
+    )))
 }
 
 /// Creates an endpoint for a stream returned by `accept`, which also returned
@@ -77,12 +77,12 @@ fn accepted_endpoint(stream: UnixStream, peer_addr: SocketAddr) -> Box<dyn GrpcE
         .local_addr()
         .map(|addr| address_string(&addr))
         .unwrap_or_default();
-    Box::new(StreamEndpoint {
-        peer_addr: address_string(&peer_addr).into_boxed_str(),
-        local_addr: local_addr.into_boxed_str(),
-        network_type: UNIX_NETWORK_TYPE,
-        inner: stream,
-    })
+    Box::new(StreamEndpoint::new(
+        stream,
+        local_addr.into_boxed_str(),
+        address_string(&peer_addr).into_boxed_str(),
+        UNIX_NETWORK_TYPE,
+    ))
 }
 
 /// Formats a Unix socket address like gRPC C-core and name resolution do: the

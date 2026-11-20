@@ -44,6 +44,7 @@
 //! * [`metadata`] - Data sent with all RPCs typically used by interceptors
 //! * [`core`] - Common types shared between clients and servers
 //! * [`attributes`] - Generic key/value storage used by gRPC plugins
+//! * [`rt`] - The runtime used for I/O, timers, and background tasks
 //!
 //! [gRPC]: https://grpc.io
 //! [our website]: https://grpc.io/docs/languages/rust
@@ -55,12 +56,12 @@ pub(crate) mod codec;
 pub mod core;
 pub mod credentials;
 pub mod metadata;
+pub mod rt;
 pub mod server;
 
 mod byte_str;
 mod inmemory;
 mod macros;
-mod rt;
 mod send_future;
 mod status;
 
@@ -78,7 +79,12 @@ pub mod __unstable {
     pub use crate::private::UnstableTrait;
 
     pub mod rt {
-        pub use crate::rt::*;
+        pub use crate::rt::unstable::*;
+
+        /// Returns the default runtime.
+        pub fn default_runtime() -> crate::rt::GrpcRuntime {
+            crate::rt::default_runtime()
+        }
     }
     pub mod client {
         pub mod boxed {

@@ -319,6 +319,7 @@ mod tests {
     use super::*;
     use crate::client::test_util::ByteSendMsg;
     use crate::client::test_util::NopRecvMessage;
+    use crate::private::UnstableToken;
     use crate::rt::tokio::TokioRuntime;
 
     type Events = Arc<Mutex<Vec<&'static str>>>;
@@ -414,7 +415,7 @@ mod tests {
     const TIMEOUT: Duration = Duration::from_secs(1);
 
     fn runtime() -> GrpcRuntime {
-        GrpcRuntime::new(TokioRuntime::default())
+        GrpcRuntime::new(TokioRuntime::default(), UnstableToken)
     }
 
     async fn invoke(

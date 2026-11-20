@@ -51,8 +51,8 @@ mod watches;
 use std::fmt;
 use std::sync::Arc;
 
-use grpc::__unstable::rt::BoxedTaskHandle;
-use grpc::__unstable::rt::GrpcRuntime;
+use grpc::rt::BoxedTaskHandle;
+use grpc::rt::GrpcRuntime;
 use xds_client::XdsClient;
 
 use crate::xds_config::XdsConfig;

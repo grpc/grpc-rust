@@ -298,7 +298,9 @@ impl<'a> GraphWalker<'a> {
             Some(WatchState::Ready { value, note }) => (value, note.as_ref()),
         };
         match &cluster.discovery {
-            ClusterDiscovery::Eds { eds_service_name } => {
+            ClusterDiscovery::Eds {
+                eds_service_name, ..
+            } => {
                 let endpoints = cache.endpoints(eds_service_name);
                 self.graph
                     .required_watches
@@ -480,6 +482,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+    use crate::resource::DEFAULT_MAX_CONCURRENT_REQUESTS;
 
     // ----- Fixtures -----
 
@@ -593,7 +596,9 @@ mod tests {
             name: name.to_owned(),
             discovery: ClusterDiscovery::Eds {
                 eds_service_name: service.to_owned(),
+                raw_eds_service_name: service.to_owned(),
             },
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         })
     }
 
@@ -604,6 +609,7 @@ mod tests {
                 hostname: host.to_owned(),
                 port,
             },
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         })
     }
 
@@ -613,6 +619,7 @@ mod tests {
             discovery: ClusterDiscovery::Aggregate {
                 children: children.map(str::to_owned).to_vec(),
             },
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         })
     }
 
@@ -620,6 +627,7 @@ mod tests {
         Arc::new(EndpointsResource {
             cluster_name: service.to_owned(),
             localities: Vec::new(),
+            drop_overloads: Vec::new(),
         })
     }
 

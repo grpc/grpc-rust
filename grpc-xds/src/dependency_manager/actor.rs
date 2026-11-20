@@ -398,6 +398,7 @@ mod tests {
     use crate::dependency_manager::cluster_graph::DnsTarget;
     use crate::resource::ClusterDiscovery;
     use crate::resource::ClusterResource;
+    use crate::resource::DEFAULT_MAX_CONCURRENT_REQUESTS;
     use crate::resource::DomainMatcher;
     use crate::resource::EndpointsResource;
     use crate::resource::PathSpecifier;
@@ -572,6 +573,7 @@ mod tests {
         let cluster = ClusterResource {
             name: name.to_owned(),
             discovery,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         };
         WatchEvent::ClusterGraph(ClusterGraphEvent::Cluster(
             name.to_owned(),
@@ -582,13 +584,20 @@ mod tests {
     /// An EDS cluster, whose EDS service is the cluster's name plus "-eds".
     fn cds_eds(name: &str) -> WatchEvent {
         let eds_service_name = format!("{name}-eds");
-        cds(name, ClusterDiscovery::Eds { eds_service_name })
+        cds(
+            name,
+            ClusterDiscovery::Eds {
+                raw_eds_service_name: eds_service_name.clone(),
+                eds_service_name,
+            },
+        )
     }
 
     fn eds(service: &str) -> WatchEvent {
         let endpoints = EndpointsResource {
             cluster_name: service.to_owned(),
             localities: Vec::new(),
+            drop_overloads: Vec::new(),
         };
         WatchEvent::ClusterGraph(ClusterGraphEvent::Endpoints(
             service.to_owned(),

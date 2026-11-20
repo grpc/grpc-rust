@@ -51,14 +51,14 @@ use crate::generated::envoy_config_route_v3_route_proto::RouteConfiguration;
 use crate::generated::envoy_type_v3_percent_proto::fractional_percent::DenominatorType;
 
 /// Validated RouteConfiguration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteConfigResource {
     pub(crate) name: String,
     pub(crate) virtual_hosts: Vec<VirtualHost>,
 }
 
 /// Validated virtual host with domain matching and routes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VirtualHost {
     pub(crate) name: String,
     pub(crate) domains: Vec<DomainMatcher>,
@@ -107,14 +107,14 @@ impl TryFrom<&str> for DomainMatcher {
 }
 
 /// A validated route with match criteria and action.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Route {
     pub(crate) route_match: RouteMatch,
     pub(crate) action: RouteAction,
 }
 
 /// Validated route match criteria.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteMatch {
     pub(crate) path_specifier: PathSpecifier,
     pub(crate) headers: Vec<HeaderMatcher>,
@@ -125,7 +125,7 @@ pub(crate) struct RouteMatch {
 }
 
 /// Path matching specifier.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PathSpecifier {
     Prefix(String),
     Path(String),
@@ -133,7 +133,7 @@ pub(crate) enum PathSpecifier {
 }
 
 /// Header matching criteria.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeaderMatcher {
     /// The header name, lowercased. Metadata keys are always lowercase, so
     /// lowercasing once here lets header names match case-insensitively
@@ -149,7 +149,7 @@ pub(crate) struct HeaderMatcher {
 /// suffix / contains / safe_regex, with optional ASCII case-insensitive
 /// matching per gRFC A63). `Present`, `Absent`, and `Range` are header-specific
 /// extensions beyond the generic StringMatcher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HeaderMatchSpecifier {
     String(StringMatcher),
     /// Match if header is present (any value).
@@ -164,14 +164,14 @@ pub(crate) enum HeaderMatchSpecifier {
 }
 
 /// Route action deciding where to send traffic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteAction {
     Cluster(String),
     WeightedClusters(Vec<WeightedCluster>),
 }
 
 /// A cluster with an associated weight for traffic splitting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WeightedCluster {
     pub(crate) name: String,
     pub(crate) weight: u32,

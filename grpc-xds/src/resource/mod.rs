@@ -41,6 +41,8 @@ mod string_matcher;
 
 pub(crate) use cluster::ClusterDiscovery;
 pub(crate) use cluster::ClusterResource;
+pub(crate) use cluster::DEFAULT_MAX_CONCURRENT_REQUESTS;
+pub(crate) use endpoint::DropOverload;
 pub(crate) use endpoint::EndpointAddress;
 pub(crate) use endpoint::EndpointsResource;
 pub(crate) use endpoint::HealthStatus;

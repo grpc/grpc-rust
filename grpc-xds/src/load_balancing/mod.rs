@@ -26,6 +26,7 @@
 
 use std::sync::Once;
 
+pub(crate) mod cluster_impl;
 pub(crate) mod cluster_manager;
 mod wrr_locality;
 
@@ -40,6 +41,7 @@ static START: Once = Once::new();
 #[allow(dead_code, reason = "no caller until there is an xDS resolver.")]
 pub(crate) fn register() {
     START.call_once(|| {
+        cluster_impl::reg();
         cluster_manager::reg();
         wrr_locality::reg();
     });

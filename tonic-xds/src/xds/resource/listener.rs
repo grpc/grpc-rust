@@ -24,6 +24,7 @@
 
 //! Validated Listener resource (LDS).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -44,7 +45,7 @@ pub(crate) enum RouteSource {
     /// Route configuration fetched dynamically via RDS.
     Rds(String),
     /// Route configuration embedded inline in the listener.
-    Inline(RouteConfigResource),
+    Inline(Arc<RouteConfigResource>),
 }
 
 /// Validated Listener resource.
@@ -127,7 +128,7 @@ impl Resource for ListenerResource {
                 let validated = RouteConfigResource::validate(route_config)?;
                 Ok(ListenerResource {
                     name,
-                    route_source: RouteSource::Inline(validated),
+                    route_source: RouteSource::Inline(Arc::new(validated)),
                     max_stream_duration,
                 })
             }

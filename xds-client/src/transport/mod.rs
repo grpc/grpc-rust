@@ -32,6 +32,10 @@ use std::future::Future;
 #[cfg(feature = "transport-tonic")]
 pub mod tonic;
 
+/// The gRPC method of the ADS stream.
+pub const ADS_METHOD: &str =
+    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
+
 /// Factory for creating xDS transport streams.
 ///
 /// This abstraction allows for different transport implementations:
@@ -45,16 +49,19 @@ pub trait Transport: Send + Sync + 'static {
     /// The receiving half produced by this transport.
     type Receiver: TransportReceiver;
 
-    /// Creates a new bidirectional ADS stream to the xDS server,
-    /// returning separate sending and receiving halves.
+    /// Creates a new bidirectional stream for the gRPC `method` (e.g. ADS or
+    /// LRS), returning separate sending and receiving halves.
     ///
     /// This may be called multiple times for reconnection.
-    fn new_stream(&self) -> impl Future<Output = Result<(Self::Sender, Self::Receiver)>> + Send;
+    fn new_stream(
+        &self,
+        method: &'static str,
+    ) -> impl Future<Output = Result<(Self::Sender, Self::Receiver)>> + Send;
 }
 
-/// Sending half of a bidirectional xDS ADS stream.
+/// Sending half of a bidirectional xDS stream.
 pub trait TransportSender: Send + 'static {
-    /// Submit serialized DiscoveryRequest bytes to the transport.
+    /// Submit a serialized request message to the transport.
     ///
     /// Completion does not guarantee network delivery.
     ///
@@ -66,9 +73,9 @@ pub trait TransportSender: Send + 'static {
     fn send(&mut self, request: Bytes) -> impl Future<Output = Result<()>> + Send;
 }
 
-/// Receiving half of a bidirectional xDS ADS stream.
+/// Receiving half of a bidirectional xDS stream.
 pub trait TransportReceiver: Send + 'static {
-    /// Receive serialized DiscoveryResponse bytes from the server.
+    /// Receive a serialized response message from the server.
     ///
     /// Returns:
     /// - `Ok(Some(bytes))` - Received a response.
@@ -134,9 +141,11 @@ pub(crate) mod mock {
     use bytes::Bytes;
     use tokio::sync::mpsc;
 
-    /// Test-side handle to one mock ADS stream.
+    /// Test-side handle to one mock stream.
     pub(crate) struct MockServer {
-        /// Requests the worker sent (initial requests, ACKs, subscription changes).
+        /// The gRPC method the stream was opened for.
+        pub(crate) method: &'static str,
+        /// Requests the worker sent.
         pub(crate) requests: mpsc::UnboundedReceiver<Bytes>,
         /// Responses to push to the worker.
         pub(crate) responses: mpsc::UnboundedSender<Result<Option<Bytes>>>,
@@ -176,10 +185,11 @@ pub(crate) mod mock {
         type Sender = MockSender;
         type Receiver = MockReceiver;
 
-        async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
+        async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
             let (req_tx, req_rx) = mpsc::unbounded_channel();
             let (resp_tx, resp_rx) = mpsc::unbounded_channel();
             let _ = self.servers.send(MockServer {
+                method,
                 requests: req_rx,
                 responses: resp_tx,
             });

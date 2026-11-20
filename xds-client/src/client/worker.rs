@@ -68,6 +68,7 @@ use crate::metrics::{self};
 use crate::resource::DecodedResource;
 use crate::resource::DecoderFn;
 use crate::runtime::Runtime;
+use crate::transport::ADS_METHOD;
 use crate::transport::Transport;
 use crate::transport::TransportBuilder;
 use crate::transport::TransportReceiver;
@@ -1483,7 +1484,7 @@ impl<R: Runtime, TB: TransportBuilder> TransportContext<R, TB> {
         let mut backoff = Backoff::new(self.retry_policy);
         loop {
             if let Ok(transport) = self.builder.build(server).await
-                && let Ok((tx, rx)) = transport.new_stream().await
+                && let Ok((tx, rx)) = transport.new_stream(ADS_METHOD).await
             {
                 let (writes, write_rx) = mpsc::unbounded_channel();
                 let (cancel, cancelled) = oneshot::channel();
@@ -2005,6 +2006,7 @@ mod tests {
             .await
             .expect("timed out waiting for stream")
             .expect("transport dropped");
+        assert_eq!(server.method, ADS_METHOD);
         let _initial = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
             .await
             .expect("timed out waiting for initial request")
@@ -2087,11 +2089,11 @@ mod tests {
         type Sender = <MockTransport as Transport>::Sender;
         type Receiver = <MockTransport as Transport>::Receiver;
 
-        async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
+        async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
             if matches!(self.phase, ReconnectPhase::Stream) {
                 connection_gate(&self.gates).await?;
             }
-            self.inner.new_stream().await
+            self.inner.new_stream(method).await
         }
     }
 

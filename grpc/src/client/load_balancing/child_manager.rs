@@ -520,7 +520,6 @@ mod test {
     use std::sync::Mutex;
     use std::sync::mpsc;
 
-    use crate::attributes::Attributes;
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::DynLbConfig;
     use crate::client::load_balancing::DynLbPolicyBuilder;
@@ -540,6 +539,7 @@ mod test {
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
+    use crate::client::name_resolution::ResolverUpdateAttributes;
     use crate::core::Address;
     use crate::rt::default_runtime;
 
@@ -564,7 +564,7 @@ mod test {
                 child_policy_builder: builder.clone(),
                 child_update: Some((
                     ResolverUpdate {
-                        attributes: Attributes::default(),
+                        attributes: ResolverUpdateAttributes::default(),
                         endpoints: Ok(vec![e.clone()]),
                         service_config: Ok(None),
                         resolution_note: None,

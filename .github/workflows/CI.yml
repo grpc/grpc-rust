@@ -87,7 +87,21 @@ jobs:
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          cp -r target/release/build/protoc-gen-grpc-rust-*/out/install protoc-cache/
+          # An example binary in protoc-gen-grpc-rust prints the location of
+          # output directory.  Copy the binaries we need from there.
+          bin_dir=$(cargo run -q -p protoc-gen-grpc-rust --release --example print_bin_dir)
+          # On Windows, this is a native path (e.g. D:\...); convert it.
+          if command -v cygpath >/dev/null; then
+            bin_dir=$(cygpath -u "$bin_dir")
+          fi
+          echo "protoc-gen-grpc-rust bin directory: $bin_dir"
+          if [ ! -d "$bin_dir" ]; then
+            echo "protoc-gen-grpc-rust bin directory does not exist"
+            exit 1
+          fi
+          mkdir -p protoc-cache
+          # Copy the whole install directory (bin/ and include/).
+          cp -r "$bin_dir/../." protoc-cache/
           echo "Cached files:"
           find protoc-cache/ -type f -exec ls -lh {} +
 

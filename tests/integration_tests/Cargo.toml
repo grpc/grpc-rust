@@ -27,3 +27,5 @@ tower-service = "0.3"
 
 [build-dependencies]
 tonic-prost-build = {path = "../../tonic-prost-build"}
+
+[lints]

@@ -3,7 +3,6 @@ name = "xds-client-opentelemetry"
 description = "OpenTelemetry metrics recorder for xds-client (gRFC A78 XdsClient metrics)"
 version = "0.1.0-alpha.4"
 edition = "2024"
-homepage = "https://github.com/grpc/grpc-rust"
 repository = "https://github.com/grpc/grpc-rust"
 license = "MIT"
 rust-version = { workspace = true }

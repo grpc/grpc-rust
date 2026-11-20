@@ -39,3 +39,5 @@ grpc-protobuf-build = { path = "../grpc-protobuf-build" }
 protobuf-well-known-types = { version = "0.36.2-release" }
 protoc-gen-grpc-rust = { path = "../protoc-gen-grpc-rust" }
 tonic-prost-build = { path = "../tonic-prost-build" }
+
+[lints]

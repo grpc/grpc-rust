@@ -19,3 +19,5 @@ publish = false
 
 [build-dependencies]
 cmake = "0.1"
+
+[lints]

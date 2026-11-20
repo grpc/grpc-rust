@@ -41,6 +41,7 @@ use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::Invoke;
+use crate::client::InvokeOnce;
 use crate::client::RequestHeaders;
 use crate::client::boxed::BoxInvoker;
 use crate::client::boxed::BoxRecvStream;
@@ -60,6 +61,7 @@ use crate::client::transport::TransportOptions;
 use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::Address;
 use crate::core::ConnectionInfo;
+use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
@@ -172,37 +174,36 @@ impl PartialEq for InternalSubchannelState {
     }
 }
 
-impl Invoke for InternalSubchannel {
+/// Starts one RPC on the connection a subchannel had when
+/// [`InternalSubchannel::ready_invoker`] was called.
+///
+/// Holding this keeps that connection's service alive, so it must be used
+/// immediately.  It is only [`InvokeOnce`], so it can't be reused.
+pub(crate) struct ReadyInvoker {
+    state: Arc<ReadyState>,
+    call_creds: Option<Arc<dyn CallCredentials>>,
+}
+
+/// An error returned by [`InternalSubchannel::ready_invoker`] when the
+/// subchannel is not READY.
+#[derive(Debug)]
+pub(crate) struct SubchannelNotReady;
+
+impl InvokeOnce for ReadyInvoker {
     type SendStream = BoxSendStream;
     type RecvStream = BoxRecvStream;
 
-    async fn invoke(
-        &self,
+    async fn invoke_once(
+        self,
         mut headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
-        let (state, call_creds) = {
-            let data = self.data.lock().unwrap();
-
-            let state = match &data.state {
-                InternalSubchannelState::Ready(state) => state.clone(),
-                _ => todo!("handle non-READY subchannel"),
-            };
-
-            let creds = data
-                .security_opts
-                .credentials
-                .get_call_credentials(private::UnstableToken)
-                .cloned();
-
-            (state, creds)
-        };
-
+        let state = self.state;
         let fail_with = |status| -> (BoxSendStream, BoxRecvStream) {
             FailingRecvStream::new_stream_pair(status, Some(state.connection_info.clone()))
         };
 
-        if let Some(call_creds) = call_creds {
+        if let Some(call_creds) = self.call_creds {
             if call_creds.minimum_channel_security_level()
                 > state.connection_info.security_info().security_level()
             {
@@ -241,6 +242,28 @@ impl Invoke for InternalSubchannel {
         }
 
         state.service.invoke(headers, options).await
+    }
+}
+
+impl Invoke for InternalSubchannel {
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        match self.ready_invoker() {
+            Ok(invoker) => invoker.invoke_once(headers, options).await,
+            Err(SubchannelNotReady) => FailingRecvStream::new_stream_pair(
+                StatusError::new(
+                    StatusCodeError::Unavailable,
+                    format!("subchannel for {} is not READY", self.address),
+                ),
+                None,
+            ),
+        }
     }
 }
 
@@ -311,6 +334,23 @@ impl PartialEq for InternalSubchannel {
 }
 
 impl InternalSubchannel {
+    /// Returns an invoker for the subchannel's current connection, or an error
+    /// if the subchannel is not READY.
+    pub(crate) fn ready_invoker(&self) -> Result<ReadyInvoker, SubchannelNotReady> {
+        let data = self.data.lock().unwrap();
+        let InternalSubchannelState::Ready(state) = &data.state else {
+            return Err(SubchannelNotReady);
+        };
+        Ok(ReadyInvoker {
+            state: state.clone(),
+            call_creds: data
+                .security_opts
+                .credentials
+                .get_call_credentials(private::UnstableToken)
+                .cloned(),
+        })
+    }
+
     pub(super) fn new_arc(
         address: Address,
         transport: ArcTransport,

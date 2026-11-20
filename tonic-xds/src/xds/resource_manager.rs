@@ -39,9 +39,10 @@
 //!
 //! Each level determines the subscriptions for the next. Publication is gated
 //! until the active route configuration and every cluster referenced by the
-//! matched virtual host have resolved (either `Ok` with both CDS and EDS, or
-//! `Err` with a per-cluster [`ClusterError`]), matching gRFC A74
-//! `XdsDependencyManager` semantics.
+//! matched virtual host have resolved, matching gRFC A74
+//! `XdsDependencyManager` semantics. A CDS failure records a per-cluster
+//! [`ClusterError`]. An EDS failure keeps the cluster `Ok` with no endpoints
+//! and a `resolution_note`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -371,10 +372,15 @@ impl CascadeState {
                         .state
                     {
                         WatchState::Pending => return,
-                        WatchState::Failed(reason) => Err(ClusterError(Arc::clone(reason))),
+                        WatchState::Failed(reason) => Ok(ClusterSnapshot {
+                            cluster: Arc::clone(cluster),
+                            endpoints: None,
+                            resolution_note: Some(Arc::clone(reason)),
+                        }),
                         WatchState::Ready(endpoints) => Ok(ClusterSnapshot {
                             cluster: Arc::clone(cluster),
-                            endpoints: Arc::clone(endpoints),
+                            endpoints: Some(Arc::clone(endpoints)),
+                            resolution_note: None,
                         }),
                     }
                 }
@@ -736,11 +742,19 @@ mod tests {
         assert!(!state.endpoints.contains_key("c1"));
         assert!(state.endpoints.contains_key("c2"));
 
-        // EDS `ResourceChanged(Err(Validation))` marks c2 failed.
+        // EDS `ResourceChanged(Err(Validation))` keeps c2 `Ok` with no
+        // endpoints and a resolution note (gRFC A74).
         state.handle_eds("c2", validation_err_event(), &client, &cache);
         let snap = cache.current().unwrap();
-        let c2_err = snap.clusters["c2"].as_ref().unwrap_err();
-        assert!(c2_err.0.contains("EDS resource 'c2'"));
+        let c2 = snap.clusters["c2"].as_ref().unwrap();
+        assert_eq!(c2.cluster.name, "c2");
+        assert!(c2.endpoints.is_none());
+        assert!(
+            c2.resolution_note
+                .as_deref()
+                .unwrap()
+                .contains("EDS resource 'c2'")
+        );
 
         // RDS `ResourceChanged(Err(Validation))` publishes top-level error and
         // cancels descendant CDS/EDS watches.
@@ -864,8 +878,15 @@ mod tests {
         assert!(snap.clusters["healthy"].is_ok());
         let cds_err = snap.clusters["bad-cds"].as_ref().unwrap_err();
         assert!(cds_err.0.contains("CDS resource 'bad-cds'"));
-        let eds_err = snap.clusters["bad-eds"].as_ref().unwrap_err();
-        assert!(eds_err.0.contains("EDS resource 'eds-missing'"));
+        let bad_eds = snap.clusters["bad-eds"].as_ref().unwrap();
+        assert!(bad_eds.endpoints.is_none());
+        assert!(
+            bad_eds
+                .resolution_note
+                .as_deref()
+                .unwrap()
+                .contains("EDS resource 'eds-missing'")
+        );
 
         // When bad-cds later recovers, the snapshot updates its entry to Ok.
         resolve_cluster(&mut state, "bad-cds", &client, &cache);
@@ -1115,7 +1136,12 @@ mod tests {
         state.handle_eds("eds-v1", ok_event(Arc::clone(&ep_v1)), &client, &cache);
         let snap_v1 = cache.current().unwrap();
         assert!(Arc::ptr_eq(
-            &snap_v1.clusters["c1"].as_ref().unwrap().endpoints,
+            snap_v1.clusters["c1"]
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .as_ref()
+                .unwrap(),
             &ep_v1
         ));
 
@@ -1135,7 +1161,12 @@ mod tests {
             &cds_v2
         ));
         assert!(Arc::ptr_eq(
-            &snap_v2.clusters["c1"].as_ref().unwrap().endpoints,
+            snap_v2.clusters["c1"]
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .as_ref()
+                .unwrap(),
             &ep_v2
         ));
     }
@@ -1166,11 +1197,21 @@ mod tests {
         state.handle_eds("shared-eds", ok_event(Arc::clone(&ep_v1)), &client, &cache);
         let snap = cache.current().expect("both clusters resolved");
         assert!(Arc::ptr_eq(
-            &snap.clusters["cluster-a"].as_ref().unwrap().endpoints,
+            snap.clusters["cluster-a"]
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .as_ref()
+                .unwrap(),
             &ep_v1
         ));
         assert!(Arc::ptr_eq(
-            &snap.clusters["cluster-b"].as_ref().unwrap().endpoints,
+            snap.clusters["cluster-b"]
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .as_ref()
+                .unwrap(),
             &ep_v1
         ));
 
@@ -1186,7 +1227,12 @@ mod tests {
         let pruned = cache.current().unwrap();
         assert!(!pruned.clusters.contains_key("cluster-a"));
         assert!(Arc::ptr_eq(
-            &pruned.clusters["cluster-b"].as_ref().unwrap().endpoints,
+            pruned.clusters["cluster-b"]
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .as_ref()
+                .unwrap(),
             &ep_v1
         ));
     }
@@ -1369,7 +1415,7 @@ mod tests {
         let snap = watch.next().await.unwrap().unwrap();
         assert_eq!(snap.clusters.len(), 3);
         assert!(snap.clusters.values().all(|res| {
-            res.as_ref().unwrap().endpoints.localities[0]
+            res.as_ref().unwrap().endpoints.as_ref().unwrap().localities[0]
                 .endpoints
                 .len()
                 == 1

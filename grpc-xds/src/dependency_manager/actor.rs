@@ -118,6 +118,9 @@ struct Actor {
     /// that a Listener that recovers unchanged needs no new fetch.
     route_config: Option<Watched<RouteConfigResource>>,
     watches: Watches,
+    /// The clusters that the selected virtual host's routes use, as of the
+    /// last [`Actor::resolve`], or `None` while there is no selection.
+    route_clusters: Option<HashSet<String>>,
     subscriptions: SubscriptionWatch,
     /// Clusters currently held by live [`ClusterSubscription`] handles.
     ///
@@ -230,6 +233,7 @@ impl Actor {
             listener,
             route_config: None,
             watches: Watches::default(),
+            route_clusters: None,
             subscriptions,
             subscribed_clusters: HashSet::new(),
         }
@@ -274,9 +278,9 @@ impl Actor {
         }
     }
 
-    /// Polls the resource watches, from the top of the resource tree down.
-    /// Returns `None` once a watch has closed, which means that the XdsClient
-    /// has stopped.
+    /// Polls the watches, from the top of the resource tree down. Returns
+    /// `None` once a watch has closed, which means that the XdsClient has
+    /// stopped.
     fn poll_watch_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<WatchEvent>> {
         if let Poll::Ready(event) = self.listener.watcher.poll_next(cx) {
             return Poll::Ready(event.map(WatchEvent::Listener));
@@ -286,10 +290,9 @@ impl Actor {
         {
             return Poll::Ready(event.map(WatchEvent::RouteConfig));
         }
-        if let Poll::Ready(event) = self.watches.poll_next(cx) {
-            return Poll::Ready(event.map(WatchEvent::ClusterGraph));
-        }
-        Poll::Pending
+        self.watches
+            .poll_next(cx)
+            .map(|event| event.map(WatchEvent::ClusterGraph))
     }
 
     /// Applies `event` to the cached states, and returns its flow-control
@@ -309,20 +312,18 @@ impl Actor {
     }
 
     /// Replaces `self.subscribed_clusters` with `clusters`, and reports whether
-    /// the root cluster set of the current route selection actually changed.
+    /// that changed the roots of the cluster graph: the union of the selected
+    /// virtual host's clusters and the subscribed clusters.
     ///
-    /// Called only when no resource events ran in the same batch, so
-    /// `self.route_config` is already reconciled with `self.listener`.
+    /// While there is no selection, the cluster watches are kept as they are
+    /// (see [`Actor::resolve`]), so a subscription change needs no update.
     fn update_subscriptions(&mut self, clusters: HashSet<Arc<str>>) -> bool {
         let prev = std::mem::replace(&mut self.subscribed_clusters, clusters);
-        if prev == self.subscribed_clusters {
-            return false;
-        }
-        let Ok(selection) = self.select_route() else {
+        let Some(route_clusters) = &self.route_clusters else {
             return false;
         };
         prev.symmetric_difference(&self.subscribed_clusters)
-            .any(|cluster| !selection.clusters.contains(cluster.as_ref()))
+            .any(|cluster| !route_clusters.contains(cluster.as_ref()))
     }
 
     /// Applies `batch` to the cached states, then updates the watches to match
@@ -333,23 +334,19 @@ impl Actor {
     /// been published: the XdsClient reads the next response once they are
     /// dropped (gRFC A88).
     fn handle_batch(&mut self, batch: Batch) {
-        let mut done = Vec::new();
-        let resource_event = !batch.events.is_empty();
-        for event in batch.events {
-            if let Some(token) = self.handle_watch_event(event) {
-                done.push(token);
-            }
-        }
-        if resource_event {
-            if let Some(clusters) = batch.subscriptions {
-                self.subscribed_clusters = clusters;
-            }
-        } else if !batch
-            .subscriptions
-            .is_some_and(|clusters| self.update_subscriptions(clusters))
-        {
+        let Batch {
+            events,
+            subscriptions,
+        } = batch;
+        let roots_changed =
+            subscriptions.is_some_and(|clusters| self.update_subscriptions(clusters));
+        if events.is_empty() && !roots_changed {
             return;
         }
+        let done: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| self.handle_watch_event(event))
+            .collect();
         match self.resolve() {
             Ok(config) => self.publisher.config(config),
             Err(Blocked::Pending) => {}
@@ -365,7 +362,13 @@ impl Actor {
         // While there is no selection, the cluster watches are kept as they
         // are: they will likely be needed again once the Listener or
         // RouteConfiguration recovers.
-        let selection = self.select_route()?;
+        let selection = match self.select_route() {
+            Ok(selection) => selection,
+            Err(blocked) => {
+                self.route_clusters = None;
+                return Err(blocked);
+            }
+        };
         self.update_clusters(selection)
     }
 
@@ -434,14 +437,17 @@ impl Actor {
     /// dynamic cluster subscriptions, updates the watches to match it, and
     /// returns the snapshot once every root cluster has resolved.
     fn update_clusters(&mut self, selection: Selection) -> Result<XdsConfig, Blocked> {
-        let roots = selection
-            .clusters
-            .iter()
-            .map(String::as_str)
-            .chain(self.subscribed_clusters.iter().map(Arc::as_ref));
+        let route_clusters = self.route_clusters.insert(selection.clusters);
+        let subscribed_clusters = &self.subscribed_clusters;
+        let roots = || {
+            route_clusters
+                .iter()
+                .map(String::as_str)
+                .chain(subscribed_clusters.iter().map(Arc::as_ref))
+        };
         let graph = walk(
             &self.watches,
-            roots,
+            roots(),
             &selection.notes,
             self.node_id.as_deref(),
         );
@@ -449,13 +455,7 @@ impl Actor {
             .reconcile(&self.client, &graph.required_watches);
 
         // A cluster is missing while it or anything below it is pending.
-        if !selection
-            .clusters
-            .iter()
-            .map(String::as_str)
-            .chain(self.subscribed_clusters.iter().map(Arc::as_ref))
-            .all(|name| graph.cluster_configs.contains_key(name))
-        {
+        if !roots().all(|name| graph.cluster_configs.contains_key(name)) {
             return Err(Blocked::Pending);
         }
         Ok(XdsConfig::try_new(
@@ -905,6 +905,25 @@ mod tests {
                  CDS resource a: failed to connect: cds down"
             )
         );
+    }
+
+    #[test]
+    fn identical_snapshot_from_resource_event_is_not_republished() {
+        let mut harness = Harness::resolved(&["a"]);
+        let cds_down = || {
+            WatchEvent::ClusterGraph(ClusterGraphEvent::Cluster(
+                "a".to_owned(),
+                ambient("cds down"),
+            ))
+        };
+        let config = harness.config([cds_down()]);
+        assert_eq!(
+            leaf_note(&config, "a"),
+            Some("CDS resource a: failed to connect: cds down")
+        );
+
+        // The same ambient error again leaves the snapshot unchanged.
+        assert!(harness.batch([cds_down()]).is_empty());
     }
 
     #[test]

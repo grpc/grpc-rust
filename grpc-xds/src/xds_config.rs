@@ -107,11 +107,18 @@ impl XdsConfig {
     /// resource allocations, selected virtual host, cluster outcomes, and
     /// resolution notes.
     pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.listener, &other.listener)
-            && Arc::ptr_eq(&self.route_config, &other.route_config)
-            && self.virtual_host_index == other.virtual_host_index
-            && self.clusters.len() == other.clusters.len()
-            && self.clusters.iter().all(|(name, result)| {
+        // Destructured so that a new field can't be silently left out.
+        let Self {
+            listener,
+            route_config,
+            virtual_host_index,
+            clusters,
+        } = self;
+        Arc::ptr_eq(listener, &other.listener)
+            && Arc::ptr_eq(route_config, &other.route_config)
+            && *virtual_host_index == other.virtual_host_index
+            && clusters.len() == other.clusters.len()
+            && clusters.iter().all(|(name, result)| {
                 other
                     .clusters
                     .get(name)
@@ -172,7 +179,8 @@ pub(crate) struct ClusterConfig {
 
 impl ClusterConfig {
     fn same_snapshot(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.cluster, &other.cluster) && self.children.same_snapshot(&other.children)
+        let Self { cluster, children } = self;
+        Arc::ptr_eq(cluster, &other.cluster) && children.same_snapshot(&other.children)
     }
 }
 
@@ -223,8 +231,12 @@ pub(crate) struct LeafEndpoints {
 
 impl LeafEndpoints {
     fn same_snapshot(&self, other: &Self) -> bool {
-        self.resolution_note == other.resolution_note
-            && match (&self.source, &other.source) {
+        let Self {
+            source,
+            resolution_note,
+        } = self;
+        *resolution_note == other.resolution_note
+            && match (source, &other.source) {
                 (None, None) => true,
                 (Some(LeafEndpointSource::Eds(a)), Some(LeafEndpointSource::Eds(b))) => {
                     Arc::ptr_eq(a, b)

@@ -56,6 +56,8 @@ use std::sync::Arc;
 use grpc::__unstable::rt::BoxedTaskHandle;
 use grpc::__unstable::rt::GrpcRuntime;
 pub(crate) use subscriptions::ClusterSubscriber;
+// TODO: remove once the xds resolver / cds LB policy uses subscriptions.
+#[expect(unused_imports)]
 pub(crate) use subscriptions::ClusterSubscription;
 use xds_client::XdsClient;
 
@@ -126,16 +128,6 @@ impl XdsDependencyManager {
     #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn subscriber(&self) -> ClusterSubscriber {
         self.subscriber.clone()
-    }
-
-    /// Subscribes to `cluster_name` for as long as the returned
-    /// [`ClusterSubscription`] (or any clone of it) remains alive.
-    ///
-    /// See [`ClusterSubscriber::subscribe_to_cluster`].
-    // TODO: remove once the xds resolver uses the dependency manager.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn subscribe_to_cluster(&self, cluster_name: &str) -> ClusterSubscription {
-        self.subscriber.subscribe_to_cluster(cluster_name)
     }
 }
 
@@ -414,7 +406,7 @@ mod tests {
         let (dependency_manager, mut rx) = start(xds_client(&control_plane));
         snapshot(&mut rx, &["a", "b"]).await;
 
-        let sub_a = dependency_manager.subscribe_to_cluster("a");
+        let sub_a = dependency_manager.subscriber().subscribe_to_cluster("a");
 
         let service = control_plane.get_service();
         set_route(service, &["b"]);

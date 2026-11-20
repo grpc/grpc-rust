@@ -877,6 +877,17 @@ impl Builder {
         fds: prost_types::FileDescriptorSet,
         mut config: Config,
     ) -> io::Result<()> {
+        /// Drop guard that will set [`NON_PATH_TYPE_ALLOWLIST`] back
+        /// to its default on exit.
+        struct Defer;
+        impl Drop for Defer {
+            fn drop(&mut self) {
+                NON_PATH_TYPE_ALLOWLIST.set(DEFAULT_NON_PATH_TYPE_ALLOWLIST);
+            }
+        }
+
+        let _defer_guard = Defer;
+
         let out_dir = if let Some(out_dir) = self.out_dir.as_ref() {
             out_dir.clone()
         } else {
@@ -927,6 +938,10 @@ impl Builder {
 
         if let Some(path) = &self.include_file {
             config.include_file(path);
+        }
+
+        if self.with_extended_rust_types {
+            NON_PATH_TYPE_ALLOWLIST.set(EXTENDED_NON_PATH_TYPE_ALLOWLIST);
         }
 
         // Note: We don't pass self.disable_comments to prost Config here

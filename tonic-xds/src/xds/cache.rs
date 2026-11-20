@@ -38,22 +38,34 @@ use crate::xds::resource::{ClusterResource, EndpointsResource, RouteConfigResour
 
 /// Validated per-cluster resources within an [`XdsConfig`] snapshot.
 ///
-/// A cluster enters [`XdsConfig::clusters`] as `Ok(ClusterSnapshot)` only once
-/// both its CDS [`ClusterResource`] and EDS [`EndpointsResource`] have resolved.
+/// A cluster enters [`XdsConfig::clusters`] as `Ok(ClusterSnapshot)` once its
+/// CDS [`ClusterResource`] is valid and its EDS [`EndpointsResource`] has
+/// resolved. Per gRFC A74, an EDS failure keeps the cluster `Ok`, with no
+/// endpoints and the reason in `resolution_note`.
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterSnapshot {
     pub(crate) cluster: Arc<ClusterResource>,
-    pub(crate) endpoints: Arc<EndpointsResource>,
+    /// `None` if the EDS resource failed without a cached fallback.
+    pub(crate) endpoints: Option<Arc<EndpointsResource>>,
+    /// Why `endpoints` is `None`.
+    pub(crate) resolution_note: Option<Arc<str>>,
 }
 
 impl ClusterSnapshot {
     fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.cluster, &other.cluster) && Arc::ptr_eq(&self.endpoints, &other.endpoints)
+        let endpoints_eq = match (&self.endpoints, &other.endpoints) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        Arc::ptr_eq(&self.cluster, &other.cluster)
+            && endpoints_eq
+            && self.resolution_note == other.resolution_note
     }
 }
 
 /// Per-cluster resolution failure recorded in [`XdsConfig::clusters`] when a
-/// referenced cluster's CDS or EDS resource fails without a cached fallback.
+/// referenced cluster's CDS resource fails without a cached fallback.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct ClusterError(pub(crate) Arc<str>);
@@ -331,19 +343,24 @@ impl XdsCache {
         }
 
         // Mirror into per-resource watch channels until XdsRouter switches to
-        // `XdsCache::watch` in the follow-up PR.
+        // `XdsCache::watch` in the follow-up PR. Entries are pruned against
+        // every cluster in the route config, the same set XdsRouter
+        // provisions. Pruning to the snapshot's clusters instead would close
+        // the router's watches for clusters the snapshot never holds (other
+        // virtual hosts, failed clusters) and rebuild them on every publish.
         for (name, state) in &config.clusters {
             if let Ok(snap) = state {
                 self.clusters
                     .update_if_changed(name, Arc::clone(&snap.cluster));
-                self.endpoints
-                    .update_if_changed(name, Arc::clone(&snap.endpoints));
+                if let Some(endpoints) = &snap.endpoints {
+                    self.endpoints
+                        .update_if_changed(name, Arc::clone(endpoints));
+                }
             }
         }
-        self.clusters
-            .retain(|name| matches!(config.clusters.get(name), Some(Ok(_))));
-        self.endpoints
-            .retain(|name| matches!(config.clusters.get(name), Some(Ok(_))));
+        let referenced = config.route_config.cluster_names();
+        self.clusters.retain(|name| referenced.contains(name));
+        self.endpoints.retain(|name| referenced.contains(name));
         self.update_route_config(Arc::clone(&config.route_config));
     }
 
@@ -381,9 +398,17 @@ impl XdsCache {
         self.config_tx.borrow().clone()
     }
 
-    /// Updates the active route configuration and notifies all watchers.
+    /// Updates the active route configuration and notifies all watchers,
+    /// unless `config` is the same [`Arc`] already stored.
     pub(crate) fn update_route_config(&self, config: Arc<RouteConfigResource>) {
-        self.route_config_tx.send_replace(Some(config));
+        self.route_config_tx.send_if_modified(|slot| {
+            if slot.as_ref().is_some_and(|prev| Arc::ptr_eq(prev, &config)) {
+                false
+            } else {
+                *slot = Some(config);
+                true
+            }
+        });
     }
 
     /// Watches route configuration changes.
@@ -696,7 +721,8 @@ mod tests {
                 "cluster-1".to_string(),
                 Ok(ClusterSnapshot {
                     cluster: Arc::clone(&c1),
-                    endpoints: Arc::clone(&ep1),
+                    endpoints: Some(Arc::clone(&ep1)),
+                    resolution_note: None,
                 }),
             )]),
         });
@@ -713,7 +739,8 @@ mod tests {
                 "cluster-1".to_string(),
                 Ok(ClusterSnapshot {
                     cluster: c1,
-                    endpoints: ep1,
+                    endpoints: Some(ep1),
+                    resolution_note: None,
                 }),
             )]),
         });
@@ -731,5 +758,75 @@ mod tests {
         let dup_err =
             tokio::time::timeout(std::time::Duration::from_millis(20), watch.next()).await;
         assert!(dup_err.is_err(), "duplicate error must not notify");
+    }
+
+    #[tokio::test]
+    async fn publish_mirror_keeps_route_config_clusters_outside_snapshot() {
+        use crate::xds::resource::route_config::RouteConfigAction;
+
+        let cache = XdsCache::new();
+        let mut rc = (*make_route_config("rc-1")).clone();
+        let mut other_vh = rc.virtual_hosts[0].clone();
+        other_vh.name = "vh2".to_string();
+        other_vh.domains = vec!["other.example.com".to_string()];
+        other_vh.routes[0].action = RouteConfigAction::Cluster("cluster-2".to_string());
+        rc.virtual_hosts.push(other_vh);
+        let rc = Arc::new(rc);
+
+        // Router-side watches: cluster-2 is only referenced by the unmatched
+        // vhost; cluster-3 is referenced by no vhost.
+        let mut rc_watch = cache.watch_route_config();
+        let c2_watch = cache.watch_cluster("cluster-2");
+        let ep2_watch = cache.watch_endpoints("cluster-2");
+        let c3_watch = cache.watch_cluster("cluster-3");
+
+        let c1 = make_cluster("cluster-1", LbPolicy::RoundRobin);
+        let publish = |endpoints: Option<Arc<EndpointsResource>>| {
+            cache.publish(Arc::new(XdsConfig {
+                route_config: Arc::clone(&rc),
+                virtual_host_index: 0,
+                clusters: HashMap::from([(
+                    "cluster-1".to_string(),
+                    Ok(ClusterSnapshot {
+                        cluster: Arc::clone(&c1),
+                        resolution_note: endpoints
+                            .is_none()
+                            .then(|| Arc::from("EDS resource 'cluster-1' failed")),
+                        endpoints,
+                    }),
+                )]),
+            }));
+        };
+
+        let ep1 = make_endpoints("cluster-1");
+        let mut ep1_watch = cache.watch_endpoints("cluster-1");
+        publish(Some(Arc::clone(&ep1)));
+        assert!(Arc::ptr_eq(&rc_watch.next().await.unwrap(), &rc));
+        assert!(Arc::ptr_eq(&ep1_watch.next().await.unwrap(), &ep1));
+        publish(Some(make_endpoints("cluster-1")));
+        ep1_watch.next().await.unwrap();
+
+        assert!(
+            !c2_watch.is_closed(),
+            "other-vhost cluster must not be pruned"
+        );
+        assert!(
+            !ep2_watch.is_closed(),
+            "other-vhost endpoints must not be pruned"
+        );
+        assert!(c3_watch.is_closed(), "unreferenced cluster must be pruned");
+        let rc_woken =
+            tokio::time::timeout(std::time::Duration::from_millis(20), rc_watch.next()).await;
+        assert!(rc_woken.is_err(), "unchanged route config must not notify");
+
+        // An EDS failure without endpoints leaves the last mirrored endpoints.
+        publish(None);
+        assert!(!ep1_watch.is_closed());
+        let ep_woken =
+            tokio::time::timeout(std::time::Duration::from_millis(20), ep1_watch.next()).await;
+        assert!(
+            ep_woken.is_err(),
+            "EDS failure must not touch mirrored endpoints"
+        );
     }
 }

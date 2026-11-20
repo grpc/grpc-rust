@@ -108,9 +108,7 @@ fn max_message_send_size() {
         server_recv_max: Some(usize::MAX),
         // Set client send limit to 1024
         client_send_max: Some(1024),
-        // TODO: This should return OutOfRange
-        // https://github.com/grpc/grpc-rust/issues/1334
-        expected_code: Some(Code::Internal),
+        expected_code: Some(Code::OutOfRange),
         ..Default::default()
     });
 
@@ -208,6 +206,124 @@ async fn response_stream_limit() {
     let mut stream = client.stream_call(req).await.unwrap().into_inner();
 
     while let Some(_b) = stream.message().await.unwrap() {}
+}
+
+#[tokio::test]
+async fn request_stream_limit_after_response_headers() {
+    use std::convert::Infallible;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    #[derive(Clone)]
+    struct BidiEchoHeadersFirst;
+
+    impl tonic::server::NamedService for BidiEchoHeadersFirst {
+        const NAME: &'static str = "test.Bidi";
+    }
+
+    impl tower_service::Service<http::Request<tonic::body::Body>> for BidiEchoHeadersFirst {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future =
+            Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+            Box::pin(async move {
+                struct HoldBodySvc;
+                impl tonic::server::StreamingService<Input1> for HoldBodySvc {
+                    type Response = Output1;
+                    type ResponseStream = ReceiverStream<Result<Output1, Status>>;
+                    type Future = Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<Response<Self::ResponseStream>, Status>,
+                                > + Send,
+                        >,
+                    >;
+
+                    fn call(&mut self, req: Request<tonic::Streaming<Input1>>) -> Self::Future {
+                        Box::pin(async move {
+                            let mut inbound = req.into_inner();
+                            let (tx, rx) = mpsc::channel(1);
+                            tokio::spawn(async move {
+                                let _tx = tx;
+                                while let Ok(Some(_)) = inbound.message().await {}
+                            });
+                            Ok(Response::new(ReceiverStream::new(rx)))
+                        })
+                    }
+                }
+
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+                Ok(grpc.streaming(HoldBodySvc, req).await)
+            })
+        }
+    }
+
+    let (client, server) = tokio::io::duplex(1024);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(BidiEchoHeadersFirst)
+            .serve_with_incoming(tokio_stream::StreamExt::chain(
+                tokio_stream::once(Ok::<_, std::io::Error>(server)),
+                tokio_stream::pending(),
+            ))
+            .await
+            .unwrap();
+    });
+
+    let mut client = Some(client);
+    let channel = Endpoint::try_from("http://[::]:50051")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_| {
+            let client = client.take();
+            async move {
+                if let Some(client) = client {
+                    Ok(TokioIo::new(client))
+                } else {
+                    Err(std::io::Error::other("Client already taken"))
+                }
+            }
+        }))
+        .await
+        .unwrap();
+
+    let mut grpc = tonic::client::Grpc::new(channel).max_encoding_message_size(1024);
+    grpc.ready().await.unwrap();
+
+    let (req_tx, req_rx) = mpsc::channel(2);
+    req_tx.send(Input1 { buf: vec![0; 64] }).await.unwrap();
+
+    // Response headers arrive while only the small initial message has been sent.
+    let mut resp_stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        grpc.streaming(
+            Request::new(ReceiverStream::new(req_rx)),
+            http::uri::PathAndQuery::from_static("/test.Bidi/Call"),
+            tonic_prost::ProstCodec::<Input1, Output1>::default(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .into_inner();
+
+    // Sending an oversized message mid-stream must surface OutOfRange on the response stream.
+    req_tx.send(Input1 { buf: vec![0; 2048] }).await.unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), resp_stream.message())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code(), Code::OutOfRange);
 }
 
 // Track caller doesn't work on async fn so we extract the async part

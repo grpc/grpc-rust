@@ -532,9 +532,27 @@ impl Invoke for LbInvoker {
                 PickResult::Queue => {}
                 PickResult::Fail(status) => {
                     // TODO: Check wait-for-ready and queue instead.
+                    if status.is_restricted_control_plane_code() {
+                        return FailingRecvStream::new_stream_pair(
+                            StatusError::new(
+                                StatusCodeError::Internal,
+                                format!("picker returned illegal status: {status}"),
+                            ),
+                            None,
+                        );
+                    }
                     return FailingRecvStream::new_stream_pair(status, None);
                 }
                 PickResult::Drop(status) => {
+                    if status.is_restricted_control_plane_code() {
+                        return FailingRecvStream::new_stream_pair(
+                            StatusError::new(
+                                StatusCodeError::Internal,
+                                format!("picker returned illegal status: {status}"),
+                            ),
+                            None,
+                        );
+                    }
                     return FailingRecvStream::new_stream_pair(status, None);
                 }
             }

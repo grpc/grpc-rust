@@ -247,7 +247,7 @@ pub enum BuildError {
 /// Stored as `Option<Arc<...>>` on [`XdsChannel`] so clones share ownership
 /// cheaply. When the last clone drops, the resource manager cascade task and
 /// ADS worker are aborted. The `XdsCache` is kept alive separately by
-/// `XdsClusterDiscovery` in the service stack.
+/// `XdsRouter` in the service stack.
 ///
 /// A pooled client is shared with other channels and stops only once all of
 /// them have dropped it.
@@ -654,7 +654,6 @@ impl XdsChannelBuilder {
         ResBody: Send + 'static,
     {
         let cluster_factory = self.lb_backend.cluster_factory::<MC, ReqBody, ResBody>(
-            parts.cache.clone(),
             make_connector,
             #[cfg(feature = "_tls-any")]
             parts.cert_provider_registry.clone(),
@@ -693,10 +692,12 @@ impl XdsChannelBuilder {
             .clone()
             .unwrap_or_else(|| Arc::new(GrpcRetryClassifierFactory));
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(
-            parts.cache.clone(),
+            parts.cache,
             retry_factory,
             self.config.route_ready_timeout,
-            move |name| ClusterRef::from_channel(name, cluster_factory.make(name)),
+            move |name, watches| {
+                ClusterRef::from_channel(name, cluster_factory.make(name, watches))
+            },
         ));
 
         // Fallback retry config for requests that carry no per-route config
@@ -1027,7 +1028,6 @@ impl LbBackend {
     /// the arm that does outlier detection.
     fn cluster_factory<MC, ReqBody, ResBody>(
         self,
-        cache: Arc<XdsCache>,
         make_connector: MC,
         #[cfg(feature = "_tls-any")] cert_registry: Arc<CertProviderRegistry>,
         outcome_classifier: Arc<dyn OutcomeClassifier>,
@@ -1047,7 +1047,6 @@ impl LbBackend {
             Self::TowerP2c => {
                 let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> =
                     Arc::new(XdsClusterDiscovery::new(
-                        cache,
                         make_connector,
                         #[cfg(feature = "_tls-any")]
                         cert_registry,
@@ -1055,7 +1054,6 @@ impl LbBackend {
                 Arc::new(TowerP2cClusterChannelFactory::new(discovery))
             }
             Self::XdsLb => Arc::new(XdsLbClusterChannelFactory::new(
-                cache,
                 make_connector,
                 outcome_classifier,
                 #[cfg(feature = "_tls-any")]
@@ -1094,16 +1092,14 @@ mod test_backends {
     pub(crate) const LB_BACKENDS: [LbBackend; 2] = [LbBackend::TowerP2c, LbBackend::XdsLb];
 
     impl LbBackend {
-        /// This backend's gRPC cluster-channel factory over `cache`, wired as
-        /// production wires it. Circuit-breaker counters are private to the
-        /// factory so concurrent tests cannot exhaust each other's limits.
+        /// This backend's gRPC cluster-channel factory, wired as production
+        /// wires it. Circuit-breaker counters are private to the factory so
+        /// concurrent tests cannot exhaust each other's limits.
         pub(crate) fn grpc_factory(
             self,
-            cache: Arc<XdsCache>,
             #[cfg(feature = "_tls-any")] cert_registry: Arc<CertProviderRegistry>,
         ) -> GrpcClusterChannelFactory {
             self.cluster_factory::<_, TonicBody, TonicBody>(
-                cache,
                 grpc_make_connector(
                     GrpcMakeConnector::new(),
                     ClusterCircuitBreakerRegistry::new_for_test(),
@@ -1151,7 +1147,7 @@ mod tests {
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
     use crate::testutil::grpc::TestServer;
-    use crate::xds::cache::XdsCache;
+    use crate::xds::cache::{ClusterWatches, XdsCache};
     use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
     use crate::xds::resource::route_config::RouteConfigResource;
@@ -1179,7 +1175,7 @@ mod tests {
                 Arc::new(TowerP2cClusterChannelFactory::new(discovery));
             self.build_grpc_channel_from_router(
                 LazyClusters::wrap(router, move |name| {
-                    ClusterRef::from_channel(name, factory.make(name))
+                    ClusterRef::from_channel(name, factory.make(name, ClusterWatches::closed()))
                 }),
                 retry,
                 interceptor,
@@ -1261,13 +1257,9 @@ mod tests {
         }
     }
 
-    /// Builds the cluster-channel factory for `backend`, reading from `cache`.
-    fn grpc_cluster_factory(
-        cache: &Arc<XdsCache>,
-        backend: LbBackend,
-    ) -> GrpcClusterChannelFactory {
+    /// Builds the cluster-channel factory for `backend`.
+    fn grpc_cluster_factory(backend: LbBackend) -> GrpcClusterChannelFactory {
         backend.grpc_factory(
-            cache.clone(),
             #[cfg(feature = "_tls-any")]
             LbBackend::empty_cert_registry(),
         )
@@ -1338,6 +1330,7 @@ mod tests {
         fn discover_cluster(
             &self,
             _cluster_name: &str,
+            _watches: ClusterWatches,
         ) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
             let endpoints = self.endpoints.clone();
             let (tx, rx) = mpsc::channel(16);
@@ -1577,7 +1570,7 @@ mod tests {
     /// Builds an XdsChannelGrpc using a real XdsRouter over the given cache,
     /// load-balanced by `backend`.
     fn build_xds_channel_from_cache(cache: &Arc<XdsCache>, backend: LbBackend) -> XdsChannelGrpc {
-        build_xds_channel_from_factory(cache, grpc_cluster_factory(cache, backend))
+        build_xds_channel_from_factory(cache, grpc_cluster_factory(backend))
     }
 
     /// Builds an XdsChannelGrpc using a real XdsRouter over the given cache,
@@ -1593,7 +1586,7 @@ mod tests {
             cache.clone(),
             Arc::new(GrpcRetryClassifierFactory),
             Some(DEFAULT_READY_TIMEOUT),
-            move |name| ClusterRef::from_channel(name, factory.make(name)),
+            move |name, watches| ClusterRef::from_channel(name, factory.make(name, watches)),
         );
         XdsChannelBuilder::new(test_config()).build_grpc_channel_from_router(
             Arc::new(router),
@@ -1837,6 +1830,7 @@ mod tests {
         fn make(
             &self,
             cluster_name: &str,
+            _watches: ClusterWatches,
         ) -> ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> {
             let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
             let _ = self.built.send((cluster_name.to_string(), dropped_rx));
@@ -2364,6 +2358,7 @@ mod tests {
         fn discover_cluster(
             &self,
             _cluster_name: &str,
+            _watches: ClusterWatches,
         ) -> BoxDiscover<EndpointAddress, EndpointChannel<EchoEndpoint>> {
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(async move {
@@ -2412,7 +2407,7 @@ mod tests {
             ClusterRef::from_channel::<
                 super::Request<shared_http_body::SharedBody<TestBody>>,
                 super::Response<TestBody>,
-            >(name, factory.make(name))
+            >(name, factory.make(name, ClusterWatches::closed()))
         });
         let routing_layer = XdsRoutingLayer::new(
             router,
@@ -2559,7 +2554,6 @@ mod tests {
         );
 
         let factory = backend.cluster_factory::<HostnameMakeConnector, TonicBody, TonicBody>(
-            cache.clone(),
             HostnameMakeConnector,
             #[cfg(feature = "_tls-any")]
             LbBackend::empty_cert_registry(),

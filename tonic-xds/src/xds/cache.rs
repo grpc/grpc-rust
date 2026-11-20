@@ -35,23 +35,85 @@ use tokio::sync::watch;
 
 use crate::xds::resource::{ClusterResource, EndpointsResource, RouteConfigResource};
 
+/// Per-cluster resource watches supplied by [`XdsRouter`](crate::xds::routing::XdsRouter)
+/// when provisioning a cluster's load-balanced channel.
+pub(crate) struct ClusterWatches {
+    pub(crate) cluster: CacheWatch<Arc<ClusterResource>>,
+    pub(crate) endpoints: CacheWatch<Arc<EndpointsResource>>,
+}
+
+impl ClusterWatches {
+    /// Creates connected CDS and EDS sender/receiver pairs for tests.
+    #[cfg(test)]
+    pub(crate) fn channel(
+        cluster: Option<Arc<ClusterResource>>,
+        endpoints: Option<Arc<EndpointsResource>>,
+    ) -> (
+        CacheSender<ClusterResource>,
+        CacheSender<EndpointsResource>,
+        Self,
+    ) {
+        let (cluster_tx, cluster) = CacheWatch::channel(cluster);
+        let (endpoints_tx, endpoints) = CacheWatch::channel(endpoints);
+        (cluster_tx, endpoints_tx, Self { cluster, endpoints })
+    }
+
+    /// Already-closed watches for mock/test callers without live xDS feeds.
+    #[cfg(test)]
+    pub(crate) fn closed() -> Self {
+        Self::channel(None, None).2
+    }
+}
+
+/// Sending half of a single-resource watch channel paired with [`CacheWatch`].
+///
+/// Dropping the sender closes all associated [`CacheWatch`] receivers.
+#[cfg(test)]
+pub(crate) struct CacheSender<T> {
+    tx: watch::Sender<Option<Arc<T>>>,
+}
+
+#[cfg(test)]
+impl<T> CacheSender<T> {
+    /// Publishes `value` unless the channel already holds the same [`Arc`].
+    pub(crate) fn send(&self, value: Arc<T>) {
+        self.tx.send_if_modified(|slot| {
+            if slot.as_ref().is_some_and(|prev| Arc::ptr_eq(prev, &value)) {
+                false
+            } else {
+                *slot = Some(value);
+                true
+            }
+        });
+    }
+}
+
 /// A wrapper around [`watch::Receiver`] that exposes only a single `next()`
 /// method, preventing misuse of the raw watch API.
 pub(crate) struct CacheWatch<T> {
-    rx: watch::Receiver<Option<Arc<T>>>,
+    rx: watch::Receiver<Option<T>>,
 }
 
-impl<T> CacheWatch<T> {
-    fn new(mut rx: watch::Receiver<Option<Arc<T>>>) -> Self {
-        // Ensure late watchers see the existing value on first next().
-        rx.mark_changed();
+impl<T: Clone> CacheWatch<T> {
+    fn from_receiver(mut rx: watch::Receiver<Option<T>>) -> Self {
+        if rx.borrow().is_some() {
+            // Ensure late watchers see the existing value on first next().
+            rx.mark_changed();
+        }
         Self { rx }
     }
 
-    /// Waits for the next resource update and returns it.
+    /// Clones this watch so the returned receiver observes the current value
+    /// (if any) on its first [`next`](Self::next) call and tracks the same
+    /// underlying sender.
+    pub(crate) fn resubscribe(&self) -> Self {
+        Self::from_receiver(self.rx.clone())
+    }
+
+    /// Waits for the next update and returns it.
     ///
-    /// Returns `None` if the sender was dropped (resource removed from cache).
-    pub(crate) async fn next(&mut self) -> Option<Arc<T>> {
+    /// Returns `None` if the sender was dropped.
+    pub(crate) async fn next(&mut self) -> Option<T> {
         loop {
             if self.rx.changed().await.is_err() {
                 return None;
@@ -69,6 +131,18 @@ impl<T> CacheWatch<T> {
     /// does not follow.
     pub(crate) fn is_closed(&self) -> bool {
         self.rx.has_changed().is_err()
+    }
+}
+
+impl<T> CacheWatch<Arc<T>> {
+    /// Creates a connected sender/receiver pair with an optional initial value.
+    ///
+    /// When `initial` is `Some`, the returned [`CacheWatch`] yields it on the
+    /// first [`next`](Self::next) call even if no further updates are sent.
+    #[cfg(test)]
+    pub(crate) fn channel(initial: Option<Arc<T>>) -> (CacheSender<T>, Self) {
+        let (tx, rx) = watch::channel(initial);
+        (CacheSender { tx }, Self::from_receiver(rx))
     }
 }
 
@@ -99,9 +173,9 @@ impl<T> WatchMap<T> {
     /// Watches resource changes for the given key.
     ///
     /// Lazily creates the watch channel if it doesn't exist yet.
-    fn watch(&self, key: &str) -> CacheWatch<T> {
+    fn watch(&self, key: &str) -> CacheWatch<Arc<T>> {
         let tx = self.ensure(key);
-        CacheWatch::new(tx.subscribe())
+        CacheWatch::from_receiver(tx.subscribe())
     }
 
     /// Removes the watch channel for the given key.
@@ -127,9 +201,9 @@ impl<T> WatchMap<T> {
 /// Consumers use [`CacheWatch`] to receive notifications:
 ///
 /// - **Routing layer**: calls [`watch_route_config`](Self::watch_route_config),
-///   owns its own `ArcSwap`, and updates it when the watch fires.
-/// - **Cluster layer**: calls [`watch_cluster`](Self::watch_cluster) to await
-///   CDS readiness, then [`watch_endpoints`](Self::watch_endpoints) to track EDS updates.
+///   owns its own `ArcSwap`, and subscribes to [`watch_cluster`](Self::watch_cluster)
+///   and [`watch_endpoints`](Self::watch_endpoints) to pass [`ClusterWatches`]
+///   into each provisioned cluster channel.
 pub(crate) struct XdsCache {
     /// Active route configuration (from LDS inline or RDS).
     route_config_tx: watch::Sender<Option<Arc<RouteConfigResource>>>,
@@ -158,8 +232,8 @@ impl XdsCache {
     }
 
     /// Watches route configuration changes.
-    pub(crate) fn watch_route_config(&self) -> CacheWatch<RouteConfigResource> {
-        CacheWatch::new(self.route_config_tx.subscribe())
+    pub(crate) fn watch_route_config(&self) -> CacheWatch<Arc<RouteConfigResource>> {
+        CacheWatch::from_receiver(self.route_config_tx.subscribe())
     }
 
     /// Updates a cluster resource and notifies watchers.
@@ -173,7 +247,7 @@ impl XdsCache {
     }
 
     /// Watches cluster resource changes for a specific cluster.
-    pub(crate) fn watch_cluster(&self, name: &str) -> CacheWatch<ClusterResource> {
+    pub(crate) fn watch_cluster(&self, name: &str) -> CacheWatch<Arc<ClusterResource>> {
         self.clusters.watch(name)
     }
 
@@ -183,7 +257,7 @@ impl XdsCache {
     }
 
     /// Watches endpoint changes for a cluster.
-    pub(crate) fn watch_endpoints(&self, cluster_name: &str) -> CacheWatch<EndpointsResource> {
+    pub(crate) fn watch_endpoints(&self, cluster_name: &str) -> CacheWatch<Arc<EndpointsResource>> {
         self.endpoints.watch(cluster_name)
     }
 
@@ -378,5 +452,73 @@ mod tests {
         assert!(cache.watch_route_config().next().await.is_some());
         assert!(cache.watch_cluster("c1").next().await.is_some());
         assert!(cache.watch_endpoints("c1").next().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn channel_delivers_initial_and_subsequent_updates() {
+        let initial = make_cluster("c1", LbPolicy::RoundRobin);
+        let (tx, mut watch) = CacheWatch::channel(Some(Arc::clone(&initial)));
+
+        let first = watch.next().await.unwrap();
+        assert!(Arc::ptr_eq(&first, &initial));
+
+        let updated = make_cluster("c1", LbPolicy::LeastRequest);
+        tx.send(Arc::clone(&updated));
+        let second = watch.next().await.unwrap();
+        assert!(Arc::ptr_eq(&second, &updated));
+    }
+
+    #[tokio::test]
+    async fn channel_dedupes_identical_arc_without_waking_receiver() {
+        let c1 = make_cluster("c1", LbPolicy::RoundRobin);
+        let (tx, mut watch) = CacheWatch::channel(Some(Arc::clone(&c1)));
+        let _ = watch.next().await.unwrap();
+
+        // Re-sending the exact same Arc must not wake the watcher.
+        tx.send(Arc::clone(&c1));
+        let woken = tokio::time::timeout(std::time::Duration::from_millis(20), watch.next()).await;
+        assert!(woken.is_err(), "unchanged Arc should not notify watcher");
+
+        // Sending a distinct Arc wakes the watcher immediately.
+        let c2 = make_cluster("c1", LbPolicy::LeastRequest);
+        tx.send(Arc::clone(&c2));
+        let next = watch.next().await.unwrap();
+        assert!(Arc::ptr_eq(&next, &c2));
+    }
+
+    #[tokio::test]
+    async fn channel_closes_when_sender_dropped() {
+        let initial = make_cluster("c1", LbPolicy::RoundRobin);
+        let (tx, mut watch) = CacheWatch::channel(Some(Arc::clone(&initial)));
+        drop(tx);
+
+        // Unseen initial value is still delivered before reporting closure.
+        let seen = watch.next().await.unwrap();
+        assert!(Arc::ptr_eq(&seen, &initial));
+        assert!(watch.next().await.is_none());
+
+        let mut closed = ClusterWatches::closed();
+        assert!(closed.cluster.next().await.is_none());
+        assert!(closed.endpoints.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resubscribe_yields_current_value_and_tracks_same_sender() {
+        let cache = XdsCache::new();
+        let entry = cache.watch_cluster("c1");
+        let mut sub = entry.resubscribe();
+
+        let c1 = make_cluster("c1", LbPolicy::RoundRobin);
+        cache.update_cluster("c1", Arc::clone(&c1));
+        assert!(Arc::ptr_eq(&sub.next().await.unwrap(), &c1));
+
+        // Late resubscribe sees existing value immediately and closes with entry.
+        let mut late_sub = entry.resubscribe();
+        assert!(Arc::ptr_eq(&late_sub.next().await.unwrap(), &c1));
+
+        cache.remove_cluster("c1");
+        assert!(entry.is_closed());
+        assert!(sub.next().await.is_none());
+        assert!(late_sub.next().await.is_none());
     }
 }

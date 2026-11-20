@@ -46,7 +46,7 @@ use crate::client::endpoint::{
 use crate::client::endpoint::{ClusterTlsConfig, ClusterTlsError};
 use crate::client::lb::{BoxDiscover, ClusterDiscovery};
 use crate::common::async_util::BoxFuture;
-use crate::xds::cache::XdsCache;
+use crate::xds::cache::ClusterWatches;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderRegistry, CertificateProvider};
 use crate::xds::connector::ClusterConnector;
@@ -81,14 +81,14 @@ fn with_liveness_settings(endpoint: Endpoint) -> Endpoint {
 
 /// xDS-backed cluster discovery, generic over the connector factory `MC`.
 ///
-/// Resolves cluster names into endpoint change streams by watching the
-/// [`XdsCache`]. On each CDS update it asks `MC` to build a [`Connector`] for
+/// Resolves cluster names into endpoint change streams over the per-cluster
+/// [`ClusterWatches`] supplied by [`XdsRouter`](crate::xds::routing::XdsRouter).
+/// On each CDS update it asks `MC` to build a [`Connector`] for
 /// the cluster. The default [`GrpcMakeConnector`] produces gRPC (plaintext or
 /// TLS) connectors from the cluster's TLS view ([`ClusterConfig::tls`]),
 /// resolving cert-provider instances against the bootstrap-built registry that
 /// discovery carries into each [`ClusterConfig`].
 pub(crate) struct XdsClusterDiscovery<MC = GrpcMakeConnector> {
-    cache: Arc<XdsCache>,
     make_connector: Arc<MC>,
     #[cfg(feature = "_tls-any")]
     cert_registry: Arc<CertProviderRegistry>,
@@ -96,38 +96,36 @@ pub(crate) struct XdsClusterDiscovery<MC = GrpcMakeConnector> {
 
 impl<MC> XdsClusterDiscovery<MC> {
     #[cfg(feature = "_tls-any")]
-    pub(crate) fn new(
-        cache: Arc<XdsCache>,
-        make_connector: MC,
-        cert_registry: Arc<CertProviderRegistry>,
-    ) -> Self {
+    pub(crate) fn new(make_connector: MC, cert_registry: Arc<CertProviderRegistry>) -> Self {
         Self {
-            cache,
             make_connector: Arc::new(make_connector),
             cert_registry,
         }
     }
 
     #[cfg(not(feature = "_tls-any"))]
-    pub(crate) fn new(cache: Arc<XdsCache>, make_connector: MC) -> Self {
+    pub(crate) fn new(make_connector: MC) -> Self {
         Self {
-            cache,
             make_connector: Arc::new(make_connector),
         }
     }
 }
 
 impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsClusterDiscovery<MC> {
-    fn discover_cluster(&self, cluster_name: &str) -> BoxDiscover<EndpointAddress, MC::Service> {
+    fn discover_cluster(
+        &self,
+        cluster_name: &str,
+        watches: ClusterWatches,
+    ) -> BoxDiscover<EndpointAddress, MC::Service> {
         let connector = Arc::new(ClusterConnector::spawn(
-            &self.cache,
+            watches.cluster,
             cluster_name.to_string(),
             self.make_connector.clone(),
             #[cfg(feature = "_tls-any")]
             self.cert_registry.clone(),
         ));
 
-        EndpointManager::new(connector).discover_endpoints(self.cache.watch_endpoints(cluster_name))
+        EndpointManager::new(connector).discover_endpoints(watches.endpoints)
     }
 }
 
@@ -573,11 +571,9 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_discovery_stream_stops_cds_task() {
-        let cache = Arc::new(XdsCache::new());
-        cache.update_cluster("c", Arc::new(plaintext_cluster()));
-        cache.update_endpoints(
-            "c",
-            Arc::new(EndpointsResource {
+        let (_cluster_tx, _endpoints_tx, watches) = ClusterWatches::channel(
+            Some(Arc::new(plaintext_cluster())),
+            Some(Arc::new(EndpointsResource {
                 cluster_name: "c".to_string(),
                 localities: vec![LocalityEndpoints {
                     locality: None,
@@ -589,18 +585,17 @@ mod tests {
                     load_balancing_weight: 100,
                     priority: 0,
                 }],
-            }),
+            })),
         );
         let (dropped, mut connector_dropped) = oneshot::channel();
         let discovery = XdsClusterDiscovery::new(
-            cache.clone(),
             ProbeMakeConnector(Mutex::new(Some(dropped))),
             #[cfg(feature = "_tls-any")]
             Arc::new(empty_registry()),
         );
 
         // Connecting the endpoint waits for the CDS task to publish a connector.
-        let mut endpoints = discovery.discover_cluster("c");
+        let mut endpoints = discovery.discover_cluster("c", watches);
         assert!(matches!(
             endpoints.next().await,
             Some(Ok(Change::Insert(..)))
@@ -609,8 +604,8 @@ mod tests {
 
         // The published connector lives in the watch channel between the CDS
         // task and the `ClusterConnector`, so it drops only once both are
-        // gone. The cluster stays in the cache, so only the drop can stop the
-        // task.
+        // gone. Both senders stay open, so only dropping `endpoints` can stop
+        // the task.
         drop(endpoints);
         let stopped = tokio::time::timeout(Duration::from_secs(1), connector_dropped).await;
         assert!(stopped.is_ok(), "CDS task outlived its discovery stream");

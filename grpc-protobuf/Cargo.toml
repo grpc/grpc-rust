@@ -33,3 +33,5 @@ tokio = { version = "1", features = ["rt", "macros"] }
 [build-dependencies]
 grpc-protobuf-build = { version = "0.10.0", path = "../grpc-protobuf-build", default-features = false }
 protobuf-well-known-types = "0.36.2-release"
+
+[lints]

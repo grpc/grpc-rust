@@ -20,3 +20,5 @@ exclude = ["examples"]
 
 [build-dependencies]
 cmake = "0.1"
+
+[lints]

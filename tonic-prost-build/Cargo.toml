@@ -5,7 +5,6 @@ authors = ["gRPC authors"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/grpc/grpc-rust"
-homepage = "https://github.com/grpc/grpc-rust"
 description = "Prost build integration for tonic"
 readme = "README.md"
 categories = ["development-tools::build-utils", "network-programming", "asynchronous"]
@@ -36,3 +35,6 @@ allowed_external_types = [
   "prost_build::*",
   "prost_types::*"
 ]
+
+[lints]
+workspace = true

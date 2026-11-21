@@ -76,6 +76,7 @@ pub(crate) fn generate_internal<T: Service>(
                 clippy::wildcard_imports,
                 // will trigger if compression is disabled
                 clippy::let_unit_value,
+                clippy::double_must_use,
             )]
             use tonic::codegen::*;
             use tonic::codegen::http::Uri;

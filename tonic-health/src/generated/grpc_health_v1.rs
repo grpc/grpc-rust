@@ -63,6 +63,7 @@ pub mod health_client {
         missing_docs,
         clippy::wildcard_imports,
         clippy::let_unit_value,
+        clippy::double_must_use,
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
@@ -210,6 +211,7 @@ pub mod health_server {
         missing_docs,
         clippy::wildcard_imports,
         clippy::let_unit_value,
+        clippy::double_must_use,
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with HealthServer.

@@ -272,7 +272,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::attributes::Attributes;
     use crate::client::CallOptions;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::QueuingPicker;
@@ -286,6 +285,7 @@ mod tests {
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::client::name_resolution::Endpoint;
+    use crate::client::name_resolution::ResolverUpdateAttributes;
     use crate::core::Address;
     use crate::metadata::MetadataMap;
     use crate::rt::default_runtime;
@@ -584,7 +584,7 @@ mod tests {
         let received = reg_recording_stub("stub_wt_forwards");
         let mut t = new_env();
         let update = ResolverUpdate {
-            attributes: Attributes::new().add("parent attribute"),
+            attributes: ResolverUpdateAttributes::new().add("parent attribute"),
             endpoints: Err("endpoints error".to_string()),
             service_config: Err("service config error".to_string()),
             resolution_note: Some("note".to_string()),

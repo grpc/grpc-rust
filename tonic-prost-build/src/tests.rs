@@ -340,3 +340,56 @@ fn test_edge_cases() {
     assert_eq!(request.to_string(), "mypackage . ()");
     assert_eq!(response.to_string(), "mypackage . ()");
 }
+
+fn generate_with_comments(service_comments: Vec<&str>, method_comments: Vec<&str>) -> String {
+    let lines = |comments: Vec<&str>| Comments {
+        leading: comments.into_iter().map(String::from).collect(),
+        trailing: vec![],
+        leading_detached: vec![],
+    };
+
+    let mut method =
+        create_test_method(".pkg.Request".to_string(), ".pkg.Response".to_string()).prost_method;
+    method.comments = lines(method_comments);
+
+    let service = Service {
+        name: "Greeter".to_string(),
+        proto_name: "Greeter".to_string(),
+        package: "pkg".to_string(),
+        comments: lines(service_comments),
+        methods: vec![method],
+        options: prost_types::ServiceOptions::default(),
+    };
+
+    let mut generator = ServiceGenerator::new(
+        true,
+        true,
+        false,
+        Attributes::default(),
+        Attributes::default(),
+        false,
+        false,
+        "super".to_string(),
+        false,
+        "tonic_prost::ProstCodec".to_string(),
+        HashSet::default(),
+    );
+    let mut buf = String::new();
+    prost_build::ServiceGenerator::generate(&mut generator, service, &mut buf);
+    buf
+}
+
+#[test]
+fn test_service_and_method_comments_are_sanitized() {
+    let generated = generate_with_comments(
+        vec![" Docs live at https://example.com/service for details."],
+        vec![" https://example.com/", " See [the guide] for details."],
+    );
+
+    // Bare URLs must be wrapped so that `rustdoc::bare_urls` stays quiet.
+    assert!(generated.contains("/// Docs live at <https://example.com/service> for details."));
+    assert!(generated.contains("/// <https://example.com/>"));
+    assert!(!generated.contains("/// https://example.com/"));
+    // Square brackets that are not links must be escaped to avoid broken intra-doc links.
+    assert!(generated.contains(r"/// See \[the guide\] for details."));
+}

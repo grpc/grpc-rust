@@ -944,7 +944,7 @@ mod tests {
     async fn assert_next<'a, T: 'a>(
         next: impl Future<Output = Snapshot<'a, T>>,
     ) -> Snapshot<'a, T> {
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(Duration::from_secs(5), next)
             .await
             .expect("next() did not resolve")
@@ -953,7 +953,7 @@ mod tests {
     // Fails the test if next() resolves without a further update.
     async fn assert_no_next<'a, T: 'a>(next: impl Future<Output = Snapshot<'a, T>>) {
         assert!(
-            GrpcRuntime::default()
+            test_runtime()
                 .timeout(Duration::from_millis(10), next)
                 .await
                 .is_err(),
@@ -1081,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn pick_of_non_ready_subchannel_waits_for_new_picker() {
         const POLICY_NAME: &str = "channel_test_non_ready_pick";
-        let runtime = GrpcRuntime::default();
+        let runtime = test_runtime();
         let invoked = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
 
@@ -1205,7 +1205,7 @@ mod tests {
         policy_name: &'static str,
         picker: Arc<dyn Picker>,
     ) -> StatusCodeError {
-        let runtime = GrpcRuntime::default();
+        let runtime = test_runtime();
         reg_stub_policy(
             policy_name,
             StubPolicyFuncs {

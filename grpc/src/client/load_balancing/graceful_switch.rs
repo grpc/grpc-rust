@@ -237,7 +237,7 @@ mod test {
     use crate::client::name_resolution::ResolverUpdate;
     use crate::core::Address;
     use crate::metadata::MetadataMap;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     fn stub_lb_config(name: &str) -> GracefulSwitchLbConfig {
         let builder = GLOBAL_LB_REGISTRY.get_policy(name).unwrap();
@@ -359,7 +359,7 @@ mod test {
 
     // Constructs the test environment for GracefulSwitchPolicy tests.
     fn new_env() -> TestEnv<GracefulSwitchPolicy> {
-        TestEnv::new(|work_scheduler| GracefulSwitchPolicy::new(default_runtime(), work_scheduler))
+        TestEnv::new(|work_scheduler| GracefulSwitchPolicy::new(test_runtime(), work_scheduler))
     }
 
     impl TestEnv<GracefulSwitchPolicy> {

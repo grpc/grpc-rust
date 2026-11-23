@@ -236,12 +236,12 @@ mod test {
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::core::Address;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     // Constructs the test environment for RoundRobinPolicy tests.
     fn new_env() -> TestEnv<RoundRobinPolicy> {
         TestEnv::new(|work_scheduler| {
-            RoundRobinPolicy::new(ChildManager::new(default_runtime(), work_scheduler))
+            RoundRobinPolicy::new(ChildManager::new(test_runtime(), work_scheduler))
         })
     }
 

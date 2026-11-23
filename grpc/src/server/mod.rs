@@ -860,7 +860,7 @@ mod tests {
         let _ = shutdown_tx.send(());
 
         // Server should exit promptly.
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down within 2s")
@@ -881,7 +881,7 @@ mod tests {
         drop(coordinator);
 
         // The watched task should exit promptly because `rx.changed()` returns `Err`, so the watcher returns `Ok(())`.
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(Duration::from_secs(1), handle)
             .await
             .expect("watched connection did not exit when coordinator was dropped")
@@ -910,7 +910,7 @@ mod tests {
             });
             let _ = serve_started_tx.send(());
             // Wrap in a short timeout so the future drops mid-flight while connections are active.
-            let _ = GrpcRuntime::default()
+            let _ = test_runtime()
                 .timeout(std::time::Duration::from_millis(50), serve_fut)
                 .await;
         });
@@ -942,7 +942,7 @@ mod tests {
         drop(coordinator);
 
         // The watched task MUST self-terminate (`rx.changed()` returns `Err`, so the watcher returns `Ok(())`) despite being mid-drain.
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(Duration::from_secs(1), handle)
             .await
             .expect("infinite watched connection did not exit when coordinator was dropped after graceful shutdown")
@@ -1099,7 +1099,7 @@ mod tests {
         let _ = shutdown_tx.send(());
 
         // Server should exit promptly and drop the listener.
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down within 2s")
@@ -1199,7 +1199,7 @@ mod tests {
             if handler_started.load(Ordering::SeqCst) {
                 break;
             }
-            GrpcRuntime::default()
+            test_runtime()
                 .sleep(std::time::Duration::from_millis(10))
                 .await;
         }
@@ -1216,7 +1216,7 @@ mod tests {
             if dropped.load(Ordering::SeqCst) {
                 break;
             }
-            GrpcRuntime::default()
+            test_runtime()
                 .sleep(std::time::Duration::from_millis(10))
                 .await;
         }
@@ -1242,7 +1242,7 @@ mod tests {
         // Unblock the handler so the RPC finishes and graceful shutdown completes.
         let _ = unblock_tx.send(());
 
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(std::time::Duration::from_secs(2), server_handle)
             .await
             .expect("server did not shut down after connection drained")

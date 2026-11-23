@@ -64,7 +64,7 @@ url = "2.5.0"
 
 [dev-dependencies]
 h2 = "0.4"
-tokio = { version = "1.47.0", features = ["test-util"] }
+tokio = { version = "1.47.0", features = ["net", "rt", "test-util", "time"] }
 async-stream = "0.3.6"
 criterion = "0.8"
 http-body-util = "0.1.0"

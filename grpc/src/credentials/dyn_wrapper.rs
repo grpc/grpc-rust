@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(info.security_protocol, "local");
 
         let addr = "127.0.0.1:0";
-        let runtime = rt::default_runtime();
+        let runtime = rt::test_runtime();
         let listener = TcpListener::bind(addr).await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 

@@ -41,6 +41,11 @@ use crate::private::UnstableTrait;
 pub(crate) use unstable::*;
 
 pub(crate) mod hyper_wrapper;
+/// A minimal Tokio-based runtime used by this crate's unit tests. The real
+/// Tokio runtime lives in the `grpc-tokio` crate, which can't be used here
+/// because it depends on this crate.
+#[cfg(test)]
+pub(crate) mod tokio;
 
 /// A boxed handle to a task spawned with [`GrpcRuntime::spawn`].
 pub type BoxedTaskHandle = Box<dyn TaskHandle>;
@@ -63,7 +68,7 @@ pub trait TaskHandle: UnstableTrait + Send + Sync {
 /// Returns the runtime used by this crate's unit tests.
 #[cfg(test)]
 pub(crate) fn test_runtime() -> GrpcRuntime {
-    default_runtime()
+    GrpcRuntime::new(tokio::TokioRuntime::default(), UnstableToken)
 }
 
 /// A handle to the runtime used by gRPC for I/O, timers, and background

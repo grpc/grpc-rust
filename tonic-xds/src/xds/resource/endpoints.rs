@@ -24,6 +24,7 @@
 
 //! Validated ClusterLoadAssignment resource (EDS).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -221,6 +222,15 @@ impl EndpointsResource {
                     HealthStatus::Unknown | HealthStatus::Healthy
                 )
             })
+    }
+
+    /// Returns the healthy endpoints a load balancer connects to, in order;
+    /// endpoints sharing a primary address collapse to the first.
+    pub(crate) fn unique_healthy_endpoints(&self) -> impl Iterator<Item = &Arc<XdsEndpoint>> {
+        let mut seen = HashSet::new();
+        self.healthy_endpoints()
+            .map(|e| &e.endpoint)
+            .filter(move |&ep| seen.insert(ep.address()))
     }
 }
 

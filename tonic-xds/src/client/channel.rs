@@ -25,7 +25,7 @@
 use crate::client::circuit_breaking::{
     CircuitBreakingMakeConnector, ClusterCircuitBreakerRegistry,
 };
-use crate::client::cluster::{ClusterChannelFactory, ClusterRef};
+use crate::client::cluster::{ClusterChannelFactory, ClusterRef, ConnectSignal};
 use crate::client::deadline::{DeadlinePolicy, set_grpc_timeout_header};
 use crate::client::endpoint::{EndpointAddress, MakeConnector};
 use crate::client::lb::{ClusterDiscovery, TowerP2cClusterChannelFactory, XdsLbService};
@@ -35,8 +35,9 @@ use crate::client::loadbalance::outcome::{
 };
 use crate::client::pool::{XdsClientPool, XdsClientPoolBuilder};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
+use crate::common::async_util::BoxFuture;
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
-use crate::xds::cache::XdsCache;
+use crate::xds::cache::{CacheWatch, XdsCache, XdsConfigResult};
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
@@ -244,9 +245,9 @@ pub enum BuildError {
 
 /// Holds owned resources whose background tasks must live as long as the channel.
 ///
-/// Stored as `Option<Arc<...>>` on [`XdsChannel`] so clones share ownership
-/// cheaply. When the last clone drops, the resource manager cascade task
-/// (which owns the [`XdsCache`] writer) and ADS worker are aborted.
+/// Owned by the state every [`XdsChannel`] clone shares. When the last clone
+/// drops, the resource manager cascade task (which owns the [`XdsCache`]
+/// writer) and ADS worker are aborted.
 ///
 /// A pooled client is shared with other channels and stops only once all of
 /// them have dropped it.
@@ -271,50 +272,85 @@ struct XdsRuntimeParts {
 ///
 /// It routes requests according to the xDS configuration that it fetches from the xDS management server.
 /// The routing implementation is based on the [Google gRPC xDS features](https://grpc.github.io/grpc/core/md_doc_grpc_xds_features.html).
-pub struct XdsChannel<S> {
+///
+/// A new channel resolves its xDS configuration right away, but runs a
+/// cluster's load balancer only while requests wait on it.
+/// [`connect`](Self::connect), or the first request, starts connecting ahead of
+/// traffic; [`xds_config`](Self::xds_config) shows what there is to connect to.
+///
+/// `Send + Sync + Clone`; clones are cheap and share one xDS runtime.
+pub struct XdsChannel<B, ResBody> {
+    inner: BoxCloneSyncService<Request<B>, Response<ResBody>, BoxError>,
+    shared: Arc<ChannelShared>,
+}
+
+/// State shared by every clone of an [`XdsChannel`].
+struct ChannelShared {
     config: Arc<XdsChannelConfig>,
-    inner: S,
+    connect: ConnectSignal,
+    cache: Arc<XdsCache>,
     /// Keeps background tasks alive. `None` when built from parts in tests.
-    _resources: Option<Arc<XdsChannelResources>>,
+    _resources: Option<XdsChannelResources>,
+}
+
+impl<B, ResBody> XdsChannel<B, ResBody> {
+    /// Starts connecting to the endpoints of every cluster the route
+    /// configuration references, without waiting for any connection, like
+    /// gRPC's `ClientConn.Connect`. Idempotent; the first request has the same
+    /// effect.
+    ///
+    /// Each cluster's load balancer then runs ahead of traffic, handing
+    /// endpoints to the [`MakeConnector`]'s connector as they're discovered,
+    /// including ones added later. The built-in connector's connections dial
+    /// on their first request; a custom [`MakeConnector`] can dial eagerly.
+    pub fn connect(&self) {
+        self.shared.connect.set();
+    }
+
+    /// Watches the xDS configuration the channel routes requests by: the
+    /// matched route configuration's clusters and their endpoints.
+    ///
+    /// Together with a custom [`MakeConnector`], this tells when every
+    /// endpoint has been connected after [`connect`](Self::connect).
+    pub fn xds_config(&self) -> CacheWatch<XdsConfigResult> {
+        self.shared.cache.watch()
+    }
 }
 
 #[allow(clippy::missing_fields_in_debug)]
-impl<S> Debug for XdsChannel<S> {
+impl<B, ResBody> Debug for XdsChannel<B, ResBody> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("XdsChannel")
-            .field("config", &self.config)
+            .field("config", &self.shared.config)
             .finish()
     }
 }
 
-impl<S: Clone> Clone for XdsChannel<S> {
+impl<B, ResBody> Clone for XdsChannel<B, ResBody> {
     fn clone(&self) -> Self {
         Self {
-            config: self.config.clone(),
             inner: self.inner.clone(),
-            _resources: self._resources.clone(),
+            shared: Arc::clone(&self.shared),
         }
     }
 }
 
-impl<Req, S> Service<Req> for XdsChannel<S>
-where
-    S: Service<Req, Error = BoxError>,
-{
-    type Response = S::Response;
+impl<B, ResBody> Service<Request<B>> for XdsChannel<B, ResBody> {
+    type Response = Response<ResBody>;
     type Error = BoxError;
-    type Future = S::Future;
+    type Future = BoxFuture<Result<Response<ResBody>, BoxError>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Req) -> Self::Future {
+    fn call(&mut self, request: Request<B>) -> Self::Future {
+        self.shared.connect.set();
         self.inner.call(request)
     }
 }
 
-/// A type-erased xDS channel over an arbitrary transport body pair.
+/// An [`XdsChannel`] over an arbitrary transport body pair.
 ///
 /// Generalizes [`XdsChannelGrpc`] to any request/response body: the channel is
 /// a `Service<Request<B>, Response = Response<ResBody>>`. The routing, retry,
@@ -324,8 +360,7 @@ where
 ///
 /// `Send + Sync + Clone`; cloning is cheap (the inner stack is
 /// reference-counted).
-pub type XdsTransportChannel<B, ResBody> =
-    BoxCloneSyncService<Request<B>, Response<ResBody>, BoxError>;
+pub type XdsTransportChannel<B, ResBody> = XdsChannel<B, ResBody>;
 
 /// A [`tonic::client::GrpcService`] implementation that can route and load-balance
 /// gRPC requests based on xDS configuration.
@@ -694,12 +729,17 @@ impl XdsChannelBuilder {
             .retry_classifier_factory
             .clone()
             .unwrap_or_else(|| Arc::new(GrpcRetryClassifierFactory));
+        let connect = ConnectSignal::default();
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(
             &parts.cache,
             retry_factory,
             self.config.route_ready_timeout,
-            move |name, watches| {
-                ClusterRef::from_channel(name, cluster_factory.make(name, watches))
+            {
+                let connect = connect.clone();
+                move |name, watches| {
+                    let channel = cluster_factory.make(name, watches, connect.clone());
+                    ClusterRef::from_channel(name, channel)
+                }
             },
         ));
 
@@ -711,10 +751,10 @@ impl XdsChannelBuilder {
         // configs come from RDS via the request's `RouteDecision`; see `RetryLayer`.
         let retry_layer = RetryLayer::new(fallback_retry);
 
-        let resources = Arc::new(XdsChannelResources {
+        let resources = XdsChannelResources {
             _resource_manager: parts.resource_manager,
             _xds_client: parts.xds_client,
-        });
+        };
 
         let routing_layer =
             XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority(), deadline);
@@ -722,6 +762,8 @@ impl XdsChannelBuilder {
             routing_layer,
             retry_layer,
             to_endpoint_req,
+            connect,
+            parts.cache,
             Some(resources),
         )
     }
@@ -772,7 +814,7 @@ impl XdsChannelBuilder {
     }
 
     /// Assembles the routing / retry / load-balancing service stack shared by
-    /// every transport, and type-erases it into an [`XdsTransportChannel`].
+    /// every transport into an [`XdsTransportChannel`].
     ///
     /// The stack is, outermost to innermost: the routing layer (stamps the
     /// matched `RouteDecision`, and bounds the whole call by the app and xDS
@@ -787,12 +829,17 @@ impl XdsChannelBuilder {
     /// `Request<ReqBody>`: the built-in gRPC path rewraps into [`TonicBody`]
     /// (and advertises the remaining deadline), while transport-generic callers
     /// pass the body through unchanged (`ReqBody = SharedBody<B>`).
+    ///
+    /// `connect` must be the signal the router's cluster channels were built
+    /// with, and `cache` the one it watches.
     fn assemble_channel_stack<B, ReqBody, ResBody, F>(
         &self,
         routing_layer: XdsRoutingLayer<ResBody>,
         retry_layer: RetryLayer,
         to_endpoint_req: F,
-        resources: Option<Arc<XdsChannelResources>>,
+        connect: ConnectSignal,
+        cache: Arc<XdsCache>,
+        resources: Option<XdsChannelResources>,
     ) -> XdsTransportChannel<B, ResBody>
     where
         F: Fn(Request<SharedBody<B>>) -> Request<ReqBody> + Clone + Send + Sync + 'static,
@@ -809,11 +856,15 @@ impl XdsChannelBuilder {
             .map_request(to_endpoint_req)
             .service(lb_service);
 
-        BoxCloneSyncService::new(XdsChannel {
-            config: self.config.clone(),
-            inner,
-            _resources: resources,
-        })
+        XdsChannel {
+            inner: BoxCloneSyncService::new(inner),
+            shared: Arc::new(ChannelShared {
+                config: self.config.clone(),
+                connect,
+                cache,
+                _resources: resources,
+            }),
+        }
     }
 
     /// Builds an `XdsChannelGrpc`, which is a type-erased gRPC channel.
@@ -1130,7 +1181,9 @@ mod tests {
     use crate::XdsUri;
     use crate::client::channel::XdsChannelGrpc;
     use crate::client::channel::{GrpcClusterChannelFactory, LB_BACKENDS, LbBackend};
-    use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ClusterRef};
+    use crate::client::cluster::{
+        ClusterChannel, ClusterChannelFactory, ClusterRef, ConnectSignal,
+    };
     use crate::client::deadline::DeadlinePolicy;
     use crate::client::endpoint::EndpointAddress;
     use crate::client::endpoint::EndpointChannel;
@@ -1178,20 +1231,31 @@ mod tests {
         ) -> XdsChannelGrpc {
             let factory: GrpcClusterChannelFactory =
                 Arc::new(TowerP2cClusterChannelFactory::new(discovery));
+            let connect = ConnectSignal::default();
+            let router = LazyClusters::wrap(router, {
+                let connect = connect.clone();
+                move |name| {
+                    let watches = ClusterWatches::closed();
+                    ClusterRef::from_channel(name, factory.make(name, watches, connect.clone()))
+                }
+            });
             self.build_grpc_channel_from_router(
-                LazyClusters::wrap(router, move |name| {
-                    ClusterRef::from_channel(name, factory.make(name, ClusterWatches::closed()))
-                }),
+                router,
+                connect,
+                Arc::new(XdsCache::new()),
                 retry,
                 interceptor,
             )
         }
 
         /// Builds an `XdsChannelGrpc` that sends each request to the cluster
-        /// client its `router` attaches to the routing decision.
+        /// client its `router` attaches to the routing decision. `connect` and
+        /// `cache` are the ones `router` was built with.
         pub(crate) fn build_grpc_channel_from_router(
             &self,
             router: Arc<dyn Router>,
+            connect: ConnectSignal,
+            cache: Arc<XdsCache>,
             retry: Arc<RetrySharedConfig>,
             interceptor: Option<Arc<dyn PreRouteInterceptor>>,
         ) -> XdsChannelGrpc {
@@ -1210,6 +1274,8 @@ mod tests {
                 routing_layer,
                 retry_layer,
                 super::grpc_endpoint_request,
+                connect,
+                cache,
                 None,
             )
         }
@@ -1609,14 +1675,22 @@ mod tests {
         use crate::client::retry::GrpcRetryClassifierFactory;
         use crate::xds::routing::{DEFAULT_READY_TIMEOUT, XdsRouter};
 
+        let connect = ConnectSignal::default();
         let router = XdsRouter::new(
             cache,
             Arc::new(GrpcRetryClassifierFactory),
             Some(DEFAULT_READY_TIMEOUT),
-            move |name, watches| ClusterRef::from_channel(name, factory.make(name, watches)),
+            {
+                let connect = connect.clone();
+                move |name, watches| {
+                    ClusterRef::from_channel(name, factory.make(name, watches, connect.clone()))
+                }
+            },
         );
         XdsChannelBuilder::new(test_config()).build_grpc_channel_from_router(
             Arc::new(router),
+            connect,
+            Arc::clone(cache),
             Arc::new(RetrySharedConfig::grpc_default()),
             None,
         )
@@ -1845,6 +1919,122 @@ mod tests {
         shutdown(servers).await;
     }
 
+    /// Once activated by `connect()` or a first request, a channel's balancers
+    /// connect every endpoint its config view lists, including ones published
+    /// later, without waiting for traffic.
+    #[tokio::test]
+    async fn test_xds_channel_connects_ahead_of_traffic() {
+        for by_request in [false, true] {
+            connects_ahead_of_traffic(by_request).await;
+        }
+    }
+
+    async fn connects_ahead_of_traffic(by_request: bool) {
+        use crate::client::endpoint::{ClusterConfig, Connector, MakeConnector, XdsEndpoint};
+        use crate::xds::cache::{CacheWatch, XdsConfigResult};
+        use std::collections::HashSet;
+
+        type Connects = mpsc::UnboundedSender<EndpointAddress>;
+
+        /// Reports every endpoint its connectors are asked to connect.
+        struct RecordingMakeConnector<MC>(MC, Connects);
+        struct RecordingConnector<S>(Arc<dyn Connector<Service = S> + Send + Sync>, Connects);
+
+        impl<S> Connector for RecordingConnector<S> {
+            type Service = S;
+            fn connect(&self, endpoint: &XdsEndpoint) -> BoxFuture<Self::Service> {
+                let _ = self.1.send(endpoint.address().clone());
+                self.0.connect(endpoint)
+            }
+        }
+
+        impl<MC: MakeConnector> MakeConnector for RecordingMakeConnector<MC> {
+            type Service = MC::Service;
+            fn make_connector(
+                &self,
+                cluster: ClusterConfig<'_>,
+            ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError>
+            {
+                let connector = self.0.make_connector(cluster)?;
+                Ok(Arc::new(RecordingConnector(connector, self.1.clone())))
+            }
+        }
+
+        /// The endpoints the next config lists for the channel's one cluster.
+        async fn listed(view: &mut CacheWatch<XdsConfigResult>) -> HashSet<EndpointAddress> {
+            let config = view.next().await.unwrap().unwrap();
+            let (_, cluster) = config.clusters().next().unwrap();
+            let endpoints = cluster.unwrap().endpoints().unwrap();
+            endpoints.map(|ep| ep.address().clone()).collect()
+        }
+
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(3).await;
+        let cache = Arc::new(XdsCache::new());
+        let publish = |servers: &[TestServer]| {
+            publish_single_cluster_config(
+                &cache,
+                cluster_name,
+                make_test_cluster(cluster_name),
+                make_test_endpoints(cluster_name, servers),
+            )
+        };
+        publish(&servers[..2]);
+
+        // XdsLb connects only while polled; TowerP2c's discovery connects
+        // eagerly either way.
+        let (connects_tx, mut connects) = mpsc::unbounded_channel();
+        let factory = LbBackend::XdsLb.cluster_factory::<_, TonicBody, TonicBody>(
+            RecordingMakeConnector(
+                super::grpc_make_connector(
+                    crate::GrpcMakeConnector::new(),
+                    super::ClusterCircuitBreakerRegistry::new_for_test(),
+                ),
+                connects_tx,
+            ),
+            #[cfg(feature = "_tls-any")]
+            LbBackend::empty_cert_registry(),
+            Arc::new(super::GrpcOutcomeClassifier),
+        );
+        let channel = build_xds_channel_from_factory(&cache, factory);
+        let mut view = channel.xds_config();
+        let initial = listed(&mut view).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(
+            connects.is_empty(),
+            "by_request={by_request}: connected idle"
+        );
+
+        let mut connected = HashSet::new();
+        let mut expect_connected = async |expected: HashSet<EndpointAddress>| {
+            let all = async {
+                while connected != expected {
+                    connected.insert(connects.recv().await.unwrap());
+                }
+            };
+            let waited = tokio::time::timeout(tokio::time::Duration::from_secs(5), all).await;
+            assert!(
+                waited.is_ok(),
+                "by_request={by_request}: connected {connected:?}"
+            );
+        };
+        if by_request {
+            let client = GreeterClient::new(channel.clone());
+            let (successful, error_types, _) = send_grpc_requests(client, 1).await;
+            assert_eq!(successful, 1, "{error_types:?}");
+        } else {
+            channel.connect();
+        }
+        expect_connected(initial).await;
+
+        publish(&servers);
+        let all = listed(&mut view).await;
+        assert_eq!(all.len(), 3);
+        expect_connected(all).await;
+
+        shutdown(servers).await;
+    }
+
     /// A cluster that leaves the route config and later rejoins it is served
     /// from its new resources, whether or not the router saw the route config
     /// without it.
@@ -1929,13 +2119,14 @@ mod tests {
             &self,
             cluster_name: &str,
             _watches: ClusterWatches,
+            connect: ConnectSignal,
         ) -> ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> {
             let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
             let _ = self.built.send((cluster_name.to_string(), dropped_rx));
             let name = cluster_name.to_string();
             let called = self.called.clone();
             let released = self.released.clone();
-            ClusterChannel::from_service(tower::service_fn(
+            let svc = tower::service_fn(
                 move |_| -> BoxFuture<Result<http::Response<TonicBody>, BoxError>> {
                     // Owned by the service, so it closes once the channel is gone.
                     let _ = &dropped_tx;
@@ -1946,7 +2137,8 @@ mod tests {
                         Err("released".into())
                     })
                 },
-            ))
+            );
+            ClusterChannel::from_service(svc, connect)
         }
     }
 
@@ -2594,11 +2786,18 @@ mod tests {
         let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<EchoEndpoint>>> =
             Arc::new(MockHttpDiscovery);
         let factory = TowerP2cClusterChannelFactory::new(discovery);
-        let router = LazyClusters::wrap(Arc::new(StaticRouter), move |name| {
-            ClusterRef::from_channel::<
-                super::Request<shared_http_body::SharedBody<TestBody>>,
-                super::Response<TestBody>,
-            >(name, factory.make(name, ClusterWatches::closed()))
+        let connect = ConnectSignal::default();
+        let router = LazyClusters::wrap(Arc::new(StaticRouter), {
+            let connect = connect.clone();
+            move |name| {
+                ClusterRef::from_channel::<
+                    super::Request<shared_http_body::SharedBody<TestBody>>,
+                    super::Response<TestBody>,
+                >(
+                    name,
+                    factory.make(name, ClusterWatches::closed(), connect.clone()),
+                )
+            }
         });
         let routing_layer = XdsRoutingLayer::new(
             router,
@@ -2617,6 +2816,8 @@ mod tests {
             routing_layer,
             retry_layer,
             |req| req,
+            connect,
+            Arc::new(XdsCache::new()),
             None,
         );
 

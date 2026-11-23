@@ -22,7 +22,7 @@
  *
  */
 
-use crate::client::cluster::{ClusterChannel, ClusterChannelFactory};
+use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ConnectSignal};
 use crate::client::route::RouteDecision;
 use crate::common::async_util::BoxFuture;
 use crate::xds::cache::ClusterWatches;
@@ -156,7 +156,11 @@ where
         &self,
         cluster_name: &str,
         watches: ClusterWatches,
+        connect: ConnectSignal,
     ) -> ClusterChannel<Req, S::Response> {
-        ClusterChannel::from_discover(self.discovery.discover_cluster(cluster_name, watches))
+        ClusterChannel::from_discover(
+            self.discovery.discover_cluster(cluster_name, watches),
+            connect,
+        )
     }
 }

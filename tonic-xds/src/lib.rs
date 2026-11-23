@@ -225,6 +225,36 @@
 //! | Least-request load balancing | [A48] | Planned |
 //! | Dual-stack endpoints (multiple addresses per endpoint) | [A61] | Planned |
 //!
+//! ## Connecting ahead of traffic
+//!
+//! A new channel resolves its xDS configuration right away, but its load
+//! balancers may wait for requests before connecting endpoints.
+//! [`XdsChannel::connect`] has them connect every endpoint of every routed
+//! cluster without waiting, as does the channel's first request; endpoints
+//! discovered later connect as they arrive. [`XdsChannel::xds_config`]
+//! watches the [`XdsConfig`] the channel routes by, so a caller can tell when
+//! every endpoint has connected.
+//!
+//! The built-in connector's connections dial on their first request, so
+//! warming connections up needs a custom [`MakeConnector`] that dials eagerly.
+//! The default backend connects a cluster's endpoints one at a time, waiting
+//! for each connector future, so such a connector should return its service
+//! at once and dial in the background; [`LbBackend::XdsLb`] connects endpoints
+//! concurrently.
+//!
+//! ```rust,no_run
+//! # async fn example(channel: tonic_xds::XdsChannelGrpc) {
+//! channel.connect();
+//! let mut config = channel.xds_config();
+//! if let Some(Ok(config)) = config.next().await {
+//!     for (name, cluster) in config.clusters() {
+//!         let endpoints = cluster.ok().and_then(|c| c.endpoints());
+//!         println!("{name}: {} endpoints", endpoints.map_or(0, Iterator::count));
+//!     }
+//! }
+//! # }
+//! ```
+//!
 //! ## Load-balancer backend
 //!
 //! By default each cluster is balanced by Tower's power-of-two-choices
@@ -313,6 +343,9 @@ pub use csds::CsdsService;
 pub use shared_http_body::SharedBody;
 pub use xds::bootstrap::{
     BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,
+};
+pub use xds::cache::{
+    CacheWatch, ClusterError, ClusterSnapshot, XdsConfig, XdsConfigError, XdsConfigResult,
 };
 pub use xds::cert_provider_config::TlsChannelCredentials;
 pub use xds::cluster_discovery::GrpcMakeConnector;

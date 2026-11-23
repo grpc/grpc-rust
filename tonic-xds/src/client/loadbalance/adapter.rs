@@ -23,7 +23,7 @@
  */
 
 //! Adapts a [`LoadBalancer`] to the service shape a
-//! [`ClusterChannel`](crate::client::cluster::ClusterChannel) buffers.
+//! [`ClusterChannel`](crate::client::cluster::ClusterChannel) drives.
 //!
 //! The balancer serves `Error = LbError` with its own future type, while the
 //! channel stack is uniformly `Error = BoxError` with a boxed future. This

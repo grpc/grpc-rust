@@ -99,14 +99,6 @@ pub mod __unstable {
         pub mod service_config {
             pub use crate::client::service_config::*;
         }
-
-        pub fn channel_builder_with_runtime(
-            target: impl Into<String>,
-            credentials: std::sync::Arc<dyn crate::credentials::ChannelCredentials>,
-            runtime: crate::rt::GrpcRuntime,
-        ) -> crate::client::ChannelBuilder {
-            crate::client::Channel::builder_with_runtime(target, credentials, runtime)
-        }
     }
     pub mod credentials {
         pub mod client {

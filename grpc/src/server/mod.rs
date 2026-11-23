@@ -217,26 +217,31 @@ impl GracefulCoordinator {
 }
 
 impl Server {
-    /// Creates a new [`ServerBuilder`] with a no-op interceptor.
-    pub fn builder() -> ServerBuilder<Identity> {
-        ServerBuilder::new()
+    /// Creates a new [`ServerBuilder`] with a no-op interceptor that uses the
+    /// given runtime.
+    ///
+    /// The runtime is used for all I/O, timers, and background tasks. Runtime
+    /// implementations are provided by separate crates, e.g. `grpc-tokio`,
+    /// whose `grpc_tokio::runtime()` returns a runtime backed by Tokio.
+    pub fn builder(runtime: GrpcRuntime) -> ServerBuilder<Identity> {
+        ServerBuilder::new(runtime)
     }
 
-    /// Binds a TCP listener to `addr` with the given server credentials and HTTP/2 configuration.
+    /// Binds a TCP listener to `addr` using the given runtime, server
+    /// credentials, and HTTP/2 configuration.
+    ///
+    /// The runtime should generally be the same one passed to
+    /// [`Server::builder`].
     // TODO: Consider making this a builder to allow adding additional listener
     // configuration without breaking changes.
-    #[cfg(feature = "_runtime-tokio")]
     pub async fn tcp_listener(
         addr: std::net::SocketAddr,
         creds: Arc<dyn crate::credentials::ServerCredentials>,
         config: Http2Config,
+        runtime: GrpcRuntime,
     ) -> Result<impl Listener, String> {
-        let listener = transport::hyper::HyperListener::new_tcp_listener(
-            addr,
-            creds,
-            &crate::rt::default_runtime(),
-        )
-        .await?;
+        let listener =
+            transport::hyper::HyperListener::new_tcp_listener(addr, creds, &runtime).await?;
         Ok(listener.with_config(config))
     }
 
@@ -728,6 +733,7 @@ mod tests {
     use crate::core::test_connection_info;
     use crate::credentials::LocalServerCredentials;
     use crate::credentials::ServerCredentials;
+    use crate::rt::test_runtime;
     use crate::server::TcpAddress;
     /// A mock connection with one RPC in flight. It finishes only when the test
     /// sends on its finish sender, even after [`graceful_shutdown`], which it
@@ -837,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn server_stops_on_shutdown_signal() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::builder().build();
+        let server = Server::builder(test_runtime()).build();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -890,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_serve_future_force_closes_connection() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::builder().build();
+        let server = Server::builder(test_runtime()).build();
 
         // A never-resolving signal future (we won't signal gracefully, we will drop the serve future directly).
         let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1078,7 +1084,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server_handle = tokio::spawn(async move {
-            Server::builder()
+            Server::builder(test_runtime())
                 .build()
                 .serve_with_shutdown(listener, async {
                     let _ = shutdown_rx.await;
@@ -1167,7 +1173,7 @@ mod tests {
             }
         }
 
-        let server = Server::builder()
+        let server = Server::builder(test_runtime())
             .add_service(DrainingService {
                 started: handler_started.clone(),
                 unblock: unblock_rx,
@@ -1262,7 +1268,7 @@ mod tests {
             }
         }
 
-        let server = Server::builder().build();
+        let server = Server::builder(test_runtime()).build();
         let result = server.serve(FailingListener).await;
         assert_eq!(
             result,
@@ -1276,9 +1282,14 @@ mod tests {
         let creds: Arc<dyn ServerCredentials> = Arc::new(LocalServerCredentials::new());
         let config = Http2Config::new().with_max_recv_message_size(1024);
 
-        let listener = Server::tcp_listener("127.0.0.1:0".parse().unwrap(), creds, config)
-            .await
-            .unwrap();
+        let listener = Server::tcp_listener(
+            "127.0.0.1:0".parse().unwrap(),
+            creds,
+            config,
+            test_runtime(),
+        )
+        .await
+        .unwrap();
 
         let local_addr = listener.local_addr();
         let tcp_addr = (local_addr as &dyn Any)

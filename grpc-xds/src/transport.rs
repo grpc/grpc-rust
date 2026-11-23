@@ -31,7 +31,6 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
-use grpc::__unstable::client::channel_builder_with_runtime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
 use grpc::client::ChannelRecvStream;
@@ -88,12 +87,8 @@ impl TransportBuilder for GrpcTransportBuilder {
     type Transport = GrpcTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        let channel = channel_builder_with_runtime(
-            server.uri(),
-            self.credentials.clone(),
-            self.runtime.clone(),
-        )
-        .build();
+        let channel =
+            Channel::builder(server.uri(), self.credentials.clone(), self.runtime.clone()).build();
         Ok(GrpcTransport::from_channel(channel))
     }
 }

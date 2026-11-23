@@ -122,6 +122,12 @@ pub(crate) fn default_runtime() -> GrpcRuntime {
     GrpcRuntime::new(NoOpRuntime::default(), UnstableToken)
 }
 
+/// Returns the runtime used by this crate's unit tests.
+#[cfg(test)]
+pub(crate) fn test_runtime() -> GrpcRuntime {
+    default_runtime()
+}
+
 /// A handle to the runtime used by gRPC for I/O, timers, and background
 /// tasks.
 ///

@@ -87,6 +87,7 @@ use crate::private;
 use crate::private::UnstableToken;
 use crate::rt::BoxEndpoint;
 use crate::rt::GrpcRuntime;
+use crate::rt::test_runtime;
 use crate::rt::tokio::TokioRuntime;
 use crate::stub_server::EchoStream;
 use crate::stub_server::StubServer;
@@ -232,7 +233,8 @@ async fn grpc_invoke_tonic_unary() {
 
     // Create the channel.
     let target = format!("dns:///{}", addr);
-    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    let channel =
+        Channel::builder(&target, LocalChannelCredentials::new_arc(), test_runtime()).build();
 
     let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
     assert_eq!(resp.message, "hello interop");
@@ -285,7 +287,8 @@ mod unix_tests {
     async fn run_unix_test(bind_path: &PathBuf, target: &str) {
         let listener = UnixListener::bind(bind_path).unwrap();
         let expected_remote_addr = bind_path.to_string_lossy().into_owned();
-        let channel = Channel::builder(target, LocalChannelCredentials::new_arc()).build();
+        let channel =
+            Channel::builder(target, LocalChannelCredentials::new_arc(), test_runtime()).build();
 
         let server = StubServer::new().start_with_incoming(UnixListenerStream::new(listener));
 
@@ -420,7 +423,7 @@ async fn grpc_invoke_failure_cases() {
             should_fail: None,
         });
         let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
-        let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
+        let channel = Channel::builder(&target, Arc::new(composite_creds), test_runtime()).build();
 
         let trailers = perform_unary_echo_failure(&channel).await;
         assert_eq!(
@@ -454,7 +457,7 @@ async fn grpc_invoke_failure_cases() {
             )),
         });
         let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
-        let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
+        let channel = Channel::builder(&target, Arc::new(composite_creds), test_runtime()).build();
 
         let trailers = perform_unary_echo_failure(&channel).await;
         assert_eq!(
@@ -496,7 +499,7 @@ async fn grpc_invoke_failure_cases() {
             )),
         });
         let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
-        let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
+        let channel = Channel::builder(&target, Arc::new(composite_creds), test_runtime()).build();
 
         let trailers = perform_unary_echo_failure(&channel).await;
         assert_eq!(
@@ -788,6 +791,7 @@ async fn connect_timeout_exceeded() {
     let channel = Channel::builder(
         &target,
         SlowChannelCredentials::new_arc(Duration::from_secs(21)),
+        test_runtime(),
     )
     .build();
 
@@ -829,7 +833,8 @@ async fn trailers_only_metadata() {
     let addr = server.addr();
 
     let target = format!("dns:///{}", addr);
-    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    let channel =
+        Channel::builder(&target, LocalChannelCredentials::new_arc(), test_runtime()).build();
 
     let trailers = perform_unary_echo_failure(&channel).await;
 
@@ -889,7 +894,8 @@ async fn error_trailers_after_headers_metadata() {
     let addr = server.addr();
 
     let target = format!("dns:///{}", addr);
-    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    let channel =
+        Channel::builder(&target, LocalChannelCredentials::new_arc(), test_runtime()).build();
 
     let (mut tx, mut rx) = channel
         .invoke(
@@ -1239,6 +1245,7 @@ async fn deadline_exceeded_waiting_for_connection() {
     let channel = Channel::builder(
         &target,
         SlowChannelCredentials::new_arc(Duration::from_secs(5)),
+        test_runtime(),
     )
     .build();
 
@@ -1297,7 +1304,7 @@ async fn deadline_exceeded_during_recv() {
         }),
     );
     let target = format!("dns:///{}", server.addr);
-    let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
+    let channel = Channel::builder(&target, Arc::new(composite_creds), test_runtime()).build();
     // Connect first, so that only the call credentials delay the RPC below.
     warm_up(&channel).await;
 
@@ -1347,7 +1354,8 @@ async fn deadline_exceeded_during_send_resets_instead_of_half_closing() {
     super::reg();
     let mut server = RawH2Server::start().await;
     let target = format!("dns:///{}", server.addr);
-    let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
+    let channel =
+        Channel::builder(&target, LocalChannelCredentials::new_arc(), test_runtime()).build();
     warm_up(&channel).await;
 
     let (mut tx, mut rx) = channel

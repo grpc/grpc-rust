@@ -98,8 +98,6 @@ use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt;
 use crate::rt::GrpcRuntime;
-#[cfg(feature = "_runtime-tokio")]
-use crate::rt::default_runtime;
 
 /// A virtual, persistent connection to a gRPC service.
 ///
@@ -119,8 +117,8 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Creates a new channel builder for the given target. Target and
-    /// credentials are required to build a channel.
+    /// Creates a new channel builder for the given target, credentials, and
+    /// runtime. All three are required to build a channel.
     ///
     /// The [target name](https://github.com/grpc/grpc/blob/master/doc/naming.md)
     /// is a fully qualified, self contained URI defined by [rfc3986](https://datatracker.ietf.org/doc/html/rfc3986).
@@ -139,6 +137,9 @@ impl Channel {
     ///
     /// Credentials must implement the [`ChannelCredentials`] trait.
     ///
+    /// The runtime is used for all I/O, timers, and background tasks. Runtime
+    /// implementations are provided by separate crates, e.g. `grpc-tokio`,
+    /// whose `grpc_tokio::runtime()` returns a runtime backed by Tokio.
     ///
     ///# Example
     ///
@@ -147,24 +148,16 @@ impl Channel {
     /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-    ///     .build();
+    /// # fn example(runtime: grpc::rt::GrpcRuntime) {
+    /// let channel = Channel::builder(
+    ///     "dns:///localhost:123",
+    ///     Arc::new(LocalChannelCredentials::new()),
+    ///     runtime, // e.g.: grpc_tokio::runtime();
+    /// )
+    /// .build();
+    /// # }
     /// ```
-    #[cfg(feature = "_runtime-tokio")]
     pub fn builder(
-        target: impl Into<String>,
-        credentials: Arc<dyn ChannelCredentials>,
-    ) -> ChannelBuilder {
-        Self::builder_with_runtime(target, credentials, default_runtime())
-    }
-
-    /// Creates a new channel builder for the given target, credentials, and
-    /// runtime.
-    ///
-    /// Always available. When the `_runtime-tokio` feature is enabled,
-    /// [`builder()`](Channel::builder) can be used instead to use the default
-    /// Tokio runtime.
-    pub(crate) fn builder_with_runtime(
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
         runtime: GrpcRuntime,
@@ -256,8 +249,14 @@ impl ChannelBuilder {
     /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-    ///     .build();
+    /// # fn example(runtime: grpc::rt::GrpcRuntime) {
+    /// let channel = Channel::builder(
+    ///     "dns:///localhost:123",
+    ///     Arc::new(LocalChannelCredentials::new()),
+    ///     runtime, // e.g.: grpc_tokio::runtime();
+    /// )
+    /// .build();
+    /// # }
     /// ```
     pub fn build(self) -> Channel {
         // TODO(nathanielford) This construction is currently a rough-cut placeholder.
@@ -888,11 +887,13 @@ mod tests {
     use crate::client::test_util::NopRecvMessage;
     use crate::credentials::LocalChannelCredentials;
     use crate::metadata::MetadataMap;
+    use crate::rt::test_runtime;
 
     fn new_channel() -> Channel {
         Channel::builder(
             "dns:///localhost:1234",
             Arc::new(LocalChannelCredentials::new()),
+            test_runtime(),
         )
         .build()
     }
@@ -1129,6 +1130,7 @@ mod tests {
         let mut channel = Channel::builder(
             format!("{scheme}:///unused"),
             Arc::new(LocalChannelCredentials::new()),
+            runtime.clone(),
         )
         .build();
         // Exit idle so the channel builds its resolver.
@@ -1222,6 +1224,7 @@ mod tests {
         let mut channel = Channel::builder(
             format!("{scheme}:///unused"),
             Arc::new(LocalChannelCredentials::new()),
+            runtime.clone(),
         )
         .build();
         // Exit idle so the channel builds its resolver.

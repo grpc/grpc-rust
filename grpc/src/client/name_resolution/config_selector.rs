@@ -176,6 +176,7 @@ mod tests {
     use crate::private;
     use crate::rt::BoxEndpoint;
     use crate::rt::GrpcRuntime;
+    use crate::rt::test_runtime;
     use crate::stub_server::RunningStubServer;
     use crate::stub_server::StubServer;
 
@@ -344,7 +345,8 @@ mod tests {
         let server = StubServer::new().start().await;
         let addr = server.addr();
         let (scheme, mut handle_rx) = FakeResolverBuilder::register();
-        let mut channel = Channel::builder(format!("{scheme}:///{addr}"), credentials).build();
+        let mut channel =
+            Channel::builder(format!("{scheme}:///{addr}"), credentials, test_runtime()).build();
         // Exit idle so the channel builds its resolver.
         channel.get_state(true);
         let resolver = GrpcRuntime::default()

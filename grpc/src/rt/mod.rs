@@ -307,9 +307,22 @@ pub(crate) mod unstable {
     }
 
     impl TcpOptions {
+        /// Sets whether `TCP_NODELAY` should be set on the socket.
+        pub fn with_enable_nodelay(mut self, enable_nodelay: bool) -> Self {
+            self.enable_nodelay = enable_nodelay;
+            self
+        }
+
         /// Returns whether `TCP_NODELAY` should be set on the socket.
         pub fn enable_nodelay(&self) -> bool {
             self.enable_nodelay
+        }
+
+        /// Sets the TCP keepalive idle time to configure on the socket, or
+        /// `None` to disable TCP keepalives.
+        pub fn with_keepalive(mut self, keepalive: Option<Duration>) -> Self {
+            self.keepalive = keepalive;
+            self
         }
 
         /// Returns the TCP keepalive idle time to configure on the socket, or

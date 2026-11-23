@@ -88,7 +88,6 @@ use crate::client::subchannel::NopBackoff;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
-use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
@@ -870,7 +869,6 @@ fn setup_registeries() {
     name_resolution::unix::reg();
     #[cfg(target_os = "linux")]
     name_resolution::unix_abstract::reg();
-    tonic_transport::reg();
 }
 
 #[cfg(test)]

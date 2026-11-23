@@ -44,23 +44,23 @@ mod registry;
 
 pub(crate) mod tonic;
 
-pub(crate) use registry::GLOBAL_TRANSPORT_REGISTRY;
-pub(crate) use registry::TransportRegistry;
+pub use registry::GLOBAL_TRANSPORT_REGISTRY;
+pub use registry::TransportRegistry;
 
 // TODO: The following options are specific to HTTP/2. We should
 // instead pass an `Attribute` like struct to the connect method instead which
 // can hold config relevant to a particular transport.
 #[derive(Clone)]
-pub(crate) struct TransportOptions {
-    pub(crate) init_stream_window_size: Option<u32>,
-    pub(crate) init_connection_window_size: Option<u32>,
-    pub(crate) http2_keep_alive_interval: Option<Duration>,
-    pub(crate) http2_keep_alive_timeout: Option<Duration>,
-    pub(crate) http2_keep_alive_while_idle: Option<bool>,
-    pub(crate) http2_max_header_list_size: Option<u32>,
-    pub(crate) http2_adaptive_window: bool,
-    pub(crate) tcp_keepalive: Option<Duration>,
-    pub(crate) tcp_nodelay: bool,
+pub struct TransportOptions {
+    pub init_stream_window_size: Option<u32>,
+    pub init_connection_window_size: Option<u32>,
+    pub http2_keep_alive_interval: Option<Duration>,
+    pub http2_keep_alive_timeout: Option<Duration>,
+    pub http2_keep_alive_while_idle: Option<bool>,
+    pub http2_max_header_list_size: Option<u32>,
+    pub http2_adaptive_window: bool,
+    pub tcp_keepalive: Option<Duration>,
+    pub tcp_nodelay: bool,
 }
 
 impl Default for TransportOptions {
@@ -80,7 +80,7 @@ impl Default for TransportOptions {
 }
 
 #[trait_variant::make(Send)]
-pub(crate) trait Transport: Sync {
+pub trait Transport: Sync {
     type Service: Invoke + 'static;
 
     async fn connect(
@@ -188,10 +188,10 @@ impl Transport for ArcTransport {
 }
 
 #[derive(Clone)]
-pub(crate) struct SecurityOpts {
-    pub(crate) credentials: Arc<dyn ChannelCredentials>,
-    pub(crate) authority: Authority,
-    pub(crate) handshake_info: ClientHandshakeInfo,
+pub struct SecurityOpts {
+    pub credentials: Arc<dyn ChannelCredentials>,
+    pub authority: Authority,
+    pub handshake_info: ClientHandshakeInfo,
 }
 
 /// Configuration options for establishing an HTTP `CONNECT` proxy tunnel.

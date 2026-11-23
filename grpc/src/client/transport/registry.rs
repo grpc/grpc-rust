@@ -81,6 +81,6 @@ impl TransportRegistry {
 /// does not exist in the local registry.
 pub static GLOBAL_TRANSPORT_REGISTRY: LazyLock<TransportRegistry> = LazyLock::new(|| {
     let registry = TransportRegistry::new();
-    super::tonic::reg_onto(&registry);
+    super::tonic::reg(&registry);
     registry
 });

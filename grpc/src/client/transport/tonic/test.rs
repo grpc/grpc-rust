@@ -131,7 +131,6 @@ const DEFAULT_TEST_SHORT_DURATION: Duration = Duration::from_millis(10);
 // Tests the tonic transport by creating a bi-di stream with a tonic server.
 #[tokio::test]
 pub(crate) async fn tonic_transport_rpc() {
-    super::reg();
     let server = StubServer::new().start().await;
     let addr = server.addr();
     println!("EchoServer listening on: {addr}");
@@ -602,8 +601,6 @@ async fn perform_unary_echo_failure(channel: &Channel) -> Trailers {
 
 #[tokio::test]
 async fn tonic_transport_invalid_base64_headers() {
-    super::reg();
-
     let server = StubServer::new()
         .with_bidirectional_streaming_echo(|request| async {
             let mut headers = HeaderMap::new();
@@ -680,7 +677,6 @@ async fn tonic_transport_invalid_base64_headers() {
 
 #[tokio::test]
 async fn tonic_transport_recv_drop_cancels_send() {
-    super::reg();
     let server = StubServer::new().start().await;
     let addr = server.addr();
 
@@ -968,7 +964,6 @@ impl RecvMessage for WrappedEchoResponse {
 
 #[tokio::test]
 async fn tonic_transport_recv_drop_sends_rst_stream() {
-    super::reg();
     let listener = TcpListener::bind("localhost:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1269,7 +1264,6 @@ async fn deadline_exceeded_waiting_for_connection() {
 // pass before the call reaches the transport.)
 #[tokio::test]
 async fn tonic_transport_deadline_already_expired() {
-    super::reg();
     let server = StubServer::new().start().await;
     let (conn, _disconnection_listener) = connect_transport(server.addr()).await;
 
@@ -1293,7 +1287,6 @@ async fn tonic_transport_deadline_already_expired() {
 // sent to the server.
 #[tokio::test(start_paused = true)]
 async fn deadline_exceeded_during_recv() {
-    super::reg();
     let mut server = RawH2Server::start().await;
 
     const CALL_CREDS_DELAY: Duration = Duration::from_millis(300);
@@ -1351,7 +1344,6 @@ async fn deadline_exceeded_during_recv() {
 // not sent until the server reads the request body.
 #[tokio::test(start_paused = true)]
 async fn deadline_exceeded_during_send_resets_instead_of_half_closing() {
-    super::reg();
     let mut server = RawH2Server::start().await;
     let target = format!("dns:///{}", server.addr);
     let channel =

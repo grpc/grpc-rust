@@ -49,13 +49,14 @@ fn main() {
     let third_party = manifest.join("proto/third_party");
     println!("cargo:rerun-if-changed={}", third_party.display());
 
-    // The five vendored dependency roots double as protoc include paths.
+    // The vendored dependency roots double as protoc include paths.
     let include_dirs: Vec<PathBuf> = [
         "envoy",
         "xds",
         "protoc-gen-validate",
         "googleapis",
         "cel-spec",
+        "grpc-proto",
     ]
     .iter()
     .map(|d| third_party.join(d))

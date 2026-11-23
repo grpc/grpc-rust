@@ -91,6 +91,10 @@ mod tests {
     use crate::generated::envoy_config_endpoint_v3_endpoint_proto::ClusterLoadAssignment;
     use crate::generated::envoy_config_listener_v3_listener_proto::Listener;
     use crate::generated::envoy_config_route_v3_route_proto::RouteConfiguration;
+    use crate::generated::grpc_lookup_v1_rls_config_proto::RouteLookupClusterSpecifier;
+    use crate::generated::grpc_lookup_v1_rls_config_proto::RouteLookupConfig;
+    use crate::generated::grpc_lookup_v1_rls_proto::RouteLookupRequest;
+    use crate::generated::grpc_lookup_v1_rls_proto::RouteLookupResponse;
 
     /// Encodes then decodes a message. `serialize` / `parse` are methods of the
     /// `protobuf::Message` trait (in scope via the `M: protobuf::Message` bound).
@@ -126,6 +130,40 @@ mod tests {
         assert_eq!(
             round_trip(&endpoints).cluster_name().as_bytes(),
             b"grpc-cluster"
+        );
+    }
+
+    #[test]
+    fn rls_route_lookup_request_round_trip() {
+        let mut req = RouteLookupRequest::new();
+        req.set_target_type("grpc");
+        req.set_stale_header_data("stale-data");
+        let decoded = round_trip(&req);
+        assert_eq!(decoded.target_type().as_bytes(), b"grpc");
+        assert_eq!(decoded.stale_header_data().as_bytes(), b"stale-data");
+    }
+
+    #[test]
+    fn rls_route_lookup_response_round_trip() {
+        let mut resp = RouteLookupResponse::new();
+        resp.set_header_data("rls-header");
+        resp.targets_mut().push("target-a");
+        let decoded = round_trip(&resp);
+        assert_eq!(decoded.header_data().as_bytes(), b"rls-header");
+        assert_eq!(decoded.targets().len(), 1);
+        assert_eq!(decoded.targets().get(0).unwrap().as_bytes(), b"target-a");
+    }
+
+    #[test]
+    fn rls_route_lookup_config_round_trip() {
+        let mut cfg = RouteLookupConfig::new();
+        cfg.set_lookup_service("rls.example.com:443");
+        let mut spec = RouteLookupClusterSpecifier::new();
+        spec.set_route_lookup_config(cfg);
+        let decoded = round_trip(&spec);
+        assert_eq!(
+            decoded.route_lookup_config().lookup_service().as_bytes(),
+            b"rls.example.com:443"
         );
     }
 }

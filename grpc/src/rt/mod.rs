@@ -75,6 +75,11 @@ pub(crate) fn test_runtime() -> GrpcRuntime {
 /// tasks.
 ///
 /// Cloning a `GrpcRuntime` is cheap; clones share the same underlying runtime.
+///
+/// The underlying runtime must keep running for as long as anything using the
+/// `GrpcRuntime` exists, e.g. every channel and server created with it. Using
+/// it after the underlying runtime has stopped is a programming error: it may
+/// panic, cause RPCs to fail, or cause them to hang.
 #[derive(Clone, Debug)]
 pub struct GrpcRuntime {
     inner: Arc<dyn Runtime>,
@@ -216,6 +221,16 @@ pub(crate) mod unstable {
     /// time-based operations such as sleeping. It provides a uniform interface
     /// that can be implemented for various async runtimes, enabling pluggable
     /// and testable infrastructure.
+    ///
+    /// # Lifetime of the underlying runtime
+    ///
+    /// Implementations are typically bound to an underlying executor or
+    /// reactor (e.g. a specific Tokio runtime). That executor must keep running
+    /// for as long as anything using this `Runtime` exists, e.g. every channel
+    /// and server created with it. If it stops, implementations need not
+    /// report an error: they may panic (e.g. when `sleep` is called or its
+    /// result is polled) or silently drop spawned tasks, so RPCs may fail or
+    /// hang. Methods that perform I/O return errors as usual.
     pub trait Runtime: Send + Sync + Debug {
         /// Spawns the given asynchronous task to run in the background.
         fn spawn(

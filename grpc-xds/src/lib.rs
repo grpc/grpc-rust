@@ -89,6 +89,22 @@ mod xds_client_runtime;
 /// snapshots.
 mod dependency_manager;
 
+/// Utilities shared by this crate's unit tests.
+#[cfg(test)]
+mod test_utils {
+    use std::sync::LazyLock;
+
+    use grpc::rt::GrpcRuntime;
+    use tokio::runtime::Runtime;
+
+    /// Returns a gRPC runtime for tests that don't run inside a Tokio runtime
+    /// (plain `#[test]`s), backed by a Tokio runtime shared by all such tests.
+    pub(crate) fn test_runtime() -> GrpcRuntime {
+        static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().unwrap());
+        grpc_tokio::runtime_with_handle(RUNTIME.handle().clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Sanity checks that the generated xDS modules are importable and usable

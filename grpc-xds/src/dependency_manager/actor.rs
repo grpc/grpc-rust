@@ -403,6 +403,7 @@ mod tests {
     use crate::resource::RouteAction;
     use crate::resource::RouteMatch;
     use crate::resource::VirtualHost;
+    use crate::test_utils::test_runtime;
     use crate::xds_config::ClusterChildren;
 
     const LISTENER: &str = "listener";
@@ -488,7 +489,7 @@ mod tests {
             listener_name: LISTENER.to_owned(),
             data_plane_authority: AUTHORITY.to_owned(),
             node_id: Some("node-1".into()),
-            runtime: grpc_tokio::runtime(),
+            runtime: test_runtime(),
             watcher: Box::new(Sender(tx)),
         };
         (options, rx)

@@ -230,6 +230,7 @@ mod tests {
 
     use super::*;
     use crate::resolver::set_picked_cluster;
+    use crate::test_utils::test_runtime;
 
     #[test]
     fn parse_config() {
@@ -458,7 +459,7 @@ mod tests {
         let scheduler = Arc::new(MockScheduler::default());
         let policy = ClusterManagerBuilder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
-            runtime: grpc_tokio::runtime(),
+            runtime: test_runtime(),
         });
         let controller = MockChannelController { latest_state: None };
         (policy, scheduler, controller)

@@ -297,6 +297,7 @@ mod tests {
     use grpc::core::Address;
 
     use super::*;
+    use crate::test_utils::test_runtime;
 
     #[test]
     fn parse_config() {
@@ -675,7 +676,7 @@ mod tests {
             child_policy_name,
             ..WrrLocalityBuilder.build(LbPolicyOptions {
                 work_scheduler,
-                runtime: grpc_tokio::runtime(),
+                runtime: test_runtime(),
             })
         })
     }

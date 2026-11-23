@@ -2,7 +2,6 @@
 name = "xds-test-util"
 edition = "2024"
 rust-version.workspace = true
-homepage = "https://github.com/grpc/grpc-rust"
 repository = "https://github.com/grpc/grpc-rust"
 description = """
 Test utilities for gRPC xDS implementations.

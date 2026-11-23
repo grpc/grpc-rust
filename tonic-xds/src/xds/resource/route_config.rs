@@ -256,6 +256,26 @@ pub(crate) struct VirtualHostConfig {
     pub routes: Vec<RouteConfig>,
 }
 
+impl VirtualHostConfig {
+    /// Returns cluster names referenced by routes in this virtual host.
+    pub(crate) fn cluster_names(&self) -> HashSet<&str> {
+        let mut clusters = HashSet::new();
+        for route in &self.routes {
+            match &route.action {
+                RouteConfigAction::Cluster(name) => {
+                    clusters.insert(name.as_str());
+                }
+                RouteConfigAction::WeightedClusters(wcs) => {
+                    for wc in wcs {
+                        clusters.insert(wc.name.as_str());
+                    }
+                }
+            }
+        }
+        clusters
+    }
+}
+
 /// A validated route with match criteria and action.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteConfig {
@@ -607,24 +627,13 @@ fn validate_route_action(
 }
 
 impl RouteConfigResource {
-    /// Returns cluster names referenced by this route configuration for cascading CDS subscriptions.
+    /// Returns cluster names referenced across all virtual hosts in this route configuration.
     pub(crate) fn cluster_names(&self) -> HashSet<String> {
-        let mut clusters = HashSet::new();
-        for vh in &self.virtual_hosts {
-            for route in &vh.routes {
-                match &route.action {
-                    RouteConfigAction::Cluster(name) => {
-                        clusters.insert(name.clone());
-                    }
-                    RouteConfigAction::WeightedClusters(wcs) => {
-                        for wc in wcs {
-                            clusters.insert(wc.name.clone());
-                        }
-                    }
-                }
-            }
-        }
-        clusters
+        self.virtual_hosts
+            .iter()
+            .flat_map(VirtualHostConfig::cluster_names)
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Applies the listener's `HttpConnectionManager` max stream duration to
@@ -746,7 +755,7 @@ mod tests {
     fn test_cluster_names() {
         let rc = make_route_config("rc-1");
         let validated = RouteConfigResource::validate(rc).unwrap();
-        let clusters = validated.cluster_names();
+        let clusters = validated.virtual_hosts[0].cluster_names();
         assert_eq!(clusters.len(), 1);
         assert!(clusters.contains("cluster-1"));
     }
@@ -945,7 +954,7 @@ mod tests {
             ..Default::default()
         };
         let validated = RouteConfigResource::validate(rc).unwrap();
-        let clusters = validated.cluster_names();
+        let clusters = validated.virtual_hosts[0].cluster_names();
         assert_eq!(clusters.len(), 2);
         assert!(clusters.contains("c1"));
         assert!(clusters.contains("c2"));

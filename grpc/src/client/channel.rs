@@ -847,7 +847,7 @@ impl SharedConfigSelector {
             .current
             .load()
             .select_config(options)
-            .map_err(sanitize_config_selector_status)
+            .map_err(|s| s.sanitize_control_plane_status("config selector returned illegal status"))
     }
 
     fn update(&self, selector: Arc<dyn ConfigSelector>) {
@@ -857,12 +857,6 @@ impl SharedConfigSelector {
         // after the first.
         let _ = self.inner.resolved.set(());
     }
-}
-
-/// Replaces status codes that config selectors may not produce with INTERNAL,
-/// per gRFC A54.
-fn sanitize_config_selector_status(status: StatusError) -> StatusError {
-    status.sanitize_control_plane_status("config selector returned illegal status")
 }
 
 // Sets up the default registries for transports, name resolvers, and load

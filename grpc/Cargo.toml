@@ -29,16 +29,6 @@ allowed_external_types = [
 ]
 
 [features]
-default = ["dns", "_runtime-tokio"]
-dns = ["dep:hickory-resolver", "_runtime-tokio"]
-# The following feature is used to ensure all modules use the runtime
-# abstraction instead of using tokio directly.
-_runtime-tokio = [
-    "tokio/rt",
-    "tokio/net",
-    "tokio/time",
-    "dep:socket2",
-]
 __unstable = []
 __internal = []
 __internal-test-utils = []
@@ -51,7 +41,6 @@ bytes = "1.10.1"
 flate2 = { version = "1.0", optional = true, default-features = false, features = [
     "zlib-rs",
 ] }
-hickory-resolver = { version = "0.26.1", optional = true }
 http = "1.1.0"
 httparse = "1.9"
 http-body = "1.0.1"
@@ -64,7 +53,6 @@ pin-project-lite = "0.2.16"
 rand = "0.10"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-socket2 = { version = "0.6", optional = true }
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
 tokio-stream = { version = "0.1.17", default-features = false }
 tonic = { version = "0.14.9", path = "../tonic", default-features = false, features = [
@@ -79,7 +67,6 @@ h2 = "0.4"
 tokio = { version = "1.47.0", features = ["test-util"] }
 async-stream = "0.3.6"
 criterion = "0.8"
-hickory-server = "0.26.1"
 http-body-util = "0.1.0"
 prost = "0.14.0"
 tempfile = "3.26"

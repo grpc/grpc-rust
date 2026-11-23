@@ -24,7 +24,7 @@
 
 //! The runtime used by gRPC for I/O, timers, and background tasks.
 //!
-//! Runtime implementations are provided by separate crates.
+//! Runtime implementations are provided by separate crates, e.g. `grpc-tokio`.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -41,8 +41,6 @@ use crate::private::UnstableTrait;
 pub(crate) use unstable::*;
 
 pub(crate) mod hyper_wrapper;
-#[cfg(feature = "_runtime-tokio")]
-pub(crate) mod tokio;
 
 /// A boxed handle to a task spawned with [`GrpcRuntime::spawn`].
 pub type BoxedTaskHandle = Box<dyn TaskHandle>;
@@ -60,66 +58,6 @@ pub trait Sleep: UnstableTrait + Send + Sync + Future<Output = ()> {}
 pub trait TaskHandle: UnstableTrait + Send + Sync {
     /// Abort the associated task.
     fn abort(&self);
-}
-
-/// A fake runtime to satisfy the compiler when no runtime is enabled. This will
-///
-/// # Panics
-///
-/// Panics if any of its functions are called.
-#[derive(Default, Debug)]
-pub(crate) struct NoOpRuntime {}
-
-impl Runtime for NoOpRuntime {
-    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> BoxedTaskHandle {
-        unimplemented!()
-    }
-
-    fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String> {
-        unimplemented!()
-    }
-
-    fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn Sleep>> {
-        unimplemented!()
-    }
-
-    fn now(&self) -> Instant {
-        unimplemented!()
-    }
-
-    fn tcp_stream(
-        &self,
-        _target: SocketAddr,
-        _opts: TcpOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
-        unimplemented!()
-    }
-
-    fn tcp_listener(
-        &self,
-        _addr: SocketAddr,
-    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
-        unimplemented!()
-    }
-
-    fn unix_listener(
-        &self,
-        _path: PathBuf,
-        _opts: UnixSocketOptions,
-    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
-        unimplemented!()
-    }
-}
-
-/// Returns the default runtime: Tokio when the `_runtime-tokio` feature is
-/// enabled, or a runtime that panics when used otherwise.
-pub(crate) fn default_runtime() -> GrpcRuntime {
-    #[cfg(feature = "_runtime-tokio")]
-    {
-        return GrpcRuntime::new(tokio::TokioRuntime::default(), UnstableToken);
-    }
-    #[allow(unreachable_code)]
-    GrpcRuntime::new(NoOpRuntime::default(), UnstableToken)
 }
 
 /// Returns the runtime used by this crate's unit tests.
@@ -142,12 +80,6 @@ pub struct GrpcRuntime {
 #[derive(Debug)]
 pub(crate) struct Elapsed;
 
-impl Default for GrpcRuntime {
-    fn default() -> Self {
-        default_runtime()
-    }
-}
-
 impl GrpcRuntime {
     /// Creates a `GrpcRuntime` from a runtime implementation.
     pub fn new<T: Runtime + 'static>(runtime: T, _: UnstableToken) -> Self {
@@ -164,7 +96,10 @@ impl GrpcRuntime {
         self.inner.spawn(task)
     }
 
-    pub fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String> {
+    pub(crate) fn get_dns_resolver(
+        &self,
+        opts: ResolverOptions,
+    ) -> Result<Box<dyn DnsResolver>, String> {
         self.inner.get_dns_resolver(opts)
     }
 
@@ -194,7 +129,7 @@ impl GrpcRuntime {
         }
     }
 
-    pub fn tcp_stream(
+    pub(crate) fn tcp_stream(
         &self,
         target: SocketAddr,
         opts: TcpOptions,
@@ -202,7 +137,7 @@ impl GrpcRuntime {
         self.inner.tcp_stream(target, opts)
     }
 
-    pub fn unix_stream(
+    pub(crate) fn unix_stream(
         &self,
         path: PathBuf,
         opts: UnixSocketOptions,
@@ -345,10 +280,38 @@ pub(crate) mod unstable {
         pub(crate) server_addr: Option<std::net::SocketAddr>,
     }
 
+    impl ResolverOptions {
+        /// Sets the address of the DNS server to use. If `None`, the system's
+        /// default DNS server will be used.
+        pub fn with_server_addr(mut self, server_addr: Option<SocketAddr>) -> Self {
+            self.server_addr = server_addr;
+            self
+        }
+
+        /// Returns the address of the DNS server to use, or `None` if the system's
+        /// default DNS server should be used.
+        pub fn server_addr(&self) -> Option<SocketAddr> {
+            self.server_addr
+        }
+    }
+
     #[derive(Default)]
     pub struct TcpOptions {
         pub(crate) enable_nodelay: bool,
         pub(crate) keepalive: Option<Duration>,
+    }
+
+    impl TcpOptions {
+        /// Returns whether `TCP_NODELAY` should be set on the socket.
+        pub fn enable_nodelay(&self) -> bool {
+            self.enable_nodelay
+        }
+
+        /// Returns the TCP keepalive idle time to configure on the socket, or
+        /// `None` if TCP keepalives should not be enabled.
+        pub fn keepalive(&self) -> Option<Duration> {
+            self.keepalive
+        }
     }
 
     #[derive(Default)]

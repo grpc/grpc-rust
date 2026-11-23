@@ -152,7 +152,7 @@ mod tests {
             "dns:///localhost:1".to_string(),
             Arc::new(LocalChannelCredentials::new()),
         )]);
-        pool.get_or_create(target, &bootstrap, GrpcRuntime::default(), None)
+        pool.get_or_create(target, &bootstrap, grpc_tokio::runtime(), None)
     }
 
     fn targets(pool: &XdsClientPool) -> Vec<String> {

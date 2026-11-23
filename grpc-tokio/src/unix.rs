@@ -30,18 +30,19 @@ use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::net::unix::SocketAddr;
 
-use crate::client::name_resolution::UNIX_NETWORK_TYPE;
-use crate::private::UnstableToken;
-use crate::rt::EndpointListener;
-use crate::rt::GrpcEndpoint;
-use crate::rt::StreamEndpoint;
-use crate::rt::tokio::TOKIO_ACCEPT_RETRY_POLICY;
-use crate::rt::tokio::accept_with_retry;
-use crate::server::ListenerAddress;
-use crate::server::UnixListenerAddress;
+use grpc::__unstable::UnstableToken;
+use grpc::__unstable::client::name_resolution::UNIX_NETWORK_TYPE;
+use grpc::__unstable::rt::EndpointListener;
+use grpc::__unstable::rt::GrpcEndpoint;
+use grpc::__unstable::rt::StreamEndpoint;
+use grpc::server::ListenerAddress;
+use grpc::server::UnixListenerAddress;
+
+use crate::runtime::TOKIO_ACCEPT_RETRY_POLICY;
+use crate::runtime::accept_with_retry;
 
 /// Connects to the Unix socket at `path`.
-pub async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, String> {
+pub(crate) async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, String> {
     let stream = UnixStream::connect(&path)
         .await
         .map_err(|err| err.to_string())?;
@@ -49,7 +50,7 @@ pub async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, String> {
 }
 
 /// Binds a listener to the Unix socket at `path`.
-pub fn bind(path: PathBuf) -> Result<Box<dyn EndpointListener>, String> {
+pub(crate) fn bind(path: PathBuf) -> Result<Box<dyn EndpointListener>, String> {
     let listener = UnixListener::bind(&path).map_err(|e| e.to_string())?;
     let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
     let local_addr = UnixListenerAddress::new(address_string(&local_addr), UnstableToken);
@@ -108,7 +109,7 @@ struct TokioUnixListener {
     local_addr: UnixListenerAddress,
 }
 
-#[crate::async_trait]
+#[grpc::async_trait]
 impl EndpointListener for TokioUnixListener {
     async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String> {
         let (stream, peer_addr) =

@@ -16,6 +16,7 @@ members = [
   "grpc-protobuf",
   "grpc-protobuf-build",
   "grpc-rustls",
+  "grpc-tokio",
   "grpc-xds",
   "protoc-gen-grpc-rust",
   "xds-client",

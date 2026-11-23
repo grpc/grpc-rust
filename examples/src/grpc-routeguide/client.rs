@@ -206,6 +206,7 @@ async fn main() {
     let channel = Channel::builder(
         format!("dns:///{address}"),
         Arc::new(LocalChannelCredentials::new()),
+        grpc_tokio::runtime(),
     )
     .build();
 

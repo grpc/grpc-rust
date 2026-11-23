@@ -114,7 +114,6 @@ pub trait GracefulConnection: Future<Output = Result<(), String>> + Send + 'stat
     fn graceful_shutdown(self: Pin<&mut Self>, token: SealedToken);
 }
 
-#[derive(Default)]
 pub struct Server {
     handler: Option<Arc<dyn DynHandle>>,
     runtime: GrpcRuntime,

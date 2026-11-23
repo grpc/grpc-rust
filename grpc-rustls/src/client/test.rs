@@ -36,6 +36,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
@@ -46,14 +47,28 @@ use crate::StaticProvider;
 use crate::client::ClientTlsConfig;
 use crate::client::RustlsChannelCredentials;
 use grpc::__unstable::UnstableToken;
+use grpc::__unstable::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::common::Authority;
-use grpc::__unstable::rt;
+use grpc::__unstable::rt::BoxEndpoint;
 use grpc::__unstable::rt::EndpointIoStream;
-use grpc::__unstable::rt::TcpOptions;
+use grpc::__unstable::rt::StreamEndpoint;
 use grpc::credentials::ChannelCredentials;
 
 static INIT: Once = Once::new();
+
+/// Connects to `addr` and wraps the connection as a gRPC endpoint.
+async fn connect_endpoint(addr: SocketAddr) -> BoxEndpoint {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let local_addr = stream.local_addr().unwrap();
+    let peer_addr = stream.peer_addr().unwrap();
+    Box::new(StreamEndpoint::new(
+        stream,
+        local_addr.to_string().into_boxed_str(),
+        peer_addr.to_string().into_boxed_str(),
+        TCP_IP_NETWORK_TYPE,
+    ))
+}
 
 fn init_provider() {
     INIT.call_once(|| {
@@ -162,11 +177,8 @@ async fn test_tls_key_log() {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
-    let endpoint = runtime
-        .tcp_stream(addr, TcpOptions::default())
-        .await
-        .unwrap();
+    let runtime = grpc_tokio::runtime();
+    let endpoint = connect_endpoint(addr).await;
     let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
     let result = creds
@@ -212,11 +224,8 @@ async fn test_tls_handshake_wrong_server_name() {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
-    let endpoint = runtime
-        .tcp_stream(addr, TcpOptions::default())
-        .await
-        .unwrap();
+    let runtime = grpc_tokio::runtime();
+    let endpoint = connect_endpoint(addr).await;
 
     let authority = Authority::new(
         // Use a hostname not in the server cert's SANs
@@ -269,11 +278,8 @@ async fn test_tls_validate_authority() {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
-    let endpoint = runtime
-        .tcp_stream(addr, TcpOptions::default())
-        .await
-        .unwrap();
+    let runtime = grpc_tokio::runtime();
+    let endpoint = connect_endpoint(addr).await;
 
     let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
@@ -312,11 +318,8 @@ async fn test_mtls_handshake_no_identity() {
         .with_root_certificates_provider(StaticProvider::new(load_root_certs("ca.pem")));
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
-    let runtime = rt::default_runtime();
-    let endpoint = runtime
-        .tcp_stream(addr, TcpOptions::default())
-        .await
-        .unwrap();
+    let runtime = grpc_tokio::runtime();
+    let endpoint = connect_endpoint(addr).await;
     let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
     // In TLS 1.3, the client considers the handshake complete immediately after
@@ -367,11 +370,8 @@ async fn test_mtls_handshake_with_identitiy() {
         .with_identity_provider(identity_provider);
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
-    let runtime = rt::default_runtime();
-    let endpoint = runtime
-        .tcp_stream(addr, TcpOptions::default())
-        .await
-        .unwrap();
+    let runtime = grpc_tokio::runtime();
+    let endpoint = connect_endpoint(addr).await;
     let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
     let result = creds
@@ -424,11 +424,7 @@ async fn check_client_resumption_disabled(
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
     for i in 0..2 {
-        let runtime = rt::default_runtime();
-        let endpoint = runtime
-            .tcp_stream(addr, TcpOptions::default())
-            .await
-            .unwrap();
+        let endpoint = connect_endpoint(addr).await;
         let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 
         let (mut tls_stream, _security, _authority_validator) = creds
@@ -587,11 +583,8 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
-    let endpoint = runtime
-        .tcp_stream(addr, TcpOptions::default())
-        .await
-        .unwrap();
+    let runtime = grpc_tokio::runtime();
+    let endpoint = connect_endpoint(addr).await;
 
     let authority = Authority::new("localhost".to_string(), Some(addr.port()));
 

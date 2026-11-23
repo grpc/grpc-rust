@@ -227,7 +227,6 @@ mod tests {
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
     use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
     use grpc::__unstable::client::name_resolution::Endpoint;
-    use grpc::__unstable::rt::default_runtime;
     use grpc::client::CallOptions;
     use grpc::client::ConnectivityState;
     use grpc::client::RequestHeaders;
@@ -462,7 +461,7 @@ mod tests {
         let scheduler = Arc::new(MockScheduler::default());
         let policy = ClusterManagerBuilder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
-            runtime: default_runtime(),
+            runtime: grpc_tokio::runtime(),
         });
         let controller = MockChannelController { latest_state: None };
         (policy, scheduler, controller)

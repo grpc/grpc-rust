@@ -33,17 +33,17 @@ use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::config::ResolverOpts;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
-use crate::rt::ResolverOptions;
-use crate::rt::{self};
+use grpc::__unstable::rt::ResolverOptions;
+use grpc::__unstable::rt::{self};
 
 /// A DNS resolver that uses hickory with the tokio runtime. This supports txt
 /// lookups in addition to A and AAAA record lookups. It also supports using
 /// custom DNS servers.
-pub(super) struct DnsResolver {
+pub(crate) struct DnsResolver {
     resolver: hickory_resolver::TokioResolver,
 }
 
-#[crate::async_trait]
+#[grpc::async_trait]
 impl rt::DnsResolver for DnsResolver {
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
         let response = self
@@ -82,8 +82,8 @@ impl rt::DnsResolver for DnsResolver {
 }
 
 impl DnsResolver {
-    pub(super) fn new(opts: ResolverOptions) -> Result<Self, String> {
-        let builder = if let Some(server_addr) = opts.server_addr {
+    pub(crate) fn new(opts: ResolverOptions) -> Result<Self, String> {
+        let builder = if let Some(server_addr) = opts.server_addr() {
             let provider = TokioRuntimeProvider::default();
             let mut udp_config = ConnectionConfig::new(ProtocolConfig::Udp);
             udp_config.port = server_addr.port();
@@ -132,9 +132,10 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
 
-    use crate::rt::DnsResolver;
-    use crate::rt::ResolverOptions;
-    use crate::rt::tokio::TokioDefaultDnsResolver;
+    use grpc::__unstable::rt::DnsResolver;
+    use grpc::__unstable::rt::ResolverOptions;
+
+    use crate::runtime::TokioDefaultDnsResolver;
 
     #[tokio::test]
     async fn compare_hickory_and_default() {
@@ -182,9 +183,7 @@ mod tests {
         ];
 
         let dns = start_in_memory_dns_server("test.local.", records).await;
-        let opts = ResolverOptions {
-            server_addr: Some(dns.addr),
-        };
+        let opts = ResolverOptions::default().with_server_addr(Some(dns.addr));
         let hickory_dns = super::DnsResolver::new(opts).unwrap();
 
         let txt = hickory_dns.lookup_txt("test.local").await.unwrap();
@@ -203,9 +202,7 @@ mod tests {
             RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
         );
         let dns = start_in_memory_dns_server("test.local.", vec![record]).await;
-        let opts = ResolverOptions {
-            server_addr: Some(dns.addr),
-        };
+        let opts = ResolverOptions::default().with_server_addr(Some(dns.addr));
         let hickory_dns = super::DnsResolver::new(opts).unwrap();
         let ips = hickory_dns.lookup_host_name("test.local").await.unwrap();
         assert_eq!(ips, vec![Ipv4Addr::new(1, 2, 3, 4)]);

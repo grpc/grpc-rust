@@ -244,7 +244,7 @@ mod tests {
 
         let addr = running_cp.addr();
         let server_config = ServerConfig::new(format!("dns:///{addr}"));
-        let transport = GrpcTransportBuilder::new(GrpcRuntime::default())
+        let transport = GrpcTransportBuilder::new(grpc_tokio::runtime())
             .build(&server_config)
             .await
             .expect("build transport");
@@ -288,9 +288,9 @@ mod tests {
         );
         let client = XdsClient::builder(
             config,
-            GrpcTransportBuilder::new(GrpcRuntime::default()),
+            GrpcTransportBuilder::new(grpc_tokio::runtime()),
             ProstCodec,
-            XdsRuntime::new(GrpcRuntime::default()),
+            XdsRuntime::new(grpc_tokio::runtime()),
         )
         .build();
 

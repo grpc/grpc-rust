@@ -125,7 +125,7 @@ where
 
 /// Background task: watches endpoint snapshots and emits incremental changes.
 ///
-/// Each time a new [`EndpointsResource`] arrives from the cache, we diff
+/// Each time a new [`EndpointsResource`] arrives on the watch, we diff
 /// `healthy_endpoints()` against the previous snapshot, keyed by primary
 /// address, and emit `Insert` for new endpoints followed by `Remove` for gone
 /// ones. An endpoint whose primary address is unchanged but whose additional

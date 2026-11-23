@@ -139,12 +139,11 @@ impl<S: Send + 'static> Connector for ClusterConnector<S> {
                     tracing::error!(
                         cluster = %cluster_name,
                         endpoint = %endpoint.address(),
-                        "cluster removed from cache before any CDS update produced a \
+                        "cluster watches closed before any CDS update produced a \
                          connector; parking the connect until discovery drops it",
                     );
-                    // The cluster left the cache before publishing a connector.
-                    // Its endpoints are removed too, so discovery drops this
-                    // future; parking avoids inventing a bogus connection.
+                    // The router dropped this cluster, which also closes its
+                    // endpoints watch, so discovery drops this future.
                     return std::future::pending().await;
                 }
             }

@@ -25,13 +25,11 @@
 //! Converts snapshot-based endpoint watch updates into incremental
 //! [`Change`] streams for Tower's load balancing infrastructure.
 //!
-//! The resource manager writes [`EndpointsResource`] snapshots into
-//! [`XdsCache`](crate::xds::cache::XdsCache), and
-//! [`XdsRouter`](crate::xds::routing::XdsRouter) resubscribes to each
-//! cluster's [`CacheWatch`] there and passes it to the cluster's channel; this
-//! module diffs consecutive snapshots and produces `Change::Insert` /
-//! `Change::Remove` events that Tower's P2C balancer (or any other
-//! `Discover`-based balancer) can consume.
+//! [`XdsRouter`](crate::xds::routing::XdsRouter) fans per-cluster
+//! [`EndpointsResource`] snapshots out on [`CacheWatch`] channels; this module
+//! diffs consecutive snapshots and produces `Change::Insert` / `Change::Remove`
+//! events that Tower's P2C balancer (or any other `Discover`-based balancer)
+//! can consume.
 //!
 //! Two flavours share one diff loop, differing only in what an added endpoint
 //! is turned into: [`EndpointManager::discover_endpoints`] connects it through
@@ -109,9 +107,9 @@ pub(crate) fn discover_addresses(
 
 /// Spawns the shared diff loop and returns the change stream it feeds.
 ///
-/// The spawned task exits when the `CacheWatch` closes (the resource manager
-/// removes the cluster's endpoints from `XdsCache`, dropping the watch
-/// sender), which ends the stream, and is aborted when the stream is dropped.
+/// The spawned task exits when the `CacheWatch` closes
+/// (when the router drops the cluster's watch sender), which ends the stream,
+/// and is aborted when the stream is dropped.
 fn spawn_diff_loop<S, F>(
     watch: CacheWatch<Arc<EndpointsResource>>,
     make_service: F,
@@ -127,7 +125,7 @@ where
 
 /// Background task: watches endpoint snapshots and emits incremental changes.
 ///
-/// Each time a new [`EndpointsResource`] arrives from the cache, we diff
+/// Each time a new [`EndpointsResource`] arrives on the watch, we diff
 /// `healthy_endpoints()` against the previous snapshot, keyed by primary
 /// address, and emit `Insert` for new endpoints followed by `Remove` for gone
 /// ones. An endpoint whose primary address is unchanged but whose additional

@@ -48,7 +48,7 @@ use crate::xds::resource::{ClusterResource, EndpointsResource, RouteConfigResour
 #[derive(Clone, Debug)]
 pub struct ClusterSnapshot {
     pub(crate) cluster: Arc<ClusterResource>,
-    /// `None` if the EDS resource failed without a cached fallback.
+    /// `None` if the EDS resource failed.
     pub(crate) endpoints: Option<Arc<EndpointsResource>>,
     /// Why `endpoints` is `None`.
     pub(crate) resolution_note: Option<Arc<str>>,
@@ -58,7 +58,10 @@ impl ClusterSnapshot {
     /// The healthy endpoints the cluster's load balancer connects to, once
     /// per address, in EDS order.
     ///
-    /// `None` if the EDS resource failed without a cached fallback.
+    /// `None` if the EDS resource failed; see
+    /// [`resolution_note`](Self::resolution_note). If the channel already has
+    /// a load balancer for this cluster, that balancer keeps its last
+    /// endpoints, which this doesn't list.
     pub fn endpoints(&self) -> Option<impl Iterator<Item = &XdsEndpoint>> {
         let endpoints = self.endpoints.as_ref()?;
         Some(endpoints.unique_healthy_endpoints().map(|ep| &**ep))

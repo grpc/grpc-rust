@@ -122,22 +122,10 @@ impl ResolverUpdate {
     }
 }
 
-/// Wrapper that allows an `Arc<dyn ConfigSelector>` to be stored in
-/// [`ResolverUpdateAttributes`](crate::client::name_resolution::ResolverUpdateAttributes),
-/// which requires values to implement [`Eq`].
-///
-/// Equality is based on pointer identity: two wrappers are equal if and only
-/// if they point to the same `ConfigSelector` allocation.
-#[derive(Debug, Clone)]
+/// Private key wrapper so callers cannot access the stored [`ConfigSelector`]
+/// directly through [`ResolverUpdate::attributes`].
+#[derive(Debug)]
 struct ConfigSelectorAttr(Arc<dyn ConfigSelector>);
-
-impl PartialEq for ConfigSelectorAttr {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for ConfigSelectorAttr {}
 
 #[cfg(test)]
 mod tests {

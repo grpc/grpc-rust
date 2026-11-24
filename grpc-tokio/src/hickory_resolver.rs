@@ -24,6 +24,8 @@
 
 use std::net::IpAddr;
 
+use grpc::__unstable::rt::ResolverOptions;
+use grpc::__unstable::rt::{self};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::ConnectionConfig;
 use hickory_resolver::config::LookupIpStrategy;
@@ -32,9 +34,6 @@ use hickory_resolver::config::ProtocolConfig;
 use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::config::ResolverOpts;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-
-use grpc::__unstable::rt::ResolverOptions;
-use grpc::__unstable::rt::{self};
 
 /// A DNS resolver that uses hickory with the tokio runtime. This supports txt
 /// lookups in addition to A and AAAA record lookups. It also supports using
@@ -116,6 +115,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
+    use grpc::__unstable::rt::DnsResolver;
+    use grpc::__unstable::rt::ResolverOptions;
     use hickory_resolver::net::runtime::TokioRuntimeProvider;
     use hickory_server::Server;
     use hickory_server::proto::rr::LowerName;
@@ -131,9 +132,6 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
-
-    use grpc::__unstable::rt::DnsResolver;
-    use grpc::__unstable::rt::ResolverOptions;
 
     use crate::runtime::TokioDefaultDnsResolver;
 
@@ -165,20 +163,16 @@ mod tests {
             Record::from_rdata(
                 Name::from_ascii("test.local.").unwrap(),
                 300,
-                RData::TXT(TXT::new(vec![
-                    "one".to_string(),
-                    "two".to_string(),
-                    "three".to_string(),
-                ])),
+                RData::TXT(
+                    TXT::try_new(["one", "two", "three"].into_iter().map(str::as_bytes)).unwrap(),
+                ),
             ),
             Record::from_rdata(
                 Name::from_ascii("test.local.").unwrap(),
                 300,
-                RData::TXT(TXT::new(vec![
-                    "abc".to_string(),
-                    "def".to_string(),
-                    "ghi".to_string(),
-                ])),
+                RData::TXT(
+                    TXT::try_new(["abc", "def", "ghi"].into_iter().map(str::as_bytes)).unwrap(),
+                ),
             ),
         ];
 

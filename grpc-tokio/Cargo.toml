@@ -1,0 +1,45 @@
+[package]
+name = "grpc-tokio"
+version = "0.10.0"
+authors = ["gRPC authors"]
+license = "MIT"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = """
+Tokio runtime support for gRPC-Rust.
+"""
+readme = "README.md"
+keywords = ["rpc", "grpc", "async", "tokio"]
+categories = ["web-programming", "network-programming", "asynchronous"]
+rust-version = { workspace = true }
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "grpc::*",
+]
+
+[features]
+default = ["dns"]
+# Uses hickory-resolver for DNS resolution, which enables custom DNS
+# authorities. Without it, only host lookups via the system resolver are
+# supported.
+dns = ["dep:hickory-resolver"]
+
+[dependencies]
+grpc = { version = "0.10.0", path = "../grpc", default-features = false, features = [
+    "__unstable",
+] }
+hickory-resolver = { version = "0.26.4", optional = true }
+pin-project-lite = "0.2.16"
+socket2 = "0.6"
+tokio = { version = "1.37.0", features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+bytes = "1.10.1"
+hickory-server = "0.26.4"
+tokio = { version = "1.47.0", features = ["macros", "rt-multi-thread", "sync", "test-util"] }

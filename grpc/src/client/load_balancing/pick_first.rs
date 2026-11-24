@@ -775,7 +775,7 @@ mod test {
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestEnv;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     // Creates an endpoint containing `addrs`, in order.
     fn endpoint(addrs: &[&str]) -> Endpoint {
@@ -803,7 +803,7 @@ mod test {
         let mut env = TestEnv::new(|work_scheduler| {
             PickFirstBuilder {}.build(LbPolicyOptions {
                 work_scheduler,
-                runtime: default_runtime(),
+                runtime: test_runtime(),
             })
         });
 

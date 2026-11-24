@@ -45,7 +45,6 @@ use crate::server::ServerTlsConfig;
 use crate::server::TlsClientCertificateRequestType;
 use grpc::__unstable::UnstableToken;
 use grpc::__unstable::client::name_resolution::TCP_IP_NETWORK_TYPE;
-use grpc::__unstable::rt;
 use grpc::__unstable::rt::EndpointIoStream;
 use grpc::__unstable::rt::StreamEndpoint;
 use grpc::credentials::ServerCredentials;
@@ -80,7 +79,7 @@ async fn test_tls_server_handshake() {
     let config = ServerTlsConfig::new(identity_provider);
     let creds = RustlsServerCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -136,7 +135,7 @@ async fn test_tls_server_handshake_no_alpn() {
     let config = ServerTlsConfig::new(identity_provider);
     let creds = RustlsServerCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -185,7 +184,7 @@ async fn test_tls_server_handshake_bad_alpn() {
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
-        let runtime = rt::default_runtime();
+        let runtime = grpc_tokio::runtime();
         let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
         assert!(result.is_err(), "Server handshake should have failed");
     });
@@ -221,7 +220,7 @@ async fn test_tls_handshake_alpn_h1_and_h2() {
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let stream = endpoint_from_tcp(stream).unwrap();
-        let runtime = rt::default_runtime();
+        let runtime = grpc_tokio::runtime();
         creds
             .accept(Box::new(stream), runtime, UnstableToken)
             .await
@@ -261,7 +260,7 @@ async fn test_tls_server_mtls_require_fail() {
 
     let creds = RustlsServerCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -312,7 +311,7 @@ async fn test_tls_server_mtls_success() {
 
     let creds = RustlsServerCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -372,7 +371,7 @@ async fn test_tls_server_mtls_optional() {
 
     let creds = RustlsServerCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -422,7 +421,7 @@ async fn test_tls_server_key_log() {
 
     let creds = RustlsServerCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -482,7 +481,7 @@ async fn check_resumption_disabled(versions: Vec<&'static rustls::SupportedProto
         for _ in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
             let stream = endpoint_from_tcp(stream).unwrap();
-            let runtime = rt::default_runtime();
+            let runtime = grpc_tokio::runtime();
             let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
             assert!(result.is_ok());
             let stream = result.unwrap().endpoint;
@@ -557,7 +556,7 @@ async fn test_tls_server_sni() {
         for _ in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
             let stream = endpoint_from_tcp(stream).unwrap();
-            let runtime = rt::default_runtime();
+            let runtime = grpc_tokio::runtime();
             let result = creds.accept(Box::new(stream), runtime, UnstableToken).await;
             assert!(
                 result.is_ok(),

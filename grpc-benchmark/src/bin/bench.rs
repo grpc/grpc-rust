@@ -185,6 +185,7 @@ async fn main() {
     let channel = Channel::builder(
         format!("dns:///127.0.0.1:{}", worker_port),
         LocalChannelCredentials::new_arc(),
+        grpc_tokio::runtime(),
     )
     .build();
     let client = WorkerServiceClient::new(channel);

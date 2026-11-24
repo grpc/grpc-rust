@@ -233,7 +233,7 @@ mod tests {
     use crate::credentials::SecurityLevel;
     use crate::metadata::MetadataMap;
     use crate::metadata::MetadataValue;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
     use crate::server::Handle;
     use crate::server::RecvStream;
     use crate::server::RequestHeaders;
@@ -262,7 +262,7 @@ mod tests {
         );
         HyperGrpcService {
             handler,
-            runtime: default_runtime(),
+            runtime: test_runtime(),
             max_recv_message_size: Some(1024),
             connection_info,
         }

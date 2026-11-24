@@ -68,7 +68,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_runs_task() {
-        let runtime = XdsRuntime::new(GrpcRuntime::default());
+        let runtime = XdsRuntime::new(grpc_tokio::runtime());
         let (tx, rx) = oneshot::channel();
         runtime.spawn(async move {
             tx.send(()).unwrap();
@@ -78,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn sleep_waits_for_duration() {
-        let runtime = XdsRuntime::new(GrpcRuntime::default());
+        let runtime = XdsRuntime::new(grpc_tokio::runtime());
         let start = std::time::Instant::now();
         runtime.sleep(Duration::from_millis(20)).await;
         assert!(start.elapsed() >= Duration::from_millis(20));

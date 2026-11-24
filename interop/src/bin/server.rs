@@ -127,7 +127,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 server_protobuf::InteropTestService::default(),
             );
 
-            let server = GrpcServer::builder()
+            let rt = grpc_tokio::runtime();
+            let server = GrpcServer::builder(rt.clone())
                 .interceptor(server_protobuf::EchoHeaders::new())
                 .add_service(test_service)
                 .build();
@@ -144,7 +145,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 Arc::new(LocalServerCredentials::new())
             };
 
-            let listener = GrpcServer::tcp_listener(addr, creds, Http2Config::default()).await?;
+            let listener =
+                GrpcServer::tcp_listener(addr, creds, Http2Config::default(), rt).await?;
             server.serve(listener).await?;
         }
     };

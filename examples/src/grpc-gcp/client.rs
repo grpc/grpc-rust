@@ -53,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls = RustlsChannelCredentials::new(ClientTlsConfig::new())?;
     let channel_creds = CompositeChannelCredentials::new(tls, Arc::new(call_creds));
 
-    let channel = Channel::builder(ENDPOINT, Arc::new(channel_creds)).build();
+    let channel =
+        Channel::builder(ENDPOINT, Arc::new(channel_creds), grpc_tokio::runtime()).build();
 
     let client = PublisherClient::new(channel);
 

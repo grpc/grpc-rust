@@ -46,7 +46,7 @@ use crate::core::Address;
 use crate::rt::GrpcRuntime;
 
 mod backoff;
-pub mod config_selector;
+pub(crate) mod config_selector;
 pub mod registry;
 
 pub(crate) mod dns;

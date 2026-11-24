@@ -342,3 +342,5 @@ tonic-prost-build = { path = "../tonic-prost-build" }
 grpc-protobuf-build = { path = "../grpc-protobuf-build", default-features = false }
 protoc-gen-grpc-rust = { path = "../protoc-gen-grpc-rust", optional = true }
 protobuf-well-known-types = { version = "0.36.2-release" }
+
+[lints]

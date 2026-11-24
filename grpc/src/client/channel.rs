@@ -37,7 +37,6 @@ use tokio::sync::Notify;
 use tokio::sync::SetOnce;
 use tokio::sync::mpsc;
 
-use crate::StatusCodeError;
 use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
@@ -532,28 +531,16 @@ impl Invoke for LbInvoker {
                 PickResult::Queue => {}
                 PickResult::Fail(status) => {
                     // TODO: Check wait-for-ready and queue instead.
-                    if status.is_restricted_control_plane_code() {
-                        return FailingRecvStream::new_stream_pair(
-                            StatusError::new(
-                                StatusCodeError::Internal,
-                                format!("picker returned illegal status: {status}"),
-                            ),
-                            None,
-                        );
-                    }
-                    return FailingRecvStream::new_stream_pair(status, None);
+                    return FailingRecvStream::new_stream_pair(
+                        status.sanitize_control_plane_status("picker returned illegal status"),
+                        None,
+                    );
                 }
                 PickResult::Drop(status) => {
-                    if status.is_restricted_control_plane_code() {
-                        return FailingRecvStream::new_stream_pair(
-                            StatusError::new(
-                                StatusCodeError::Internal,
-                                format!("picker returned illegal status: {status}"),
-                            ),
-                            None,
-                        );
-                    }
-                    return FailingRecvStream::new_stream_pair(status, None);
+                    return FailingRecvStream::new_stream_pair(
+                        status.sanitize_control_plane_status("picker returned illegal status"),
+                        None,
+                    );
                 }
             }
             // Queued: wait for this snapshot to be superseded, then retry the
@@ -860,7 +847,7 @@ impl SharedConfigSelector {
             .current
             .load()
             .select_config(options)
-            .map_err(sanitize_config_selector_status)
+            .map_err(|s| s.sanitize_control_plane_status("config selector returned illegal status"))
     }
 
     fn update(&self, selector: Arc<dyn ConfigSelector>) {
@@ -869,19 +856,6 @@ impl SharedConfigSelector {
         // observe the new selector. This fails, harmlessly, on every update
         // after the first.
         let _ = self.inner.resolved.set(());
-    }
-}
-
-/// Replaces status codes that config selectors may not produce with INTERNAL,
-/// per gRFC A54.
-fn sanitize_config_selector_status(status: StatusError) -> StatusError {
-    if status.is_restricted_control_plane_code() {
-        StatusError::new(
-            StatusCodeError::Internal,
-            format!("config selector returned illegal status: {status}"),
-        )
-    } else {
-        status
     }
 }
 
@@ -899,6 +873,7 @@ fn setup_registeries() {
 
 #[cfg(test)]
 mod tests {
+    use crate::StatusCodeError;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -1079,12 +1054,23 @@ mod tests {
         }
     }
 
+    // Fails every pick with its status.
     #[derive(Debug)]
-    struct FailPicker;
+    struct FailPicker(StatusError);
 
     impl Picker for FailPicker {
         fn pick(&self, _options: PickOptions<'_>) -> PickResult {
-            PickResult::Fail(StatusError::new(StatusCodeError::Internal, "fail picker"))
+            PickResult::Fail(self.0.clone())
+        }
+    }
+
+    // Drops every pick with its status.
+    #[derive(Debug)]
+    struct DropPicker(StatusError);
+
+    impl Picker for DropPicker {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
+            PickResult::Drop(self.0.clone())
         }
     }
 
@@ -1191,7 +1177,10 @@ mod tests {
         lb_state_tx
             .send(LbState {
                 connectivity_state: ConnectivityState::TransientFailure,
-                picker: Arc::new(FailPicker),
+                picker: Arc::new(FailPicker(StatusError::new(
+                    StatusCodeError::Internal,
+                    "fail picker",
+                ))),
             })
             .unwrap();
         lb_work_scheduler.schedule_work(None);
@@ -1206,5 +1195,103 @@ mod tests {
             trailers.status().as_ref().unwrap_err().message(),
             "fail picker"
         );
+    }
+
+    // Performs an RPC on a channel whose LB policy uses `picker`, and returns
+    // the RPC's resulting status code.
+    async fn rpc_status_code_with_picker(
+        policy_name: &'static str,
+        picker: Arc<dyn Picker>,
+    ) -> StatusCodeError {
+        let runtime = GrpcRuntime::default();
+        reg_stub_policy(
+            policy_name,
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new(move |_data, _update, _config, controller| {
+                    controller.update_picker(LbState {
+                        connectivity_state: ConnectivityState::TransientFailure,
+                        picker: picker.clone(),
+                    });
+                    Ok(())
+                })),
+                ..Default::default()
+            },
+        );
+
+        let (scheme, mut resolver_rx) = FakeResolverBuilder::register();
+        let mut channel = Channel::builder(
+            format!("{scheme}:///unused"),
+            Arc::new(LocalChannelCredentials::new()),
+        )
+        .build();
+        // Exit idle so the channel builds its resolver.
+        channel.get_state(true);
+        let resolver = runtime
+            .timeout(Duration::from_secs(5), resolver_rx.recv())
+            .await
+            .expect("timed out waiting for the channel to build its resolver")
+            .unwrap();
+        resolver
+            .update(ResolverUpdate {
+                endpoints: Ok(vec![Endpoint {
+                    addresses: vec![Address {
+                        network_type: name_resolution::TCP_IP_NETWORK_TYPE,
+                        address: "127.0.0.1:1".to_string().into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]),
+                service_config: Ok(Some(
+                    ServiceConfig::parse(&format!(
+                        r#"{{"loadBalancingConfig": [{{"{policy_name}": {{}}}}]}}"#
+                    ))
+                    .unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (_tx, mut rx) = runtime
+            .timeout(
+                Duration::from_secs(5),
+                channel.invoke(RequestHeaders::new(), CallOptions::default()),
+            )
+            .await
+            .expect("the RPC should fail");
+        let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut NopRecvMessage).await else {
+            std::panic!("expected trailers");
+        };
+        trailers.status().as_ref().unwrap_err().code()
+    }
+
+    // A picker that fails a pick with a restricted status code results in an
+    // INTERNAL status, per gRFC A54.
+    #[tokio::test]
+    async fn picker_fail_with_restricted_code_converted_to_internal() {
+        let code = rpc_status_code_with_picker(
+            "channel_test_restricted_fail_pick",
+            Arc::new(FailPicker(StatusError::new(
+                StatusCodeError::NotFound,
+                "restricted",
+            ))),
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Internal);
+    }
+
+    // A picker that drops a pick with a restricted status code results in an
+    // INTERNAL status, per gRFC A54.
+    #[tokio::test]
+    async fn picker_drop_with_restricted_code_converted_to_internal() {
+        let code = rpc_status_code_with_picker(
+            "channel_test_restricted_drop_pick",
+            Arc::new(DropPicker(StatusError::new(
+                StatusCodeError::NotFound,
+                "restricted",
+            ))),
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Internal);
     }
 }

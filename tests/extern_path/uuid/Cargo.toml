@@ -10,3 +10,5 @@ name = "uuid1"
 prost = "0.14"
 [build-dependencies]
 prost-build = "0.14"
+
+[lints]

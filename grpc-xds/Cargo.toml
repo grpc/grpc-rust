@@ -40,3 +40,5 @@ xds-test-util = { path = "../xds-test-util" }
 protobuf-codegen = "4.36.2-release"
 protobuf-well-known-types = "0.36.2-release"
 protoc-gen-grpc-rust = { version = "0.10.0", path = "../protoc-gen-grpc-rust" }
+
+[lints]

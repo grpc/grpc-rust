@@ -10,7 +10,6 @@ description = """
 A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility.
 """
 edition = "2024"
-homepage = "https://github.com/grpc/grpc-rust"
 keywords = ["rpc", "grpc", "async", "futures", "protobuf"]
 license = "MIT"
 readme = "../README.md"

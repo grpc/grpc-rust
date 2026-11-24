@@ -25,6 +25,12 @@
 //! grpc-rls implements the Route Lookup Service (RLS) load balancing policy
 //! for Rust gRPC.
 
+#[allow(
+    dead_code,
+    reason = "no caller until RLS control channel is implemented."
+)]
+mod adaptive;
+
 /// Module `generated` contains the generated Protobuf messages for the
 /// `grpc.lookup.v1` package. The messages are an implementation detail consumed
 /// only within grpc-rls. The blanket `allow` covers machine-generated code; the

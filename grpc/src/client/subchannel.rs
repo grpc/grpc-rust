@@ -225,19 +225,9 @@ impl InvokeOnce for ReadyInvoker {
                 .get_metadata(&call_details, &channel_sec_info, headers.metadata_mut())
                 .await
             {
-                let status = if s.is_restricted_control_plane_code() {
-                    StatusError::new(
-                        StatusCodeError::Internal,
-                        format!(
-                            "transport: received call credentials error with illegal status: {}",
-                            s.message()
-                        ),
-                    )
-                } else {
-                    s
-                };
-
-                return fail_with(status);
+                return fail_with(s.sanitize_control_plane_status(
+                    "transport: received call credentials error with illegal status",
+                ));
             }
         }
 

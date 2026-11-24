@@ -123,8 +123,8 @@ impl ResolverUpdate {
 }
 
 /// Wrapper that allows an `Arc<dyn ConfigSelector>` to be stored in
-/// [`Attributes`](crate::attributes::Attributes), which requires values to
-/// implement [`Eq`].
+/// [`ResolverUpdateAttributes`](crate::client::name_resolution::ResolverUpdateAttributes),
+/// which requires values to implement [`Eq`].
 ///
 /// Equality is based on pointer identity: two wrappers are equal if and only
 /// if they point to the same `ConfigSelector` allocation.

@@ -27,7 +27,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::*;
-use crate::attributes::Attributes;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
@@ -42,6 +41,7 @@ use crate::client::load_balancing::test_utils;
 use crate::client::load_balancing::test_utils::StubPolicyFuncs;
 use crate::client::load_balancing::test_utils::TestEnv;
 use crate::client::name_resolution::Endpoint;
+use crate::client::name_resolution::ResolverUpdateAttributes;
 use crate::core::Address;
 use crate::rt::test_runtime;
 
@@ -285,7 +285,7 @@ async fn child_receives_all_resolver_update_fields() {
         .unwrap();
     let endpoint = new_test_endpoint("child-0", "127.0.0.1:8000");
     let update = ResolverUpdate {
-        attributes: Attributes::new().add(Marker(7)),
+        attributes: ResolverUpdateAttributes::new().add(Marker(7)),
         endpoints: Ok(vec![endpoint.clone()]),
         service_config: Err("service config error".to_string()),
         resolution_note: Some("note".to_string()),

@@ -27,6 +27,7 @@
 //! Name Resolution is the process by which a channel's target is converted into
 //! network addresses (typically IP addresses) used by the channel to connect to
 //! a service.
+use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
@@ -274,9 +275,9 @@ pub trait ChannelController: Send + Sync {
 /// ResolverUpdate contains the current Resolver state relevant to the
 /// channel.
 pub struct ResolverUpdate {
-    /// Attributes contains arbitrary data about the resolver intended for
-    /// consumption by the load balancing policy.
-    pub attributes: Attributes,
+    /// Arbitrary data about the resolver intended for consumption by the load
+    /// balancing policy.
+    pub attributes: ResolverUpdateAttributes,
 
     /// A list of endpoints which each identify a logical host serving the
     /// service indicated by the target URI.
@@ -294,6 +295,41 @@ pub struct ResolverUpdate {
     /// returns an empty endpoint list but a valid service config may set
     /// to this to something like "no DNS entries found for <name>".
     pub resolution_note: Option<String>,
+}
+
+/// A type-keyed collection of attributes attached to a [`ResolverUpdate`].
+///
+/// Each type may appear at most once.
+#[derive(Clone, Debug, Default)]
+pub struct ResolverUpdateAttributes(Attributes);
+
+impl ResolverUpdateAttributes {
+    /// Constructs a new, empty instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a value to the attributes, returning a new
+    /// `ResolverUpdateAttributes` with the value added.
+    ///
+    /// If a value of the same type already exists, it is replaced.
+    pub fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
+        Self(self.0.add(value))
+    }
+
+    /// Gets a reference to a value of type `T`, if present.
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.0.get::<T>()
+    }
+
+    /// Removes the value of type `T`, if present, returning a new
+    /// `ResolverUpdateAttributes` without the value.
+    ///
+    /// The returned object holds no reference to the removed value, so it is
+    /// dropped once no other `ResolverUpdateAttributes` instance references it.
+    pub fn remove<T: 'static>(&self) -> Self {
+        Self(self.0.remove::<T>())
+    }
 }
 
 impl Default for ResolverUpdate {
@@ -642,5 +678,37 @@ mod test {
                 tc.name
             );
         }
+    }
+
+    #[test]
+    fn test_resolver_update_attributes() {
+        let attrs = ResolverUpdateAttributes::new();
+        assert_eq!(attrs.get::<i32>(), None);
+
+        let attrs = attrs.add(10i32).add("hello".to_string());
+        assert_eq!(attrs.get::<i32>(), Some(&10));
+        assert_eq!(attrs.get::<String>(), Some(&"hello".to_string()));
+
+        // Replacing an existing type overwrites its value.
+        let replaced = attrs.add(20i32);
+        assert_eq!(replaced.get::<i32>(), Some(&20));
+        assert_eq!(attrs.get::<i32>(), Some(&10));
+
+        // Removing a type clears only that type.
+        let removed = replaced.remove::<i32>();
+        assert_eq!(removed.get::<i32>(), None);
+        assert_eq!(removed.get::<String>(), Some(&"hello".to_string()));
+
+        // ResolverUpdate::with_endpoints preserves ResolverUpdateAttributes.
+        let update = ResolverUpdate {
+            attributes: replaced,
+            ..Default::default()
+        };
+        let sharded = update.with_endpoints(Err("err".to_string()));
+        assert_eq!(sharded.attributes.get::<i32>(), Some(&20));
+        assert_eq!(
+            sharded.attributes.get::<String>(),
+            Some(&"hello".to_string())
+        );
     }
 }

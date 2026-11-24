@@ -172,7 +172,9 @@ impl XdsClient {
     /// Watch a resource by name.
     ///
     /// Returns a [`ResourceWatcher`] that receives events for this resource.
-    /// Dropping the watcher automatically unsubscribes.
+    /// Dropping the watcher automatically unsubscribes. Once a resource has no
+    /// watchers, its cached copy is discarded, and a later watch waits for the
+    /// server to resend it.
     ///
     /// # Arguments
     ///

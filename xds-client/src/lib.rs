@@ -61,8 +61,8 @@
 //!             // Signal is sent automatically when done is dropped
 //!         }
 //!         ResourceEvent::ResourceChanged { result: Err(error), .. } => {
-//!             // Resource was invalidated (validation error or deleted)
-//!             eprintln!("Resource invalidated: {}", error);
+//!             // No usable resource (invalid or does not exist)
+//!             eprintln!("Resource unavailable: {}", error);
 //!         }
 //!         ResourceEvent::AmbientError { error, .. } => {
 //!             // Non-fatal error, continue using cached resource

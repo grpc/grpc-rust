@@ -35,7 +35,8 @@ use crate::message::Node;
 pub struct ServerConfig {
     uri: String,
     // Future extensions per gRFC:
-    // - `ignore_resource_deletion: bool` (gRFC A53)
+    // - `fail_on_data_errors: bool` (gRFC A88)
+    // - `resource_timer_is_transient_error: bool` (gRFC A88)
     // - Server features / capabilities
     // - Per-server channel credentials config
 }

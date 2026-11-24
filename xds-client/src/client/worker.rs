@@ -311,19 +311,6 @@ enum ResourceState {
 }
 
 impl ResourceState {
-    /// Canonical A78 `grpc.xds.cache_state` attribute value for this state.
-    ///
-    /// When gRFC A88 (data error caching) is implemented, a `NACKedButCached`
-    /// variant will map to `"nacked_but_cached"` here.
-    fn cache_state_label(&self) -> &'static str {
-        match self {
-            ResourceState::Requested => "requested",
-            ResourceState::Received => "acked",
-            ResourceState::NACKed(_) => "nacked",
-            ResourceState::DoesNotExist => "does_not_exist",
-        }
-    }
-
     fn status(&self) -> ResourceStatus {
         match self {
             ResourceState::Requested => ResourceStatus::Requested,
@@ -339,11 +326,11 @@ impl ResourceState {
 struct CachedResource {
     /// Current state of the resource.
     state: ResourceState,
-    /// The decoded resource, if successfully received.
-    /// None if state is Requested, NACKed, or DoesNotExist.
+    /// The last accepted resource, if any. Per gRFC A88, it stays cached
+    /// across later data errors (NACKs and deletions), which watchers then
+    /// receive as ambient errors.
     resource: Option<Arc<DecodedResource>>,
-    /// The last accepted version as received, for snapshots. Unlike
-    /// `resource`, it is kept when the resource is later rejected or removed.
+    /// The last accepted version as received, for snapshots.
     accepted: Option<AcceptedResource>,
 }
 
@@ -366,53 +353,57 @@ impl CachedResource {
         }
     }
 
-    /// Create a cached resource in DoesNotExist state.
-    fn does_not_exist(accepted: Option<AcceptedResource>) -> Self {
-        Self {
-            state: ResourceState::DoesNotExist,
-            resource: None,
-            accepted,
-        }
-    }
-
-    /// Create a cached resource in NACKed state.
-    fn nacked(rejected: RejectedUpdate, accepted: Option<AcceptedResource>) -> Self {
-        Self {
-            state: ResourceState::NACKed(rejected),
-            resource: None,
-            accepted,
-        }
-    }
-
     /// Returns true if the resource is in Requested state (waiting for server response).
     fn is_requested(&self) -> bool {
         matches!(self.state, ResourceState::Requested)
     }
 
-    /// Convert cached state to a ResourceEvent for notifying watchers.
-    /// Returns None if state is Requested (nothing to notify yet).
-    fn to_event(&self) -> Option<ResourceEvent<DecodedResource>> {
-        // Cache-dump events for new watchers do not gate flow control.
-        let done = ProcessingDone::detached();
-        match &self.state {
-            ResourceState::Received => {
-                self.resource
-                    .as_ref()
-                    .map(|r| ResourceEvent::ResourceChanged {
-                        result: Ok(Arc::clone(r)),
-                        done,
-                    })
-            }
-            ResourceState::DoesNotExist => Some(ResourceEvent::ResourceChanged {
-                result: Err(Error::ResourceDoesNotExist),
-                done,
-            }),
-            ResourceState::NACKed(rejected) => Some(ResourceEvent::ResourceChanged {
-                result: Err(Error::Validation(rejected.details.clone())),
-                done,
-            }),
-            ResourceState::Requested => None,
+    /// Canonical `grpc.xds.cache_state` attribute value for this entry
+    /// (gRFC A78, A88).
+    fn cache_state_label(&self) -> &'static str {
+        let cached = self.resource.is_some();
+        match self.state {
+            ResourceState::Requested => "requested",
+            ResourceState::Received => "acked",
+            ResourceState::NACKed(_) if cached => "nacked_but_cached",
+            ResourceState::NACKed(_) => "nacked",
+            ResourceState::DoesNotExist if cached => "does_not_exist_but_cached",
+            ResourceState::DoesNotExist => "does_not_exist",
         }
+    }
+
+    /// Event reporting this entry's data error, if any. Per gRFC A88, the
+    /// error is ambient while a resource is cached, so watchers keep using it.
+    fn error_event(&self, done: ProcessingDone) -> Option<ResourceEvent<DecodedResource>> {
+        let error = match &self.state {
+            ResourceState::NACKed(rejected) => Error::Validation(rejected.details.clone()),
+            ResourceState::DoesNotExist => Error::ResourceDoesNotExist,
+            ResourceState::Requested | ResourceState::Received => return None,
+        };
+        Some(if self.resource.is_some() {
+            ResourceEvent::AmbientError { error, done }
+        } else {
+            ResourceEvent::ResourceChanged {
+                result: Err(error),
+                done,
+            }
+        })
+    }
+
+    /// Events replaying this entry to a new watcher: the cached resource, then
+    /// any data error, in that order (gRFC A88).
+    fn replay(&self) -> impl Iterator<Item = ResourceEvent<DecodedResource>> {
+        // Replayed events do not gate flow control.
+        let resource = self
+            .resource
+            .as_ref()
+            .map(|r| ResourceEvent::ResourceChanged {
+                result: Ok(Arc::clone(r)),
+                done: ProcessingDone::detached(),
+            });
+        resource
+            .into_iter()
+            .chain(self.error_event(ProcessingDone::detached()))
     }
 }
 
@@ -431,9 +422,11 @@ struct TypeState {
     watchers: HashMap<WatcherId, WatcherEntry>,
     /// Current subscription mode (wildcard or named resources).
     subscription: SubscriptionMode,
-    /// Resource cache: name -> cached resource.
+    /// Resource cache: name -> cached resource. Holds only resources some
+    /// watcher subscribes to.
     cache: HashMap<String, CachedResource>,
-    /// Whether missing resources in SotW should be treated as deleted (per A53).
+    /// Whether missing resources in SotW should be treated as deleted (per the
+    /// xDS protocol).
     all_resources_required_in_sotw: bool,
 }
 
@@ -507,21 +500,30 @@ impl TypeState {
             .map(|e| &e.event_tx)
     }
 
-    /// Snapshots of the subscribed resources in the cache.
+    /// Notifies the watchers of `name` of its data error, if any.
+    fn notify_error(&self, name: &str, done: &ProcessingDone) {
+        let Some(cached) = self.cache.get(name) else {
+            return;
+        };
+        for event_tx in self.matching_watchers(name) {
+            if let Some(event) = cached.error_event(done.share()) {
+                let _ = event_tx.send(event);
+            }
+        }
+    }
+
+    /// Snapshots of the cached resources.
     fn snapshot(&self) -> impl Iterator<Item = ResourceSnapshot> + '_ {
-        self.cache
-            .iter()
-            .filter(|(name, _)| self.subscription.includes(name))
-            .map(|(name, cached)| ResourceSnapshot {
-                type_url: self.type_url.to_string(),
-                name: name.clone(),
-                status: cached.state.status(),
-                accepted: cached.accepted.clone(),
-                rejected: match &cached.state {
-                    ResourceState::NACKed(rejected) => Some(rejected.clone()),
-                    _ => None,
-                },
-            })
+        self.cache.iter().map(|(name, cached)| ResourceSnapshot {
+            type_url: self.type_url.to_string(),
+            name: name.clone(),
+            status: cached.state.status(),
+            accepted: cached.accepted.clone(),
+            rejected: match &cached.state {
+                ResourceState::NACKed(rejected) => Some(rejected.clone()),
+                _ => None,
+            },
+        })
     }
 
     /// Current number of cached resources in each `grpc.xds.cache_state`, keyed
@@ -530,7 +532,7 @@ impl TypeState {
     fn resource_state_counts(&self) -> HashMap<&'static str, i64> {
         let mut counts: HashMap<&'static str, i64> = HashMap::new();
         for cached in self.cache.values() {
-            *counts.entry(cached.state.cache_state_label()).or_insert(0) += 1;
+            *counts.entry(cached.cache_state_label()).or_insert(0) += 1;
         }
         counts
     }
@@ -607,7 +609,8 @@ pub(crate) enum WatchEvent {
         event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
         /// Decoder function for this resource type.
         decoder: DecoderFn,
-        /// Whether all resources must be present in SotW responses (per A53).
+        /// Whether all resources must be present in SotW responses (per the
+        /// xDS protocol).
         all_resources_required_in_sotw: bool,
     },
     /// Unsubscribe a watcher.
@@ -961,8 +964,8 @@ where
                 Entry::Occupied(o) => o.into_mut(),
             };
 
-            if let Some(event) = cached.to_event() {
-                // Enqueue cached state without waiting for the watcher.
+            // Enqueue cached state without waiting for the watcher.
+            for event in cached.replay() {
                 let _ = event_tx.send(event);
             }
         }
@@ -988,7 +991,8 @@ where
         subscriptions_changed
     }
 
-    /// Remove a watcher from the state.
+    /// Remove a watcher from the state, evicting resources no watcher
+    /// subscribes to anymore.
     /// Returns the type_url and whether subscriptions changed.
     fn remove_watcher(&mut self, watcher_id: WatcherId) -> Option<(String, bool)> {
         let type_url = self
@@ -1014,6 +1018,18 @@ where
                 .sync_resource_counts(&type_url_arc, &HashMap::new());
             // Cancel all pending resource timers for this type.
             self.resource_timers.retain(|key, _| key.0 != type_url);
+        } else if subscriptions_changed {
+            // Like gRPC core, forget unsubscribed resources, so the cache stays
+            // bounded and a later watch waits for a fresh copy.
+            let subscription = &type_state.subscription;
+            type_state
+                .cache
+                .retain(|name, _| subscription.includes(name));
+            self.resource_timers
+                .retain(|(url, name), _| *url != type_url || subscription.includes(name));
+            let counts = type_state.resource_state_counts();
+            self.recorder
+                .sync_resource_counts(&type_state.type_url, &counts);
         }
 
         Some((type_url, subscriptions_changed))
@@ -1080,8 +1096,11 @@ where
     /// if some resources in the response fail validation. Each resource is processed
     /// independently:
     /// - Valid resources are cached and dispatched to watchers
-    /// - Invalid resources are cached as NACKed and errors sent to specific watchers
+    /// - Invalid resources are marked NACKed and errors sent to specific watchers
     /// - Missing resources (for types with ALL_RESOURCES_REQUIRED_IN_SOTW) are marked deleted
+    ///
+    /// Per gRFC A88, these data errors keep any previously accepted version
+    /// cached, and its watchers receive them as ambient errors.
     ///
     /// Cache/state updates, notification enqueueing, and the ACK/NACK form one
     /// synchronous actor turn. Watcher queues are unbounded, so a slow watcher
@@ -1141,9 +1160,11 @@ where
             type_state.nonce = response.nonce.clone();
         }
 
-        let received_names: HashSet<String> = valid_resources
+        // Resources present in the response, valid or not.
+        let seen_names: HashSet<String> = valid_resources
             .iter()
             .map(|(r, _)| r.name().to_string())
+            .chain(per_resource_errors.iter().map(|(name, _)| name.clone()))
             .collect();
 
         let nack_error = nack_error_message(&top_level_errors, &per_resource_errors);
@@ -1157,10 +1178,10 @@ where
             self.notify_resource_error(&type_url, &resource_name, rejected, &done);
         }
 
-        // Detect deleted resources (per A53):
-        // For resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
-        // any previously-received resource not in this response is deleted.
-        self.detect_deleted_resources(&type_url, &received_names, &done);
+        // Detect deleted resources: for resource types with
+        // ALL_RESOURCES_REQUIRED_IN_SOTW = true, a cached resource missing
+        // from this response has been deleted.
+        self.detect_deleted_resources(&type_url, &seen_names, &done);
 
         match nack_error {
             None => {
@@ -1193,6 +1214,11 @@ where
 
         for (resource, accepted) in resources {
             let resource_name = resource.name().to_string();
+            // Skip resources no watcher subscribes to, e.g. ones sent before
+            // the server saw an unsubscription.
+            if !type_state.subscription.includes(&resource_name) {
+                continue;
+            }
             let resource = Arc::new(resource);
             type_state.cache.insert(
                 resource_name.clone(),
@@ -1214,10 +1240,12 @@ where
             .sync_resource_counts(&type_state.type_url, &counts);
     }
 
-    /// Send validation-error notifications for a specific resource.
+    /// Record a validation error for a specific resource and notify its watchers.
     ///
     /// Per gRFC A46/A88, errors are routed only to watchers interested in
-    /// that specific resource (plus wildcard watchers).
+    /// that specific resource (plus wildcard watchers). A previously accepted
+    /// version stays cached, so the error is ambient. Errors for resources no
+    /// watcher subscribes to are ignored.
     fn notify_resource_error(
         &mut self,
         type_url: &str,
@@ -1226,19 +1254,15 @@ where
         done: &ProcessingDone,
     ) {
         let type_state = match self.type_states.get_mut(type_url) {
-            Some(s) => s,
-            None => return,
+            Some(s) if s.subscription.includes(resource_name) => s,
+            _ => return,
         };
 
-        let error = rejected.details.clone();
-        let accepted = type_state
+        type_state
             .cache
-            .remove(resource_name)
-            .and_then(|c| c.accepted);
-        type_state.cache.insert(
-            resource_name.to_string(),
-            CachedResource::nacked(rejected, accepted),
-        );
+            .entry(resource_name.to_string())
+            .or_insert_with(CachedResource::requested)
+            .state = ResourceState::NACKed(rejected);
         let counts = type_state.resource_state_counts();
         self.recorder
             .sync_resource_counts(&type_state.type_url, &counts);
@@ -1247,25 +1271,20 @@ where
         self.resource_timers
             .remove(&(type_url.to_string(), resource_name.to_string()));
 
-        for event_tx in type_state.matching_watchers(resource_name) {
-            let event = ResourceEvent::ResourceChanged {
-                result: Err(Error::Validation(error.clone())),
-                done: done.share(),
-            };
-            let _ = event_tx.send(event);
-        }
+        type_state.notify_error(resource_name, done);
     }
 
-    /// Detect resources that were deleted (present in cache but not in response)
-    /// and notify matching watchers.
+    /// Detect deleted resources (cached but missing from the response) and
+    /// notify matching watchers.
     ///
-    /// Per gRFC A53, for resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
-    /// if a previously-received resource is absent from a new SotW response,
-    /// it is treated as deleted.
+    /// For resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true, a SotW
+    /// response contains every subscribed resource, so a missing one has been
+    /// deleted. Per gRFC A88, the resource stays cached, and the deletion is
+    /// an ambient error.
     fn detect_deleted_resources(
         &mut self,
         type_url: &str,
-        received_names: &HashSet<String>,
+        seen_names: &HashSet<String>,
         done: &ProcessingDone,
     ) {
         let type_state = match self.type_states.get_mut(type_url) {
@@ -1277,28 +1296,22 @@ where
             return;
         }
 
-        let deleted_names: Vec<String> = type_state
-            .cache
-            .iter()
-            .filter(|(name, cached)| {
-                matches!(cached.state, ResourceState::Received) && !received_names.contains(*name)
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-
-        for name in deleted_names {
-            let accepted = type_state.cache.remove(&name).and_then(|c| c.accepted);
-            type_state
-                .cache
-                .insert(name.clone(), CachedResource::does_not_exist(accepted));
-
-            for event_tx in type_state.matching_watchers(&name) {
-                let event = ResourceEvent::ResourceChanged {
-                    result: Err(Error::ResourceDoesNotExist),
-                    done: done.share(),
-                };
-                let _ = event_tx.send(event);
+        // A resource not received yet may be missing because the response
+        // predates its request; the resource timer covers it instead. A
+        // deletion is reported once, not on every response that omits it.
+        let mut deleted_names = Vec::new();
+        for (name, cached) in &mut type_state.cache {
+            if cached.resource.is_some()
+                && !matches!(cached.state, ResourceState::DoesNotExist)
+                && !seen_names.contains(name)
+            {
+                cached.state = ResourceState::DoesNotExist;
+                deleted_names.push(name.clone());
             }
+        }
+
+        for name in &deleted_names {
+            type_state.notify_error(name, done);
         }
 
         // Reconcile the resources gauge once from the updated cache.
@@ -1424,30 +1437,19 @@ where
             None => return,
         };
 
-        let is_pending = type_state
+        let Some(cached) = type_state
             .cache
-            .get(name)
-            .map(|c| c.is_requested())
-            .unwrap_or(true);
-
-        if !is_pending {
+            .get_mut(name)
+            .filter(|cached| cached.is_requested())
+        else {
             return;
-        }
-
-        type_state
-            .cache
-            .insert(name.to_string(), CachedResource::does_not_exist(None));
+        };
+        cached.state = ResourceState::DoesNotExist;
         let counts = type_state.resource_state_counts();
         self.recorder
             .sync_resource_counts(&type_state.type_url, &counts);
 
-        for event_tx in type_state.matching_watchers(name) {
-            let event = ResourceEvent::ResourceChanged {
-                result: Err(Error::ResourceDoesNotExist),
-                done: ProcessingDone::detached(),
-            };
-            let _ = event_tx.send(event);
-        }
+        type_state.notify_error(name, &ProcessingDone::detached());
     }
 }
 
@@ -1906,8 +1908,8 @@ mod tests {
         }
     }
 
-    /// Like [`TestResource`] but with `ALL_RESOURCES_REQUIRED_IN_SOTW`, so
-    /// resources missing from a response are treated as deleted (gRFC A53).
+    /// Like [`VersionedResource`] but with `ALL_RESOURCES_REQUIRED_IN_SOTW`,
+    /// so resources missing from a response are treated as deleted.
     #[derive(Debug, Clone)]
     struct SotwResource;
 
@@ -1917,15 +1919,15 @@ mod tests {
         const ALL_RESOURCES_REQUIRED_IN_SOTW: bool = true;
 
         fn deserialize(bytes: Bytes) -> Result<Self::Message> {
-            String::from_utf8(bytes.to_vec()).map_err(|e| Error::Validation(e.to_string()))
+            VersionedResource::deserialize(bytes)
         }
 
         fn name(message: &Self::Message) -> &str {
-            message
+            VersionedResource::name(message)
         }
 
-        fn validate(_message: Self::Message) -> Result<Self> {
-            Ok(Self)
+        fn validate(message: Self::Message) -> Result<Self> {
+            VersionedResource::validate(message).map(|_| Self)
         }
     }
 
@@ -2407,6 +2409,43 @@ mod tests {
         assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
     }
 
+    /// A re-watch after the last watcher of a resource is dropped gets a fresh
+    /// resource timer rather than the dropped watch's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn rewatch_after_drop_restarts_resource_timer() {
+        let (builder, mut servers) = mock_transport();
+        let (sleeps_tx, mut sleeps) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout));
+        let client = XdsClient::builder(
+            config,
+            builder,
+            FakeCodec,
+            ObservedRuntime { sleeps: sleeps_tx },
+        )
+        .build();
+        // Keeps the type subscribed after res-1 is dropped.
+        let _other = client.watch::<TestResource>("res-0");
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        let dropped = watch_synced(&client, &mut server, "res-1").await;
+        // Both timers run from t=0 before res-1 is dropped.
+        for _ in 0..2 {
+            assert_eq!(sleeps.recv().await.unwrap(), timeout);
+        }
+        drop(dropped);
+        server.requests.recv().await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let mut rewatched = watch_synced(&client, &mut server, "res-1").await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_no_event(&mut rewatched, "re-watch kept the dropped watch's deadline").await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let (result, _done) = next_changed(&mut rewatched).await;
+        assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cached_resource_does_not_start_another_timer() {
         let (builder, mut servers) = mock_transport();
@@ -2882,20 +2921,32 @@ mod tests {
         watcher
     }
 
+    /// Next event, failing the test if none arrives within 5s.
+    async fn next_event<T: Resource>(watcher: &mut ResourceWatcher<T>) -> ResourceEvent<T> {
+        tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("timed out waiting for event")
+            .expect("watcher closed")
+    }
+
     /// Next event, unwrapped to its result and `ProcessingDone` token.
     async fn next_changed<T: Resource>(
         watcher: &mut ResourceWatcher<T>,
-    ) -> (
-        Result<std::sync::Arc<T>>,
-        crate::client::watch::ProcessingDone,
-    ) {
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
-            .await
-            .expect("timed out waiting for event")
-            .expect("watcher closed");
-        match event {
+    ) -> (Result<Arc<T>>, ProcessingDone) {
+        match next_event(watcher).await {
             ResourceEvent::ResourceChanged { result, done } => (result, done),
             ResourceEvent::AmbientError { .. } => panic!("unexpected ambient error"),
+        }
+    }
+
+    /// Next event, which must be an ambient error, unwrapped to the error and
+    /// its `ProcessingDone` token.
+    async fn next_ambient<T: Resource>(
+        watcher: &mut ResourceWatcher<T>,
+    ) -> (Error, ProcessingDone) {
+        match next_event(watcher).await {
+            ResourceEvent::AmbientError { error, done } => (error, done),
+            ResourceEvent::ResourceChanged { .. } => panic!("unexpected resource change"),
         }
     }
 
@@ -3240,8 +3291,8 @@ mod tests {
         assert!(next_changed(&mut w_ok).await.0.is_ok());
     }
 
-    /// Deletion events (SotW resource missing from a response, gRFC A53)
-    /// gate the next response like regular updates.
+    /// Deletion events (SotW resource missing from a response) gate the next
+    /// response like regular updates.
     #[tokio::test]
     async fn deletion_events_gate_next_response() {
         let (_client, mut watcher, server) = connected_client_for::<SotwResource>().await;
@@ -3259,8 +3310,8 @@ mod tests {
             .responses
             .send(Ok(Some(sotw_response("2", "n2", &[]))))
             .unwrap();
-        let (result, deletion_done) = next_changed(&mut watcher).await;
-        assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+        let (error, deletion_done) = next_ambient(&mut watcher).await;
+        assert!(matches!(error, Error::ResourceDoesNotExist));
 
         server
             .responses
@@ -3274,6 +3325,95 @@ mod tests {
 
         drop(deletion_done);
         assert!(next_changed(&mut watcher).await.0.is_ok());
+    }
+
+    /// Per gRFC A88, data errors on a cached resource are ambient: the
+    /// resource stays cached, and a later valid version clears the error.
+    #[tokio::test]
+    async fn data_errors_on_cached_resource_are_ambient() {
+        let recorder = Arc::new(CapturingRecorder::default());
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
+            .with_metrics_recorder(recorder.clone())
+            .build();
+        let mut watcher = client.watch::<SotwResource>("res-0");
+        let mut server = servers.recv().await.unwrap();
+        let _initial = server.requests.recv().await.unwrap();
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("1", &next_nonce(), &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+        let _ack = server.requests.recv().await.unwrap();
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("2", &next_nonce(), &["res-0#bad"]))))
+            .unwrap();
+        let (error, _) = next_ambient(&mut watcher).await;
+        assert!(matches!(error, Error::Validation(_)));
+        let _nack = server.requests.recv().await.unwrap();
+        assert_eq!(gauge_for(&recorder.take(), "nacked_but_cached"), Some(1));
+        // Rejected, but present in the response, so not deleted.
+        let snapshot = take_snapshot(&client).await;
+        assert_eq!(snapshot[0].status, ResourceStatus::Nacked);
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("3", &next_nonce(), &[]))))
+            .unwrap();
+        let (error, _) = next_ambient(&mut watcher).await;
+        assert!(matches!(error, Error::ResourceDoesNotExist));
+        let _ack = server.requests.recv().await.unwrap();
+        assert_eq!(
+            gauge_for(&recorder.take(), "does_not_exist_but_cached"),
+            Some(1)
+        );
+
+        // The deletion is reported once, so the next event is the valid version.
+        server
+            .responses
+            .send(Ok(Some(sotw_response("4", &next_nonce(), &[]))))
+            .unwrap();
+        server
+            .responses
+            .send(Ok(Some(sotw_response("5", &next_nonce(), &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+    }
+
+    /// A new watcher of a resource with a data error receives the cached
+    /// resource, then the error, in that order (gRFC A88).
+    #[tokio::test]
+    async fn new_watcher_replays_cached_resource_then_ambient_error() {
+        let (client, mut watcher, server) = connected_client_for::<SotwResource>().await;
+        server
+            .responses
+            .send(Ok(Some(sotw_response("1", &next_nonce(), &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("2", &next_nonce(), &["res-0#bad"]))))
+            .unwrap();
+        let _ = next_ambient(&mut watcher).await;
+        let mut nacked = client.watch::<SotwResource>("res-0");
+        assert!(next_changed(&mut nacked).await.0.is_ok());
+        let (error, _) = next_ambient(&mut nacked).await;
+        assert!(matches!(error, Error::Validation(_)));
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("3", &next_nonce(), &[]))))
+            .unwrap();
+        let _ = next_ambient(&mut watcher).await;
+        let mut deleted = client.watch::<SotwResource>("res-0");
+        assert!(next_changed(&mut deleted).await.0.is_ok());
+        let (error, _) = next_ambient(&mut deleted).await;
+        assert!(matches!(error, Error::ResourceDoesNotExist));
     }
 
     /// Events staged for a watcher that was dropped must not wedge flow
@@ -3452,6 +3592,14 @@ mod tests {
             .expect("timed out waiting for snapshot")
     }
 
+    async fn snapshot_names(client: &XdsClient) -> Vec<String> {
+        take_snapshot(client)
+            .await
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    }
+
     fn versioned_response(version: &str, nonce: &str, names: &[&str]) -> Bytes {
         response_for(VERSIONED_TYPE_URL, version, nonce, names)
     }
@@ -3518,7 +3666,8 @@ mod tests {
                 &["res-0#bad"],
             ))))
             .unwrap();
-        assert!(next_changed(&mut watcher).await.0.is_err());
+        let (error, _) = next_ambient(&mut watcher).await;
+        assert!(matches!(error, Error::Validation(_)));
         let nack = server.requests.recv().await.unwrap();
         assert_eq!(parse_request(&nack), ("1".to_string(), nack_nonce));
 
@@ -3602,8 +3751,8 @@ mod tests {
             .responses
             .send(Ok(Some(sotw_response("2", &next_nonce(), &[]))))
             .unwrap();
-        let (result, _done) = next_changed(&mut watcher).await;
-        assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+        let (error, _) = next_ambient(&mut watcher).await;
+        assert!(matches!(error, Error::ResourceDoesNotExist));
 
         let snapshot = take_snapshot(&client).await;
         assert_eq!(snapshot[0].status, ResourceStatus::DoesNotExist);
@@ -3628,28 +3777,77 @@ mod tests {
         assert!(snapshot[0].accepted.is_none());
     }
 
+    /// Like gRPC core, the client forgets a resource once no watcher subscribes
+    /// to it. Responses sent before the server saw the unsubscription cannot
+    /// re-create it, and a new watch waits for the server to resend it.
     #[tokio::test]
-    async fn snapshot_omits_unsubscribed_resources() {
-        let (client, mut watcher, mut server) = connected_client().await;
-        let other = watch_synced(&client, &mut server, "res-1").await;
+    async fn dropping_last_watcher_evicts_resource() {
+        let recorder = Arc::new(CapturingRecorder::default());
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
+            .with_metrics_recorder(recorder.clone())
+            .build();
+        let mut watcher = client.watch::<VersionedResource>("res-0");
+        let mut server = servers.recv().await.unwrap();
+        let _initial = server.requests.recv().await.unwrap();
+        let other = client.watch::<VersionedResource>("res-1");
+        let _subscribe = server.requests.recv().await.unwrap();
         server
             .responses
-            .send(Ok(Some(response("1", &next_nonce(), &["res-0", "res-1"]))))
+            .send(Ok(Some(versioned_response(
+                "1",
+                &next_nonce(),
+                &["res-0", "res-1"],
+            ))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+        let _ack = server.requests.recv().await.unwrap();
+        let _ = recorder.take();
+
+        drop(other);
+        let _unsubscribe = server.requests.recv().await.unwrap();
+        assert_eq!(gauge_for(&recorder.take(), "acked"), Some(1));
+        assert_eq!(snapshot_names(&client).await, ["res-0"]);
+
+        for (version, names) in [("2", ["res-0", "res-1"]), ("3", ["res-0", "res-1#bad"])] {
+            server
+                .responses
+                .send(Ok(Some(versioned_response(version, &next_nonce(), &names))))
+                .unwrap();
+            assert!(next_changed(&mut watcher).await.0.is_ok());
+            let _ack_or_nack = server.requests.recv().await.unwrap();
+        }
+        assert_eq!(snapshot_names(&client).await, ["res-0"]);
+
+        let mut rewatched = client.watch::<VersionedResource>("res-1");
+        let _resubscribe = server.requests.recv().await.unwrap();
+        assert_no_event(&mut rewatched, "evicted resource was replayed").await;
+        server
+            .responses
+            .send(Ok(Some(versioned_response("4", &next_nonce(), &["res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut rewatched).await.0.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_wildcard_watcher_evicts_unwatched_resources() {
+        let (client, mut watcher, mut server) = connected_client().await;
+        let wildcard = watch_synced(&client, &mut server, "").await;
+        server
+            .responses
+            .send(Ok(Some(response("1", &next_nonce(), &["res-0", "res-9"]))))
             .unwrap();
         assert!(next_changed(&mut watcher).await.0.is_ok());
         let _ack = server.requests.recv().await.unwrap();
 
-        // The cache keeps res-1 after its last watcher goes away, but the
-        // client no longer subscribes to it.
-        drop(other);
-        let _unsubscribe = server.requests.recv().await.unwrap();
+        // The wildcard watcher still subscribes to res-9.
+        drop(client.watch::<TestResource>("res-9"));
+        assert_eq!(snapshot_names(&client).await, ["res-0", "res-9"]);
 
-        let names: Vec<String> = take_snapshot(&client)
-            .await
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
-        assert_eq!(names, ["res-0"]);
+        drop(wildcard);
+        let _unsubscribe = server.requests.recv().await.unwrap();
+        assert_eq!(snapshot_names(&client).await, ["res-0"]);
     }
 
     #[tokio::test]
@@ -3664,12 +3862,7 @@ mod tests {
         assert!(next_changed(&mut wildcard).await.0.is_ok());
         assert!(next_changed(&mut wildcard).await.0.is_ok());
 
-        let names: Vec<String> = take_snapshot(&client)
-            .await
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
-        assert_eq!(names, ["res-0", "res-9"]);
+        assert_eq!(snapshot_names(&client).await, ["res-0", "res-9"]);
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 
 [dev-dependencies]
 grpc = { version = "0.10.0", path = "../grpc", features = ["__internal-test-utils"] }
+grpc-tokio = { path = "../grpc-tokio" }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 xds-client = { version = "0.1.0-alpha.4", path = "../xds-client", default-features = false, features = ["test-util"] }

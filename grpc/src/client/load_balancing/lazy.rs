@@ -185,7 +185,7 @@ mod tests {
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::client::load_balancing::test_utils::new_request_headers;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     #[derive(Debug, PartialEq, Eq)]
     enum MockEvent {
@@ -202,7 +202,7 @@ mod tests {
         let env = TestEnv::new(|work_scheduler| {
             let options = LbPolicyOptions {
                 work_scheduler,
-                runtime: default_runtime(),
+                runtime: test_runtime(),
             };
             Lazy::new(builder, options)
         });

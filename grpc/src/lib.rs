@@ -33,9 +33,15 @@
 //! Please see [our website] for everything you should need to get started using
 //! gRPC.
 //!
+//! # Runtimes
+//!
+//! This crate is runtime-agnostic: all I/O, timers, and task spawning are
+//! performed through a pluggable runtime that must be provided when creating
+//! a channel or server. Tokio support is provided by the `grpc-tokio` crate.
+//!
 //! # Feature Flags
 //!
-//! The only currently-supported feature flags are the defaults.
+//! There are currently no supported feature flags.
 //!
 //! # Modules
 //!
@@ -80,11 +86,6 @@ pub mod __unstable {
 
     pub mod rt {
         pub use crate::rt::unstable::*;
-
-        /// Returns the default runtime.
-        pub fn default_runtime() -> crate::rt::GrpcRuntime {
-            crate::rt::default_runtime()
-        }
     }
     pub mod client {
         pub mod boxed {
@@ -98,14 +99,6 @@ pub mod __unstable {
         }
         pub mod service_config {
             pub use crate::client::service_config::*;
-        }
-
-        pub fn channel_builder_with_runtime(
-            target: impl Into<String>,
-            credentials: std::sync::Arc<dyn crate::credentials::ChannelCredentials>,
-            runtime: crate::rt::GrpcRuntime,
-        ) -> crate::client::ChannelBuilder {
-            crate::client::Channel::builder_with_runtime(target, credentials, runtime)
         }
     }
     pub mod credentials {

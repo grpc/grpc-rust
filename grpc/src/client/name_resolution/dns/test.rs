@@ -52,7 +52,7 @@ use crate::rt::Runtime;
 use crate::rt::Sleep;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
-use crate::rt::default_runtime;
+use crate::rt::test_runtime;
 use crate::rt::tokio::TokioRuntime;
 
 const DEFAULT_TEST_SHORT_TIMEOUT: Duration = Duration::from_millis(10);
@@ -181,7 +181,7 @@ pub(crate) async fn dns_basic() {
     let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: default_runtime(),
+        runtime: test_runtime(),
         work_scheduler: work_scheduler.clone(),
     };
     let mut resolver = builder.build(target, opts);
@@ -203,7 +203,7 @@ pub(crate) async fn invalid_target() {
     let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: default_runtime(),
+        runtime: test_runtime(),
         work_scheduler: work_scheduler.clone(),
     };
     let mut resolver = builder.build(target, opts);
@@ -232,7 +232,7 @@ struct FakeDns {
 #[crate::async_trait]
 impl rt::DnsResolver for FakeDns {
     async fn lookup_host_name(&self, _: &str) -> Result<Vec<std::net::IpAddr>, String> {
-        GrpcRuntime::default().sleep(self.latency).await;
+        test_runtime().sleep(self.latency).await;
         self.lookup_result.clone()
     }
 
@@ -360,7 +360,7 @@ pub(crate) async fn rate_limit() {
     let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: default_runtime(),
+        runtime: test_runtime(),
         work_scheduler: work_scheduler.clone(),
     };
     let dns_client = opts
@@ -391,7 +391,7 @@ pub(crate) async fn rate_limit() {
             _ = work_rx.recv() => {
                 panic!("Received unexpected work request from resolver");
             }
-            _ = GrpcRuntime::default().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
+            _ = test_runtime().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
                 println!("No work requested from resolver.");
             }
         };
@@ -403,7 +403,7 @@ pub(crate) async fn re_resolution_after_success() {
     let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: default_runtime(),
+        runtime: test_runtime(),
         work_scheduler: work_scheduler.clone(),
     };
     let dns_opts = DnsOptions {
@@ -440,7 +440,7 @@ pub(crate) async fn backoff_on_error() {
     let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: default_runtime(),
+        runtime: test_runtime(),
         work_scheduler: work_scheduler.clone(),
     };
     let dns_opts = DnsOptions {
@@ -488,7 +488,7 @@ pub(crate) async fn backoff_on_error() {
         _ = work_rx.recv() => {
             panic!("Received unexpected work request from resolver.");
         }
-        _ = GrpcRuntime::default().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
+        _ = test_runtime().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
             println!("No event received from resolver.");
         }
     };

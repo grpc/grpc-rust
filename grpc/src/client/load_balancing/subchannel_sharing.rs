@@ -404,7 +404,7 @@ mod tests {
     use crate::client::name_resolution::ResolverUpdate;
     use crate::core::Address;
     use crate::metadata::MetadataMap;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     // Constructs the test environment for SubchannelSharing tests, wrapping a
     // StubPolicy with the given funcs.
@@ -416,7 +416,7 @@ mod tests {
         TestEnv::new(|work_scheduler| {
             let options = LbPolicyOptions {
                 work_scheduler: work_scheduler.clone(),
-                runtime: default_runtime(),
+                runtime: test_runtime(),
             };
             SubchannelSharing::new(StubPolicy::new(funcs, options), work_scheduler)
         })
@@ -981,7 +981,7 @@ mod tests {
             },
             LbPolicyOptions {
                 work_scheduler: work_scheduler.clone(),
-                runtime: default_runtime(),
+                runtime: test_runtime(),
             },
         );
 

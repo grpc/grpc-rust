@@ -288,7 +288,7 @@ mod tests {
     use crate::client::name_resolution::Endpoint;
     use crate::core::Address;
     use crate::metadata::MetadataMap;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     struct StubState {
         subchannel: Arc<dyn Subchannel>,
@@ -402,7 +402,7 @@ mod tests {
         TestEnv::new(|work_scheduler| {
             WeightedTargetBuilder::default().build(LbPolicyOptions {
                 work_scheduler,
-                runtime: default_runtime(),
+                runtime: test_runtime(),
             })
         })
     }
@@ -421,7 +421,7 @@ mod tests {
             }
             .build(LbPolicyOptions {
                 work_scheduler,
-                runtime: default_runtime(),
+                runtime: test_runtime(),
             })
         })
     }

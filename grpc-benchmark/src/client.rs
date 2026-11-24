@@ -186,7 +186,7 @@ impl BenchmarkClient {
 
         for _ in 0..channel_count {
             let target = server_targets.next().unwrap(); // cyclic, non-empty iterator.
-            let mut builder = Channel::builder(target, credentials.clone());
+            let mut builder = Channel::builder(target, credentials.clone(), grpc_tokio::runtime());
             if let Some(authority) = &authority {
                 builder = builder.authority(authority);
             }

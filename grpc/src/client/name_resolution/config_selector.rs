@@ -144,8 +144,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use std::sync::Weak;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bytes::Bytes;

@@ -22,10 +22,11 @@
  *
  */
 
-//! Route Lookup Service (RLS) load balancing policy components.
+//! grpc-rls implements the Route Lookup Service (RLS) load balancing policy
+//! for Rust gRPC.
 
 #[allow(
     dead_code,
     reason = "no caller until RLS control channel is implemented."
 )]
-pub(crate) mod adaptive;
+mod adaptive;

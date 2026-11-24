@@ -70,7 +70,7 @@ impl AdaptiveThrottler {
     /// Creates a new [`AdaptiveThrottler`] with the default RLS parameters
     /// (30s window, 100 bins, 2.0 accept ratio, 8 request padding), anchored
     /// at `now`.
-    pub fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant) -> Self {
         Self::with_params(
             DEFAULT_DURATION,
             DEFAULT_BINS,
@@ -102,13 +102,13 @@ impl AdaptiveThrottler {
     /// in the history window. When it returns `false`, the caller must invoke
     /// [`register_backend_response`](Self::register_backend_response) once the
     /// backend responds.
-    pub fn should_throttle(&mut self, now: Instant) -> bool {
+    pub(crate) fn should_throttle(&mut self, now: Instant) -> bool {
         self.should_throttle_with(now, rand::random::<f64>)
     }
 
     /// Registers a backend `response` received at `now` for a request
     /// previously allowed by [`should_throttle`](Self::should_throttle).
-    pub fn register_backend_response(&mut self, now: Instant, response: BackendResponse) {
+    pub(crate) fn register_backend_response(&mut self, now: Instant, response: BackendResponse) {
         match response {
             BackendResponse::Accepted => self.accepts.add(now, 1),
             BackendResponse::Throttled => self.throttles.add(now, 1),

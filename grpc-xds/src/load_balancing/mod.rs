@@ -27,7 +27,6 @@
 use std::sync::Once;
 
 pub(crate) mod cluster_manager;
-pub(crate) mod rls;
 mod wrr_locality;
 
 static START: Once = Once::new();

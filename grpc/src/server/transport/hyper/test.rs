@@ -72,7 +72,6 @@ use crate::rt::EndpointIoStream;
 use crate::rt::EndpointListener;
 use crate::rt::GrpcRuntime;
 use crate::rt::StreamEndpoint;
-use crate::rt::address::ListenerAddress;
 use crate::rt::default_runtime;
 use crate::rt::hyper_wrapper::HyperCompatExec;
 use crate::rt::hyper_wrapper::HyperStream;
@@ -82,6 +81,7 @@ use crate::server::DynHandle;
 use crate::server::DynSendStream;
 use crate::server::Handle;
 use crate::server::Listener;
+use crate::server::ListenerAddress;
 use crate::server::RecvStream;
 use crate::server::RequestHeaders;
 use crate::server::ResponseHeaders;
@@ -219,8 +219,8 @@ impl EndpointListener for EndpointsListener {
         }
     }
 
-    fn local_addr(&self) -> Box<dyn ListenerAddress> {
-        Box::new(InMemoryAddress)
+    fn local_addr(&self) -> &dyn ListenerAddress {
+        &InMemoryAddress
     }
 }
 

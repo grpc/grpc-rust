@@ -32,7 +32,6 @@ use std::sync::Arc;
 use bytes::Buf;
 use bytes::Bytes;
 use grpc::__unstable::client::channel_builder_with_runtime;
-use grpc::__unstable::rt::GrpcRuntime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
 use grpc::client::ChannelRecvStream;
@@ -47,6 +46,7 @@ use grpc::core::RecvMessage;
 use grpc::core::SendMessage;
 use grpc::credentials::ChannelCredentials;
 use grpc::credentials::LocalChannelCredentials;
+use grpc::rt::GrpcRuntime;
 use xds_client::Error;
 use xds_client::Result;
 use xds_client::ServerConfig;
@@ -54,10 +54,6 @@ use xds_client::Transport;
 use xds_client::TransportBuilder;
 use xds_client::TransportReceiver;
 use xds_client::TransportSender;
-
-/// The gRPC path for the ADS StreamAggregatedResources RPC.
-const ADS_PATH: &str =
-    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
 
 /// Factory for creating gRPC-based transports for `xds-client`.
 #[derive(Clone)]
@@ -122,27 +118,30 @@ impl GrpcTransport {
 }
 
 impl Transport for GrpcTransport {
-    type Sender = GrpcAdsSender;
-    type Receiver = GrpcAdsReceiver;
+    type Sender = GrpcStreamSender;
+    type Receiver = GrpcStreamReceiver;
 
-    async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
-        let headers = RequestHeaders::new().with_method_name(ADS_PATH);
+    async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
+        let headers = RequestHeaders::new().with_method_name(method);
         let (send_stream, recv_stream) = self.channel.invoke(headers, CallOptions::new()).await;
 
-        Ok((GrpcAdsSender(send_stream), GrpcAdsReceiver(recv_stream)))
+        Ok((
+            GrpcStreamSender(send_stream),
+            GrpcStreamReceiver(recv_stream),
+        ))
     }
 }
 
-/// Sending half of a `GrpcTransport` ADS stream.
-pub(crate) struct GrpcAdsSender(ChannelSendStream);
+/// Sending half of a `GrpcTransport` stream.
+pub(crate) struct GrpcStreamSender(ChannelSendStream);
 
-impl std::fmt::Debug for GrpcAdsSender {
+impl std::fmt::Debug for GrpcStreamSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrpcAdsSender").finish()
+        f.debug_struct("GrpcStreamSender").finish()
     }
 }
 
-impl TransportSender for GrpcAdsSender {
+impl TransportSender for GrpcStreamSender {
     async fn send(&mut self, request: Bytes) -> Result<()> {
         let msg = RawBytes(request);
         self.0
@@ -153,16 +152,16 @@ impl TransportSender for GrpcAdsSender {
     }
 }
 
-/// Receiving half of a `GrpcTransport` ADS stream.
-pub(crate) struct GrpcAdsReceiver(ChannelRecvStream);
+/// Receiving half of a `GrpcTransport` stream.
+pub(crate) struct GrpcStreamReceiver(ChannelRecvStream);
 
-impl std::fmt::Debug for GrpcAdsReceiver {
+impl std::fmt::Debug for GrpcStreamReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrpcAdsReceiver").finish()
+        f.debug_struct("GrpcStreamReceiver").finish()
     }
 }
 
-impl TransportReceiver for GrpcAdsReceiver {
+impl TransportReceiver for GrpcStreamReceiver {
     async fn recv(&mut self) -> Result<Option<Bytes>> {
         loop {
             let mut msg_buf = RawBytesBuffer::default();
@@ -218,6 +217,7 @@ mod tests {
     use xds_client::ProstCodec;
     use xds_client::ResourceEvent;
     use xds_client::XdsClient;
+    use xds_client::transport::ADS_METHOD;
     use xds_test_util::XdsTestControlPlaneService;
     use xds_test_util::config::AdsTypeUrl;
     use xds_test_util::config::build_inline_listener;
@@ -254,7 +254,7 @@ mod tests {
             .await
             .expect("build transport");
 
-        let (mut tx, mut rx) = transport.new_stream().await.expect("new stream");
+        let (mut tx, mut rx) = transport.new_stream(ADS_METHOD).await.expect("new stream");
 
         let mut request = DiscoveryRequest::new();
         request.set_type_url(AdsTypeUrl::Lds.to_string());

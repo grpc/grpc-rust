@@ -53,7 +53,7 @@ pub(crate) mod dns;
 pub(crate) use registry::global_registry;
 
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
 
 pub(crate) mod proxy_resolver;
 

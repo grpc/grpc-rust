@@ -21,3 +21,5 @@ tonic-web = { path = "../../tonic-web" }
 
 [build-dependencies]
 tonic-prost-build = { path = "../../tonic-prost-build" }
+
+[lints]

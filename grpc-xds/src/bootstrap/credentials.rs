@@ -33,13 +33,13 @@ use grpc::__unstable::credentials::client::ValidateAuthority;
 use grpc::__unstable::credentials::common::Authority;
 use grpc::__unstable::credentials::protocol_info_new;
 use grpc::__unstable::rt::BoxEndpoint;
-use grpc::__unstable::rt::GrpcRuntime;
 use grpc::async_trait;
 use grpc::credentials::ChannelCredentials;
 use grpc::credentials::ProtocolInfo;
 use grpc::credentials::SecurityInfo;
 use grpc::credentials::SecurityLevel;
 use grpc::credentials::call::CallCredentials;
+use grpc::rt::GrpcRuntime;
 
 const INSECURE_PROTOCOL_NAME: &str = "insecure";
 static INSECURE_PROTO_INFO: ProtocolInfo = protocol_info_new(INSECURE_PROTOCOL_NAME);

@@ -111,7 +111,7 @@ struct InMemoryListenerAddress {
     id: String,
 }
 
-impl crate::rt::address::ListenerAddress for InMemoryListenerAddress {
+impl crate::server::ListenerAddress for InMemoryListenerAddress {
     fn network(&self) -> &str {
         "inmemory"
     }
@@ -124,6 +124,7 @@ pub struct InMemoryListener {
 
 struct InMemoryListenerInner {
     id: String,
+    addr: InMemoryListenerAddress,
     r: TokioMutex<mpsc::Receiver<InMemoryServerCall>>,
     close_notify: Arc<Notify>,
     drop_notify: Arc<Notify>,
@@ -150,6 +151,7 @@ impl InMemoryListener {
         listeners.insert(id.clone(), s);
         Self {
             inner: Arc::new(InMemoryListenerInner {
+                addr: InMemoryListenerAddress { id: id.clone() },
                 id,
                 r: TokioMutex::new(r),
                 close_notify: Arc::new(Notify::new()),
@@ -196,10 +198,8 @@ impl Listener for InMemoryListener {
         }
     }
 
-    fn local_addr(&self) -> Box<dyn crate::rt::address::ListenerAddress> {
-        Box::new(InMemoryListenerAddress {
-            id: self.inner.id.clone(),
-        })
+    fn local_addr(&self) -> &dyn crate::server::ListenerAddress {
+        &self.inner.addr
     }
 }
 

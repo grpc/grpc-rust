@@ -25,12 +25,14 @@
 use std::any::Any;
 use std::fmt;
 
+use crate::private::UnstableToken;
+
 /// The address a [`Listener`](super::Listener) is bound to.
 ///
-/// All implementations provide a human-readable string via [`Display`].
+/// All implementations provide a human-readable string via [`Display`](std::fmt::Display).
 /// Callers needing structured data (e.g. `TcpAddress` or `std::net::SocketAddr`) can
 /// downcast via stable trait upcasting coercion (`let any: &dyn Any = addr;`)
-/// and [`downcast_ref`](Any::downcast_ref).
+/// and [`downcast_ref`](std::any::Any#method.downcast_ref).
 ///
 /// This is analogous to Go's `net.Addr` interface.
 pub trait ListenerAddress: fmt::Debug + Any + Send + Sync + 'static {
@@ -59,18 +61,18 @@ impl ListenerAddress for TcpAddress {
 
 /// Address for a Unix socket listener.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UnixListenerAddress {
+pub struct UnixListenerAddress {
     path: String,
 }
 
 impl UnixListenerAddress {
     /// Creates a new Unix listener address.
-    pub(crate) fn new(path: String) -> Self {
+    pub fn new(path: String, _: UnstableToken) -> Self {
         Self { path }
     }
 
     /// Returns the socket path.
-    pub(crate) fn path(&self) -> &str {
+    pub fn path(&self) -> &str {
         &self.path
     }
 }
@@ -78,31 +80,6 @@ impl UnixListenerAddress {
 impl ListenerAddress for UnixListenerAddress {
     fn network(&self) -> &str {
         "unix"
-    }
-}
-
-/// Address representing a listener whose local address could not be determined.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FailingSocketAddress {
-    network: &'static str,
-    error: String,
-}
-
-impl FailingSocketAddress {
-    /// Creates a new `FailingSocketAddress` with the specified network and error description.
-    pub fn new(network: &'static str, error: String) -> Self {
-        Self { network, error }
-    }
-
-    /// Returns the underlying error message describing why obtaining the address failed.
-    pub fn error(&self) -> &str {
-        &self.error
-    }
-}
-
-impl ListenerAddress for FailingSocketAddress {
-    fn network(&self) -> &str {
-        self.network
     }
 }
 
@@ -144,57 +121,30 @@ mod tests {
 
     #[test]
     fn unix_address_path() {
-        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string());
+        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string(), UnstableToken);
         assert_eq!(addr.path(), "/tmp/grpc.sock");
     }
 
     #[test]
     fn unix_address_network_is_unix() {
-        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string());
+        let addr = UnixListenerAddress::new("/tmp/grpc.sock".to_string(), UnstableToken);
         assert_eq!(addr.network(), "unix");
     }
 
     #[test]
     fn unix_address_debug_contains_path() {
-        let addr = UnixListenerAddress::new("/var/run/server.sock".to_string());
+        let addr = UnixListenerAddress::new("/var/run/server.sock".to_string(), UnstableToken);
         assert!(format!("{addr:?}").contains("/var/run/server.sock"));
     }
 
     #[test]
     fn unix_address_downcast_via_any_supertrait() {
-        let addr = UnixListenerAddress::new("/tmp/test.sock".to_string());
+        let addr = UnixListenerAddress::new("/tmp/test.sock".to_string(), UnstableToken);
         let trait_obj: &dyn ListenerAddress = &addr;
         let any_ref: &dyn Any = trait_obj;
         let downcasted = any_ref
             .downcast_ref::<UnixListenerAddress>()
             .expect("downcast failed");
         assert_eq!(downcasted.path(), "/tmp/test.sock");
-    }
-
-    #[test]
-    fn failing_address_network() {
-        let addr = FailingSocketAddress::new("tcp", "permission denied".to_string());
-        assert_eq!(addr.network(), "tcp");
-        assert_eq!(addr.error(), "permission denied");
-    }
-
-    #[test]
-    fn failing_address_debug_contains_network_and_error() {
-        let addr = FailingSocketAddress::new("unix", "socket unbound".to_string());
-        let debug_str = format!("{addr:?}");
-        assert!(debug_str.contains("unix"));
-        assert!(debug_str.contains("socket unbound"));
-    }
-
-    #[test]
-    fn failing_address_downcast_via_any_supertrait() {
-        let addr = FailingSocketAddress::new("tcp", "bad address".to_string());
-        let trait_obj: &dyn ListenerAddress = &addr;
-        let any_ref: &dyn Any = trait_obj;
-        let downcasted = any_ref
-            .downcast_ref::<FailingSocketAddress>()
-            .expect("downcast failed");
-        assert_eq!(downcasted.error(), "bad address");
-        assert!(any_ref.downcast_ref::<TcpAddress>().is_none());
     }
 }

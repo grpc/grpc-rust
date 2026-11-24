@@ -5,7 +5,6 @@ description = """
 Health Checking module of `tonic` gRPC implementation.
 """
 edition = "2024"
-homepage = "https://github.com/grpc/grpc-rust"
 keywords = ["rpc", "grpc", "async", "healthcheck"]
 license = "MIT"
 name = "tonic-health"

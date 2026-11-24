@@ -33,8 +33,8 @@ mod json;
 use std::fmt;
 use std::sync::Arc;
 
-use grpc::__unstable::rt::GrpcRuntime;
 use grpc::credentials::ChannelCredentials;
+use grpc::rt::GrpcRuntime;
 pub use json::BootstrapError;
 use xds_client::message::Node;
 

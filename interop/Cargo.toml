@@ -43,3 +43,5 @@ protoc-gen-grpc-rust = ["dep:protoc-gen-grpc-rust", "grpc-protobuf-build/protoc-
 tonic-prost-build = {path = "../tonic-prost-build"}
 grpc-protobuf-build = {path = "../grpc-protobuf-build", default-features = false}
 protoc-gen-grpc-rust = { path = "../protoc-gen-grpc-rust", optional = true }
+
+[lints]

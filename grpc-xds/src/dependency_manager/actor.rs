@@ -391,7 +391,7 @@ impl Actor {
 mod tests {
     use std::sync::mpsc;
 
-    use grpc::__unstable::rt::GrpcRuntime;
+    use grpc::rt::GrpcRuntime;
 
     use super::*;
     use crate::dependency_manager::XdsConfigUpdate;

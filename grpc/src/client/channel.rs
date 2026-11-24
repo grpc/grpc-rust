@@ -37,11 +37,11 @@ use tokio::sync::Notify;
 use tokio::sync::SetOnce;
 use tokio::sync::mpsc;
 
-use crate::StatusCodeError;
 use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::Invoke;
+use crate::client::InvokeOnce;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
@@ -88,7 +88,6 @@ use crate::client::subchannel::NopBackoff;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
-#[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
 use crate::core::RecvMessage;
@@ -506,29 +505,42 @@ impl Invoke for LbInvoker {
                 .pick(PickOptions::new(&headers, &options))
             {
                 PickResult::Pick(mut pr) => {
-                    let on_complete = pr.on_complete.take();
                     let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() else {
                         panic!(
                             "picked subchannel is not an implementation provided by the channel"
                         );
                     };
-                    let (tx, rx) = sc.invoke(headers, options).await;
-                    // Notify the LB policy when the RPC completes (or is
-                    // abandoned) so it can release any per-call state.
-                    let rx = match on_complete {
-                        Some(on_complete) => {
-                            BoxRecvStream::new(CompletionRecvStream::new(rx, on_complete))
-                        }
-                        None => rx,
-                    };
-                    return (tx, rx);
+                    if let Ok(invoker) = sc.ready_invoker() {
+                        let on_complete = pr.on_complete.take();
+                        let (tx, rx) = invoker.invoke_once(headers, options).await;
+                        // Notify the LB policy when the RPC completes (or is
+                        // abandoned) so it can release any per-call state.
+                        let rx = match on_complete {
+                            Some(on_complete) => {
+                                BoxRecvStream::new(CompletionRecvStream::new(rx, on_complete))
+                            }
+                            None => rx,
+                        };
+                        return (tx, rx);
+                    }
+                    // The subchannel likely left READY before the LB policy
+                    // updated its picker, so queue the pick and wait for a new
+                    // picker.  Dropping the pick drops its completion callback
+                    // without invoking it, since the RPC never started.
                 }
                 PickResult::Queue => {}
                 PickResult::Fail(status) => {
-                    return FailingRecvStream::new_stream_pair(status, None);
+                    // TODO: Check wait-for-ready and queue instead.
+                    return FailingRecvStream::new_stream_pair(
+                        status.sanitize_control_plane_status("picker returned illegal status"),
+                        None,
+                    );
                 }
                 PickResult::Drop(status) => {
-                    todo!("dropped pick: {:?}", status);
+                    return FailingRecvStream::new_stream_pair(
+                        status.sanitize_control_plane_status("picker returned illegal status"),
+                        None,
+                    );
                 }
             }
             // Queued: wait for this snapshot to be superseded, then retry the
@@ -838,7 +850,7 @@ impl SharedConfigSelector {
             .current
             .load()
             .select_config(options)
-            .map_err(sanitize_config_selector_status)
+            .map_err(|s| s.sanitize_control_plane_status("config selector returned illegal status"))
     }
 
     fn update(&self, selector: Arc<dyn ConfigSelector>) {
@@ -847,19 +859,6 @@ impl SharedConfigSelector {
         // observe the new selector. This fails, harmlessly, on every update
         // after the first.
         let _ = self.inner.resolved.set(());
-    }
-}
-
-/// Replaces status codes that config selectors may not produce with INTERNAL,
-/// per gRFC A54.
-fn sanitize_config_selector_status(status: StatusError) -> StatusError {
-    if status.is_restricted_control_plane_code() {
-        StatusError::new(
-            StatusCodeError::Internal,
-            format!("config selector returned illegal status: {status}"),
-        )
-    } else {
-        status
     }
 }
 
@@ -872,17 +871,26 @@ fn setup_registeries() {
     name_resolution::unix::reg();
     #[cfg(target_os = "linux")]
     name_resolution::unix_abstract::reg();
-    #[cfg(feature = "_runtime-tokio")]
     tonic_transport::reg();
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::StatusCodeError;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use super::*;
+    use crate::client::load_balancing::Pick;
+    use crate::client::load_balancing::test_utils::StubPolicyFuncs;
+    use crate::client::load_balancing::test_utils::reg_stub_policy;
+    use crate::client::name_resolution::Endpoint;
+    use crate::client::name_resolution::test_utils::FakeResolverBuilder;
+    use crate::client::test_util::NopRecvMessage;
     use crate::credentials::LocalChannelCredentials;
+    use crate::metadata::MetadataMap;
 
     fn new_channel() -> Channel {
         Channel::builder(
@@ -1015,5 +1023,278 @@ mod tests {
         watcher.update(1);
         let snapshot = assert_next(snapshot.next()).await;
         assert_eq!(*snapshot.value(), 1);
+    }
+
+    // Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // Picks `subchannel`, with a completion callback that records whether it
+    // was invoked or dropped.
+    #[derive(Debug)]
+    struct SubchannelPicker {
+        subchannel: Arc<dyn Subchannel>,
+        invoked: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Picker for SubchannelPicker {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
+            let invoked = self.invoked.clone();
+            let guard = DropFlag(self.dropped.clone());
+            PickResult::Pick(Pick {
+                subchannel: self.subchannel.clone(),
+                metadata: MetadataMap::new(),
+                on_complete: Some(Box::new(move |_| {
+                    let _guard = guard;
+                    invoked.store(true, Ordering::SeqCst);
+                })),
+            })
+        }
+    }
+
+    // Fails every pick with its status.
+    #[derive(Debug)]
+    struct FailPicker(StatusError);
+
+    impl Picker for FailPicker {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
+            PickResult::Fail(self.0.clone())
+        }
+    }
+
+    // Drops every pick with its status.
+    #[derive(Debug)]
+    struct DropPicker(StatusError);
+
+    impl Picker for DropPicker {
+        fn pick(&self, _options: PickOptions<'_>) -> PickResult {
+            PickResult::Drop(self.0.clone())
+        }
+    }
+
+    // A pick of a subchannel that is no longer READY (the LB policy hasn't
+    // updated its picker yet) is queued until the next picker, instead of
+    // failing the RPC.
+    #[tokio::test]
+    async fn pick_of_non_ready_subchannel_waits_for_new_picker() {
+        const POLICY_NAME: &str = "channel_test_non_ready_pick";
+        let runtime = GrpcRuntime::default();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        // An LB policy that creates a subchannel for the first address but
+        // never connects it, so it stays IDLE, while reporting READY with a
+        // picker that picks it.  It sends its work scheduler to the test, and
+        // publishes the LB states sent by the test when its work is scheduled.
+        let (work_scheduler_tx, mut work_scheduler_rx) = mpsc::unbounded_channel();
+        let (lb_state_tx, lb_state_rx) = mpsc::unbounded_channel::<LbState>();
+        let lb_state_rx = Arc::new(Mutex::new(lb_state_rx));
+        reg_stub_policy(
+            POLICY_NAME,
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new({
+                    let invoked = invoked.clone();
+                    let dropped = dropped.clone();
+                    move |data, update, _config, controller| {
+                        let address = update.endpoints.as_ref().unwrap()[0].addresses[0].clone();
+                        let (subchannel, _state) = controller.new_subchannel(
+                            &address,
+                            data.lb_policy_options.work_scheduler.clone(),
+                        );
+                        controller.update_picker(LbState {
+                            connectivity_state: ConnectivityState::Ready,
+                            picker: Arc::new(SubchannelPicker {
+                                subchannel,
+                                invoked: invoked.clone(),
+                                dropped: dropped.clone(),
+                            }),
+                        });
+                        let _ =
+                            work_scheduler_tx.send(data.lb_policy_options.work_scheduler.clone());
+                        Ok(())
+                    }
+                })),
+                work: Some(Arc::new(move |_data, _work_data, controller| {
+                    while let Ok(state) = lb_state_rx.lock().try_recv() {
+                        controller.update_picker(state);
+                    }
+                })),
+                ..Default::default()
+            },
+        );
+
+        let (scheme, mut resolver_rx) = FakeResolverBuilder::register();
+        let mut channel = Channel::builder(
+            format!("{scheme}:///unused"),
+            Arc::new(LocalChannelCredentials::new()),
+        )
+        .build();
+        // Exit idle so the channel builds its resolver.
+        channel.get_state(true);
+        let resolver = runtime
+            .timeout(Duration::from_secs(5), resolver_rx.recv())
+            .await
+            .expect("timed out waiting for the channel to build its resolver")
+            .unwrap();
+        resolver
+            .update(ResolverUpdate {
+                endpoints: Ok(vec![Endpoint {
+                    addresses: vec![Address {
+                        network_type: name_resolution::TCP_IP_NETWORK_TYPE,
+                        address: "127.0.0.1:1".to_string().into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]),
+                service_config: Ok(Some(
+                    ServiceConfig::parse(&format!(
+                        r#"{{"loadBalancingConfig": [{{"{POLICY_NAME}": {{}}}}]}}"#
+                    ))
+                    .unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let lb_work_scheduler = work_scheduler_rx.recv().await.unwrap();
+
+        let mut call =
+            std::pin::pin!(channel.invoke(RequestHeaders::new(), CallOptions::default()));
+        assert!(
+            runtime
+                .timeout(Duration::from_millis(10), &mut call)
+                .await
+                .is_err(),
+            "the RPC should wait for a new picker"
+        );
+        // The pick was abandoned without starting the RPC.
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!invoked.load(Ordering::SeqCst));
+
+        // The next picker is used.
+        lb_state_tx
+            .send(LbState {
+                connectivity_state: ConnectivityState::TransientFailure,
+                picker: Arc::new(FailPicker(StatusError::new(
+                    StatusCodeError::Internal,
+                    "fail picker",
+                ))),
+            })
+            .unwrap();
+        lb_work_scheduler.schedule_work(None);
+        let (_tx, mut rx) = runtime
+            .timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the RPC should use the new picker");
+        let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut NopRecvMessage).await else {
+            std::panic!("expected trailers");
+        };
+        assert_eq!(
+            trailers.status().as_ref().unwrap_err().message(),
+            "fail picker"
+        );
+    }
+
+    // Performs an RPC on a channel whose LB policy uses `picker`, and returns
+    // the RPC's resulting status code.
+    async fn rpc_status_code_with_picker(
+        policy_name: &'static str,
+        picker: Arc<dyn Picker>,
+    ) -> StatusCodeError {
+        let runtime = GrpcRuntime::default();
+        reg_stub_policy(
+            policy_name,
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new(move |_data, _update, _config, controller| {
+                    controller.update_picker(LbState {
+                        connectivity_state: ConnectivityState::TransientFailure,
+                        picker: picker.clone(),
+                    });
+                    Ok(())
+                })),
+                ..Default::default()
+            },
+        );
+
+        let (scheme, mut resolver_rx) = FakeResolverBuilder::register();
+        let mut channel = Channel::builder(
+            format!("{scheme}:///unused"),
+            Arc::new(LocalChannelCredentials::new()),
+        )
+        .build();
+        // Exit idle so the channel builds its resolver.
+        channel.get_state(true);
+        let resolver = runtime
+            .timeout(Duration::from_secs(5), resolver_rx.recv())
+            .await
+            .expect("timed out waiting for the channel to build its resolver")
+            .unwrap();
+        resolver
+            .update(ResolverUpdate {
+                endpoints: Ok(vec![Endpoint {
+                    addresses: vec![Address {
+                        network_type: name_resolution::TCP_IP_NETWORK_TYPE,
+                        address: "127.0.0.1:1".to_string().into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]),
+                service_config: Ok(Some(
+                    ServiceConfig::parse(&format!(
+                        r#"{{"loadBalancingConfig": [{{"{policy_name}": {{}}}}]}}"#
+                    ))
+                    .unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (_tx, mut rx) = runtime
+            .timeout(
+                Duration::from_secs(5),
+                channel.invoke(RequestHeaders::new(), CallOptions::default()),
+            )
+            .await
+            .expect("the RPC should fail");
+        let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut NopRecvMessage).await else {
+            std::panic!("expected trailers");
+        };
+        trailers.status().as_ref().unwrap_err().code()
+    }
+
+    // A picker that fails a pick with a restricted status code results in an
+    // INTERNAL status, per gRFC A54.
+    #[tokio::test]
+    async fn picker_fail_with_restricted_code_converted_to_internal() {
+        let code = rpc_status_code_with_picker(
+            "channel_test_restricted_fail_pick",
+            Arc::new(FailPicker(StatusError::new(
+                StatusCodeError::NotFound,
+                "restricted",
+            ))),
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Internal);
+    }
+
+    // A picker that drops a pick with a restricted status code results in an
+    // INTERNAL status, per gRFC A54.
+    #[tokio::test]
+    async fn picker_drop_with_restricted_code_converted_to_internal() {
+        let code = rpc_status_code_with_picker(
+            "channel_test_restricted_drop_pick",
+            Arc::new(DropPicker(StatusError::new(
+                StatusCodeError::NotFound,
+                "restricted",
+            ))),
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Internal);
     }
 }

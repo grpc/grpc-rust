@@ -44,6 +44,7 @@ use crate::client::name_resolution::dns::reg;
 use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::test_utils::TestChannelController;
 use crate::client::name_resolution::test_utils::TestWorkScheduler;
+use crate::private::UnstableToken;
 use crate::rt;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
@@ -305,7 +306,7 @@ pub(crate) async fn dns_lookup_error() {
     };
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: GrpcRuntime::new(runtime),
+        runtime: GrpcRuntime::new(runtime, UnstableToken),
         work_scheduler: work_scheduler.clone(),
     };
     let mut resolver = builder.build(target, opts);
@@ -332,7 +333,7 @@ pub(crate) async fn dns_lookup_timeout() {
     let dns_client = runtime.dns.clone();
     let opts = ResolverOptions {
         authority: "ignored".to_string(),
-        runtime: GrpcRuntime::new(runtime),
+        runtime: GrpcRuntime::new(runtime, UnstableToken),
         work_scheduler: work_scheduler.clone(),
     };
     let dns_opts = DnsOptions {

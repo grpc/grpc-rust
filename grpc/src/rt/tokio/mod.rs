@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
+use crate::private::UnstableTrait;
 use crate::rt::BoxEndpoint;
 use crate::rt::BoxFuture;
 use crate::rt::BoxedTaskHandle;
@@ -45,9 +46,8 @@ use crate::rt::Sleep;
 use crate::rt::StreamEndpoint;
 use crate::rt::TaskHandle;
 use crate::rt::TcpOptions;
-use crate::rt::address::FailingSocketAddress;
-use crate::rt::address::ListenerAddress;
-use crate::rt::address::TcpAddress;
+use crate::server::ListenerAddress;
+use crate::server::TcpAddress;
 
 #[cfg(feature = "dns")]
 mod hickory_resolver;
@@ -85,11 +85,15 @@ pub(crate) struct TokioRuntime {
     _priv: (),
 }
 
+impl UnstableTrait for JoinHandle<()> {}
+
 impl TaskHandle for JoinHandle<()> {
     fn abort(&self) {
         self.abort();
     }
 }
+
+impl UnstableTrait for tokio::time::Sleep {}
 
 impl Sleep for tokio::time::Sleep {}
 
@@ -163,7 +167,11 @@ impl Runtime for TokioRuntime {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(Box::new(TokioTcpListener { listener }) as Box<dyn super::EndpointListener>)
+            let local_addr = TcpAddress(listener.local_addr().map_err(|e| e.to_string())?);
+            Ok(Box::new(TokioTcpListener {
+                listener,
+                local_addr,
+            }) as Box<dyn super::EndpointListener>)
         })
     }
 
@@ -199,20 +207,22 @@ impl TokioDefaultDnsResolver {
 
 impl StreamEndpoint<TcpStream> {
     pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
-        Ok(StreamEndpoint {
-            local_addr: stream
-                .local_addr()
-                .map_err(|err| err.to_string())?
-                .to_string()
-                .into_boxed_str(),
-            peer_addr: stream
-                .peer_addr()
-                .map_err(|err| err.to_string())?
-                .to_string()
-                .into_boxed_str(),
-            network_type: TCP_IP_NETWORK_TYPE,
-            inner: stream,
-        })
+        let local_addr = stream
+            .local_addr()
+            .map_err(|err| err.to_string())?
+            .to_string()
+            .into_boxed_str();
+        let peer_addr = stream
+            .peer_addr()
+            .map_err(|err| err.to_string())?
+            .to_string()
+            .into_boxed_str();
+        Ok(StreamEndpoint::new(
+            stream,
+            local_addr,
+            peer_addr,
+            TCP_IP_NETWORK_TYPE,
+        ))
     }
 
     /// Creates an endpoint for a stream returned by `accept`, which also
@@ -220,16 +230,17 @@ impl StreamEndpoint<TcpStream> {
     /// the client has already reset the connection. If the local address can't
     /// be read, it is left empty.
     fn new_from_accepted_tcp(stream: TcpStream, peer_addr: SocketAddr) -> Self {
-        StreamEndpoint {
-            local_addr: stream
-                .local_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_default()
-                .into_boxed_str(),
-            peer_addr: peer_addr.to_string().into_boxed_str(),
-            network_type: TCP_IP_NETWORK_TYPE,
-            inner: stream,
-        }
+        let local_addr = stream
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_default()
+            .into_boxed_str();
+        StreamEndpoint::new(
+            stream,
+            local_addr,
+            peer_addr.to_string().into_boxed_str(),
+            TCP_IP_NETWORK_TYPE,
+        )
     }
 }
 
@@ -295,6 +306,8 @@ where
 /// Wraps `tokio::net::TcpListener` as an [`EndpointListener`](super::EndpointListener).
 struct TokioTcpListener {
     listener: tokio::net::TcpListener,
+    /// Determined when binding, so that binding fails if it can't be read.
+    local_addr: TcpAddress,
 }
 
 #[crate::async_trait]
@@ -307,12 +320,8 @@ impl super::EndpointListener for TokioTcpListener {
         )))
     }
 
-    fn local_addr(&self) -> Box<dyn ListenerAddress> {
-        // TODO: Should the API return result or a FailingAddress type?
-        match self.listener.local_addr().map_err(|e| e.to_string()) {
-            Ok(addr) => Box::new(TcpAddress(addr)),
-            Err(err) => Box::new(FailingSocketAddress::new("tcp", err)),
-        }
+    fn local_addr(&self) -> &dyn ListenerAddress {
+        &self.local_addr
     }
 }
 

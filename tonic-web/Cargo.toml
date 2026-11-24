@@ -5,7 +5,6 @@ description = """
 grpc-web protocol translation for tonic services.
 """
 edition = "2024"
-homepage = "https://github.com/grpc/grpc-rust"
 keywords = ["rpc", "grpc", "grpc-web"]
 license = "MIT"
 name = "tonic-web"

@@ -61,13 +61,13 @@ use crate::metadata::AsciiMetadataValue;
 use crate::metadata::MetadataMap;
 use crate::private::SealedToken;
 use crate::rt::GrpcRuntime;
-use crate::rt::address::ListenerAddress;
 use crate::send_future::SendFuture;
 
 pub mod builder;
 pub mod descriptor;
 pub(crate) mod http2_config;
 pub mod interceptor;
+mod listener_address;
 pub(crate) mod router;
 pub mod service;
 pub(crate) mod transport;
@@ -75,6 +75,9 @@ pub(crate) mod transport;
 use builder::ServerBuilder;
 pub use http2_config::Http2Config;
 use interceptor::Identity;
+pub use listener_address::ListenerAddress;
+pub use listener_address::TcpAddress;
+pub use listener_address::UnixListenerAddress;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -148,7 +151,7 @@ pub trait Listener: sealed::Sealed {
     async fn accept(&self, token: SealedToken) -> Result<Self::Transport, String>;
 
     /// Returns the address this listener is bound to.
-    fn local_addr(&self) -> Box<dyn ListenerAddress>;
+    fn local_addr(&self) -> &dyn ListenerAddress;
 }
 
 /// A connection accepted by a [`Listener`] that can serve RPCs.
@@ -725,7 +728,7 @@ mod tests {
     use crate::core::test_connection_info;
     use crate::credentials::LocalServerCredentials;
     use crate::credentials::ServerCredentials;
-    use crate::rt::address::TcpAddress;
+    use crate::server::TcpAddress;
     /// A mock connection with one RPC in flight. It finishes only when the test
     /// sends on its finish sender, even after [`graceful_shutdown`], which it
     /// reports on its shutdown receiver.
@@ -997,8 +1000,8 @@ mod tests {
                 .ok_or_else(|| "mock listener closed".to_string())
         }
 
-        fn local_addr(&self) -> Box<dyn ListenerAddress> {
-            Box::new(MockListenerAddress)
+        fn local_addr(&self) -> &dyn ListenerAddress {
+            &MockListenerAddress
         }
     }
 
@@ -1254,8 +1257,8 @@ mod tests {
                 Err("simulated listener accept error".to_string())
             }
 
-            fn local_addr(&self) -> Box<dyn ListenerAddress> {
-                Box::new(MockListenerAddress)
+            fn local_addr(&self) -> &dyn ListenerAddress {
+                &MockListenerAddress
             }
         }
 
@@ -1278,7 +1281,7 @@ mod tests {
             .unwrap();
 
         let local_addr = listener.local_addr();
-        let tcp_addr = (&*local_addr as &dyn Any)
+        let tcp_addr = (local_addr as &dyn Any)
             .downcast_ref::<TcpAddress>()
             .expect("expected TcpAddress");
         assert!(tcp_addr.0.port() > 0);

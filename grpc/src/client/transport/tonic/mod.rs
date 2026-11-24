@@ -52,13 +52,6 @@ use tonic::body::Body;
 use tonic::client::Grpc;
 use tonic::client::GrpcService;
 use tonic::metadata::MetadataMap as TonicMeta;
-use tower::ServiceBuilder;
-use tower::buffer::Buffer;
-use tower::buffer::future::ResponseFuture as BufferResponseFuture;
-use tower::limit::ConcurrencyLimitLayer;
-use tower::limit::RateLimitLayer;
-use tower::util::BoxService;
-use tower_service::Service as TowerService;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -96,8 +89,6 @@ use crate::rt::hyper_wrapper::HyperStream;
 
 #[cfg(test)]
 mod test;
-
-const DEFAULT_BUFFER_SIZE: usize = 1024;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -502,21 +493,10 @@ impl Transport for TransportBuilder {
                 let _ = tx.send(Ok(()));
             }
         }));
-        let sender = SendRequestWrapper::from(sender);
-
-        let service = ServiceBuilder::new()
-            .option_layer(opts.concurrency_limit.map(ConcurrencyLimitLayer::new))
-            .option_layer(opts.rate_limit.map(|(l, d)| RateLimitLayer::new(l, d)))
-            .map_err(Into::<BoxError>::into)
-            .service(sender);
-
-        let service = BoxService::new(service);
-        let (service, worker) = Buffer::pair(service, DEFAULT_BUFFER_SIZE);
-        runtime.spawn(Box::pin(worker));
         let authority = &security_info.authority.host_port_string();
         let uri = Uri::from_maybe_shared(format!("http://{}", authority))
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
-        let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
+        let grpc = Grpc::with_origin(TonicService { inner: sender }, uri);
 
         let connection_info = ConnectionInfo::new(
             local_address,
@@ -534,63 +514,27 @@ impl Transport for TransportBuilder {
     }
 }
 
-struct SendRequestWrapper {
-    inner: SendRequest<Body>,
-}
-
-impl From<SendRequest<Body>> for SendRequestWrapper {
-    fn from(inner: SendRequest<Body>) -> Self {
-        Self { inner }
-    }
-}
-
-impl TowerService<HttpRequest<Body>> for SendRequestWrapper {
-    type Response = HttpResponse<Body>;
-    type Error = BoxError;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, req: http::Request<Body>) -> Self::Future {
-        let fut = self.inner.send_request(req);
-        Box::pin(async move { fut.await.map_err(Into::into).map(|res| res.map(Body::new)) })
-    }
-}
-
+/// Adapts hyper's HTTP/2 [`SendRequest`] to tonic's [`GrpcService`].
+///
+/// `SendRequest` is cheaply cloneable, and HTTP/2 multiplexes requests over the
+/// connection, so no additional buffering or concurrency limiting is needed:
+/// hyper/h2 queue streams that exceed the peer's `MAX_CONCURRENT_STREAMS`.
 #[derive(Clone)]
 struct TonicService {
-    inner: Buffer<http::Request<Body>, BoxFuture<'static, Result<http::Response<Body>, BoxError>>>,
+    inner: SendRequest<Body>,
 }
 
 impl GrpcService<Body> for TonicService {
     type ResponseBody = Body;
     type Error = BoxError;
-    type Future = ResponseFuture;
+    type Future = BoxFuture<'static, Result<HttpResponse<Body>, BoxError>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        tower::Service::poll_ready(&mut self.inner, cx)
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
-        ResponseFuture {
-            inner: tower::Service::call(&mut self.inner, request),
-        }
-    }
-}
-
-/// A future that resolves to an HTTP response.
-///
-/// This is returned by the `Service::call` on [`Channel`].
-pub(crate) struct ResponseFuture {
-    inner: BufferResponseFuture<BoxFuture<'static, Result<HttpResponse<Body>, BoxError>>>,
-}
-
-impl Future for ResponseFuture {
-    type Output = Result<http::Response<Body>, BoxError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+    fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
+        let fut = self.inner.send_request(request);
+        Box::pin(async move { fut.await.map_err(Into::into).map(|res| res.map(Body::new)) })
     }
 }

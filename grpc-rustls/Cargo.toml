@@ -55,3 +55,4 @@ tonic = { version = "0.14.9", path = "../tonic", default-features = false, featu
 ] }
 tonic-prost = { version = "0.14.9", path = "../tonic-prost" }
 
+[lints]

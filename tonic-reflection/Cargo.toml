@@ -8,7 +8,6 @@ description = """
 Server Reflection module of `tonic` gRPC implementation.
 """
 edition = "2024"
-homepage = "https://github.com/grpc/grpc-rust"
 keywords = ["rpc", "grpc", "async", "reflection"]
 license = "MIT"
 name = "tonic-reflection"

@@ -1,0 +1,22 @@
+[package]
+name = "grpc-rls"
+version = "0.1.0-alpha.1"
+authors = ["gRPC authors"]
+license = "MIT"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = """
+Route Lookup Service (RLS) load balancing for the Rust gRPC implementation.
+"""
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = []
+
+[dependencies]
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }

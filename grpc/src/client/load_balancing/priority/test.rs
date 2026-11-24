@@ -43,7 +43,7 @@ use crate::client::load_balancing::test_utils::StubPolicyFuncs;
 use crate::client::load_balancing::test_utils::TestEnv;
 use crate::client::name_resolution::Endpoint;
 use crate::core::Address;
-use crate::rt::default_runtime;
+use crate::rt::test_runtime;
 
 impl ChildData {
     /// Returns whether the child has been created and is currently
@@ -163,7 +163,7 @@ fn parse_child_config_picks_first_supported_policy() {
 fn setup_test_env() -> TestEnv<PriorityPolicy> {
     TestEnv::new(|work_scheduler| {
         Builder {}.build(LbPolicyOptions {
-            runtime: default_runtime(),
+            runtime: test_runtime(),
             work_scheduler,
         })
     })

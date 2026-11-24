@@ -98,14 +98,32 @@ impl ChannelCredentials for InsecureChannelCredentials {
 
 #[cfg(test)]
 mod tests {
+    use grpc::__unstable::client::name_resolution::TCP_IP_NETWORK_TYPE;
     use grpc::__unstable::rt;
+    use grpc::__unstable::rt::BoxEndpoint;
     use grpc::__unstable::rt::EndpointIoStream;
-    use grpc::__unstable::rt::TcpOptions;
+    use grpc::__unstable::rt::StreamEndpoint;
+    use std::net::SocketAddr;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+
     use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
 
     use super::*;
+
+    /// Connects to `addr` and wraps the connection as a gRPC endpoint.
+    async fn connect_endpoint(addr: SocketAddr) -> BoxEndpoint {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let local_addr = stream.local_addr().unwrap();
+        let peer_addr = stream.peer_addr().unwrap();
+        Box::new(StreamEndpoint::new(
+            stream,
+            local_addr.to_string().into_boxed_str(),
+            peer_addr.to_string().into_boxed_str(),
+            TCP_IP_NETWORK_TYPE,
+        ))
+    }
 
     #[tokio::test]
     async fn insecure_connect_passes_through_plaintext() {
@@ -116,11 +134,8 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let authority = Authority::new("example.com", Some(server_addr.port()));
 
-        let runtime = rt::default_runtime();
-        let endpoint = runtime
-            .tcp_stream(server_addr, TcpOptions::default())
-            .await
-            .unwrap();
+        let runtime = grpc_tokio::runtime();
+        let endpoint = connect_endpoint(server_addr).await;
 
         let output = creds
             .connect(

@@ -439,8 +439,6 @@ mod tests {
     use std::sync::mpsc;
     use std::task::Waker;
 
-    use grpc::rt::GrpcRuntime;
-
     use super::*;
     use crate::dependency_manager::ClusterSubscriber;
     use crate::dependency_manager::XdsConfigUpdate;
@@ -576,7 +574,7 @@ mod tests {
             listener_name: LISTENER.to_owned(),
             data_plane_authority: AUTHORITY.to_owned(),
             node_id: Some("node-1".into()),
-            runtime: GrpcRuntime::default(),
+            runtime: grpc_tokio::runtime(),
             watcher: Box::new(Sender(tx)),
         };
         (options, rx)

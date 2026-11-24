@@ -283,7 +283,7 @@ mod tests {
             Node::new("test", "0"),
             format!("dns:///{}", control_plane.addr()),
         );
-        let runtime = GrpcRuntime::default();
+        let runtime = grpc_tokio::runtime();
         let transport = GrpcTransportBuilder::new(runtime.clone());
         XdsClient::builder(config, transport, ProstCodec, XdsRuntime::new(runtime)).build()
     }
@@ -300,7 +300,7 @@ mod tests {
             listener_name: LISTENER.to_owned(),
             data_plane_authority: "example.com".to_owned(),
             node_id: None,
-            runtime: GrpcRuntime::default(),
+            runtime: grpc_tokio::runtime(),
             watcher: Box::new(Sender(tx)),
         });
         (dependency_manager, rx)

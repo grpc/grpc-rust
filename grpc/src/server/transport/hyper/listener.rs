@@ -135,7 +135,7 @@ mod tests {
     use crate::rt::EndpointListener;
     use crate::rt::TcpOptions;
     use crate::rt::UnixSocketOptions;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
     use crate::server::Listener;
     use crate::server::ListenerAddress;
     use crate::server::TcpAddress;
@@ -169,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_tcp_listener_accepts_connection() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let listener = HyperListener::new_tcp_listener(
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(LocalServerCredentials::new()),
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_tcp_listener_returns_error_when_address_in_use() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = occupied.local_addr().unwrap();
 
@@ -203,7 +203,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn new_unix_listener_accepts_connection() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let dir = tempdir().unwrap();
         let path = dir.path().join("hyper.sock");
         let listener = HyperListener::new_unix_listener(
@@ -224,7 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_unix_listener_returns_error_when_bind_fails() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing").join("hyper.sock");
 

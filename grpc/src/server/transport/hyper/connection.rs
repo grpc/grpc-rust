@@ -365,7 +365,7 @@ mod tests {
 
     use super::*;
     use crate::credentials::ProtocolInfo;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
     use crate::server::CallOptions;
     use crate::server::Handle;
     use crate::server::RecvStream;
@@ -426,14 +426,14 @@ mod tests {
             )
             .await
             .unwrap();
-            default_runtime().sleep(self.0).await;
+            test_runtime().sleep(self.0).await;
             Trailers::new(Ok(()))
         }
     }
 
     #[tokio::test]
     async fn handshake_failure_propagates_on_serving_future() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let (server_ep, _client_ep) = endpoint_pair();
         let creds = Arc::new(StubHandshakeCreds(HandshakeBehavior::Fail));
         let transport = HyperTransport::new(server_ep, creds, Arc::new(Http2Config::new()));
@@ -443,7 +443,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn handshake_timeout_propagates_on_serving_future() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let (server_ep, _client_ep) = endpoint_pair();
         let creds = Arc::new(StubHandshakeCreds(HandshakeBehavior::Stall));
         let config = Http2Config::new().with_handshake_timeout(Duration::from_millis(30));
@@ -454,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_during_handshake_resolves_cleanly() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let (server_ep, _client_ep) = endpoint_pair();
         let creds = Arc::new(StubHandshakeCreds(HandshakeBehavior::Stall));
         let transport = HyperTransport::new(server_ep, creds, Arc::new(Http2Config::new()));
@@ -472,7 +472,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn graceful_shutdown_lets_in_flight_rpc_finish() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let (server_ep, client_ep) = endpoint_pair();
         let creds = Arc::new(InsecureTestCreds);
         let handler = Arc::new(SlowHandle(Duration::from_secs(60)));
@@ -522,7 +522,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn connection_age_without_grace_lets_in_flight_rpc_finish() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let (server_ep, client_ep) = endpoint_pair();
         let creds = Arc::new(InsecureTestCreds);
         let config = Http2Config::new().with_max_connection_age(Duration::from_millis(30));
@@ -571,7 +571,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn connection_age_grace_period_force_closes_stalled_rpc() {
-        let rt = default_runtime();
+        let rt = test_runtime();
         let (server_ep, client_ep) = endpoint_pair();
         let creds = Arc::new(InsecureTestCreds);
         let config = Http2Config::new()
@@ -656,7 +656,7 @@ mod tests {
             creds,
             Arc::new(config),
             Arc::new(DummyHandle),
-            default_runtime(),
+            test_runtime(),
             0.5,
         );
 

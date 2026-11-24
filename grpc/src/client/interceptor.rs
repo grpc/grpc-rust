@@ -206,15 +206,21 @@ where
 /// use grpc::client::stream_util::ResponseValidator;
 /// use grpc::client::interceptor::InvokeExt;
 ///
+/// # fn example(runtime: grpc::rt::GrpcRuntime) {
 /// // Create a channel:
-/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-///     .build();
+/// let channel = Channel::builder(
+///     "dns:///localhost:123",
+///     Arc::new(LocalChannelCredentials::new()),
+///     runtime, // e.g.: grpc_tokio::runtime();
+/// )
+/// .build();
 ///
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///
 /// // Combine them:
 /// let combined_invoker = channel.with_interceptor(interceptor);
+/// # }
 /// ```
 ///
 pub trait InvokeExt: Invoke + Sized {
@@ -250,14 +256,20 @@ pub trait InvokeExt: Invoke + Sized {
 /// use grpc::client::stream_util::ResponseValidator;
 /// use grpc::client::interceptor::InvokeOnceExt;
 ///
+/// # fn example(runtime: grpc::rt::GrpcRuntime) {
 /// // Create a channel:
-/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-///     .build();
+/// let channel = Channel::builder(
+///     "dns:///localhost:123",
+///     Arc::new(LocalChannelCredentials::new()),
+///     runtime, // e.g.: grpc_tokio::runtime();
+/// )
+/// .build();
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///
 /// // Combine them:
 /// let combined_invoke_once = (&channel).with_interceptor(interceptor);
+/// # }
 /// ```
 pub trait InvokeOnceExt: InvokeOnce + Sized {
     /// Attaches a reusable interceptor to this non-reusable invoker and returns

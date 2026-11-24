@@ -51,6 +51,7 @@ async fn main() {
     let channel = Channel::builder(
         "dns:///[::1]:50051",
         Arc::new(LocalChannelCredentials::new()),
+        grpc_tokio::runtime(),
     )
     .build();
     let client = GreeterClient::new(channel);

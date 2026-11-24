@@ -42,6 +42,7 @@ tokio-rustls = { version = "0.26", default-features = false }
 [dev-dependencies]
 bytes = "1.10.1"
 grpc = { version = "0.10.0", path = "../grpc", features = ["__unstable"] }
+grpc-tokio = { path = "../grpc-tokio" }
 prost = "0.14.0"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile = "3.26"

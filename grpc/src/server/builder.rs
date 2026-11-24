@@ -37,6 +37,7 @@ use crate::server::service::Service;
 /// finish with [`build()`](ServerBuilder::build).
 pub struct ServerBuilder<I = Identity> {
     router: RouterBuilder<I>,
+    runtime: GrpcRuntime,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,10 +45,12 @@ pub struct ServerBuilder<I = Identity> {
 // ---------------------------------------------------------------------------
 
 impl ServerBuilder<Identity> {
-    /// Creates a new `ServerBuilder` with no interceptors.
-    pub(crate) fn new() -> Self {
+    /// Creates a new `ServerBuilder` with no interceptors that uses the given
+    /// runtime.
+    pub(crate) fn new(runtime: GrpcRuntime) -> Self {
         ServerBuilder {
             router: RouterBuilder::new(),
+            runtime,
         }
     }
 }
@@ -66,6 +69,7 @@ impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
     {
         ServerBuilder {
             router: self.router.chain_interceptor(next),
+            runtime: self.runtime,
         }
     }
 
@@ -75,28 +79,9 @@ impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
         self
     }
 
-    /// Builds the [`Server`] with the explicitly provided runtime.
-    ///
-    /// Always available. When the `_runtime-tokio` feature is enabled,
-    /// [`build()`](ServerBuilder::build) can be used instead to use the default
-    /// Tokio runtime.
-    pub fn build_with_runtime(self, runtime: GrpcRuntime) -> Server {
-        Server::new(self.router.build(), runtime)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// build() — uses the default runtime when _runtime-tokio is enabled
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "_runtime-tokio")]
-impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
-    /// Builds the [`Server`] using the default Tokio runtime.
-    ///
-    /// Available only when the `_runtime-tokio` feature is enabled. Without it,
-    /// use [`build_with_runtime()`](ServerBuilder::build_with_runtime).
+    /// Builds the [`Server`].
     pub fn build(self) -> Server {
-        Server::new(self.router.build(), crate::rt::default_runtime())
+        Server::new(self.router.build(), self.runtime)
     }
 }
 
@@ -109,6 +94,7 @@ mod tests {
     use crate::core::RecvMessage;
     use crate::core::StreamEnded;
     use crate::core::StreamError;
+    use crate::rt::test_runtime;
     use crate::server::CallOptions;
     use crate::server::DynHandle;
     use crate::server::Handle;
@@ -200,7 +186,7 @@ mod tests {
     #[test]
     fn server_builder_builds_without_services() {
         // Should not panic — creates a server with empty router.
-        let _server = Server::builder().build();
+        let _server = Server::builder(test_runtime()).build();
     }
 
     #[tokio::test]
@@ -220,7 +206,7 @@ mod tests {
             order: order.clone(),
         };
 
-        let _server = Server::builder()
+        let _server = Server::builder(test_runtime())
             .interceptor(chain)
             .add_service(svc)
             .build();
@@ -244,7 +230,7 @@ mod tests {
         };
 
         // Test the new .interceptor() API.
-        let _server = Server::builder()
+        let _server = Server::builder(test_runtime())
             .interceptor(chain)
             .add_service(svc)
             .build();
@@ -272,7 +258,7 @@ mod tests {
             }
         }
 
-        let _server = Server::builder()
+        let _server = Server::builder(test_runtime())
             .add_service(SvcA)
             .add_service(SvcB)
             .build();
@@ -280,7 +266,7 @@ mod tests {
 
     #[test]
     fn server_builder_with_explicit_runtime() {
-        let rt = crate::rt::default_runtime();
-        let _server = Server::builder().build_with_runtime(rt);
+        let rt = crate::rt::test_runtime();
+        let _server = Server::builder(rt).build();
     }
 }

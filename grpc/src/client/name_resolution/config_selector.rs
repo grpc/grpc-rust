@@ -31,6 +31,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::StatusError;
+use crate::client::RequestHeaders;
 use crate::client::boxed::ArcInterceptor;
 use crate::client::name_resolution::ResolverUpdate;
 
@@ -55,19 +56,31 @@ impl RpcConfig {
 }
 
 /// The data provided to a [`ConfigSelector`] when selecting the configuration
-/// for an RPC. Currently empty; reserved for future additions.
-#[derive(Debug, Default)]
+/// for an RPC.
+#[derive(Debug)]
 #[non_exhaustive]
-pub struct SelectConfigOptions {}
+pub struct SelectConfigOptions<'a> {
+    /// The headers of the RPC, after any interceptors installed on the
+    /// channel have run.
+    pub request_headers: &'a RequestHeaders,
+}
+
+impl<'a> SelectConfigOptions<'a> {
+    /// Creates the options for selecting the configuration of an RPC with
+    /// `request_headers`.
+    pub fn new(request_headers: &'a RequestHeaders) -> Self {
+        Self { request_headers }
+    }
+}
 
 /// Controls what configuration to use for every RPC.
 ///
 /// A `ConfigSelector` is supplied by a name resolver through the attributes of
 /// a `ResolverUpdate` and is consulted by the channel once per RPC.
 ///
-/// Work that depends on the request, such as matching on its headers, or that
+/// The selector may inspect the RPC's headers, e.g. to route it. Work that
 /// attaches per-RPC state to its [`CallOptions`](crate::client::CallOptions)
-/// for later stages (such as the picker), belongs in the
+/// for later stages (such as the picker) belongs in the
 /// [`RpcConfig::interceptor`] that the selector returns.
 pub trait ConfigSelector: Send + Sync + Debug {
     /// Selects the configuration for the RPC, or terminates it with the
@@ -75,7 +88,7 @@ pub trait ConfigSelector: Send + Sync + Debug {
     ///
     /// Errors with a status code that the control plane may not use, as
     /// defined by gRFC A54, are converted to INTERNAL by the channel.
-    fn select_config(&self, options: SelectConfigOptions) -> Result<RpcConfig, StatusError>;
+    fn select_config(&self, options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError>;
 }
 
 /// The config selector a channel uses when its resolver does not supply one.
@@ -85,7 +98,7 @@ pub trait ConfigSelector: Send + Sync + Debug {
 pub(crate) struct DefaultConfigSelector;
 
 impl ConfigSelector for DefaultConfigSelector {
-    fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
+    fn select_config(&self, _options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError> {
         // TODO: Return a MethodConfig derived from the channel's default
         // service config.
         Ok(RpcConfig::default())
@@ -129,9 +142,8 @@ impl Eq for ConfigSelectorAttr {}
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::Mutex;
     use std::sync::Weak;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -176,6 +188,7 @@ mod tests {
     use crate::private;
     use crate::rt::BoxEndpoint;
     use crate::rt::GrpcRuntime;
+    use crate::rt::test_runtime;
     use crate::stub_server::RunningStubServer;
     use crate::stub_server::StubServer;
 
@@ -190,26 +203,39 @@ mod tests {
     #[derive(Debug)]
     struct FakeConfigSelector {
         status: StatusError,
-        calls: AtomicUsize,
+        /// The method name of each RPC the selector was consulted for.
+        methods: Mutex<Vec<String>>,
     }
 
     impl FakeConfigSelector {
         fn new_arc(code: StatusCodeError) -> Arc<Self> {
             Arc::new(Self {
                 status: StatusError::new(code, "fake config selector error"),
-                calls: AtomicUsize::new(0),
+                methods: Mutex::new(Vec::new()),
             })
         }
 
         /// Returns how many times this selector was consulted.
         fn calls(&self) -> usize {
-            self.calls.load(Ordering::Relaxed)
+            self.methods.lock().unwrap().len()
+        }
+
+        /// Returns the method name of each RPC the selector was consulted
+        /// for.
+        fn methods(&self) -> Vec<String> {
+            self.methods.lock().unwrap().clone()
         }
     }
 
     impl ConfigSelector for FakeConfigSelector {
-        fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
+        fn select_config(
+            &self,
+            options: SelectConfigOptions<'_>,
+        ) -> Result<RpcConfig, StatusError> {
+            self.methods
+                .lock()
+                .unwrap()
+                .push(options.request_headers.method_name().to_string());
             Err(self.status.clone())
         }
     }
@@ -272,7 +298,10 @@ mod tests {
     }
 
     impl ConfigSelector for ClusterConfigSelector {
-        fn select_config(&self, _options: SelectConfigOptions) -> Result<RpcConfig, StatusError> {
+        fn select_config(
+            &self,
+            _options: SelectConfigOptions<'_>,
+        ) -> Result<RpcConfig, StatusError> {
             Ok(RpcConfig::default()
                 .with_interceptor(ArcInterceptor::from_arc(self.interceptor.clone())))
         }
@@ -344,10 +373,11 @@ mod tests {
         let server = StubServer::new().start().await;
         let addr = server.addr();
         let (scheme, mut handle_rx) = FakeResolverBuilder::register();
-        let mut channel = Channel::builder(format!("{scheme}:///{addr}"), credentials).build();
+        let mut channel =
+            Channel::builder(format!("{scheme}:///{addr}"), credentials, test_runtime()).build();
         // Exit idle so the channel builds its resolver.
         channel.get_state(true);
-        let resolver = GrpcRuntime::default()
+        let resolver = test_runtime()
             .timeout(DEFAULT_TEST_TIMEOUT, handle_rx.recv())
             .await
             .expect("timed out waiting for the channel to build its resolver")
@@ -377,7 +407,7 @@ mod tests {
     /// the RPC stays in progress until it's passed to [`finish_unary_echo`].
     async fn start_unary_echo(channel: &Channel) -> UnaryEchoRpc {
         let headers = RequestHeaders::new().with_method_name(UNARY_ECHO_METHOD);
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(
                 DEFAULT_TEST_TIMEOUT,
                 channel.invoke(headers, CallOptions::default()),
@@ -395,7 +425,7 @@ mod tests {
     ) -> JoinHandle<UnaryEchoRpc> {
         let channel = channel.clone();
         let rpc_handle = tokio::spawn(async move { start_unary_echo(&channel).await });
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(DEFAULT_TEST_TIMEOUT, interceptions.recv())
             .await
             .expect("timed out waiting for the RPC to reach its interceptor")
@@ -441,7 +471,7 @@ mod tests {
                 }
             }
         };
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(DEFAULT_TEST_TIMEOUT, finish)
             .await
             .expect("timed out waiting for the RPC to end")
@@ -475,7 +505,7 @@ mod tests {
 
         assert_eq!(status.code(), StatusCodeError::Unavailable);
         assert_eq!(status.message(), "fake config selector error");
-        assert_eq!(selector.calls(), 1);
+        assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
     }
 
     #[tokio::test]
@@ -504,7 +534,7 @@ mod tests {
         let mut rpc = tokio::spawn(async move { unary_echo(&rpc_channel, "hello").await });
 
         assert!(
-            GrpcRuntime::default()
+            test_runtime()
                 .timeout(DEFAULT_TEST_SHORT_TIMEOUT, &mut rpc)
                 .await
                 .is_err(),
@@ -522,7 +552,7 @@ mod tests {
         let status = rpc.await.unwrap().unwrap_err();
         assert_eq!(status.code(), StatusCodeError::Unavailable);
         assert_eq!(status.message(), "fake config selector error");
-        assert_eq!(selector.calls(), 1);
+        assert_eq!(selector.methods(), [UNARY_ECHO_METHOD]);
     }
 
     #[tokio::test]

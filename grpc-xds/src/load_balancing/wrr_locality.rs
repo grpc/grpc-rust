@@ -294,7 +294,6 @@ mod tests {
     use grpc::__unstable::client::load_balancing::test_utils;
     use grpc::__unstable::client::load_balancing::test_utils::StubPolicyFuncs;
     use grpc::__unstable::client::load_balancing::test_utils::TestEnv;
-    use grpc::__unstable::rt::default_runtime;
     use grpc::core::Address;
 
     use super::*;
@@ -676,7 +675,7 @@ mod tests {
             child_policy_name,
             ..WrrLocalityBuilder.build(LbPolicyOptions {
                 work_scheduler,
-                runtime: default_runtime(),
+                runtime: grpc_tokio::runtime(),
             })
         })
     }

@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use tower::{BoxError, Service, load::Load};
 
-use crate::client::cluster::{ClusterChannel, ClusterChannelFactory};
+use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ConnectSignal};
 use crate::client::endpoint::MakeConnector;
 use crate::client::loadbalance::adapter::ClusterChannelAdapter;
 use crate::client::loadbalance::channel_state::ReadyChannel;
@@ -98,6 +98,7 @@ where
         &self,
         cluster_name: &str,
         watches: ClusterWatches,
+        connect: ConnectSignal,
     ) -> ClusterChannel<Req, <MC::Service as Service<Req>>::Response> {
         let connector = Arc::new(ClusterConnector::spawn(
             watches.cluster,
@@ -132,7 +133,7 @@ where
             outlier_detection,
             self.outcome_classifier.clone(),
         );
-        ClusterChannel::from_service(ClusterChannelAdapter::new(lb))
+        ClusterChannel::from_service(ClusterChannelAdapter::new(lb), connect)
     }
 }
 
@@ -230,7 +231,7 @@ mod tests {
 
         let factory = grpc_factory();
         let channel: ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> =
-            factory.make(CLUSTER, watches);
+            factory.make(CLUSTER, watches, ConnectSignal::default());
 
         let seen = call_servers(&channel, 50).await;
         assert_eq!(
@@ -249,7 +250,7 @@ mod tests {
         let (cluster_tx, endpoints_tx, watches) = ClusterWatches::channel(None, None);
         let factory = grpc_factory();
         let mut channel: ClusterChannel<http::Request<TonicBody>, http::Response<TonicBody>> =
-            factory.make(CLUSTER, watches);
+            factory.make(CLUSTER, watches, ConnectSignal::default());
 
         cluster_tx.send(plaintext_cluster());
         endpoints_tx.send(endpoints_for(&servers));

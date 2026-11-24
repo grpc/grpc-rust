@@ -1416,13 +1416,16 @@ mod tests {
 
     /// Builds a no-op cluster client handle for routing tests.
     fn noop_cluster_client(cluster_name: &str, _watches: ClusterWatches) -> ClusterRef {
-        use crate::client::cluster::ClusterChannel;
+        use crate::client::cluster::{ClusterChannel, ConnectSignal};
         use crate::common::async_util::BoxFuture;
 
         let svc = tower::service_fn(|_: ()| -> BoxFuture<Result<(), tower::BoxError>> {
             Box::pin(async { Ok(()) })
         });
-        ClusterRef::from_channel(cluster_name, ClusterChannel::from_service(svc))
+        ClusterRef::from_channel(
+            cluster_name,
+            ClusterChannel::from_service(svc, ConnectSignal::default()),
+        )
     }
 
     type ProvisionedClusters = Arc<std::sync::Mutex<Vec<String>>>;

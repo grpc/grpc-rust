@@ -15,6 +15,7 @@ members = [
   "grpc-google-cloud-auth",
   "grpc-protobuf",
   "grpc-protobuf-build",
+  "grpc-rls",
   "grpc-rustls",
   "grpc-xds",
   "protoc-gen-grpc-rust",

@@ -222,6 +222,24 @@ pub trait CallBuilder<C: InvokeOnce>: Sized {
         self
     }
 
+    /// Configures whether the call is ["wait-for-ready"][wait-for-ready].
+    ///
+    /// When enabled, the call will not fail if the channel is in a transient
+    /// failure state; instead, it waits until the channel is able to connect to
+    /// a server, or until its deadline is reached (see
+    /// [`with_timeout`](Self::with_timeout)).  When disabled (the default), the
+    /// call fails immediately with `UNAVAILABLE` if the channel is in a
+    /// transient failure state.  gRPC will never fail calls made on a channel
+    /// that is idle or connecting, regardless of this setting.
+    ///
+    /// A value set here takes precedence over the service config.
+    ///
+    /// [wait-for-ready]: https://grpc.io/docs/guides/wait-for-ready/
+    fn with_wait_for_ready(mut self, enabled: bool) -> Self {
+        self.args_mut(Internal).set_wait_for_ready(enabled);
+        self
+    }
+
     /// Attaches a multi-use `interceptor` to the call.
     fn with_interceptor<I: Intercept<C>>(
         self,

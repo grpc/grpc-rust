@@ -114,12 +114,13 @@ pub enum DecodeResult<T> {
 /// determine whether a previously-seen resource that's absent from a new response
 /// has been deleted or is simply not included.
 ///
-/// Per gRFC A53, the behavior depends on the resource type:
+/// The xDS protocol defines the behavior per resource type:
 ///
 /// - **`ALL_RESOURCES_REQUIRED_IN_SOTW = true`** (default): The server always
-///   sends all resources of this type in each response. If a subscribed
-///   resource is missing, it's treated as deleted. Watchers receive `ResourceDoesNotExist`.
-///   Examples: Listener (LDS), Cluster (CDS).
+///   sends all resources of this type in each response. If a received
+///   resource is missing, it's treated as deleted. Per gRFC A88, watchers
+///   receive `ResourceDoesNotExist` as an ambient error and keep using the
+///   cached version. Examples: Listener (LDS), Cluster (CDS).
 ///
 /// - **`ALL_RESOURCES_REQUIRED_IN_SOTW = false`**: The resource type allows partial
 ///   responses. Missing resources are not treated as deleted; the client continues
@@ -157,12 +158,13 @@ pub trait Resource: Sized + Send + Sync + 'static {
     /// Whether all subscribed resources must be present in each SotW response.
     ///
     /// When `true` (default), if a previously-received resource is absent from a new
-    /// response, it is treated as deleted. Watchers are notified with `ResourceDoesNotExist`.
+    /// response, it is treated as deleted. Per gRFC A88, watchers receive
+    /// `ResourceDoesNotExist` as an ambient error and keep using the cached version.
     ///
     /// When `false`, missing resources are not treated as deleted. The client continues
     /// using the cached version until explicitly removed or updated.
     ///
-    /// Per gRFC A53:
+    /// Per the xDS protocol:
     /// - LDS (Listener) and CDS (Cluster): `true`
     /// - RDS (RouteConfiguration) and EDS (ClusterLoadAssignment): `false`
     const ALL_RESOURCES_REQUIRED_IN_SOTW: bool = true;

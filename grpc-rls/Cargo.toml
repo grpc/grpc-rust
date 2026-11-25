@@ -10,6 +10,8 @@ Route Lookup Service (RLS) load balancing for the Rust gRPC implementation.
 """
 edition = "2024"
 rust-version.workspace = true
+# Not published yet: the build.rs codegen requires protoc (and a C++ build of
+# `protoc-gen-grpc-rust`), which doesn't fit docs.rs / crates.io publishing.
 publish = false
 
 [lints]
@@ -19,4 +21,12 @@ workspace = true
 allowed_external_types = []
 
 [dependencies]
+grpc = { version = "0.10.0", path = "../grpc", default-features = false }
+grpc-protobuf = { version = "0.10.0", path = "../grpc-protobuf" }
+protobuf = "4.36.2-release"
+protobuf-well-known-types = "0.36.2-release"
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
+
+[build-dependencies]
+grpc-protobuf-build = { version = "0.10.0", path = "../grpc-protobuf-build" }
+protobuf-well-known-types = "0.36.2-release"

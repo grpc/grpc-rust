@@ -13,7 +13,7 @@ curl -Ls https://github.com/grpc/grpc-proto/archive/master.tar.gz | tar xz -C "$
 base="$tmpdir/grpc-proto-master"
 
 # Copy protos in 'proto' from grpc-proto for these projects
-for project in interop grpc-benchmark; do
+for project in interop grpc-benchmark grpc-rls; do
   while read -r proto; do
     [ -f "$base/$proto" ] && cp "$base/$proto" "$project/third_party/grpc-proto/$proto"
     echo "$proto"

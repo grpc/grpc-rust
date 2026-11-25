@@ -177,18 +177,20 @@ impl XdsRouter {
 }
 
 /// The clients and per-cluster CDS/EDS senders of the healthy clusters the
-/// active route config references.
+/// active route config references: those whose snapshot has endpoints.
 ///
 /// The router's watch task reconciles this set against each
 /// [`XdsConfig`](crate::xds::cache::XdsConfig) snapshot. Because snapshots are
 /// completeness-gated, every provisioned cluster starts with both its initial
 /// `ClusterResource` and `EndpointsResource` seeded on [`ClusterWatches`].
-/// On an EDS failure (gRFC A74 `resolution_note`), a provisioned cluster keeps
-/// its last endpoints; an unprovisioned one fails with the note.
-/// When a cluster leaves the route config or transitions to [`ClusterError`],
-/// the set drops both its client and senders — closing downstream CDS/EDS
-/// watch streams deterministically without touching [`XdsCache`]. Requests
-/// already routed to a dropped client keep it alive until they complete.
+/// When a cluster leaves the route config, transitions to [`ClusterError`], or
+/// has no endpoints because its EDS resource failed, the set drops both its
+/// client and senders — closing downstream CDS/EDS watch streams
+/// deterministically without touching [`XdsCache`]. Routes to a cluster without
+/// a client still resolve, and the LB stage fails them with its error (gRFC
+/// A74), which for a cluster without endpoints is its `resolution_note` (gRFC
+/// A88). Requests already routed to a dropped client keep it alive until they
+/// complete.
 struct ClusterSet<F> {
     provision: F,
     clusters: HashMap<String, OwnedCluster>,
@@ -221,28 +223,34 @@ where
     ) -> bool {
         let mut changed = false;
         self.clusters.retain(|name, _| {
-            let keep = matches!(clusters.get(name), Some(Ok(_)));
+            let keep = matches!(
+                clusters.get(name),
+                Some(Ok(ClusterSnapshot {
+                    endpoints: Some(_),
+                    ..
+                }))
+            );
             if !keep {
                 changed = true;
             }
             keep
         });
         for (name, res) in clusters {
-            let Ok(snap) = res else {
+            let Ok(ClusterSnapshot {
+                cluster,
+                endpoints: Some(endpoints),
+                ..
+            }) = res
+            else {
                 continue;
             };
             if let Some(existing) = self.clusters.get(name) {
-                existing.cluster_tx.send(Arc::clone(&snap.cluster));
-                if let Some(endpoints) = &snap.endpoints {
-                    existing.endpoints_tx.send(Arc::clone(endpoints));
-                }
+                existing.cluster_tx.send(Arc::clone(cluster));
+                existing.endpoints_tx.send(Arc::clone(endpoints));
                 continue;
             }
-            let Some(endpoints) = &snap.endpoints else {
-                continue;
-            };
             changed = true;
-            let (cluster_tx, cluster_watch) = CacheWatch::channel(Some(Arc::clone(&snap.cluster)));
+            let (cluster_tx, cluster_watch) = CacheWatch::channel(Some(Arc::clone(cluster)));
             let (endpoints_tx, endpoints_watch) = CacheWatch::channel(Some(Arc::clone(endpoints)));
             let watches = ClusterWatches {
                 cluster: cluster_watch,
@@ -356,11 +364,10 @@ fn resolve_route(
             .to_string(),
     };
 
-    let cluster_ref = match rc.cluster_outcome(&cluster) {
-        Some(Ok(client)) => Some(client.clone()),
-        Some(Err(err)) => return Err(RoutingError::cluster_unavailable(&cluster, err)),
-        None => None,
-    };
+    // A failed cluster still routes; the LB stage fails the attempt (gRFC A74).
+    let cluster_ref = rc
+        .cluster_outcome(&cluster)
+        .map(|outcome| outcome.cloned().map_err(Clone::clone));
 
     // Retry config for the matched route, pre-compiled at `route_idx` in the
     // same snapshot we routed on so retry and routing act on one RDS version.
@@ -398,18 +405,10 @@ pub(crate) enum RoutingError {
     NoMatchingRoute(String),
     #[error("weighted cluster selection failed (empty cluster list)")]
     EmptyWeightedClusters,
-    /// Top-level (LDS/RDS/VirtualHost) or target-cluster (CDS/EDS) xDS
-    /// configuration failed, surfaced as `UNAVAILABLE`.
+    /// Top-level (LDS/RDS/VirtualHost) xDS configuration failed, surfaced as
+    /// `UNAVAILABLE`.
     #[error("{}", .0.message())]
     Unavailable(#[source] tonic::Status),
-}
-
-impl RoutingError {
-    pub(crate) fn cluster_unavailable(cluster: &str, err: &ClusterError) -> Self {
-        Self::Unavailable(tonic::Status::unavailable(format!(
-            "cluster '{cluster}' unavailable: {err}"
-        )))
-    }
 }
 
 impl RouteConfigResource {
@@ -1479,7 +1478,10 @@ mod tests {
         };
         let config = router.snapshot().expect("config");
         let decision = router.route(&input, &config).unwrap();
-        let client = decision.cluster_ref.expect("decision carries a client");
+        let client = decision
+            .cluster_ref
+            .and_then(Result::ok)
+            .expect("decision carries a client");
         assert!(client.same_client(config.cluster(&decision.cluster).unwrap()));
         client
     }
@@ -1621,7 +1623,8 @@ mod tests {
         };
         let publish = |cache: &XdsCache,
                        cluster: &Arc<ClusterResource>,
-                       endpoints: &Arc<EndpointsResource>| {
+                       endpoints: &Arc<EndpointsResource>,
+                       resolution_note: Option<&str>| {
             cache.publish(Arc::new(XdsConfig {
                 route_config: Arc::clone(&rc),
                 virtual_host_index: 0,
@@ -1630,7 +1633,7 @@ mod tests {
                     Ok(ClusterSnapshot {
                         cluster: Arc::clone(cluster),
                         endpoints: Some(Arc::clone(endpoints)),
-                        resolution_note: None,
+                        resolution_note: resolution_note.map(Into::into),
                     }),
                 )]),
             }));
@@ -1639,7 +1642,7 @@ mod tests {
         let c0 = make_cluster();
         let ep0 = make_endpoints();
         let cache = Arc::new(XdsCache::new());
-        publish(&cache, &c0, &ep0);
+        publish(&cache, &c0, &ep0, None);
 
         let (watches_tx, mut watches_rx) = tokio::sync::mpsc::unbounded_channel();
         let router = XdsRouter::new(
@@ -1661,42 +1664,33 @@ mod tests {
 
         // Pure CDS and EDS updates forward to ClusterWatches without rebuilding RoutingSnapshot.
         let c1 = make_cluster();
-        publish(&cache, &c1, &ep0);
+        publish(&cache, &c1, &ep0, None);
         tokio::task::yield_now().await;
         assert!(Arc::ptr_eq(&watches.cluster.next().await.unwrap(), &c1));
         assert!(Arc::ptr_eq(&router.snapshot().unwrap(), &initial_snapshot));
 
         let ep1 = make_endpoints();
-        publish(&cache, &c1, &ep1);
+        publish(&cache, &c1, &ep1, None);
         tokio::task::yield_now().await;
         assert!(Arc::ptr_eq(&watches.endpoints.next().await.unwrap(), &ep1));
         assert!(Arc::ptr_eq(&router.snapshot().unwrap(), &initial_snapshot));
 
-        // An EDS failure keeps the provisioned cluster on its last endpoints.
-        cache.publish(Arc::new(XdsConfig {
-            route_config: Arc::clone(&rc),
-            virtual_host_index: 0,
-            clusters: HashMap::from([(
-                "cluster-a".to_string(),
-                Ok(ClusterSnapshot {
-                    cluster: Arc::clone(&c1),
-                    endpoints: None,
-                    resolution_note: Some("EDS resource 'cluster-a': does not exist".into()),
-                }),
-            )]),
-        }));
+        // A new note alone, e.g. from an ambient error, leaves the cluster as is.
+        publish(&cache, &c1, &ep1, Some("LDS resource 'listener': NACKed"));
         tokio::task::yield_now().await;
-        let eds_update = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            watches.endpoints.next(),
-        )
+        let update = tokio::time::timeout(Duration::from_millis(20), async {
+            tokio::select! {
+                _ = watches.cluster.next() => {}
+                _ = watches.endpoints.next() => {}
+            }
+        })
         .await;
-        assert!(eds_update.is_err(), "EDS failure must not touch endpoints");
+        assert!(update.is_err(), "unchanged resources must not be forwarded");
+        assert!(Arc::ptr_eq(&router.snapshot().unwrap(), &initial_snapshot));
         assert!(
             watches_rx.try_recv().is_err(),
             "cluster must not be rebuilt"
         );
-        assert!(Arc::ptr_eq(&router.snapshot().unwrap(), &initial_snapshot));
 
         // Removing the cluster from the route config drops its senders and closes both watches.
         cache.publish_route_config_for_test(make_route_config("cluster-b"));
@@ -1824,9 +1818,11 @@ mod tests {
             )
             .expect("healthy route succeeds");
         assert_eq!(ok_decision.cluster, "healthy");
-        assert!(ok_decision.cluster_ref.is_some());
+        assert!(matches!(ok_decision.cluster_ref, Some(Ok(_))));
 
-        let err = router
+        // A failed cluster still routes; the decision carries its error for the
+        // LB stage to fail the attempt with.
+        let bad_decision = router
             .route(
                 &RouteInput {
                     authority: "svc",
@@ -1835,12 +1831,11 @@ mod tests {
                 },
                 &snapshot,
             )
-            .unwrap_err();
-        assert!(matches!(&err, RoutingError::Unavailable(_)));
-        let status = tonic::Status::from_error(Box::new(err));
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert!(status.message().contains("cluster 'broken' unavailable"));
-        assert!(status.message().contains("CDS resource 'broken'"));
+            .expect("route to a failed cluster resolves");
+        let Some(Err(err)) = bad_decision.cluster_ref else {
+            panic!("decision carries the cluster error");
+        };
+        assert_eq!(err.to_string(), "CDS resource 'broken': does not exist");
 
         // If the healthy cluster later fails, its watches close cleanly.
         cache.publish(Arc::new(XdsConfig {
@@ -1865,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xds_router_fails_cluster_without_endpoints_until_eds_recovers() {
+    async fn xds_router_carries_eds_failure_until_eds_recovers() {
         use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
         use crate::xds::resource::cluster::LbPolicy;
 
@@ -1909,19 +1904,25 @@ mod tests {
         );
         tokio::task::yield_now().await;
 
-        // Without endpoints the cluster is not provisioned and fails with the note.
-        assert!(watches_rx.try_recv().is_err());
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "svc",
             path: "/",
             headers: &headers,
         };
-        let snapshot = router.snapshot().expect("snapshot available");
-        let err = router.route(&input, &snapshot).unwrap_err();
-        let status = tonic::Status::from_error(Box::new(err));
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert!(status.message().contains("EDS resource 'cluster-a'"));
+        let assert_carries_note = || {
+            let snapshot = router.snapshot().expect("snapshot available");
+            let decision = router.route(&input, &snapshot).expect("route resolves");
+            let Some(Err(err)) = decision.cluster_ref else {
+                panic!("decision carries the EDS error");
+            };
+            assert!(err.to_string().contains("EDS resource 'cluster-a'"));
+        };
+
+        // Without endpoints the cluster is not provisioned, but still routes,
+        // carrying the note for the LB stage to fail the attempt with.
+        assert!(watches_rx.try_recv().is_err());
+        assert_carries_note();
 
         // Once EDS resolves, the cluster is provisioned with those endpoints.
         let endpoints = Arc::new(EndpointsResource {
@@ -1935,6 +1936,18 @@ mod tests {
             &watches.endpoints.next().await.unwrap(),
             &endpoints
         ));
+        routed_client(&router);
+
+        // A later EDS failure drops the provisioned cluster, closing its
+        // watches, and routes carry the note until EDS recovers.
+        publish(&cache, None);
+        tokio::task::yield_now().await;
+        assert!(watches.endpoints.next().await.is_none());
+        assert_carries_note();
+
+        publish(&cache, Some(Arc::clone(&endpoints)));
+        tokio::task::yield_now().await;
+        watches_rx.recv().await.expect("cluster provisioned again");
         routed_client(&router);
     }
 

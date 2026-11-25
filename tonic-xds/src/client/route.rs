@@ -70,10 +70,12 @@ pub(crate) struct RouteDecision {
     /// listener's default already applied. `None` when there is no limit.
     pub max_stream_duration: Option<Duration>,
     /// The client for `cluster`, shared with the [`RoutingSnapshot`] this
-    /// decision was made on. The request and its retries use this client even if
-    /// the cluster leaves the route config while they are in flight. `None` when
-    /// the router provisions no cluster clients.
-    pub cluster_ref: Option<ClusterRef>,
+    /// decision was made on, or why it has none: its CDS or EDS resource failed.
+    /// The request and its retries use this client even if the cluster leaves
+    /// the route config while they are in flight. `XdsLbService` fails each
+    /// attempt with the error, as gRPC's cds LB policy fails picks for a failed
+    /// cluster (gRFC A74). `None` when the router provisions no cluster clients.
+    pub cluster_ref: Option<Result<ClusterRef, ClusterError>>,
 }
 
 /// A hook that runs before xDS route selection.
@@ -109,8 +111,8 @@ pub(crate) struct RoutingSnapshot {
     retry_policies: Vec<Option<Arc<RetrySharedConfig>>>,
     /// Resolution outcome for each cluster the matched virtual host references,
     /// keyed by cluster name: a provisioned [`ClusterRef`] when CDS + EDS
-    /// resolved, or the [`ClusterError`] surfaced when a route targets a failed
-    /// cluster. Empty when the router provisions no cluster clients.
+    /// resolved, or else the [`ClusterError`] that requests routed to the
+    /// cluster fail with. Empty when the router provisions no cluster clients.
     clusters: HashMap<String, Result<ClusterRef, ClusterError>>,
 }
 

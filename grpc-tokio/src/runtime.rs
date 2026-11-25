@@ -91,7 +91,7 @@ impl DnsResolver for TokioDefaultDnsResolver {
 impl TokioDefaultDnsResolver {
     pub(crate) fn new(opts: ResolverOptions) -> Result<Self, String> {
         if opts.server_addr().is_some() {
-            return Err("Custom DNS server are not supported, enable optional feature 'dns' to enable support.".to_string());
+            return Err("Custom DNS servers are not supported, enable optional feature 'dns' to enable support.".to_string());
         }
         Ok(TokioDefaultDnsResolver { _priv: () })
     }
@@ -211,7 +211,6 @@ impl Runtime for TokioRuntime {
         }))
     }
 
-    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
         // A Tokio timer is bound to the runtime that is current when it is
         // created.
@@ -221,7 +220,6 @@ impl Runtime for TokioRuntime {
         })
     }
 
-    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn now(&self) -> Instant {
         // Use tokio's clock so that a paused/advanced test clock is respected.
         let _guard = self.handle.enter();
@@ -395,7 +393,6 @@ where
             backoff = policy.initial_backoff;
             continue;
         }
-        #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
         sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
     }

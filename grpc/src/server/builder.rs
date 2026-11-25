@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn server_builder_with_explicit_runtime() {
-        let rt = crate::rt::test_runtime();
+        let rt = test_runtime();
         let _server = Server::builder(rt).build();
     }
 }

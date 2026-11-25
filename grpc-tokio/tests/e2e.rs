@@ -256,9 +256,9 @@ fn run_on_thread<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + '
     }
 }
 
-/// Starts a server with no services on the Tokio runtime, connects to it with
-/// a channel on the Tokio runtime, and verifies an RPC fails with
-/// UNIMPLEMENTED.
+/// Starts a server running [`EchoService`] on the Tokio runtime, connects to it
+/// with a channel on the Tokio runtime, and verifies an RPC to a method the
+/// server doesn't implement fails with UNIMPLEMENTED.
 #[tokio::test]
 async fn rpc_to_unregistered_method_is_unimplemented() {
     let rt = grpc_tokio::runtime();

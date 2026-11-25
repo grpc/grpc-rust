@@ -40,7 +40,9 @@ use percent_encoding::percent_decode_str;
 use percent_encoding::utf8_percent_encode;
 use url::Url;
 
+use crate::attributes::AnyAttribute;
 use crate::attributes::Attributes;
+use crate::attributes::RawAttributes;
 use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
 use crate::core::Address;
@@ -301,7 +303,7 @@ pub struct ResolverUpdate {
 ///
 /// Each type may appear at most once.
 #[derive(Clone, Debug, Default)]
-pub struct ResolverUpdateAttributes(Attributes);
+pub struct ResolverUpdateAttributes(RawAttributes<dyn AnyAttribute>);
 
 impl ResolverUpdateAttributes {
     /// Constructs a new, empty instance.
@@ -313,7 +315,7 @@ impl ResolverUpdateAttributes {
     /// `ResolverUpdateAttributes` with the value added.
     ///
     /// If a value of the same type already exists, it is replaced.
-    pub fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
+    pub fn add<T: Send + Sync + Debug + 'static>(&self, value: T) -> Self {
         Self(self.0.add(value))
     }
 
@@ -682,12 +684,19 @@ mod test {
 
     #[test]
     fn test_resolver_update_attributes() {
+        #[derive(Debug)]
+        struct NonEqValue(f64);
+
         let attrs = ResolverUpdateAttributes::new();
         assert_eq!(attrs.get::<i32>(), None);
 
-        let attrs = attrs.add(10i32).add("hello".to_string());
+        let attrs = attrs
+            .add(10i32)
+            .add("hello".to_string())
+            .add(NonEqValue(2.5));
         assert_eq!(attrs.get::<i32>(), Some(&10));
         assert_eq!(attrs.get::<String>(), Some(&"hello".to_string()));
+        assert_eq!(attrs.get::<NonEqValue>().unwrap().0, 2.5);
 
         // Replacing an existing type overwrites its value.
         let replaced = attrs.add(20i32);
@@ -698,6 +707,7 @@ mod test {
         let removed = replaced.remove::<i32>();
         assert_eq!(removed.get::<i32>(), None);
         assert_eq!(removed.get::<String>(), Some(&"hello".to_string()));
+        assert_eq!(removed.get::<NonEqValue>().unwrap().0, 2.5);
 
         // ResolverUpdate::with_endpoints preserves ResolverUpdateAttributes.
         let update = ResolverUpdate {

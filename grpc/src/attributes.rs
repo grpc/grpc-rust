@@ -49,79 +49,97 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-/// Ensures only types that support comparison can be inserted into the
-/// Attributes struct. This allows the use of value-based equality rather than
-/// relying on pointer comparisons.
-trait AttributeTrait: Any + Send + Sync + Debug {
-    fn any_ref(&self) -> &dyn Any;
-    fn dyn_eq(&self, other: &dyn AttributeTrait) -> bool;
+/// Base trait for values stored in [`RawAttributes`] when value equality is
+/// not required.
+pub(crate) trait AnyAttribute: Any + Send + Sync + Debug {}
+
+impl<T: Any + Send + Sync + Debug> AnyAttribute for T {}
+
+/// Ensures only types that support comparison can be inserted into [`Eq`]-based
+/// attribute collections. This allows the use of value-based equality rather
+/// than relying on pointer comparisons.
+pub(crate) trait EqAttribute: AnyAttribute {
+    fn dyn_eq(&self, other: &dyn EqAttribute) -> bool;
 }
 
-impl<T: Any + Send + Sync + Eq + Debug> AttributeTrait for T {
-    fn any_ref(&self) -> &dyn Any {
+impl<T: Any + Send + Sync + Eq + Debug> EqAttribute for T {
+    fn dyn_eq(&self, other: &dyn EqAttribute) -> bool {
+        (other as &dyn Any).downcast_ref::<T>() == Some(self)
+    }
+}
+
+/// Trait implemented by the unsized trait object types backing
+/// [`RawAttributes`]. This trait exists "outside" the dyn and is resolved at
+/// compile time. That's in contrast to AnyAttribute and EqAttribute which are
+/// used with dyn to have indirect calls at runtime.
+pub(crate) trait ErasedAttribute: Send + Sync + Debug + 'static {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl ErasedAttribute for dyn AnyAttribute {
+    fn as_any(&self) -> &dyn Any {
         self
     }
+}
 
-    fn dyn_eq(&self, other: &dyn AttributeTrait) -> bool {
-        if let Some(other) = other.any_ref().downcast_ref::<T>() {
-            self == other
-        } else {
-            false
+impl ErasedAttribute for dyn EqAttribute {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A node in the persistent list backing [`RawAttributes`].
+///
+/// Each node points to the next (older) node, allowing structural sharing
+/// between `RawAttributes` instances.
+struct Node<V: ?Sized> {
+    value: Arc<V>,
+    next: Option<Arc<Node<V>>>,
+}
+
+/// Shared persistent-list implementation for type-keyed attribute collections.
+///
+/// Parameterized over the erased trait object `V` (`dyn AnyAttribute` or
+/// `dyn EqAttribute`) so only [`Eq`]-capable attribute collections require
+/// stored values to implement [`Eq`].
+pub(crate) struct RawAttributes<V: ?Sized> {
+    head: Option<Arc<Node<V>>>,
+}
+
+impl<V: ?Sized> Clone for RawAttributes<V> {
+    fn clone(&self) -> Self {
+        Self {
+            head: self.head.clone(),
         }
     }
 }
 
-/// A node in the persistent list backing [`Attributes`].
-///
-/// Each node points to the next (older) node, allowing structural sharing
-/// between `Attributes` instances.
-struct Node {
-    value: Arc<dyn AttributeTrait>,
-    next: Option<Arc<Node>>,
+impl<V: ?Sized> Default for RawAttributes<V> {
+    fn default() -> Self {
+        Self { head: None }
+    }
 }
 
-/// A collection of attributes indexed by their type.
-///
-/// `Attributes` provides a map-like interface where values are keyed by their
-/// TypeId.
-///
-/// Equality and ordering of `Attributes` are structural.
-/// This means two `Attributes` maps are equal if they contain the same set of
-/// values, compared by value (via `Eq` trait).
-/// Stored types must implement `Any + Send + Sync + Eq + Debug`.
-///
-/// # Warning
-///
-/// This collection is intended to store a small number of values (few hundreds)
-/// and is optimized for memory usage. It is **not** optimized for query speed.
-#[derive(Clone, Default)]
-pub struct Attributes {
-    head: Option<Arc<Node>>,
-}
-
-impl Attributes {
+impl<V: ?Sized + ErasedAttribute> RawAttributes<V> {
     /// Constructs a new, empty instance.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Adds a value to the attributes.
-    /// Returns a new Attributes object with the value added.
-    /// If a value of the same type already exists, it is replaced.
-    pub fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
-        Attributes {
+    fn add_arc(&self, value: Arc<V>) -> Self {
+        Self {
             head: Some(Arc::new(Node {
-                value: Arc::new(value),
+                value,
                 next: self.head.clone(),
             })),
         }
     }
 
-    /// Gets a reference to a value of type T.
-    pub fn get<T: 'static>(&self) -> Option<&T> {
+    /// Gets a reference to a value of type `T`.
+    pub(crate) fn get<T: 'static>(&self) -> Option<&T> {
         let mut current = self.head.as_deref();
         while let Some(node) = current {
-            if let Some(v) = node.value.any_ref().downcast_ref::<T>() {
+            if let Some(v) = node.value.as_any().downcast_ref::<T>() {
                 return Some(v);
             }
             current = node.next.as_deref();
@@ -129,14 +147,14 @@ impl Attributes {
         None
     }
 
-    /// Removes the value of type T, if present.
-    /// Returns a new Attributes object without the value.
+    /// Removes the value of type `T`, if present.
+    /// Returns a new `RawAttributes` object without the value.
     ///
     /// The returned object holds no reference to the removed value, so it is
-    /// dropped once no other `Attributes` instance references it.
+    /// dropped once no other `RawAttributes` instance references it.
     ///
     /// This operation is O(n) in both time and space.
-    pub fn remove<T: 'static>(&self) -> Self {
+    pub(crate) fn remove<T: 'static>(&self) -> Self {
         // Nodes older than the oldest `T` are shared as-is; newer nodes are
         // rebuilt (reusing their value `Arc`s) with every `T` left out.
         let mut original_nodes = Vec::new();
@@ -147,7 +165,7 @@ impl Attributes {
         }
         let Some(oldest) = original_nodes
             .iter()
-            .rposition(|n| n.value.any_ref().is::<T>())
+            .rposition(|n| n.value.as_any().is::<T>())
         else {
             return self.clone();
         };
@@ -155,27 +173,27 @@ impl Attributes {
         let head = original_nodes[..oldest]
             .iter()
             .rev()
-            .filter(|n| !n.value.any_ref().is::<T>())
+            .filter(|n| !n.value.as_any().is::<T>())
             .fold(tail, |next, original| {
                 Some(Arc::new(Node {
                     value: original.value.clone(),
                     next,
                 }))
             });
-        Attributes { head }
+        Self { head }
     }
 
     /// Returns an iterator over the live values, newest first.
     ///
     /// Each type is yielded at most once; values shadowed by a more recent
     /// `add` of the same type are skipped.
-    fn iter(&self) -> impl Iterator<Item = &Arc<dyn AttributeTrait>> {
+    fn iter(&self) -> impl Iterator<Item = &Arc<V>> {
         let mut current = self.head.as_deref();
         let mut seen = BTreeSet::new();
         std::iter::from_fn(move || {
             while let Some(node) = current {
                 current = node.next.as_deref();
-                if seen.insert(node.value.any_ref().type_id()) {
+                if seen.insert(node.value.as_any().type_id()) {
                     return Some(&node.value);
                 }
             }
@@ -184,16 +202,32 @@ impl Attributes {
     }
 }
 
-impl Debug for Attributes {
+impl RawAttributes<dyn AnyAttribute> {
+    /// Adds a value to the attributes, replacing any existing value of the same
+    /// type.
+    pub(crate) fn add<T: Send + Sync + Debug + 'static>(&self, value: T) -> Self {
+        self.add_arc(Arc::new(value))
+    }
+}
+
+impl RawAttributes<dyn EqAttribute> {
+    /// Adds a value to the attributes, replacing any existing value of the same
+    /// type.
+    pub(crate) fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
+        self.add_arc(Arc::new(value))
+    }
+}
+
+impl<V: ?Sized + ErasedAttribute> Debug for RawAttributes<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl PartialEq for Attributes {
+impl PartialEq for RawAttributes<dyn EqAttribute> {
     fn eq(&self, other: &Self) -> bool {
-        fn collect(a: &Attributes) -> Vec<(TypeId, &Arc<dyn AttributeTrait>)> {
-            let mut v: Vec<_> = a.iter().map(|v| (v.any_ref().type_id(), v)).collect();
+        fn collect(a: &RawAttributes<dyn EqAttribute>) -> Vec<(TypeId, &Arc<dyn EqAttribute>)> {
+            let mut v: Vec<_> = a.iter().map(|v| (v.as_any().type_id(), v)).collect();
             v.sort_by_key(|(id, _)| *id);
             v
         }
@@ -206,7 +240,60 @@ impl PartialEq for Attributes {
     }
 }
 
-impl Eq for Attributes {}
+impl Eq for RawAttributes<dyn EqAttribute> {}
+
+/// A collection of attributes indexed by their type.
+///
+/// `Attributes` provides a map-like interface where values are keyed by their
+/// TypeId.
+///
+/// Equality of `Attributes` is structural.
+/// This means two `Attributes` maps are equal if they contain the same set of
+/// values, compared by value (via `Eq` trait).
+/// Stored types must implement `Any + Send + Sync + Eq + Debug`.
+///
+/// # Warning
+///
+/// This collection is intended to store a small number of values (few hundreds)
+/// and is optimized for memory usage. It is **not** optimized for query speed.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Attributes(RawAttributes<dyn EqAttribute>);
+
+impl Attributes {
+    /// Constructs a new, empty instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a value to the attributes.
+    /// Returns a new Attributes object with the value added.
+    /// If a value of the same type already exists, it is replaced.
+    pub fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
+        Self(self.0.add(value))
+    }
+
+    /// Gets a reference to a value of type T.
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.0.get::<T>()
+    }
+
+    /// Removes the value of type T, if present.
+    /// Returns a new Attributes object without the value.
+    ///
+    /// The returned object holds no reference to the removed value, so it is
+    /// dropped once no other `Attributes` instance references it.
+    ///
+    /// This operation is O(n) in both time and space.
+    pub fn remove<T: 'static>(&self) -> Self {
+        Self(self.0.remove::<T>())
+    }
+}
+
+impl Debug for Attributes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -299,15 +386,15 @@ mod tests {
         assert_eq!(attrs.get::<Priority>(), Some(&p));
     }
 
-    fn type_ids(attrs: &Attributes) -> Vec<TypeId> {
-        attrs.iter().map(|v| v.any_ref().type_id()).collect()
+    fn type_ids<V: ?Sized + ErasedAttribute>(attrs: &RawAttributes<V>) -> Vec<TypeId> {
+        attrs.iter().map(|v| v.as_any().type_id()).collect()
     }
 
     #[test]
     fn test_iter_order() {
         let attrs = Attributes::new().add(1i32).add(2u32).add(3u64);
         assert_eq!(
-            type_ids(&attrs),
+            type_ids(&attrs.0),
             vec![
                 TypeId::of::<u64>(),
                 TypeId::of::<u32>(),
@@ -320,8 +407,9 @@ mod tests {
     fn test_iter_shadowing() {
         let attrs = Attributes::new().add(1i32).add(2i32);
         let values: Vec<_> = attrs
+            .0
             .iter()
-            .map(|v| *v.any_ref().downcast_ref::<i32>().unwrap())
+            .map(|v| *v.as_any().downcast_ref::<i32>().unwrap())
             .collect();
         assert_eq!(values, vec![2]);
     }
@@ -350,8 +438,8 @@ mod tests {
     fn test_structural_sharing() {
         let a1 = Attributes::new().add(1i32);
         let a2 = a1.add(2u32);
-        let a1_head = a1.head.as_ref().unwrap();
-        let a2_next = a2.head.as_ref().unwrap().next.as_ref().unwrap();
+        let a1_head = a1.0.head.as_ref().unwrap();
+        let a2_next = a2.0.head.as_ref().unwrap().next.as_ref().unwrap();
         assert!(Arc::ptr_eq(a1_head, a2_next));
     }
 
@@ -366,11 +454,29 @@ mod tests {
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Attributes>();
+        assert_send_sync::<RawAttributes<dyn AnyAttribute>>();
+    }
+
+    #[test]
+    fn test_raw_any_attributes_without_eq() {
+        #[derive(Debug)]
+        struct NonEq(f64);
+
+        let attrs = RawAttributes::<dyn AnyAttribute>::new()
+            .add(NonEq(1.5))
+            .add(42i32);
+        assert_eq!(attrs.get::<NonEq>().unwrap().0, 1.5);
+        assert_eq!(attrs.get::<i32>(), Some(&42));
+        assert_eq!(format!("{attrs:?}"), "[42, NonEq(1.5)]");
+
+        let removed = attrs.remove::<NonEq>();
+        assert!(removed.get::<NonEq>().is_none());
+        assert_eq!(removed.get::<i32>(), Some(&42));
     }
 
     /// Returns the `n`th node (0 = head) of the raw chain.
-    fn nth_node(attrs: &Attributes, n: usize) -> &Arc<Node> {
-        let mut node = attrs.head.as_ref().unwrap();
+    fn nth_node(attrs: &Attributes, n: usize) -> &Arc<Node<dyn EqAttribute>> {
+        let mut node = attrs.0.head.as_ref().unwrap();
         for _ in 0..n {
             node = node.next.as_ref().unwrap();
         }
@@ -396,7 +502,7 @@ mod tests {
         let a2 = a1.remove::<bool>();
         assert_eq!(a1, a2);
         assert!(Arc::ptr_eq(nth_node(&a1, 0), nth_node(&a2, 0)));
-        assert!(Attributes::new().remove::<bool>().head.is_none());
+        assert!(Attributes::new().remove::<bool>().0.head.is_none());
     }
 
     #[test]
@@ -418,7 +524,7 @@ mod tests {
             .add(4u64)
             .remove::<i32>();
         assert_eq!(
-            type_ids(&attrs),
+            type_ids(&attrs.0),
             vec![TypeId::of::<u64>(), TypeId::of::<u32>(), TypeId::of::<u8>()]
         );
     }

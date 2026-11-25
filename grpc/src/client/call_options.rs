@@ -82,11 +82,10 @@ impl CallOptions {
     ///
     /// When enabled, the call will not fail if the channel is in a transient
     /// failure state; instead, it waits until the channel is able to connect to
-    /// a server, or until its deadline is reached (see
+    /// a server, or until the call's deadline is reached (see
     /// [`set_deadline`](Self::set_deadline)).  When disabled (the default), the
-    /// call fails immediately with `UNAVAILABLE` if the channel is in a
-    /// transient failure state.  This setting does not affect the RPC when the
-    /// channel is idle or connecting.
+    /// call will queue while attempting to connect, but will fail without
+    /// sending if connection attempts have failed.
     ///
     /// A value set here takes precedence over the service config.
     ///

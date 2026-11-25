@@ -216,9 +216,21 @@ impl RecvMessage for NopRecvMessage {
 /// Common trait for configuring an RPC call.  Implemented by all gRPC protobuf
 /// call builders.
 pub trait CallBuilder<C: InvokeOnce>: Sized {
-    /// Applies the timeout `t` to the call.
-    fn with_timeout(mut self, t: Duration) -> Self {
-        self.args_mut(Internal).set_deadline(Instant::now() + t);
+    /// Configures the call with a deadline of `Instant::now() + timeout`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timeout` is so large that the deadline cannot hold the
+    /// resulting [`Instant`], e.g. if `timeout` is [`Duration::MAX`].
+    fn with_timeout(self, timeout: Duration) -> Self {
+        self.with_deadline(Instant::now() + timeout)
+    }
+
+    /// Configures the call to have the specified deadline.  If a call does not
+    /// complete by then, it will be failed with DEADLINE_EXCEEDED.  This
+    /// replaces any previously set deadline.
+    fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.args_mut(Internal).set_deadline(deadline);
         self
     }
 
@@ -226,11 +238,10 @@ pub trait CallBuilder<C: InvokeOnce>: Sized {
     ///
     /// When enabled, the call will not fail if the channel is in a transient
     /// failure state; instead, it waits until the channel is able to connect to
-    /// a server, or until its deadline is reached (see
-    /// [`with_timeout`](Self::with_timeout)).  When disabled (the default), the
-    /// call fails immediately with `UNAVAILABLE` if the channel is in a
-    /// transient failure state.  gRPC will never fail calls made on a channel
-    /// that is idle or connecting, regardless of this setting.
+    /// a server, or until the call's deadline is reached (see
+    /// [`with_deadline`](Self::with_deadline)).  When disabled (the default),
+    /// the call will queue while attempting to connect, but will fail without
+    /// sending if connection attempts have failed.
     ///
     /// A value set here takes precedence over the service config.
     ///

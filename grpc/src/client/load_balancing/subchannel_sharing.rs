@@ -360,7 +360,7 @@ impl Picker for UnwrapPicker {
         match result {
             PickResult::Pick(mut pick) => {
                 let Some(subchannel) = pick.subchannel.downcast_ref::<SharedSubchannel>() else {
-                    return PickResult::Fail(StatusError::new(
+                    return PickResult::Drop(StatusError::new(
                         StatusCodeError::Internal,
                         format!(
                             "received unexpected subchannel type: {:?}",

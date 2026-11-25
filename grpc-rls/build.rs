@@ -28,7 +28,6 @@
 //! protos under `third_party/grpc-proto/` into `OUT_DIR`. See `src/lib.rs` for
 //! how the generated root module is pulled in.
 
-use std::path::Path;
 use std::path::PathBuf;
 
 fn main() {
@@ -48,24 +47,13 @@ fn main() {
     // prebuilt protoc is provided on `$PATH`, so `find_protoc` falls back to it.
     let protoc = find_protoc();
 
-    // Collect every vendored proto as an include-relative import path, e.g.
-    // "grpc/lookup/v1/rls.proto". All of them live in the same package
-    // directory, so protoc places `generated.rs` at a predictable location.
-    let mut found = Vec::new();
-    collect_protos(&include_dir, &mut found);
-    let mut protos: Vec<String> = found
-        .iter()
-        .map(|p| {
-            // Proto import paths are always forward-slash. Normalize here so
-            // they match protoc's input expectations on Windows, where
-            // `strip_prefix` yields backslashes.
-            p.strip_prefix(&include_dir)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    protos.sort();
+    // Include-relative import paths of the protos to compile. Both live in the
+    // same package directory, so protoc places `generated.rs` at a predictable
+    // location.
+    let protos = [
+        "grpc/lookup/v1/rls.proto",
+        "grpc/lookup/v1/rls_config.proto",
+    ];
 
     // Fresh output tree.
     if gen_dir.exists() {
@@ -104,16 +92,4 @@ fn find_protoc() -> PathBuf {
     }
     // Fall back to $PATH resolution.
     PROTOC_NAME.into()
-}
-
-/// Recursively collects `*.proto` file paths under `dir` into `out`.
-fn collect_protos(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            collect_protos(&path, out);
-        } else if path.extension().is_some_and(|e| e == "proto") {
-            out.push(path);
-        }
-    }
 }

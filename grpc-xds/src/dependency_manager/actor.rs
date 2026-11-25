@@ -391,6 +391,8 @@ impl Actor {
 mod tests {
     use std::sync::mpsc;
 
+    use grpc::rt::test_runtime;
+
     use super::*;
     use crate::dependency_manager::XdsConfigUpdate;
     use crate::dependency_manager::cluster_graph::DnsTarget;
@@ -403,7 +405,6 @@ mod tests {
     use crate::resource::RouteAction;
     use crate::resource::RouteMatch;
     use crate::resource::VirtualHost;
-    use crate::test_utils::test_runtime;
     use crate::xds_config::ClusterChildren;
 
     const LISTENER: &str = "listener";

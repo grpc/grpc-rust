@@ -227,10 +227,10 @@ mod tests {
     use grpc::client::ConnectivityState;
     use grpc::client::RequestHeaders;
     use grpc::core::Address;
+    use grpc::rt::test_runtime;
 
     use super::*;
     use crate::resolver::set_picked_cluster;
-    use crate::test_utils::test_runtime;
 
     #[test]
     fn parse_config() {

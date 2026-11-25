@@ -44,7 +44,7 @@ pub(crate) mod hyper_wrapper;
 /// A minimal Tokio-based runtime used by this crate's unit tests. The real
 /// Tokio runtime lives in the `grpc-tokio` crate, which can't be used here
 /// because it depends on this crate.
-#[cfg(test)]
+#[cfg(any(test, feature = "__internal-test-utils"))]
 pub(crate) mod tokio;
 
 /// A boxed handle to a task spawned with [`GrpcRuntime::spawn`].
@@ -65,9 +65,16 @@ pub trait TaskHandle: UnstableTrait + Send + Sync {
     fn abort(&self);
 }
 
-/// Returns the runtime used by this crate's unit tests.
-#[cfg(test)]
-pub(crate) fn test_runtime() -> GrpcRuntime {
+/// Returns the runtime used by unit tests in this crate and other gRPC crates.
+///
+/// Unlike `grpc_tokio::runtime()`, this can be created outside a Tokio
+/// runtime: each operation uses the Tokio runtime that is current when it is
+/// called (e.g. via `tokio::spawn`), and panics if there is none. This lets
+/// synchronous tests construct components that require a runtime but never
+/// use it.
+#[cfg(any(test, feature = "__internal-test-utils"))]
+#[doc(hidden)]
+pub fn test_runtime() -> GrpcRuntime {
     GrpcRuntime::new(tokio::TokioRuntime::default(), UnstableToken)
 }
 

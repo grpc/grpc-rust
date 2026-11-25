@@ -295,9 +295,9 @@ mod tests {
     use grpc::__unstable::client::load_balancing::test_utils::StubPolicyFuncs;
     use grpc::__unstable::client::load_balancing::test_utils::TestEnv;
     use grpc::core::Address;
+    use grpc::rt::test_runtime;
 
     use super::*;
-    use crate::test_utils::test_runtime;
 
     #[test]
     fn parse_config() {

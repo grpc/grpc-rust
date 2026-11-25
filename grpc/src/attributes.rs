@@ -68,18 +68,21 @@ impl<T: Any + Send + Sync + Eq + Debug> EqAttribute for T {
     }
 }
 
-/// Trait implemented by the unsized trait object types backing [`RawAttributes`].
-pub(crate) trait DynAttribute: Send + Sync + Debug + 'static {
+/// Trait implemented by the unsized trait object types backing
+/// [`RawAttributes`]. This trait parameterizes RawAttributes directly and is
+/// resolved at compile time. That's in contrast to AnyAttribute and
+/// EqAttribute which are per-entry, so use indirect calls at runtime.
+pub(crate) trait ErasedAttribute: Send + Sync + Debug + 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-impl DynAttribute for dyn AnyAttribute {
+impl ErasedAttribute for dyn AnyAttribute {
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-impl DynAttribute for dyn EqAttribute {
+impl ErasedAttribute for dyn EqAttribute {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -117,7 +120,7 @@ impl<V: ?Sized> Default for RawAttributes<V> {
     }
 }
 
-impl<V: ?Sized + DynAttribute> RawAttributes<V> {
+impl<V: ?Sized + ErasedAttribute> RawAttributes<V> {
     /// Constructs a new, empty instance.
     pub(crate) fn new() -> Self {
         Self::default()
@@ -215,7 +218,7 @@ impl RawAttributes<dyn EqAttribute> {
     }
 }
 
-impl<V: ?Sized + DynAttribute> Debug for RawAttributes<V> {
+impl<V: ?Sized + ErasedAttribute> Debug for RawAttributes<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
@@ -383,7 +386,7 @@ mod tests {
         assert_eq!(attrs.get::<Priority>(), Some(&p));
     }
 
-    fn type_ids<V: ?Sized + DynAttribute>(attrs: &RawAttributes<V>) -> Vec<TypeId> {
+    fn type_ids<V: ?Sized + ErasedAttribute>(attrs: &RawAttributes<V>) -> Vec<TypeId> {
         attrs.iter().map(|v| v.as_any().type_id()).collect()
     }
 

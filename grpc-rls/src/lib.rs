@@ -31,10 +31,10 @@
 )]
 mod adaptive;
 
-/// Module `generated` contains the generated Protobuf messages for the
-/// `grpc.lookup.v1` package. The messages are an implementation detail consumed
-/// only within grpc-rls. The blanket `allow` covers machine-generated code; the
-/// tree is built into `OUT_DIR` by `build.rs` and its root is included here.
+/// Module `generated` contains the generated Protobuf messages and the
+/// `RouteLookupService` client stub for the `grpc.lookup.v1` package. They are
+/// an implementation detail consumed only within grpc-rls. The blanket `allow`
+/// covers machine-generated code, which `build.rs` writes into `OUT_DIR`.
 #[allow(
     missing_docs,
     missing_debug_implementations,
@@ -48,10 +48,7 @@ mod adaptive;
     clippy::uninlined_format_args
 )]
 mod generated {
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/generated/grpc/lookup/v1/generated.rs"
-    ));
+    grpc::include_proto!("grpc/lookup/v1", "rls");
 }
 
 #[cfg(test)]

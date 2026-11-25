@@ -179,8 +179,9 @@ impl RoutingSnapshot {
     }
 
     /// Returns `true` when `self` already reflects `config`'s route resource,
-    /// matched virtual host, and per-cluster error entries (assuming healthy
-    /// `ClusterRef` handles did not change).
+    /// matched virtual host, and per-cluster errors, including those of
+    /// clusters without endpoints (assuming healthy `ClusterRef` handles did
+    /// not change).
     pub(crate) fn matches_config(&self, config: &XdsConfig) -> bool {
         Arc::ptr_eq(&self.resource, &config.route_config)
             && self.virtual_host_index == config.virtual_host_index
@@ -191,6 +192,9 @@ impl RoutingSnapshot {
                 .all(|(name, res)| match (self.clusters.get(name), res) {
                     (Some(Ok(_)), Ok(_)) => true,
                     (Some(Err(a)), Err(b)) => a == b,
+                    (Some(Err(a)), Ok(snap)) => {
+                        snap.endpoints.is_none() && *a == snap.no_endpoints_error(name)
+                    }
                     _ => false,
                 })
     }

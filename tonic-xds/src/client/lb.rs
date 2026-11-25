@@ -186,6 +186,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::retry::{GrpcRetryClassifier, RetryConfig, RetryLayer, RetrySharedConfig};
+    use shared_http_body::SharedBody;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tonic::body::Body as TonicBody;
 
     #[tokio::test]
     async fn failed_cluster_fails_the_attempt_with_its_error() {
@@ -208,5 +212,40 @@ mod tests {
             status.message(),
             "cluster 'c' unavailable: EDS resource 'c': does not exist"
         );
+    }
+
+    /// Routing runs once per call, so every retry attempt would carry the same
+    /// failed cluster. The error must not be retried, even when the route's
+    /// policy retries `UNAVAILABLE`.
+    #[tokio::test]
+    async fn failed_cluster_error_is_not_retried() {
+        let retry_unavailable = RetrySharedConfig::new(
+            RetryConfig::new().num_retries(3),
+            Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
+        );
+        let mut request = Request::new(TonicBody::empty());
+        request.extensions_mut().insert(RouteDecision {
+            cluster: "c".into(),
+            request_hash: None,
+            retry_config: Some(Arc::new(retry_unavailable)),
+            max_stream_duration: None,
+            cluster_ref: Some(Err(ClusterError("EDS resource 'c': does not exist".into()))),
+        });
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = attempts.clone();
+        let service = tower::ServiceBuilder::new()
+            .layer(RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default())))
+            .map_request(move |request: Request<SharedBody<TonicBody>>| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                request
+            })
+            .service(XdsLbService::<_, http::Response<TonicBody>>::new());
+
+        let err = service.oneshot(request).await.unwrap_err();
+        assert_eq!(
+            tonic::Status::from_error(err).code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 }

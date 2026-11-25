@@ -74,6 +74,16 @@ impl ClusterSnapshot {
         self.resolution_note.as_deref()
     }
 
+    /// The error RPCs routed to this cluster fail with while it has no
+    /// endpoints: its resolution note.
+    pub(crate) fn no_endpoints_error(&self, name: &str) -> ClusterError {
+        ClusterError(
+            self.resolution_note
+                .clone()
+                .unwrap_or_else(|| format!("cluster '{name}' has no endpoints").into()),
+        )
+    }
+
     fn ptr_eq(&self, other: &Self) -> bool {
         let endpoints_eq = match (&self.endpoints, &other.endpoints) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),

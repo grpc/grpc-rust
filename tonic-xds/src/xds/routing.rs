@@ -79,9 +79,9 @@ enum RouterState {
 ///
 /// The watch task also owns a client and CDS/EDS watch senders for each healthy
 /// cluster the route config references (see [`ClusterSet`]). Each
-/// [`RouteDecision`] carries the client of its cluster, while routes targeting
-/// a cluster with a [`ClusterError`] or arriving while top-level LDS/RDS has
-/// failed fail immediately with `UNAVAILABLE`.
+/// [`RouteDecision`] carries its cluster's client, or the [`ClusterError`] for
+/// the LB stage to fail the attempt with. Requests arriving while top-level
+/// LDS/RDS has failed fail immediately with `UNAVAILABLE`.
 ///
 /// The first RPC blocks (up to `ready_timeout`, defaulting to
 /// [`DEFAULT_READY_TIMEOUT`], or without an internal timeout when `None`) until
@@ -279,9 +279,7 @@ where
                 let outcome = match res {
                     Ok(snap) => match self.clusters.get(name) {
                         Some(owned) => Ok(owned.cluster.clone()),
-                        None => Err(ClusterError(snap.resolution_note.clone().unwrap_or_else(
-                            || format!("cluster '{name}' has no endpoints").into(),
-                        ))),
+                        None => Err(snap.no_endpoints_error(name)),
                     },
                     Err(err) => Err(err.clone()),
                 };
@@ -1949,6 +1947,85 @@ mod tests {
         tokio::task::yield_now().await;
         watches_rx.recv().await.expect("cluster provisioned again");
         routed_client(&router);
+    }
+
+    #[tokio::test]
+    async fn xds_router_rebuilds_snapshot_for_eds_failure_only_when_its_note_changes() {
+        use crate::xds::resource::circuit_breaking::CircuitBreakingConfig;
+        use crate::xds::resource::cluster::LbPolicy;
+
+        let rc = Arc::new(simple_rc(vec![VirtualHostConfig {
+            name: "vh".into(),
+            domains: vec!["*".into()],
+            routes: vec![
+                simple_route("/healthy", "healthy"),
+                simple_route("/failed", "failed"),
+            ],
+        }]));
+        let cluster = |name: &str| {
+            Arc::new(ClusterResource {
+                name: name.into(),
+                eds_service_name: None,
+                lb_policy: LbPolicy::RoundRobin,
+                security: None,
+                circuit_breaking: CircuitBreakingConfig::default(),
+                outlier_detection: Default::default(),
+            })
+        };
+        let (healthy, failed) = (cluster("healthy"), cluster("failed"));
+        // Publishes new `healthy` endpoints along with `failed`'s note.
+        let publish = |cache: &XdsCache, note: &str| {
+            let endpoints = Arc::new(EndpointsResource {
+                cluster_name: "healthy".into(),
+                localities: vec![],
+            });
+            cache.publish(Arc::new(XdsConfig {
+                route_config: Arc::clone(&rc),
+                virtual_host_index: 0,
+                clusters: HashMap::from([
+                    (
+                        "healthy".to_string(),
+                        Ok(ClusterSnapshot {
+                            cluster: Arc::clone(&healthy),
+                            endpoints: Some(endpoints),
+                            resolution_note: None,
+                        }),
+                    ),
+                    (
+                        "failed".to_string(),
+                        Ok(ClusterSnapshot {
+                            cluster: Arc::clone(&failed),
+                            endpoints: None,
+                            resolution_note: Some(note.into()),
+                        }),
+                    ),
+                ]),
+            }));
+        };
+
+        let cache = Arc::new(XdsCache::new());
+        let eds_error = "EDS resource 'failed': does not exist";
+        publish(&cache, eds_error);
+        let router = XdsRouter::for_test(&cache);
+        tokio::task::yield_now().await;
+        let initial = router.snapshot().expect("snapshot available");
+
+        // An update to another cluster leaves the failed cluster's error, and
+        // so the snapshot, as is.
+        publish(&cache, eds_error);
+        tokio::task::yield_now().await;
+        assert!(Arc::ptr_eq(&router.snapshot().unwrap(), &initial));
+
+        // A new note, e.g. from an ambient error, changes what RPCs fail with.
+        let note = format!("{eds_error}; LDS resource 'listener': NACKed");
+        publish(&cache, &note);
+        tokio::task::yield_now().await;
+        let snapshot = router.snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&snapshot, &initial));
+        let Some(Err(err)) = snapshot.cluster_outcome("failed") else {
+            panic!("failed cluster carries its error");
+        };
+        assert_eq!(err.to_string(), note);
     }
 
     #[tokio::test(start_paused = true)]

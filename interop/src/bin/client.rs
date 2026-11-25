@@ -27,6 +27,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use grpc::client::Channel;
 use grpc::client::interceptor::InvokeExt as _;
 use grpc::credentials::LocalChannelCredentials;
 use grpc_rustls::RootCertificates;
@@ -186,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     RustlsChannelCredentials::new(GrpcClientTlsConfig::new())?
                 };
-                let mut builder = grpc::client::Channel::builder(&target, Arc::new(creds));
+                let mut builder = Channel::builder(&target, Arc::new(creds), grpc_tokio::runtime());
                 let authority = matches
                     .server_host_override
                     .as_deref()
@@ -196,9 +197,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 builder.build()
             } else {
-                let mut builder = grpc::client::Channel::builder(
+                let mut builder = Channel::builder(
                     &target,
                     Arc::new(LocalChannelCredentials::new()),
+                    grpc_tokio::runtime(),
                 );
                 if let Some(authority) = &matches.server_host_override {
                     builder = builder.authority(authority);

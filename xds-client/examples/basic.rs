@@ -228,8 +228,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ResourceEvent::ResourceChanged {
                 result: Err(error), ..
             } => {
-                // Resource was invalidated (validation error, deleted, etc.)
-                println!("Resource invalidated: {error}");
+                // No usable resource (invalid or does not exist)
+                println!("Resource unavailable: {error}");
             }
 
             ResourceEvent::AmbientError { error, .. } => {

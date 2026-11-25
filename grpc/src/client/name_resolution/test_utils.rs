@@ -40,7 +40,7 @@ use crate::client::name_resolution::WorkScheduler;
 use crate::client::name_resolution::global_registry;
 use crate::client::service_config::ParseResult;
 use crate::client::service_config::ServiceConfig;
-use crate::rt::GrpcRuntime;
+use crate::rt::test_runtime;
 
 /// A work scheduler for testing.
 pub(crate) struct TestWorkScheduler {
@@ -163,7 +163,7 @@ impl FakeResolverHandle {
         let (result_tx, result_rx) = oneshot::channel();
         self.update_tx.send((update, result_tx)).unwrap();
         self.work_scheduler.schedule_work();
-        GrpcRuntime::default()
+        test_runtime()
             .timeout(Duration::from_secs(10), result_rx)
             .await
             .expect("timed out waiting for the channel to apply the update")

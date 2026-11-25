@@ -60,9 +60,9 @@ use crate::resource::{DecodedResource, Resource};
 ///         // Signal is sent automatically when done is dropped
 ///     }
 ///     ResourceEvent::ResourceChanged { result: Err(error), done } => {
-///         // Resource was invalidated (validation error or deleted)
-///         eprintln!("Resource invalidated: {}", error);
-///         // Stop using the previously cached resource
+///         // No usable resource (invalid or does not exist)
+///         eprintln!("Resource unavailable: {}", error);
+///         // Stop using any previously delivered resource
 ///     }
 ///     ResourceEvent::AmbientError { error, .. } => {
 ///         // Non-fatal error, continue using cached resource
@@ -112,30 +112,31 @@ pub enum ResourceEvent<T> {
     ///
     /// This event is sent when:
     /// - A new valid resource is received (`Ok(resource)`)
-    /// - A validation error occurred (`Err(Error::Validation(...))`)
-    /// - The resource was deleted or doesn't exist (`Err(Error::ResourceDoesNotExist)`)
+    /// - No valid version of the resource is cached, and it fails validation
+    ///   (`Err(Error::Validation(...))`) or does not exist
+    ///   (`Err(Error::ResourceDoesNotExist)`)
     ///
-    /// When `result` is `Err`, the previously cached resource (if any) should be
-    /// invalidated. The watcher should stop using the old resource data.
+    /// When `result` is `Err`, there is no usable resource; stop using any
+    /// previously delivered one. Errors for a cached resource are delivered
+    /// as [`AmbientError`](Self::AmbientError) instead.
     ///
     /// The resource is wrapped in `Arc` because multiple watchers may
     /// subscribe to the same resource and share the same data.
     ResourceChanged {
         /// The result of the resource update.
         /// - `Ok(resource)`: New valid resource received
-        /// - `Err(error)`: Cache-invalidating error (validation failure, does not exist)
+        /// - `Err(error)`: No usable resource (validation failure, does not exist)
         result: Result<Arc<T>, Error>,
         /// Signal when processing is complete.
         done: ProcessingDone,
     },
     /// Indicates a non-fatal error that doesn't affect the cached resource.
     ///
-    /// This is sent for transient errors like temporary connectivity issues
-    /// with the xDS management server. The previously cached resource (if any)
-    /// should continue to be used.
-    ///
-    /// Per gRFC A88, ambient errors should not cause the client to stop using
-    /// a previously valid resource.
+    /// Per gRFC A88, this is sent when an update to a cached resource fails
+    /// validation (`Error::Validation`) or the resource is deleted
+    /// (`Error::ResourceDoesNotExist`). The watcher should keep using the
+    /// cached resource and may surface the error, e.g. in logs. A later
+    /// `ResourceChanged` clears it.
     AmbientError {
         /// The error that occurred.
         error: Error,
@@ -193,8 +194,8 @@ impl<T: Resource> ResourceWatcher<T> {
     ///             // Signal is sent automatically when done is dropped
     ///         }
     ///         ResourceEvent::ResourceChanged { result: Err(error), done } => {
-    ///             // Resource was invalidated (validation error or deleted)
-    ///             eprintln!("Resource invalidated: {}", error);
+    ///             // No usable resource (invalid or does not exist)
+    ///             eprintln!("Resource unavailable: {}", error);
     ///         }
     ///         ResourceEvent::AmbientError { error, .. } => {
     ///             // Non-fatal error, continue using cached resource

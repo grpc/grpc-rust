@@ -520,7 +520,6 @@ mod test {
     use std::sync::Mutex;
     use std::sync::mpsc;
 
-    use crate::attributes::Attributes;
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::DynLbConfig;
     use crate::client::load_balancing::DynLbPolicyBuilder;
@@ -540,14 +539,15 @@ mod test {
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
+    use crate::client::name_resolution::ResolverUpdateAttributes;
     use crate::core::Address;
-    use crate::rt::default_runtime;
+    use crate::rt::test_runtime;
 
     // Constructs the test environment for ChildManager tests, registering a
     // StubPolicy named `test_name` with the given funcs as the child policy.
     fn new_env(funcs: StubPolicyFuncs, test_name: &'static str) -> TestEnv<ChildManager<Endpoint>> {
         test_utils::reg_stub_policy(test_name, funcs);
-        TestEnv::new(|work_scheduler| ChildManager::new(default_runtime(), work_scheduler))
+        TestEnv::new(|work_scheduler| ChildManager::new(test_runtime(), work_scheduler))
     }
 
     impl TestEnv<ChildManager<Endpoint>> {
@@ -564,7 +564,7 @@ mod test {
                 child_policy_builder: builder.clone(),
                 child_update: Some((
                     ResolverUpdate {
-                        attributes: Attributes::default(),
+                        attributes: ResolverUpdateAttributes::default(),
                         endpoints: Ok(vec![e.clone()]),
                         service_config: Ok(None),
                         resolution_note: None,
@@ -849,7 +849,7 @@ mod test {
 
         let names = [name1, name2];
         let mut child_manager =
-            ChildManager::new(default_runtime(), Arc::new(TestWorkScheduler { tx_work }));
+            ChildManager::new(test_runtime(), Arc::new(TestWorkScheduler { tx_work }));
 
         // Request that child one requests work.
         let cfg = Arc::new(Mutex::new(HashMap::<&'static str, ()>::new())) as DynLbConfig;

@@ -26,34 +26,52 @@
 //!
 //! [`XdsResourceManager`](crate::xds::resource_manager::XdsResourceManager)
 //! publishes validated, self-consistent [`XdsConfig`] snapshots into
-//! [`XdsCache`]. [`XdsRouter`](crate::xds::routing::XdsRouter) is the sole
-//! subscriber to [`XdsCache::watch`] and fans per-cluster CDS/EDS updates out
-//! over router-owned [`CacheSender`] / [`CacheWatch`] channels bundled in
-//! [`ClusterWatches`].
+//! [`XdsCache`]. [`XdsRouter`](crate::xds::routing::XdsRouter) subscribes to
+//! [`XdsCache::watch`] and fans per-cluster CDS/EDS updates out over
+//! router-owned [`CacheSender`] / [`CacheWatch`] channels bundled in
+//! [`ClusterWatches`]. Applications watch the same snapshots through
+//! [`XdsChannel::xds_config`](crate::XdsChannel::xds_config).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::client::endpoint::XdsEndpoint;
 use crate::xds::resource::{ClusterResource, EndpointsResource, RouteConfigResource};
 
-/// Validated per-cluster resources within an [`XdsConfig`] snapshot.
+/// A resolved cluster within an [`XdsConfig`]: its CDS resource is valid and
+/// its EDS resource has resolved.
 ///
-/// A cluster enters [`XdsConfig::clusters`] as `Ok(ClusterSnapshot)` once its
-/// CDS [`ClusterResource`] is valid and its EDS [`EndpointsResource`] has
-/// resolved. Per gRFC A74, an EDS failure keeps the cluster `Ok`, with no
-/// endpoints and the reason in `resolution_note`.
+/// Per gRFC A74, an EDS failure still resolves the cluster, with no endpoints
+/// and the reason in [`resolution_note`](Self::resolution_note).
 #[derive(Clone, Debug)]
-pub(crate) struct ClusterSnapshot {
+pub struct ClusterSnapshot {
     pub(crate) cluster: Arc<ClusterResource>,
-    /// `None` if the EDS resource failed without a cached fallback.
+    /// `None` if the EDS resource failed.
     pub(crate) endpoints: Option<Arc<EndpointsResource>>,
     /// Why `endpoints` is `None`.
     pub(crate) resolution_note: Option<Arc<str>>,
 }
 
 impl ClusterSnapshot {
+    /// The healthy endpoints the cluster's load balancer connects to, once
+    /// per address, in EDS order.
+    ///
+    /// `None` if the EDS resource failed; see
+    /// [`resolution_note`](Self::resolution_note). If the channel already has
+    /// a load balancer for this cluster, that balancer keeps its last
+    /// endpoints, which this doesn't list.
+    pub fn endpoints(&self) -> Option<impl Iterator<Item = &XdsEndpoint>> {
+        let endpoints = self.endpoints.as_ref()?;
+        Some(endpoints.unique_healthy_endpoints().map(|ep| &**ep))
+    }
+
+    /// Why [`endpoints`](Self::endpoints) is `None`.
+    pub fn resolution_note(&self) -> Option<&str> {
+        self.resolution_note.as_deref()
+    }
+
     fn ptr_eq(&self, other: &Self) -> bool {
         let endpoints_eq = match (&self.endpoints, &other.endpoints) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -66,24 +84,27 @@ impl ClusterSnapshot {
     }
 }
 
-/// Per-cluster resolution failure recorded in [`XdsConfig::clusters`] when a
-/// referenced cluster's CDS resource fails without a cached fallback.
+/// Why a cluster in an [`XdsConfig`] failed to resolve: its CDS resource
+/// failed without a cached fallback.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub(crate) struct ClusterError(pub(crate) Arc<str>);
+pub struct ClusterError(pub(crate) Arc<str>);
 
-/// Top-level xDS configuration failure published when the Listener (LDS),
-/// RouteConfiguration (RDS), or authority virtual-host selection fails without
-/// a cached fallback.
+/// Why the xDS configuration failed to resolve: the Listener (LDS),
+/// RouteConfiguration (RDS), or virtual host for the channel's authority
+/// failed without a cached fallback.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub(crate) struct XdsConfigError(pub(crate) Arc<str>);
+pub struct XdsConfigError(pub(crate) Arc<str>);
 
 /// Atomic, completeness-gated snapshot of the active route configuration and
 /// all clusters referenced by the matched virtual host, aligned with gRFC A74
 /// `XdsConfig`.
+///
+/// A snapshot is published only once every referenced cluster has resolved or
+/// failed.
 #[derive(Clone, Debug)]
-pub(crate) struct XdsConfig {
+pub struct XdsConfig {
     pub(crate) route_config: Arc<RouteConfigResource>,
     /// Index into `route_config.virtual_hosts` matching the channel's target authority.
     pub(crate) virtual_host_index: usize,
@@ -94,6 +115,16 @@ pub(crate) struct XdsConfig {
 }
 
 impl XdsConfig {
+    /// Every cluster the matched virtual host references, by name, in
+    /// arbitrary order.
+    pub fn clusters(
+        &self,
+    ) -> impl Iterator<Item = (&str, Result<&ClusterSnapshot, &ClusterError>)> {
+        self.clusters
+            .iter()
+            .map(|(name, cluster)| (name.as_str(), cluster.as_ref()))
+    }
+
     fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.route_config, &other.route_config)
             && self.virtual_host_index == other.virtual_host_index
@@ -109,8 +140,8 @@ impl XdsConfig {
     }
 }
 
-/// Top-level watch payload published by [`XdsCache`].
-pub(crate) type XdsConfigResult = Result<Arc<XdsConfig>, XdsConfigError>;
+/// The latest xDS configuration, or why it failed to resolve.
+pub type XdsConfigResult = Result<Arc<XdsConfig>, XdsConfigError>;
 
 /// Per-cluster resource watches supplied by [`XdsRouter`](crate::xds::routing::XdsRouter)
 /// when provisioning a cluster's load-balanced channel.
@@ -163,9 +194,13 @@ impl<T> CacheSender<T> {
     }
 }
 
-/// A wrapper around [`watch::Receiver`] that exposes only a single `next()`
-/// method, preventing misuse of the raw watch API.
-pub(crate) struct CacheWatch<T> {
+/// Watches a value for updates.
+///
+/// Each [`next`](Self::next) call waits for a value newer than the last one it
+/// returned; the first call returns the current value, if there is one.
+/// Intermediate updates may be skipped.
+#[derive(Debug)]
+pub struct CacheWatch<T> {
     rx: watch::Receiver<Option<T>>,
 }
 
@@ -178,10 +213,9 @@ impl<T: Clone> CacheWatch<T> {
         Self { rx }
     }
 
-    /// Waits for the next update and returns it.
-    ///
-    /// Returns `None` if the sender was dropped.
-    pub(crate) async fn next(&mut self) -> Option<T> {
+    /// Waits for the next update and returns it, or `None` once no more
+    /// updates can arrive.
+    pub async fn next(&mut self) -> Option<T> {
         loop {
             if self.rx.changed().await.is_err() {
                 return None;
@@ -482,5 +516,70 @@ mod tests {
         let dup_err =
             tokio::time::timeout(std::time::Duration::from_millis(20), watch.next()).await;
         assert!(dup_err.is_err(), "duplicate error must not notify");
+    }
+
+    #[test]
+    fn config_view_lists_clusters_and_connectable_endpoints() {
+        use crate::client::endpoint::EndpointAddress;
+        use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
+
+        let endpoint = |host: &str, health_status| ResolvedEndpoint {
+            endpoint: Arc::new(EndpointAddress::new(host, 8080).into()),
+            health_status,
+            load_balancing_weight: 1,
+        };
+        let endpoints = Arc::new(EndpointsResource {
+            cluster_name: "ok".to_string(),
+            localities: vec![LocalityEndpoints {
+                locality: None,
+                endpoints: vec![
+                    endpoint("10.0.0.1", HealthStatus::Healthy),
+                    endpoint("10.0.0.2", HealthStatus::Unhealthy),
+                    endpoint("10.0.0.3", HealthStatus::Unknown),
+                    endpoint("10.0.0.1", HealthStatus::Healthy),
+                ],
+                load_balancing_weight: 100,
+                priority: 0,
+            }],
+        });
+        let snapshot = |name, endpoints, resolution_note: Option<&str>| {
+            Ok(ClusterSnapshot {
+                cluster: make_cluster(name, LbPolicy::RoundRobin),
+                endpoints,
+                resolution_note: resolution_note.map(Into::into),
+            })
+        };
+        let config = XdsConfig {
+            route_config: make_route_config("rc-1"),
+            virtual_host_index: 0,
+            clusters: HashMap::from([
+                ("ok".to_string(), snapshot("ok", Some(endpoints), None)),
+                (
+                    "no-eds".to_string(),
+                    snapshot("no-eds", None, Some("eds failed")),
+                ),
+                ("no-cds".to_string(), Err(ClusterError("cds failed".into()))),
+            ]),
+        };
+
+        let clusters: HashMap<_, _> = config.clusters().collect();
+        assert_eq!(clusters.len(), 3);
+
+        let ok = clusters["ok"].unwrap();
+        let addresses: Vec<_> = ok.endpoints().unwrap().map(|ep| ep.address()).collect();
+        assert_eq!(
+            addresses,
+            [
+                &EndpointAddress::new("10.0.0.1", 8080),
+                &EndpointAddress::new("10.0.0.3", 8080),
+            ]
+        );
+        assert_eq!(ok.resolution_note(), None);
+
+        let no_eds = clusters["no-eds"].unwrap();
+        assert!(no_eds.endpoints().is_none());
+        assert_eq!(no_eds.resolution_note(), Some("eds failed"));
+
+        assert_eq!(clusters["no-cds"].unwrap_err().to_string(), "cds failed");
     }
 }

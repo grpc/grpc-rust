@@ -72,9 +72,9 @@ use crate::rt::EndpointIoStream;
 use crate::rt::EndpointListener;
 use crate::rt::GrpcRuntime;
 use crate::rt::StreamEndpoint;
-use crate::rt::default_runtime;
 use crate::rt::hyper_wrapper::HyperCompatExec;
 use crate::rt::hyper_wrapper::HyperStream;
+use crate::rt::test_runtime;
 use crate::server::BoxedRecvStream;
 use crate::server::CallOptions;
 use crate::server::DynHandle;
@@ -347,7 +347,7 @@ impl Handle for StreamMessagesWithoutHeadersHandle {
 
 #[tokio::test(start_paused = true)]
 async fn keep_alive_closes_connection_when_client_stops_responding() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let config =
         Http2Config::new().with_keep_alive(Duration::from_millis(20), Duration::from_millis(50));
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
@@ -378,7 +378,7 @@ async fn keep_alive_closes_connection_when_client_stops_responding() {
 
 #[tokio::test(start_paused = true)]
 async fn keep_alive_keeps_responsive_connection_open() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let config =
         Http2Config::new().with_keep_alive(Duration::from_millis(20), Duration::from_millis(50));
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
@@ -410,7 +410,7 @@ async fn keep_alive_keeps_responsive_connection_open() {
 
 #[tokio::test(start_paused = true)]
 async fn send_message_without_headers_auto_flushes_headers_and_delivers_messages() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(InsecureTestCreds);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, creds);
@@ -466,7 +466,7 @@ async fn send_message_without_headers_auto_flushes_headers_and_delivers_messages
 
 #[tokio::test(start_paused = true)]
 async fn oversize_request_message_surfaces_recv_error_to_handler() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(InsecureTestCreds);
     let config = Http2Config::new().with_max_recv_message_size(16);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
@@ -559,7 +559,7 @@ async fn client_rst_stream_before_headers_cancels_handler() {
         entered: entered_tx,
         dropped: dropped_tx,
     });
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -611,7 +611,7 @@ async fn client_rst_stream_after_headers_cancels_handler() {
         entered: entered_tx,
         dropped: dropped_tx,
     });
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -664,7 +664,7 @@ async fn dropping_serving_connection_cancels_in_flight_handler() {
         entered: entered_tx,
         dropped: dropped_tx,
     });
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(InsecureTestCreds);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, creds);
@@ -785,7 +785,7 @@ impl DynHandle for CustomTrailersHandler {
 
 #[tokio::test(start_paused = true)]
 async fn custom_trailer_metadata_preserved_on_streaming_response() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -836,7 +836,7 @@ async fn custom_trailer_metadata_preserved_on_streaming_response() {
 
 #[tokio::test(start_paused = true)]
 async fn custom_trailer_metadata_preserved_on_trailers_only_response() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -888,7 +888,7 @@ async fn custom_trailer_metadata_preserved_on_trailers_only_response() {
 
 #[tokio::test(start_paused = true)]
 async fn custom_trailer_metadata_preserved_on_error_response() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -986,7 +986,7 @@ async fn outgoing_reserved_headers_stripped_and_messages_delivered() {
         }
     }
 
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(InsecureTestCreds);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, creds);
@@ -1115,7 +1115,7 @@ impl ServerCredentials for TestHandshakeCreds {
 
 #[tokio::test(start_paused = true)]
 async fn bad_handshake_does_not_kill_accept_loop() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(TestHandshakeCreds::new(
         HandshakeTestMode::FailFirstThenSucceed,
     ));
@@ -1170,7 +1170,7 @@ async fn bad_handshake_does_not_kill_accept_loop() {
 
 #[tokio::test(start_paused = true)]
 async fn stalled_handshake_does_not_block_subsequent_connections() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(TestHandshakeCreds::new(
         HandshakeTestMode::StallFirstThenSucceed,
     ));
@@ -1230,7 +1230,7 @@ async fn stalled_handshake_does_not_block_subsequent_connections() {
 
 #[tokio::test(start_paused = true)]
 async fn handshake_timeout_terminates_stalled_connection() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(TestHandshakeCreds::new(
         HandshakeTestMode::StallFirstThenSucceed,
     ));
@@ -1274,7 +1274,7 @@ async fn handshake_timeout_terminates_stalled_connection() {
 
 #[tokio::test(start_paused = true)]
 async fn malformed_bin_header_returns_internal_error_without_invoking_handler() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let creds = Arc::new(InsecureTestCreds);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, creds);
@@ -1368,7 +1368,7 @@ async fn request_reserved_headers_extracted_and_filtered_from_metadata() {
         }
     }
 
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -1466,7 +1466,7 @@ async fn response_content_type_overwritten_when_handler_sets_it() {
         }
     }
 
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -1522,7 +1522,7 @@ async fn response_content_type_overwritten_when_handler_sets_it() {
 
 #[tokio::test(start_paused = true)]
 async fn invalid_content_type_rejected_with_unsupported_media_type() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -1557,7 +1557,7 @@ async fn invalid_content_type_rejected_with_unsupported_media_type() {
 
 #[tokio::test(start_paused = true)]
 async fn invalid_method_rejected_with_method_not_allowed() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -1592,7 +1592,7 @@ async fn invalid_method_rejected_with_method_not_allowed() {
 
 #[tokio::test(start_paused = true)]
 async fn unsupported_grpc_encoding_rejected_with_unimplemented() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let listener = listener_with(accept_rx, Arc::new(InsecureTestCreds));
     let (server_ep, client_ep) = endpoint_pair();
@@ -1654,7 +1654,7 @@ impl Handle for CaptureConnectionInfoHandle {
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_listener_reports_unix_connection_info_to_handler() {
-    let rt = default_runtime();
+    let rt = test_runtime();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hyper.sock");
     let listener = HyperListener::new_unix_listener(

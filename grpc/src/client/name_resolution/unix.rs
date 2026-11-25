@@ -100,7 +100,7 @@ mod tests {
         let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
         let opts = ResolverOptions {
             authority: "ignored".to_string(),
-            runtime: rt::default_runtime(),
+            runtime: rt::test_runtime(),
             work_scheduler: work_scheduler.clone(),
         };
 
@@ -153,7 +153,7 @@ mod tests {
         let (work_scheduler, mut work_rx) = TestWorkScheduler::new_pair();
         let opts = ResolverOptions {
             authority: "ignored".to_string(),
-            runtime: rt::default_runtime(),
+            runtime: rt::test_runtime(),
             work_scheduler: work_scheduler.clone(),
         };
 

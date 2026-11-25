@@ -126,7 +126,7 @@ where
 /// Background task: watches endpoint snapshots and emits incremental changes.
 ///
 /// Each time a new [`EndpointsResource`] arrives on the watch, we diff
-/// `healthy_endpoints()` against the previous snapshot, keyed by primary
+/// `unique_healthy_endpoints()` against the previous snapshot, keyed by primary
 /// address, and emit `Insert` for new endpoints followed by `Remove` for gone
 /// ones. An endpoint whose primary address is unchanged but whose additional
 /// addresses or hostname changed is re-emitted as an `Insert` under the same
@@ -143,13 +143,10 @@ async fn diff_loop<S, F>(
     let mut active: HashMap<EndpointAddress, Arc<XdsEndpoint>> = HashMap::new();
 
     while let Some(endpoints) = watch.next().await {
-        let mut latest: HashMap<EndpointAddress, Arc<XdsEndpoint>> = HashMap::new();
-        for ep in endpoints.healthy_endpoints() {
-            // Endpoints sharing a primary address collapse to the first.
-            latest
-                .entry(ep.endpoint.address().clone())
-                .or_insert_with(|| Arc::clone(&ep.endpoint));
-        }
+        let latest: HashMap<EndpointAddress, Arc<XdsEndpoint>> = endpoints
+            .unique_healthy_endpoints()
+            .map(|ep| (ep.address().clone(), Arc::clone(ep)))
+            .collect();
 
         for (addr, endpoint) in &latest {
             if active.get(addr) == Some(endpoint) {

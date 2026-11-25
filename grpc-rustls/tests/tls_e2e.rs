@@ -160,7 +160,8 @@ async fn grpc_invoke_tonic_unary_tls() {
     let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
 
     let target = format!("dns:///{addr}");
-    let channel = Channel::builder(&target, Arc::new(composite_creds)).build();
+    let channel =
+        Channel::builder(&target, Arc::new(composite_creds), grpc_tokio::runtime()).build();
 
     let (headers, resp, trailers) = perform_unary_echo(&channel, "hello interop tls").await;
 

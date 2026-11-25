@@ -532,6 +532,7 @@ mod tests {
     use super::*;
     use crate::core::RecvMessage;
     use crate::core::test_connection_info;
+    use crate::rt::test_runtime;
 
     struct NopRecvMessage;
     impl RecvMessage for NopRecvMessage {
@@ -624,7 +625,7 @@ mod tests {
                 _: impl RecvStream + 'static,
             ) -> Trailers {
                 self.0.store(true, Ordering::SeqCst);
-                GrpcRuntime::default()
+                test_runtime()
                     .sleep(std::time::Duration::from_secs(60))
                     .await;
                 self.1.store(true, Ordering::SeqCst);
@@ -645,21 +646,21 @@ mod tests {
 
         let mut serving_conn = transport.serve(
             Arc::new(HangingHandler(hs, hf)),
-            crate::rt::default_runtime(),
+            crate::rt::test_runtime(),
             crate::private::SealedToken,
         );
 
         // Poll the serving connection briefly to start the handler.
         tokio::select! {
             _ = &mut serving_conn => {}
-            _ = GrpcRuntime::default().sleep(std::time::Duration::from_millis(20)) => {}
+            _ = test_runtime().sleep(std::time::Duration::from_millis(20)) => {}
         }
         assert!(handler_started.load(Ordering::SeqCst));
 
         // Now DROP `serving_conn` (simulating what watch() does on `break`).
         drop(serving_conn);
 
-        GrpcRuntime::default()
+        test_runtime()
             .sleep(std::time::Duration::from_millis(50))
             .await;
         // With the inline fix, dropping the connection future drops the handler future immediately -> handler never finishes.

@@ -69,9 +69,9 @@ impl<T: Any + Send + Sync + Eq + Debug> EqAttribute for T {
 }
 
 /// Trait implemented by the unsized trait object types backing
-/// [`RawAttributes`]. This trait parameterizes RawAttributes directly and is
-/// resolved at compile time. That's in contrast to AnyAttribute and
-/// EqAttribute which are per-entry, so use indirect calls at runtime.
+/// [`RawAttributes`]. This trait exists "outside" the dyn and is resolved at
+/// compile time. That's in contrast to AnyAttribute and EqAttribute which are
+/// used with dyn to have indirect calls at runtime.
 pub(crate) trait ErasedAttribute: Send + Sync + Debug + 'static {
     fn as_any(&self) -> &dyn Any;
 }

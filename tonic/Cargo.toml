@@ -140,3 +140,7 @@ allowed_external_types = [
 [[bench]]
 harness = false
 name = "decode"
+
+[[bench]]
+harness = false
+name = "encode"

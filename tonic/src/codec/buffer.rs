@@ -33,9 +33,20 @@ pub struct DecodeBuf<'a> {
 }
 
 /// A specialized buffer to encode gRPC messages into.
+///
+/// See [`BufferSettings::with_zero_copy_threshold`](super::BufferSettings::with_zero_copy_threshold)
+/// for sending large buffers without copying them into this buffer.
 #[derive(Debug)]
 pub struct EncodeBuf<'a> {
     buf: &'a mut BytesMut,
+    zero_copy: Option<ZeroCopy<'a>>,
+}
+
+#[derive(Debug)]
+struct ZeroCopy<'a> {
+    threshold: usize,
+    // (offset in `buf`, taken buffer)
+    chunks: &'a mut Vec<(usize, Bytes)>,
 }
 
 impl<'a> DecodeBuf<'a> {
@@ -78,7 +89,21 @@ impl Buf for DecodeBuf<'_> {
 
 impl<'a> EncodeBuf<'a> {
     pub(crate) fn new(buf: &'a mut BytesMut) -> Self {
-        EncodeBuf { buf }
+        EncodeBuf {
+            buf,
+            zero_copy: None,
+        }
+    }
+
+    pub(crate) fn with_zero_copy(
+        buf: &'a mut BytesMut,
+        chunks: &'a mut Vec<(usize, Bytes)>,
+        threshold: usize,
+    ) -> Self {
+        EncodeBuf {
+            buf,
+            zero_copy: Some(ZeroCopy { threshold, chunks }),
+        }
     }
 }
 
@@ -111,10 +136,19 @@ unsafe impl BufMut for EncodeBuf<'_> {
     }
 
     #[inline]
-    fn put<T: Buf>(&mut self, src: T)
+    fn put<T: Buf>(&mut self, mut src: T)
     where
         Self: Sized,
     {
+        if let Some(zero_copy) = &mut self.zero_copy {
+            let len = src.remaining();
+            if len != 0 && len >= zero_copy.threshold {
+                zero_copy
+                    .chunks
+                    .push((self.buf.len(), src.copy_to_bytes(len)));
+                return;
+            }
+        }
         self.buf.put(src)
     }
 
@@ -166,5 +200,28 @@ mod tests {
 
         buf.put_u8(b'a');
         assert_eq!(buf.remaining_mut(), initial - 20 - 1);
+    }
+
+    #[test]
+    fn encode_buf_zero_copy() {
+        let mut bytes = BytesMut::with_capacity(100);
+        let mut chunks = Vec::new();
+        let mut buf = EncodeBuf::with_zero_copy(&mut bytes, &mut chunks, 4);
+
+        let large = Bytes::from(vec![1u8; 4]);
+        buf.put_slice(b"ab");
+        buf.put(Bytes::from_static(b"cde"));
+        buf.put(large.clone());
+        buf.put(Bytes::new());
+        buf.put_slice(b"fg");
+        buf.put(&[2u8; 5][..]);
+
+        assert_eq!(&bytes[..], b"abcdefg");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, 5);
+        assert_eq!(chunks[0].1, large);
+        assert_eq!(chunks[0].1.as_ptr(), large.as_ptr());
+        assert_eq!(chunks[1].0, 7);
+        assert_eq!(&chunks[1].1[..], &[2u8; 5][..]);
     }
 }

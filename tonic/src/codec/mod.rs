@@ -87,10 +87,14 @@ const DEFAULT_YIELD_THRESHOLD: usize = 32 * 1024;
 /// not affect the responsiveness of your streaming rpc (for reasonable
 /// sizes of yield threshold).
 /// Yield threshold defaults to 32 KiB.
+///
+/// Zero-copy encoding is disabled by default, see
+/// [`BufferSettings::with_zero_copy_threshold`].
 #[derive(Clone, Copy, Debug)]
 pub struct BufferSettings {
     buffer_size: usize,
     yield_threshold: usize,
+    zero_copy_threshold: Option<usize>,
 }
 
 impl BufferSettings {
@@ -99,6 +103,26 @@ impl BufferSettings {
         Self {
             buffer_size,
             yield_threshold,
+            zero_copy_threshold: None,
+        }
+    }
+
+    /// Send large buffers written by the encoder without copying them into
+    /// the encode buffer.
+    ///
+    /// A non-empty [`bytes::Buf`] of at least `threshold` bytes passed to
+    /// [`bytes::BufMut::put`] is taken with [`bytes::Buf::copy_to_bytes`] and
+    /// sent as its own body chunk. For [`bytes::Bytes`], such as a prost
+    /// `bytes = "bytes"` field, this is a reference count increment. The bytes
+    /// on the wire are unchanged, and compressed messages are not affected.
+    ///
+    /// Only use this when large buffers are cheap to turn into `Bytes`. For
+    /// other `Buf` types such as `&[u8]`, `copy_to_bytes` still copies into a
+    /// new allocation.
+    pub fn with_zero_copy_threshold(self, threshold: usize) -> Self {
+        Self {
+            zero_copy_threshold: Some(threshold),
+            ..self
         }
     }
 }
@@ -108,6 +132,7 @@ impl Default for BufferSettings {
         Self {
             buffer_size: DEFAULT_CODEC_BUFFER_SIZE,
             yield_threshold: DEFAULT_YIELD_THRESHOLD,
+            zero_copy_threshold: None,
         }
     }
 }

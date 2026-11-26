@@ -34,6 +34,7 @@ use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
 use std::{
+    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -42,9 +43,10 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 /// Combinator for efficient encoding of messages into reasonably sized buffers.
 /// EncodedBytes encodes ready messages from its delegate stream into a BytesMut,
-/// splitting off and yielding a buffer when either:
-///  * The delegate stream polls as not ready, or
-///  * The encoded buffer surpasses YIELD_THRESHOLD.
+/// splitting off and yielding a buffer when:
+///  * The delegate stream polls as not ready,
+///  * The encoded buffer surpasses YIELD_THRESHOLD, or
+///  * Zero-copy encoding takes a buffer from the encoded message.
 #[pin_project(project = EncodedBytesProj)]
 #[derive(Debug)]
 struct EncodedBytes<T, U> {
@@ -55,6 +57,8 @@ struct EncodedBytes<T, U> {
     max_message_size: Option<usize>,
     buf: BytesMut,
     uncompression_buf: BytesMut,
+    chunks: Vec<(usize, Bytes)>,
+    pending: VecDeque<Bytes>,
     error: Option<Status>,
 }
 
@@ -89,6 +93,8 @@ impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
             max_message_size,
             buf,
             uncompression_buf,
+            chunks: Vec::new(),
+            pending: VecDeque::new(),
             error: None,
         }
     }
@@ -109,9 +115,15 @@ where
             max_message_size,
             buf,
             uncompression_buf,
+            chunks,
+            pending,
             error,
         } = self.project();
         let buffer_settings = encoder.buffer_settings();
+
+        if let Some(chunk) = pending.pop_front() {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
 
         if let Some(status) = error.take() {
             return Poll::Ready(Some(Err(status)));
@@ -133,12 +145,18 @@ where
                         encoder,
                         buf,
                         uncompression_buf,
+                        chunks,
                         *compression_encoding,
                         *max_message_size,
                         buffer_settings,
                         item,
                     ) {
                         return Poll::Ready(Some(Err(status)));
+                    }
+
+                    if !chunks.is_empty() {
+                        split_chunks(buf, chunks, pending);
+                        return Poll::Ready(pending.pop_front().map(Ok));
                     }
 
                     if buf.len() >= buffer_settings.yield_threshold {
@@ -157,10 +175,12 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_item<T>(
     encoder: &mut T,
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
+    chunks: &mut Vec<(usize, Bytes)>,
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
     buffer_settings: BufferSettings,
@@ -170,6 +190,7 @@ where
     T: Encoder<Error = Status>,
 {
     let offset = buf.len();
+    chunks.clear();
 
     buf.reserve(HEADER_SIZE);
     buf.put_slice(&[0u8; HEADER_SIZE]);
@@ -194,29 +215,63 @@ where
         )
         .map_err(|err| Status::internal(format!("Error compressing: {err}")))?;
     } else {
+        let mut dst = match buffer_settings.zero_copy_threshold {
+            Some(threshold) => EncodeBuf::with_zero_copy(buf, chunks, threshold),
+            None => EncodeBuf::new(buf),
+        };
         encoder
-            .encode(item, &mut EncodeBuf::new(buf))
+            .encode(item, &mut dst)
             .map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
     }
 
     // now that we know length, we can write the header
-    finish_encoding(compression_encoding, max_message_size, &mut buf[offset..])
+    finish_encoding(
+        compression_encoding,
+        max_message_size,
+        &mut buf[offset..],
+        chunks,
+    )
+}
+
+// The whole buffer is moved, not only the bytes up to the last chunk, so that a
+// message is never left partially sent if encoding a later message fails.
+fn split_chunks(
+    buf: &mut BytesMut,
+    chunks: &mut Vec<(usize, Bytes)>,
+    pending: &mut VecDeque<Bytes>,
+) {
+    let mut split = 0;
+    for (offset, chunk) in chunks.drain(..) {
+        if offset > split {
+            pending.push_back(buf.split_to(offset - split).freeze());
+            split = offset;
+        }
+        pending.push_back(chunk);
+    }
+    if !buf.is_empty() {
+        pending.push_back(buf.split_to(buf.len()).freeze());
+    }
 }
 
 fn finish_encoding(
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
     buf: &mut [u8],
+    chunks: &[(usize, Bytes)],
 ) -> Result<(), Status> {
-    let len = buf.len() - HEADER_SIZE;
+    let len = chunks
+        .iter()
+        .fold((buf.len() - HEADER_SIZE) as u64, |len, (_, chunk)| {
+            len.saturating_add(chunk.len() as u64)
+        });
     let limit = max_message_size.unwrap_or(DEFAULT_MAX_SEND_MESSAGE_SIZE);
-    if len > limit {
+    if len > limit as u64 {
         return Err(Status::out_of_range(format!(
             "Error, encoded message length too large: found {len} bytes, the limit is: {limit} bytes"
         )));
     }
 
-    if len > u32::MAX as usize {
+    if len > u32::MAX as u64 {
         return Err(Status::resource_exhausted(format!(
             "Cannot return body with more than 4GB of data but got {len} bytes"
         )));
@@ -429,6 +484,7 @@ mod tests {
                 &mut encoder,
                 &mut buf,
                 &mut uncompression_buf,
+                &mut Vec::new(),
                 None,
                 None,
                 BufferSettings::default(),
@@ -448,5 +504,352 @@ mod tests {
             &[0u8; HEADER_SIZE],
             "Buffer must contain only initialized zero bytes."
         );
+    }
+
+    mod zero_copy {
+        use super::super::*;
+        use crate::Code;
+        use http_body_util::BodyExt;
+        use std::pin::pin;
+
+        const THRESHOLD: usize = 1024;
+        const PREFIX: &[u8] = b"prefix";
+        const SUFFIX: &[u8] = b"suffix";
+
+        /// Encodes a message as `PREFIX`, the payload passed to `put`, then
+        /// `SUFFIX`, like a message with a `Bytes` field between other fields.
+        struct PayloadEncoder {
+            buffer_settings: BufferSettings,
+            fail_len: Option<usize>,
+        }
+
+        impl Encoder for PayloadEncoder {
+            type Item = Bytes;
+            type Error = Status;
+
+            fn encode(&mut self, item: Bytes, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+                let fail = self.fail_len == Some(item.len());
+                dst.put_slice(PREFIX);
+                dst.put(item);
+                if fail {
+                    return Err(Status::internal("payload rejected"));
+                }
+                dst.put_slice(SUFFIX);
+                Ok(())
+            }
+
+            fn buffer_settings(&self) -> BufferSettings {
+                self.buffer_settings
+            }
+        }
+
+        struct Encoded {
+            data: Vec<Bytes>,
+            trailers: HeaderMap,
+        }
+
+        impl Encoded {
+            fn concat(&self) -> Vec<u8> {
+                self.data.concat()
+            }
+
+            fn status(&self) -> (Code, String) {
+                let status = Status::from_header_map(&self.trailers).expect("grpc-status");
+                (status.code(), status.message().to_string())
+            }
+
+            fn shares(&self, payload: &Bytes) -> usize {
+                self.data
+                    .iter()
+                    .filter(|d| d.as_ptr() == payload.as_ptr() && d.len() == payload.len())
+                    .count()
+            }
+        }
+
+        async fn encode(
+            buffer_settings: BufferSettings,
+            items: Vec<Result<Bytes, Status>>,
+            compression_encoding: Option<CompressionEncoding>,
+            max_message_size: Option<usize>,
+            fail_len: Option<usize>,
+        ) -> Encoded {
+            let encoder = PayloadEncoder {
+                buffer_settings,
+                fail_len,
+            };
+            let mut body = pin!(EncodeBody::new_server(
+                encoder,
+                tokio_stream::iter(items),
+                compression_encoding,
+                SingleMessageCompressionOverride::default(),
+                max_message_size,
+            ));
+
+            let mut data = Vec::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.expect("server body does not fail");
+                match frame.into_data() {
+                    Ok(d) => data.push(d),
+                    Err(frame) => {
+                        assert!(body.is_end_stream());
+                        return Encoded {
+                            data,
+                            trailers: frame.into_trailers().expect("trailers"),
+                        };
+                    }
+                }
+            }
+            panic!("no trailers");
+        }
+
+        fn payload(len: usize) -> Bytes {
+            (0..len).map(|i| i as u8).collect::<Vec<_>>().into()
+        }
+
+        fn enabled(settings: BufferSettings) -> BufferSettings {
+            settings.with_zero_copy_threshold(THRESHOLD)
+        }
+
+        async fn encode_both(
+            settings: BufferSettings,
+            items: Vec<Result<Bytes, Status>>,
+            compression_encoding: Option<CompressionEncoding>,
+            max_message_size: Option<usize>,
+        ) -> (Encoded, Encoded) {
+            let off = encode(
+                settings,
+                items.clone(),
+                compression_encoding,
+                max_message_size,
+                None,
+            )
+            .await;
+            let on = encode(
+                enabled(settings),
+                items,
+                compression_encoding,
+                max_message_size,
+                None,
+            )
+            .await;
+            assert_eq!(off.concat(), on.concat());
+            assert_eq!(off.status(), on.status());
+            (off, on)
+        }
+
+        #[tokio::test]
+        async fn same_bytes_around_threshold() {
+            for len in [
+                0,
+                1,
+                THRESHOLD - 1,
+                THRESHOLD,
+                THRESHOLD + 1,
+                3 * 1024 * 1024 + 7,
+            ] {
+                let payload = payload(len);
+                let (_, on) = encode_both(
+                    BufferSettings::default(),
+                    vec![Ok(payload.clone())],
+                    None,
+                    None,
+                )
+                .await;
+
+                let mut expected = vec![0u8];
+                expected
+                    .extend_from_slice(&((PREFIX.len() + len + SUFFIX.len()) as u32).to_be_bytes());
+                expected.extend_from_slice(PREFIX);
+                expected.extend_from_slice(&payload);
+                expected.extend_from_slice(SUFFIX);
+                assert_eq!(on.concat(), expected, "len {len}");
+                assert_eq!(on.status(), (Code::Ok, String::new()));
+
+                let shares = if len >= THRESHOLD { 1 } else { 0 };
+                assert_eq!(on.shares(&payload), shares, "len {len}");
+            }
+        }
+
+        #[tokio::test]
+        async fn streaming_mixed_sizes() {
+            let lens = [10, 5000, 3, 70_000, 0, THRESHOLD, 2048, 100, 40_000, 1];
+            let payloads: Vec<Bytes> = lens.iter().map(|&len| payload(len)).collect();
+            let items: Vec<_> = payloads.iter().cloned().map(Ok).collect();
+
+            for settings in [BufferSettings::default(), BufferSettings::new(512, 4096)] {
+                let (_, on) = encode_both(settings, items.clone(), None, None).await;
+
+                let shared: Vec<usize> = on
+                    .data
+                    .iter()
+                    .filter_map(|d| payloads.iter().position(|p| p.as_ptr() == d.as_ptr()))
+                    .collect();
+                let large: Vec<usize> = (0..lens.len()).filter(|&i| lens[i] >= THRESHOLD).collect();
+                assert_eq!(shared, large);
+            }
+        }
+
+        #[tokio::test]
+        async fn max_message_size() {
+            let payload = payload(2048);
+            let len = PREFIX.len() + payload.len() + SUFFIX.len();
+
+            let (_, on) = encode_both(
+                BufferSettings::default(),
+                vec![Ok(payload.clone())],
+                None,
+                Some(len),
+            )
+            .await;
+            assert_eq!(on.status(), (Code::Ok, String::new()));
+            assert_eq!(on.shares(&payload), 1);
+
+            let (_, on) = encode_both(
+                BufferSettings::default(),
+                vec![Ok(payload.clone())],
+                None,
+                Some(len - 1),
+            )
+            .await;
+            assert!(on.data.is_empty());
+            let message = format!(
+                "Error, encoded message length too large: found {len} bytes, the limit is: {} bytes",
+                len - 1
+            );
+            assert_eq!(on.status(), (Code::OutOfRange, message));
+        }
+
+        #[cfg(feature = "gzip")]
+        #[tokio::test]
+        async fn compressed_is_not_split() {
+            let payloads = [payload(100), payload(64 * 1024)];
+            let items = payloads.iter().cloned().map(Ok).collect();
+            let (off, on) = encode_both(
+                BufferSettings::default(),
+                items,
+                Some(CompressionEncoding::Gzip),
+                None,
+            )
+            .await;
+            assert_eq!(off.data.len(), on.data.len());
+            for payload in &payloads {
+                assert_eq!(on.shares(payload), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn source_error_after_chunk() {
+            let small = payload(10);
+            let large = payload(100_000);
+            let items = vec![
+                Ok(small),
+                Ok(large.clone()),
+                Err(Status::data_loss("source failed")),
+            ];
+
+            let (_, on) = encode_both(BufferSettings::default(), items, None, None).await;
+            assert_eq!(on.status(), (Code::DataLoss, "source failed".to_string()));
+            assert_eq!(on.shares(&large), 1);
+        }
+
+        #[tokio::test]
+        async fn encoder_error_after_chunk() {
+            let items = vec![
+                Ok(payload(10)),
+                Ok(payload(5000)),
+                Ok(payload(THRESHOLD + 3)),
+            ];
+            let failed = encode(
+                enabled(BufferSettings::default()),
+                items.clone(),
+                None,
+                None,
+                Some(THRESHOLD + 3),
+            )
+            .await;
+            let (code, message) = failed.status();
+            assert_eq!(code, Code::Internal);
+            assert!(message.contains("payload rejected"), "{message}");
+
+            // Messages yielded before the failure are complete.
+            let complete = encode(
+                BufferSettings::default(),
+                items[..2].to_vec(),
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(failed.concat(), complete.concat());
+        }
+
+        /// Writes each part with `put`, so every part of at least `THRESHOLD`
+        /// bytes becomes its own chunk.
+        struct PartsEncoder(BufferSettings);
+
+        impl Encoder for PartsEncoder {
+            type Item = Vec<Bytes>;
+            type Error = Status;
+
+            fn encode(&mut self, item: Vec<Bytes>, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+                for part in item {
+                    dst.put(part);
+                }
+                Ok(())
+            }
+
+            fn buffer_settings(&self) -> BufferSettings {
+                self.0
+            }
+        }
+
+        async fn encode_parts(settings: BufferSettings, parts: Vec<Bytes>) -> Vec<Bytes> {
+            let mut body = pin!(EncodeBody::new_server(
+                PartsEncoder(settings),
+                tokio_stream::iter(vec![Ok(parts)]),
+                None,
+                SingleMessageCompressionOverride::default(),
+                None,
+            ));
+            let mut data = Vec::new();
+            while let Some(frame) = body.frame().await {
+                match frame.expect("server body does not fail").into_data() {
+                    Ok(d) => data.push(d),
+                    Err(_) => break,
+                }
+            }
+            data
+        }
+
+        #[tokio::test]
+        async fn several_chunks_in_one_message() {
+            // Two chunks back to back, a small part between chunks, and a chunk
+            // at the end of the message with nothing after it.
+            let (a, b, c) = (
+                payload(THRESHOLD),
+                payload(THRESHOLD + 1),
+                payload(2 * THRESHOLD),
+            );
+            let parts = vec![
+                Bytes::from_static(b"head"),
+                a.clone(),
+                b.clone(),
+                Bytes::from_static(b"mid"),
+                c.clone(),
+            ];
+
+            let off = encode_parts(BufferSettings::default(), parts.clone()).await;
+            let on = encode_parts(enabled(BufferSettings::default()), parts).await;
+
+            assert_eq!(off.concat(), on.concat());
+            let large = [a.as_ptr(), b.as_ptr(), c.as_ptr()];
+            let shared: Vec<*const u8> = on
+                .iter()
+                .map(|d| d.as_ptr())
+                .filter(|p| large.contains(p))
+                .collect();
+            assert_eq!(shared, large);
+            assert_eq!(on.last().map(|d| d.as_ptr()), Some(c.as_ptr()));
+        }
     }
 }

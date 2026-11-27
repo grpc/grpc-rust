@@ -38,6 +38,13 @@ use tokio::net::UnixStream;
 
 #[cfg(not(target_os = "windows"))]
 async fn connect_uds(uds_path: String) -> Result<UnixStream, ConnectError> {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    if uds_path.starts_with('\0') {
+        return Err(ConnectError(
+            "abstract uds connections are only allowed on linux and android".into(),
+        ));
+    }
+
     UnixStream::connect(uds_path)
         .await
         .map_err(|err| ConnectError(From::from(err)))

@@ -372,7 +372,8 @@ impl Endpoint {
     /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
     /// stream-level flow control.
     ///
-    /// Default is 65,535
+    /// If unset, hyper's default is used (currently 2 MiB). Has no effect when
+    /// [`Endpoint::http2_adaptive_window`] is enabled.
     ///
     /// [spec]: https://httpwg.org/specs/rfc9113.html#InitialWindowSize
     pub fn initial_stream_window_size(self, sz: impl Into<Option<u32>>) -> Self {
@@ -384,7 +385,8 @@ impl Endpoint {
 
     /// Sets the max connection-level flow control for HTTP2
     ///
-    /// Default is 65,535
+    /// If unset, hyper's default is used (currently 5 MiB). Has no effect when
+    /// [`Endpoint::http2_adaptive_window`] is enabled.
     pub fn initial_connection_window_size(self, sz: impl Into<Option<u32>>) -> Self {
         Endpoint {
             init_connection_window_size: sz.into(),

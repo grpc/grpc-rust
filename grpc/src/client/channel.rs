@@ -528,8 +528,12 @@ impl Invoke for LbInvoker {
                     // without invoking it, since the RPC never started.
                 }
                 PickResult::Queue => {}
+                // Failing picks for wait-for-ready RPCs queue instead.
+                PickResult::Fail(_status) if options.wait_for_ready() == Some(true) => {
+                    // TODO: save and propagate status so that it can be
+                    // returned when the deadline is reached.
+                }
                 PickResult::Fail(status) => {
-                    // TODO: Check wait-for-ready and queue instead.
                     return FailingRecvStream::new_stream_pair(
                         status.sanitize_control_plane_status("picker returned illegal status"),
                         None,
@@ -875,13 +879,13 @@ fn setup_registeries() {
 
 #[cfg(test)]
 mod tests {
-    use crate::StatusCodeError;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use super::*;
+    use crate::StatusCodeError;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::reg_stub_policy;
@@ -1078,10 +1082,60 @@ mod tests {
         }
     }
 
+    // Builds a channel that resolves to a single address and uses a stub LB
+    // policy registered as `policy_name` with `funcs`.  The channel is taken
+    // out of idle and the resolver update has been delivered on return.
+    async fn channel_with_stub_policy(
+        policy_name: &'static str,
+        funcs: StubPolicyFuncs,
+    ) -> Channel {
+        let runtime = test_runtime();
+        reg_stub_policy(policy_name, funcs);
+
+        let (scheme, mut resolver_rx) = FakeResolverBuilder::register();
+        let mut channel = Channel::builder(
+            format!("{scheme}:///unused"),
+            Arc::new(LocalChannelCredentials::new()),
+            runtime.clone(),
+        )
+        .build();
+        // Exit idle so the channel builds its resolver.
+        channel.get_state(true);
+        let resolver = runtime
+            .timeout(Duration::from_secs(5), resolver_rx.recv())
+            .await
+            .expect("timed out waiting for the channel to build its resolver")
+            .unwrap();
+        resolver
+            .update(ResolverUpdate {
+                endpoints: Ok(vec![Endpoint {
+                    addresses: vec![Address {
+                        network_type: name_resolution::TCP_IP_NETWORK_TYPE,
+                        address: "127.0.0.1:1".to_string().into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]),
+                service_config: Ok(Some(
+                    ServiceConfig::parse(&format!(
+                        r#"{{"loadBalancingConfig": [{{"{policy_name}": {{}}}}]}}"#
+                    ))
+                    .unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        channel
+    }
+
     // A pick of a subchannel that is no longer READY (the LB policy hasn't
     // updated its picker yet) is queued until the next picker, instead of
     // failing the RPC.
-    #[tokio::test]
+    //
+    // Uses a paused clock so the timeout below only fires after the RPC has
+    // called the picker (and then queued again).
+    #[tokio::test(start_paused = true)]
     async fn pick_of_non_ready_subchannel_waits_for_new_picker() {
         const POLICY_NAME: &str = "channel_test_non_ready_pick";
         let runtime = test_runtime();
@@ -1095,7 +1149,7 @@ mod tests {
         let (work_scheduler_tx, mut work_scheduler_rx) = mpsc::unbounded_channel();
         let (lb_state_tx, lb_state_rx) = mpsc::unbounded_channel::<LbState>();
         let lb_state_rx = Arc::new(Mutex::new(lb_state_rx));
-        reg_stub_policy(
+        let channel = channel_with_stub_policy(
             POLICY_NAME,
             StubPolicyFuncs {
                 resolver_update: Some(Arc::new({
@@ -1127,42 +1181,8 @@ mod tests {
                 })),
                 ..Default::default()
             },
-        );
-
-        let (scheme, mut resolver_rx) = FakeResolverBuilder::register();
-        let mut channel = Channel::builder(
-            format!("{scheme}:///unused"),
-            Arc::new(LocalChannelCredentials::new()),
-            runtime.clone(),
         )
-        .build();
-        // Exit idle so the channel builds its resolver.
-        channel.get_state(true);
-        let resolver = runtime
-            .timeout(Duration::from_secs(5), resolver_rx.recv())
-            .await
-            .expect("timed out waiting for the channel to build its resolver")
-            .unwrap();
-        resolver
-            .update(ResolverUpdate {
-                endpoints: Ok(vec![Endpoint {
-                    addresses: vec![Address {
-                        network_type: name_resolution::TCP_IP_NETWORK_TYPE,
-                        address: "127.0.0.1:1".to_string().into(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }]),
-                service_config: Ok(Some(
-                    ServiceConfig::parse(&format!(
-                        r#"{{"loadBalancingConfig": [{{"{POLICY_NAME}": {{}}}}]}}"#
-                    ))
-                    .unwrap(),
-                )),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        .await;
         let lb_work_scheduler = work_scheduler_rx.recv().await.unwrap();
 
         let mut call =
@@ -1207,9 +1227,10 @@ mod tests {
     async fn rpc_status_code_with_picker(
         policy_name: &'static str,
         picker: Arc<dyn Picker>,
+        call_options: CallOptions,
     ) -> StatusCodeError {
         let runtime = test_runtime();
-        reg_stub_policy(
+        let channel = channel_with_stub_policy(
             policy_name,
             StubPolicyFuncs {
                 resolver_update: Some(Arc::new(move |_data, _update, _config, controller| {
@@ -1221,47 +1242,13 @@ mod tests {
                 })),
                 ..Default::default()
             },
-        );
-
-        let (scheme, mut resolver_rx) = FakeResolverBuilder::register();
-        let mut channel = Channel::builder(
-            format!("{scheme}:///unused"),
-            Arc::new(LocalChannelCredentials::new()),
-            runtime.clone(),
         )
-        .build();
-        // Exit idle so the channel builds its resolver.
-        channel.get_state(true);
-        let resolver = runtime
-            .timeout(Duration::from_secs(5), resolver_rx.recv())
-            .await
-            .expect("timed out waiting for the channel to build its resolver")
-            .unwrap();
-        resolver
-            .update(ResolverUpdate {
-                endpoints: Ok(vec![Endpoint {
-                    addresses: vec![Address {
-                        network_type: name_resolution::TCP_IP_NETWORK_TYPE,
-                        address: "127.0.0.1:1".to_string().into(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }]),
-                service_config: Ok(Some(
-                    ServiceConfig::parse(&format!(
-                        r#"{{"loadBalancingConfig": [{{"{policy_name}": {{}}}}]}}"#
-                    ))
-                    .unwrap(),
-                )),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        .await;
 
         let (_tx, mut rx) = runtime
             .timeout(
                 Duration::from_secs(5),
-                channel.invoke(RequestHeaders::new(), CallOptions::default()),
+                channel.invoke(RequestHeaders::new(), call_options),
             )
             .await
             .expect("the RPC should fail");
@@ -1281,6 +1268,7 @@ mod tests {
                 StatusCodeError::NotFound,
                 "restricted",
             ))),
+            CallOptions::default(),
         )
         .await;
         assert_eq!(code, StatusCodeError::Internal);
@@ -1296,8 +1284,200 @@ mod tests {
                 StatusCodeError::NotFound,
                 "restricted",
             ))),
+            CallOptions::default(),
         )
         .await;
         assert_eq!(code, StatusCodeError::Internal);
+    }
+
+    fn wait_for_ready_call_option() -> CallOptions {
+        let mut options = CallOptions::default();
+        options.set_wait_for_ready(true);
+        options
+    }
+
+    // Builds a channel whose LB policy initially publishes the LB states sent
+    // on the returned sender whenever the returned work scheduler is invoked.
+    async fn channel_with_lb_states(
+        policy_name: &'static str,
+    ) -> (
+        Channel,
+        mpsc::UnboundedSender<LbState>,
+        Arc<dyn WorkScheduler>,
+    ) {
+        let (work_scheduler_tx, mut work_scheduler_rx) = mpsc::unbounded_channel();
+        let (lb_state_tx, lb_state_rx) = mpsc::unbounded_channel::<LbState>();
+        let lb_state_rx = Arc::new(Mutex::new(lb_state_rx));
+        let channel = channel_with_stub_policy(
+            policy_name,
+            StubPolicyFuncs {
+                resolver_update: Some(Arc::new(move |data, _update, _config, _controller| {
+                    let _ = work_scheduler_tx.send(data.lb_policy_options.work_scheduler.clone());
+                    Ok(())
+                })),
+                work: Some(Arc::new(move |_data, _work_data, controller| {
+                    while let Ok(state) = lb_state_rx.lock().try_recv() {
+                        controller.update_picker(state);
+                    }
+                })),
+                ..Default::default()
+            },
+        )
+        .await;
+        let lb_work_scheduler = work_scheduler_rx.recv().await.unwrap();
+        (channel, lb_state_tx, lb_work_scheduler)
+    }
+
+    fn transient_failure(picker: impl Picker + 'static) -> LbState {
+        LbState {
+            connectivity_state: ConnectivityState::TransientFailure,
+            picker: Arc::new(picker),
+        }
+    }
+
+    // A wait-for-ready RPC is not failed by a picker that fails the pick; it
+    // waits for a new picker instead.
+    //
+    // Uses a paused clock so we can be sure the new picker is pushed at the
+    // proper instant and the RPC has an opportunity to use it.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_ready_rpc_waits_through_failed_pick() {
+        let runtime = test_runtime();
+        let (channel, lb_state_tx, lb_work_scheduler) =
+            channel_with_lb_states("channel_test_wfr_failed_pick").await;
+        lb_state_tx
+            .send(transient_failure(FailPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "fail picker",
+            ))))
+            .unwrap();
+        lb_work_scheduler.schedule_work(None);
+
+        let mut call =
+            std::pin::pin!(channel.invoke(RequestHeaders::new(), wait_for_ready_call_option()));
+        assert!(
+            runtime
+                .timeout(Duration::from_millis(50), &mut call)
+                .await
+                .is_err(),
+            "the wait-for-ready RPC should wait for a new picker"
+        );
+
+        // A new picker that also fails the pick keeps the RPC queued.
+        lb_state_tx
+            .send(transient_failure(FailPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "fail picker 2",
+            ))))
+            .unwrap();
+        lb_work_scheduler.schedule_work(None);
+        assert!(
+            runtime
+                .timeout(Duration::from_millis(50), &mut call)
+                .await
+                .is_err(),
+            "the wait-for-ready RPC should still be waiting"
+        );
+
+        // The next picker is used; dropping the pick fails the RPC.
+        lb_state_tx
+            .send(transient_failure(DropPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "drop picker",
+            ))))
+            .unwrap();
+        lb_work_scheduler.schedule_work(None);
+        let (_tx, mut rx) = runtime
+            .timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the RPC should use the new picker");
+        let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut NopRecvMessage).await else {
+            std::panic!("expected trailers");
+        };
+        assert_eq!(
+            trailers.status().as_ref().unwrap_err().message(),
+            "drop picker"
+        );
+    }
+
+    // A wait-for-ready RPC queued behind failed picks fails with
+    // DEADLINE_EXCEEDED once its deadline is reached.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_ready_rpc_deadline_exceeded_while_queued() {
+        let runtime = test_runtime();
+        let (channel, lb_state_tx, lb_work_scheduler) =
+            channel_with_lb_states("channel_test_wfr_deadline").await;
+        lb_state_tx
+            .send(transient_failure(FailPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "fail picker",
+            ))))
+            .unwrap();
+        lb_work_scheduler.schedule_work(None);
+
+        let mut options = wait_for_ready_call_option();
+        options.set_deadline(runtime.now() + Duration::from_millis(50));
+        let (_tx, mut rx) = runtime
+            .timeout(
+                Duration::from_secs(5),
+                channel.invoke(RequestHeaders::new(), options),
+            )
+            .await
+            .expect("the RPC should fail at its deadline");
+        let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut NopRecvMessage).await else {
+            std::panic!("expected trailers");
+        };
+        assert_eq!(
+            trailers.status().as_ref().unwrap_err().code(),
+            StatusCodeError::DeadlineExceeded
+        );
+    }
+
+    // A wait-for-ready RPC fails immediately when the picker drops the pick.
+    #[tokio::test]
+    async fn wait_for_ready_rpc_fails_on_dropped_pick() {
+        let code = rpc_status_code_with_picker(
+            "channel_test_wfr_dropped_pick",
+            Arc::new(DropPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "drop picker",
+            ))),
+            wait_for_ready_call_option(),
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Unavailable);
+    }
+
+    // An RPC is not wait-for-ready by default.
+    #[tokio::test]
+    async fn non_wait_for_ready_is_the_default() {
+        let code = rpc_status_code_with_picker(
+            "channel_test_non_wfr_default_failed_pick",
+            Arc::new(FailPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "fail picker",
+            ))),
+            CallOptions::default(),
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Unavailable);
+    }
+
+    // An RPC that explicitly disables wait-for-ready fails immediately when
+    // the picker fails the pick.
+    #[tokio::test]
+    async fn non_wait_for_ready_rpc_fails_on_failed_pick() {
+        let mut options = CallOptions::default();
+        options.set_wait_for_ready(false);
+        let code = rpc_status_code_with_picker(
+            "channel_test_non_wfr_failed_pick",
+            Arc::new(FailPicker(StatusError::new(
+                StatusCodeError::Unavailable,
+                "fail picker",
+            ))),
+            options,
+        )
+        .await;
+        assert_eq!(code, StatusCodeError::Unavailable);
     }
 }

@@ -44,6 +44,10 @@ use std::time::Instant;
 pub struct CallOptions {
     /// The deadline for the call.  If unset, the call may run indefinitely.
     deadline: Option<Instant>,
+    /// Whether the call was configured as wait-for-ready.  `None` means the
+    /// application did not specify a value, so the service config should take
+    /// precedence.
+    wait_for_ready: Option<bool>,
     /// Custom options keyed by type.  Holds at most one entry per type.
     options: Vec<Entry>,
 }
@@ -72,6 +76,30 @@ impl CallOptions {
     /// Reads the deadline currently set in the [`CallOptions`].
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Configures whether the call is ["wait-for-ready"][wait-for-ready].
+    ///
+    /// When enabled, the call will not fail if the channel is in a transient
+    /// failure state; instead, it waits until the channel is able to connect to
+    /// a server, or until the call's deadline is reached (see
+    /// [`set_deadline`](Self::set_deadline)).  When disabled (the default), the
+    /// call will queue while attempting to connect, but will fail without
+    /// sending if connection attempts have failed.
+    ///
+    /// A value set here takes precedence over the service config.
+    ///
+    /// [wait-for-ready]: https://grpc.io/docs/guides/wait-for-ready/
+    pub fn set_wait_for_ready(&mut self, enabled: bool) {
+        self.wait_for_ready = Some(enabled);
+    }
+
+    /// Reads the wait-for-ready setting currently set in the [`CallOptions`],
+    /// or `None` if it has not been set.
+    ///
+    /// See [`set_wait_for_ready`](Self::set_wait_for_ready) for details.
+    pub fn wait_for_ready(&self) -> Option<bool> {
+        self.wait_for_ready
     }
 
     /// Sets a custom option of type `T`.
@@ -408,6 +436,23 @@ mod tests {
         let cloned = opts.clone();
         assert_eq!(cloned.deadline(), Some(deadline));
         assert_eq!(cloned.get_option::<UserId>(), Some(&UserId(1)));
+    }
+
+    #[test]
+    fn wait_for_ready_defaults_to_unset() {
+        assert_eq!(CallOptions::new().wait_for_ready(), None);
+    }
+
+    #[test]
+    fn set_wait_for_ready() {
+        let mut opts = CallOptions::new();
+        opts.set_wait_for_ready(true);
+        assert_eq!(opts.wait_for_ready(), Some(true));
+        assert_eq!(opts.clone().wait_for_ready(), Some(true));
+
+        // An explicit `false` is distinct from unset.
+        opts.set_wait_for_ready(false);
+        assert_eq!(opts.wait_for_ready(), Some(false));
     }
 
     #[test]

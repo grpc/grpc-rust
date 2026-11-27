@@ -50,10 +50,10 @@ may be a good resource as it shows examples of many of the gRPC features.
 
 ### Dependencies
 
-[`tonic-build`] uses `protoc` [Protocol Buffers compiler] in some APIs which compile Protocol Buffers resource files such as [`tonic_build::compile_protos()`].
+[`tonic-build`] uses `protoc` [Protocol Buffers compiler] in some APIs which compile Protocol Buffers resource files such as [`tonic_prost_build::compile_protos()`].
 
 [Protocol Buffers compiler]: https://protobuf.dev/downloads/
-[`tonic_build::compile_protos()`]: https://docs.rs/tonic-build/latest/tonic_build/fn.compile_protos.html
+[`tonic_prost_build::compile_protos()`]: https://docs.rs/tonic-prost-build/latest/tonic_prost_build/fn.compile_protos.html
 
 ## Getting Help
 

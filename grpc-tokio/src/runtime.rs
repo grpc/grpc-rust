@@ -24,7 +24,6 @@
 
 use std::future::Future;
 use std::io;
-#[cfg(any(test, not(feature = "dns")))]
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -51,6 +50,7 @@ use grpc::rt::TaskHandle;
 use grpc::server::ListenerAddress;
 use grpc::server::TcpAddress;
 use tokio::net::TcpStream;
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -91,20 +91,76 @@ impl DnsResolver for TokioDefaultDnsResolver {
 impl TokioDefaultDnsResolver {
     pub(crate) fn new(opts: ResolverOptions) -> Result<Self, String> {
         if opts.server_addr().is_some() {
-            return Err("Custom DNS server are not supported, enable optional feature 'dns' to enable support.".to_string());
+            return Err("Custom DNS servers are not supported, enable optional feature 'dns' to enable support.".to_string());
         }
         Ok(TokioDefaultDnsResolver { _priv: () })
     }
 }
 
-/// A gRPC [`Runtime`] backed by [Tokio](https://tokio.rs).
+/// A gRPC [`Runtime`] backed by a specific [Tokio](https://tokio.rs) runtime.
 ///
-/// This does not create a Tokio runtime: each operation uses the Tokio
-/// runtime that is current when it is called (e.g. via `tokio::spawn`), which
-/// must have the IO and time drivers enabled.
-#[derive(Debug, Default)]
+/// All tasks, timers, and I/O are bound to the runtime identified by `handle`,
+/// regardless of which thread or executor calls into gRPC. The runtime must
+/// have the IO and time drivers enabled.
+#[derive(Debug)]
 pub(crate) struct TokioRuntime {
-    _priv: (),
+    handle: Handle,
+}
+
+impl TokioRuntime {
+    pub(crate) fn new(handle: Handle) -> Self {
+        Self { handle }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Polls `fut` within the context of the Tokio runtime identified by
+    /// `handle`.
+    ///
+    /// Tokio registers sockets and timers with the runtime that is current
+    /// when they are created or first polled, and some libraries (e.g.
+    /// hickory) spawn tasks onto the current runtime. Wrapping a future in
+    /// `InRuntime` binds all of that to `handle`'s runtime, so the future can
+    /// be polled from any thread or executor.
+    pub(crate) struct InRuntime<F> {
+        handle: Handle,
+        #[pin]
+        fut: F,
+    }
+}
+
+impl<F> InRuntime<F> {
+    pub(crate) fn new(handle: Handle, fut: F) -> Self {
+        Self { handle, fut }
+    }
+}
+
+impl<F: Future> Future for InRuntime<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.project();
+        let _guard = this.handle.enter();
+        this.fut.poll(cx)
+    }
+}
+
+/// Runs a [`DnsResolver`]'s lookups within the context of a specific Tokio
+/// runtime.
+struct InRuntimeDnsResolver<R> {
+    handle: Handle,
+    inner: R,
+}
+
+#[grpc::async_trait]
+impl<R: DnsResolver> DnsResolver for InRuntimeDnsResolver<R> {
+    async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
+        InRuntime::new(self.handle.clone(), self.inner.lookup_host_name(name)).await
+    }
+
+    async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, String> {
+        InRuntime::new(self.handle.clone(), self.inner.lookup_txt(name)).await
+    }
 }
 
 /// Wraps a Tokio [`JoinHandle`] as a [`TaskHandle`].
@@ -140,30 +196,33 @@ impl Sleep for TokioSleep {}
 
 impl Runtime for TokioRuntime {
     fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> BoxedTaskHandle {
-        Box::new(TokioTaskHandle(tokio::spawn(task)))
+        Box::new(TokioTaskHandle(self.handle.spawn(task)))
     }
 
     fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String> {
+        let _guard = self.handle.enter();
         #[cfg(feature = "dns")]
-        {
-            Ok(Box::new(hickory_resolver::DnsResolver::new(opts)?))
-        }
+        let inner = hickory_resolver::DnsResolver::new(opts)?;
         #[cfg(not(feature = "dns"))]
-        {
-            Ok(Box::new(TokioDefaultDnsResolver::new(opts)?))
-        }
+        let inner = TokioDefaultDnsResolver::new(opts)?;
+        Ok(Box::new(InRuntimeDnsResolver {
+            handle: self.handle.clone(),
+            inner,
+        }))
     }
 
-    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
+        // A Tokio timer is bound to the runtime that is current when it is
+        // created.
+        let _guard = self.handle.enter();
         Box::pin(TokioSleep {
             inner: tokio::time::sleep(duration),
         })
     }
 
-    #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn now(&self) -> Instant {
         // Use tokio's clock so that a paused/advanced test clock is respected.
+        let _guard = self.handle.enter();
         tokio::time::Instant::now().into_std()
     }
 
@@ -172,7 +231,7 @@ impl Runtime for TokioRuntime {
         target: SocketAddr,
         opts: TcpOptions,
     ) -> BoxFuture<Result<BoxEndpoint, String>> {
-        Box::pin(async move {
+        Box::pin(InRuntime::new(self.handle.clone(), async move {
             let stream = TcpStream::connect(target)
                 .await
                 .map_err(|err| err.to_string())?;
@@ -189,7 +248,7 @@ impl Runtime for TokioRuntime {
             }
             let stream: Box<dyn GrpcEndpoint> = Box::new(tcp_endpoint(stream)?);
             Ok(stream)
-        })
+        }))
     }
 
     #[cfg(unix)]
@@ -198,14 +257,15 @@ impl Runtime for TokioRuntime {
         path: std::path::PathBuf,
         _opts: UnixSocketOptions,
     ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
-        Box::pin(unix::connect(path))
+        Box::pin(InRuntime::new(self.handle.clone(), unix::connect(path)))
     }
 
     fn tcp_listener(
         &self,
         addr: SocketAddr,
     ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
-        Box::pin(async move {
+        let handle = self.handle.clone();
+        Box::pin(InRuntime::new(self.handle.clone(), async move {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -213,8 +273,9 @@ impl Runtime for TokioRuntime {
             Ok(Box::new(TokioTcpListener {
                 listener,
                 local_addr,
+                handle,
             }) as Box<dyn EndpointListener>)
-        })
+        }))
     }
 
     #[cfg(unix)]
@@ -223,7 +284,10 @@ impl Runtime for TokioRuntime {
         path: std::path::PathBuf,
         _opts: UnixSocketOptions,
     ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
-        Box::pin(async move { unix::bind(path) })
+        let handle = self.handle.clone();
+        Box::pin(InRuntime::new(self.handle.clone(), async move {
+            unix::bind(path, handle)
+        }))
     }
 
     #[cfg(not(unix))]
@@ -329,7 +393,6 @@ where
             backoff = policy.initial_backoff;
             continue;
         }
-        #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
         sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
     }
@@ -340,13 +403,15 @@ struct TokioTcpListener {
     listener: tokio::net::TcpListener,
     /// Determined when binding, so that binding fails if it can't be read.
     local_addr: TcpAddress,
+    /// The runtime the listener was bound in, which `accept` runs within.
+    handle: Handle,
 }
 
 #[grpc::async_trait]
 impl EndpointListener for TokioTcpListener {
     async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String> {
-        let (stream, peer_addr) =
-            accept_with_retry(&TOKIO_ACCEPT_RETRY_POLICY, || self.listener.accept()).await;
+        let accept = accept_with_retry(&TOKIO_ACCEPT_RETRY_POLICY, || self.listener.accept());
+        let (stream, peer_addr) = InRuntime::new(self.handle.clone(), accept).await;
         Ok(Box::new(accepted_tcp_endpoint(stream, peer_addr)))
     }
 
@@ -361,7 +426,12 @@ mod tests {
     use std::future::Ready;
     use std::future::ready;
     use std::io;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::time::Duration;
+
+    use grpc::__unstable::rt::TcpOptions;
+    use tokio::runtime::Handle;
 
     use super::AcceptRetryPolicy;
     use super::DnsResolver;
@@ -391,7 +461,7 @@ mod tests {
     async fn run_script(script: Vec<io::Result<u32>>) -> (u32, usize, Duration) {
         let mut script = VecDeque::from(script);
         let mut calls = 0;
-        let runtime = TokioRuntime::default();
+        let runtime = TokioRuntime::new(Handle::current());
         let start = runtime.now();
         let result = accept_with_retry(&TEST_POLICY, || -> Ready<io::Result<u32>> {
             calls += 1;
@@ -458,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_hostname() {
-        let runtime = TokioRuntime::default();
+        let runtime = TokioRuntime::new(Handle::current());
 
         let dns = runtime
             .get_dns_resolver(ResolverOptions::default())
@@ -487,7 +557,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn now_reflects_paused_clock() {
-        let runtime = TokioRuntime::default();
+        let runtime = TokioRuntime::new(Handle::current());
         let start = runtime.now();
 
         tokio::time::advance(Duration::from_secs(3600)).await;
@@ -495,5 +565,64 @@ mod tests {
 
         runtime.sleep(Duration::from_secs(60)).await;
         assert_eq!(runtime.now() - start, Duration::from_secs(3660));
+    }
+
+    /// Builds a multi-threaded Tokio runtime. Tests that use it run outside
+    /// any Tokio runtime context themselves, as a non-Tokio caller would.
+    fn multi_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn spawn_from_outside_runtime() {
+        let rt = multi_thread_runtime();
+        let runtime = TokioRuntime::new(rt.handle().clone());
+        assert!(Handle::try_current().is_err());
+
+        let (tx, rx) = mpsc::channel();
+        runtime.spawn(Box::pin(async move {
+            tx.send(()).unwrap();
+        }));
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("spawned task did not run");
+    }
+
+    #[test]
+    fn sleep_created_and_polled_outside_runtime() {
+        let rt = multi_thread_runtime();
+        let runtime = TokioRuntime::new(rt.handle().clone());
+
+        // Both creating and polling the timer happen outside any Tokio
+        // runtime context; the timer is driven by `rt`.
+        let sleep = runtime.sleep(Duration::from_millis(10));
+        futures_executor::block_on(sleep);
+    }
+
+    #[test]
+    fn tcp_stream_polled_outside_runtime() {
+        let rt = multi_thread_runtime();
+        let runtime = TokioRuntime::new(rt.handle().clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let endpoint =
+            futures_executor::block_on(runtime.tcp_stream(addr, TcpOptions::default())).unwrap();
+        assert_eq!(endpoint.get_peer_address(), addr.to_string());
+    }
+
+    #[test]
+    fn dns_lookup_polled_outside_runtime() {
+        let rt = multi_thread_runtime();
+        let runtime = TokioRuntime::new(rt.handle().clone());
+
+        let dns = runtime
+            .get_dns_resolver(ResolverOptions::default())
+            .unwrap();
+        let ips = futures_executor::block_on(dns.lookup_host_name("localhost")).unwrap();
+        assert!(!ips.is_empty());
     }
 }

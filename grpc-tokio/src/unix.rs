@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::net::unix::SocketAddr;
+use tokio::runtime::Handle;
 
 use grpc::__unstable::UnstableToken;
 use grpc::__unstable::client::name_resolution::UNIX_NETWORK_TYPE;
@@ -38,6 +39,7 @@ use grpc::__unstable::rt::StreamEndpoint;
 use grpc::server::ListenerAddress;
 use grpc::server::UnixListenerAddress;
 
+use crate::runtime::InRuntime;
 use crate::runtime::TOKIO_ACCEPT_RETRY_POLICY;
 use crate::runtime::accept_with_retry;
 
@@ -49,14 +51,16 @@ pub(crate) async fn connect(path: PathBuf) -> Result<Box<dyn GrpcEndpoint>, Stri
     endpoint(stream)
 }
 
-/// Binds a listener to the Unix socket at `path`.
-pub(crate) fn bind(path: PathBuf) -> Result<Box<dyn EndpointListener>, String> {
+/// Binds a listener to the Unix socket at `path`. The listener accepts
+/// connections within the context of `handle`'s runtime.
+pub(crate) fn bind(path: PathBuf, handle: Handle) -> Result<Box<dyn EndpointListener>, String> {
     let listener = UnixListener::bind(&path).map_err(|e| e.to_string())?;
     let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
     let local_addr = UnixListenerAddress::new(address_string(&local_addr), UnstableToken);
     Ok(Box::new(TokioUnixListener {
         listener,
         local_addr,
+        handle,
     }))
 }
 
@@ -107,13 +111,18 @@ struct TokioUnixListener {
     listener: UnixListener,
     /// Determined when binding, so that binding fails if it can't be read.
     local_addr: UnixListenerAddress,
+    /// The runtime the listener was bound in, which `accept` runs within.
+    handle: Handle,
 }
 
 #[grpc::async_trait]
 impl EndpointListener for TokioUnixListener {
     async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String> {
-        let (stream, peer_addr) =
-            accept_with_retry(&TOKIO_ACCEPT_RETRY_POLICY, || self.listener.accept()).await;
+        let (stream, peer_addr) = InRuntime::new(
+            self.handle.clone(),
+            accept_with_retry(&TOKIO_ACCEPT_RETRY_POLICY, || self.listener.accept()),
+        )
+        .await;
         Ok(accepted_endpoint(stream, peer_addr))
     }
 

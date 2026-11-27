@@ -227,6 +227,7 @@ mod tests {
     use grpc::client::ConnectivityState;
     use grpc::client::RequestHeaders;
     use grpc::core::Address;
+    use grpc::rt::test_runtime;
 
     use super::*;
     use crate::resolver::set_picked_cluster;
@@ -458,7 +459,7 @@ mod tests {
         let scheduler = Arc::new(MockScheduler::default());
         let policy = ClusterManagerBuilder.build(LbPolicyOptions {
             work_scheduler: scheduler.clone(),
-            runtime: grpc_tokio::runtime(),
+            runtime: test_runtime(),
         });
         let controller = MockChannelController { latest_state: None };
         (policy, scheduler, controller)

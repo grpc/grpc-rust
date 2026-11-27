@@ -44,7 +44,7 @@ pub(crate) mod hyper_wrapper;
 /// A minimal Tokio-based runtime used by this crate's unit tests. The real
 /// Tokio runtime lives in the `grpc-tokio` crate, which can't be used here
 /// because it depends on this crate.
-#[cfg(test)]
+#[cfg(any(test, feature = "__internal-test-utils"))]
 pub(crate) mod tokio;
 
 /// A boxed handle to a task spawned with [`GrpcRuntime::spawn`].
@@ -65,9 +65,16 @@ pub trait TaskHandle: UnstableTrait + Send + Sync {
     fn abort(&self);
 }
 
-/// Returns the runtime used by this crate's unit tests.
-#[cfg(test)]
-pub(crate) fn test_runtime() -> GrpcRuntime {
+/// Returns the runtime used by unit tests in this crate and other gRPC crates.
+///
+/// Unlike `grpc_tokio::runtime()`, this can be created outside a Tokio
+/// runtime: each operation uses the Tokio runtime that is current when it is
+/// called (e.g. via `tokio::spawn`), and panics if there is none. This lets
+/// synchronous tests construct components that require a runtime but never
+/// use it.
+#[cfg(any(test, feature = "__internal-test-utils"))]
+#[doc(hidden)]
+pub fn test_runtime() -> GrpcRuntime {
     GrpcRuntime::new(tokio::TokioRuntime::default(), UnstableToken)
 }
 
@@ -75,6 +82,11 @@ pub(crate) fn test_runtime() -> GrpcRuntime {
 /// tasks.
 ///
 /// Cloning a `GrpcRuntime` is cheap; clones share the same underlying runtime.
+///
+/// The underlying runtime must keep running for as long as anything using the
+/// `GrpcRuntime` exists, e.g. every channel and server created with it. Using
+/// it after the underlying runtime has stopped is a programming error: it may
+/// panic, cause RPCs to fail, or cause them to hang.
 #[derive(Clone, Debug)]
 pub struct GrpcRuntime {
     inner: Arc<dyn Runtime>,
@@ -216,6 +228,16 @@ pub(crate) mod unstable {
     /// time-based operations such as sleeping. It provides a uniform interface
     /// that can be implemented for various async runtimes, enabling pluggable
     /// and testable infrastructure.
+    ///
+    /// # Lifetime of the underlying runtime
+    ///
+    /// Implementations are typically bound to an underlying executor or
+    /// reactor (e.g. a specific Tokio runtime). That executor must keep running
+    /// for as long as anything using this `Runtime` exists, e.g. every channel
+    /// and server created with it. If it stops, implementations need not
+    /// report an error: they may panic (e.g. when `sleep` is called or its
+    /// result is polled) or silently drop spawned tasks, so RPCs may fail or
+    /// hang. Methods that perform I/O return errors as usual.
     pub trait Runtime: Send + Sync + Debug {
         /// Spawns the given asynchronous task to run in the background.
         fn spawn(

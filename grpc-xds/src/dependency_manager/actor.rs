@@ -391,6 +391,8 @@ impl Actor {
 mod tests {
     use std::sync::mpsc;
 
+    use grpc::rt::test_runtime;
+
     use super::*;
     use crate::dependency_manager::XdsConfigUpdate;
     use crate::dependency_manager::cluster_graph::DnsTarget;
@@ -488,7 +490,7 @@ mod tests {
             listener_name: LISTENER.to_owned(),
             data_plane_authority: AUTHORITY.to_owned(),
             node_id: Some("node-1".into()),
-            runtime: grpc_tokio::runtime(),
+            runtime: test_runtime(),
             watcher: Box::new(Sender(tx)),
         };
         (options, rx)

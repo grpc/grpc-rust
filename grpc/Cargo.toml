@@ -31,7 +31,7 @@ allowed_external_types = [
 [features]
 __unstable = []
 __internal = []
-__internal-test-utils = []
+__internal-test-utils = ["tokio/net", "tokio/rt", "tokio/time"]
 gzip = ["dep:flate2"]
 
 [dependencies]

@@ -345,6 +345,25 @@ impl EncodeState {
     }
 }
 
+fn is_cancelled(
+    cancellation_fut: Pin<&mut Option<WaitForCancellationFutureOwned>>,
+    cx: &mut Context<'_>,
+) -> bool {
+    cancellation_fut
+        .as_pin_mut()
+        .is_some_and(|fut| fut.poll(cx).is_ready())
+}
+
+fn cancelled_status() -> Status {
+    #[cfg_attr(not(feature = "h2"), allow(unused_mut))]
+    let mut status = Status::cancelled("client cancelled");
+    // h2 inspects the error's source chain to determine the RST code, so we
+    // set it here.
+    #[cfg(feature = "h2")]
+    status.set_source(std::sync::Arc::new(H2Error::from(H2Reason::CANCEL)));
+    status
+}
+
 impl<T, U> Body for EncodeBody<T, U>
 where
     T: Encoder<Error = Status>,
@@ -361,23 +380,10 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let self_proj = self.project();
+        let mut self_proj = self.project();
 
-        if let Some(cancellation_fut) = self_proj.cancellation_fut.as_pin_mut()
-            && let Poll::Ready(()) = cancellation_fut.poll(cx)
-        {
-            #[cfg(feature = "h2")]
-            let status = {
-                let mut status = Status::cancelled("client cancelled");
-                // h2 inspects the error's source chain to determine the RST
-                // code, so we set it here.
-                status.set_source(std::sync::Arc::new(H2Error::from(H2Reason::CANCEL)));
-                status
-            };
-
-            #[cfg(not(feature = "h2"))]
-            let status = Status::cancelled("client cancelled");
-            return Poll::Ready(Some(Err(status)));
+        if is_cancelled(self_proj.cancellation_fut.as_mut(), cx) {
+            return Poll::Ready(Some(Err(cancelled_status())));
         }
 
         match ready!(self_proj.inner.poll_next(cx)) {
@@ -389,6 +395,12 @@ where
                     Some(Ok(Frame::trailers(status.to_header_map()?))).into()
                 }
             },
+            // The request may have been cancelled after the check above and its
+            // source then ended.  Ending the body here would end the stream
+            // gracefully instead of resetting it.
+            None if is_cancelled(self_proj.cancellation_fut.as_mut(), cx) => {
+                Some(Err(cancelled_status())).into()
+            }
             None => self_proj
                 .state
                 .trailers()
@@ -448,5 +460,65 @@ mod tests {
             &[0u8; HEADER_SIZE],
             "Buffer must contain only initialized zero bytes."
         );
+    }
+
+    struct BytesEncoder;
+
+    impl Encoder for BytesEncoder {
+        type Item = Bytes;
+        type Error = Status;
+
+        fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            dst.put(item);
+            Ok(())
+        }
+    }
+
+    /// A request source that ends, first cancelling the request if `cancel` is
+    /// set.  This is how a cancellation that races the end of the source looks
+    /// to `poll_frame`: not cancelled when it checks, cancelled once the source
+    /// has ended.
+    struct EndingSource {
+        cancel: Option<CancellationToken>,
+    }
+
+    impl Stream for EndingSource {
+        type Item = Result<Bytes, Status>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(token) = self.cancel.take() {
+                token.cancel();
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    fn poll_ending_body(cancel: bool) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+        let token = CancellationToken::new();
+        let source = EndingSource {
+            cancel: cancel.then(|| token.clone()),
+        };
+        let mut body = std::pin::pin!(EncodeBody::new_client_with_cancellation(
+            BytesEncoder,
+            source,
+            None,
+            None,
+            Some(token),
+        ));
+        body.as_mut()
+            .poll_frame(&mut Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[test]
+    fn client_body_ends_when_source_ends() {
+        assert!(matches!(poll_ending_body(false), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn client_body_fails_when_cancelled_as_source_ends() {
+        let Poll::Ready(Some(Err(status))) = poll_ending_body(true) else {
+            panic!("expected the body to fail");
+        };
+        assert_eq!(status.code(), crate::Code::Cancelled);
     }
 }

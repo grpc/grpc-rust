@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.10](https://github.com/grpc/grpc-rust/compare/tonic-health-v0.14.9...tonic-health-v0.14.10) - 2026-11-27
+
+### Other
+
+- updates for Rust 1.100 warnings ([#3063](https://github.com/grpc/grpc-rust/pull/3063))
+
 ## [0.14.7](https://github.com/grpc/grpc-rust/compare/tonic-health-v0.14.6...tonic-health-v0.14.7) - 2026-10-26
 
 ### Other

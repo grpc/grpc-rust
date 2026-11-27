@@ -55,7 +55,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
 tokio-stream = { version = "0.1.17", default-features = false }
-tonic = { version = "0.14.9", path = "../tonic", default-features = false, features = [
+tonic = { version = "0.14.10", path = "../tonic", default-features = false, features = [
     "codegen",
     "h2",
 ] }
@@ -70,11 +70,11 @@ criterion = "0.8"
 http-body-util = "0.1.0"
 prost = "0.14.0"
 tempfile = "3.26"
-tonic = { version = "0.14.9", path = "../tonic", default-features = false, features = [
+tonic = { version = "0.14.10", path = "../tonic", default-features = false, features = [
     "server",
     "router",
 ] }
-tonic-prost = { version = "0.14.9", path = "../tonic-prost" }
+tonic-prost = { version = "0.14.10", path = "../tonic-prost" }
 
 [[bench]]
 name = "metadata"

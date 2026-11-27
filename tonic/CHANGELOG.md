@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.10](https://github.com/grpc/grpc-rust/compare/tonic-v0.14.9...tonic-v0.14.10) - 2026-11-27
+
+### Fixed
+
+- *(codec)* don't end a cancelled request with END_STREAM ([#2985](https://github.com/grpc/grpc-rust/pull/2985))
+
+### Other
+
+- updates for Rust 1.100 warnings ([#3063](https://github.com/grpc/grpc-rust/pull/3063))
+
 ## [0.14.9](https://github.com/grpc/grpc-rust/compare/tonic-v0.14.8...tonic-v0.14.9) - 2026-10-29
 
 ### Added

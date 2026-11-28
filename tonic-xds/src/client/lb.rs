@@ -25,7 +25,7 @@
 use crate::client::cluster::{ClusterChannel, ClusterChannelFactory, ConnectSignal};
 use crate::client::route::RouteDecision;
 use crate::common::async_util::BoxFuture;
-use crate::xds::cache::ClusterWatches;
+use crate::xds::cache::{ClusterError, ClusterWatches};
 use http::Request;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -64,10 +64,22 @@ pub(crate) enum LoadBalancingError {
     /// router that provisions no clients.
     #[error("routing decision carries no client for cluster '{0}'")]
     NoClusterClient(String),
+    /// The routed cluster's CDS or EDS resource failed (gRFC A74), surfaced as
+    /// `UNAVAILABLE`.
+    #[error("{}", .0.message())]
+    ClusterUnavailable(#[source] tonic::Status),
+}
+
+impl LoadBalancingError {
+    fn cluster_unavailable(cluster: &str, err: &ClusterError) -> Self {
+        Self::ClusterUnavailable(tonic::Status::unavailable(format!(
+            "cluster '{cluster}' unavailable: {err}"
+        )))
+    }
 }
 
 /// A Tower Service that sends each request to the cluster client carried by its
-/// [`RouteDecision`].
+/// [`RouteDecision`], or fails it with the error carried instead.
 pub(crate) struct XdsLbService<Req, Resp> {
     _types: PhantomData<fn(Req) -> Resp>,
 }
@@ -109,7 +121,13 @@ where
         // Taken rather than cloned so the request, once queued in the cluster's
         // channel, does not keep that channel's client alive. Each retry attempt
         // starts from the retry layer's copy of the request, which still has it.
-        let cluster_ref = decision.cluster_ref.take();
+        let cluster_ref = match decision.cluster_ref.take().transpose() {
+            Ok(cluster_ref) => cluster_ref,
+            Err(err) => {
+                let err = LoadBalancingError::cluster_unavailable(&decision.cluster, &err);
+                return Box::pin(async move { Err(err.into()) });
+            }
+        };
         let Some(cluster_client) = cluster_ref
             .as_ref()
             .and_then(|cluster| cluster.client::<Request<B>, Resp>())
@@ -162,5 +180,72 @@ where
             self.discovery.discover_cluster(cluster_name, watches),
             connect,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::retry::{GrpcRetryClassifier, RetryConfig, RetryLayer, RetrySharedConfig};
+    use shared_http_body::SharedBody;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tonic::body::Body as TonicBody;
+
+    #[tokio::test]
+    async fn failed_cluster_fails_the_attempt_with_its_error() {
+        let mut request = Request::new(());
+        request.extensions_mut().insert(RouteDecision {
+            cluster: "c".into(),
+            request_hash: None,
+            retry_config: None,
+            max_stream_duration: None,
+            cluster_ref: Some(Err(ClusterError("EDS resource 'c': does not exist".into()))),
+        });
+
+        let err = XdsLbService::<Request<()>, http::Response<()>>::new()
+            .oneshot(request)
+            .await
+            .unwrap_err();
+        let status = tonic::Status::from_error(err);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "cluster 'c' unavailable: EDS resource 'c': does not exist"
+        );
+    }
+
+    /// Routing runs once per call, so every retry attempt would carry the same
+    /// failed cluster. The error must not be retried, even when the route's
+    /// policy retries `UNAVAILABLE`.
+    #[tokio::test]
+    async fn failed_cluster_error_is_not_retried() {
+        let retry_unavailable = RetrySharedConfig::new(
+            RetryConfig::new().num_retries(3),
+            Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
+        );
+        let mut request = Request::new(TonicBody::empty());
+        request.extensions_mut().insert(RouteDecision {
+            cluster: "c".into(),
+            request_hash: None,
+            retry_config: Some(Arc::new(retry_unavailable)),
+            max_stream_duration: None,
+            cluster_ref: Some(Err(ClusterError("EDS resource 'c': does not exist".into()))),
+        });
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = attempts.clone();
+        let service = tower::ServiceBuilder::new()
+            .layer(RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default())))
+            .map_request(move |request: Request<SharedBody<TonicBody>>| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                request
+            })
+            .service(XdsLbService::<_, http::Response<TonicBody>>::new());
+
+        let err = service.oneshot(request).await.unwrap_err();
+        assert_eq!(
+            tonic::Status::from_error(err).code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 }

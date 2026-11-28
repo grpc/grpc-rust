@@ -42,7 +42,12 @@
 //! matched virtual host have resolved, matching gRFC A74
 //! `XdsDependencyManager` semantics. A CDS failure records a per-cluster
 //! [`ClusterError`]. An EDS failure keeps the cluster `Ok` with no endpoints
-//! and a `resolution_note`.
+//! and the reason in its `resolution_note`.
+//!
+//! Per gRFC A88, an ambient error (such as a rejected update to a cached
+//! resource) keeps the cached resource and is added to the `resolution_note`
+//! of each affected cluster: LDS and RDS errors to every cluster, CDS and EDS
+//! errors to their own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -93,8 +98,12 @@ impl XdsResourceManager {
 enum WatchState<T> {
     /// Subscribed, awaiting the first response from `xds-client`.
     Pending,
-    /// Validated resource received (and retained across [`ResourceEvent::AmbientError`]s).
-    Ready(Arc<T>),
+    /// Validated resource received. `note` holds the latest
+    /// [`ResourceEvent::AmbientError`], if any; the next valid update clears it.
+    Ready {
+        value: Arc<T>,
+        note: Option<Arc<str>>,
+    },
     /// Resource invalidated (`ResourceDoesNotExist` or initial validation failure
     /// with no cached fallback).
     Failed(Arc<str>),
@@ -110,10 +119,10 @@ impl<T> WatchState<T> {
     ) -> ProcessingDone {
         match event {
             ResourceEvent::ResourceChanged {
-                result: Ok(resource),
+                result: Ok(value),
                 done,
             } => {
-                *self = Self::Ready(resource);
+                *self = Self::Ready { value, note: None };
                 done
             }
             ResourceEvent::ResourceChanged {
@@ -126,7 +135,14 @@ impl<T> WatchState<T> {
                 *self = Self::Failed(describe(err));
                 done
             }
-            ResourceEvent::AmbientError { done, .. } => done,
+            ResourceEvent::AmbientError { error, done } => {
+                // `xds-client` sends ambient errors only once a resource is
+                // cached; ignore any other so it can't mask a failure reason.
+                if let Self::Ready { note, .. } = self {
+                    *note = Some(describe(error));
+                }
+                done
+            }
         }
     }
 }
@@ -193,6 +209,22 @@ fn reconcile<T: Resource>(
             map.insert(name.to_string(), Watch::new(xds_client, name));
         }
     }
+}
+
+/// Joins `notes` with `"; "`, or returns `None` if there are none. A single
+/// note is shared rather than copied.
+fn join_notes<'n>(notes: impl IntoIterator<Item = &'n Arc<str>>) -> Option<Arc<str>> {
+    let mut notes = notes.into_iter();
+    let first = notes.next()?;
+    let Some(second) = notes.next() else {
+        return Some(Arc::clone(first));
+    };
+    let mut joined = format!("{first}; {second}");
+    for note in notes {
+        joined.push_str("; ");
+        joined.push_str(note);
+    }
+    Some(joined.into())
 }
 
 /// Mutable state for the entire LDS -> RDS -> VirtualHost -> CDS -> EDS cascade.
@@ -277,7 +309,9 @@ impl CascadeState {
 
     fn prune_stale_rds(&mut self) {
         let keep_rds = match &self.lds.state {
-            WatchState::Ready(listener) => match &listener.route_source {
+            WatchState::Ready {
+                value: listener, ..
+            } => match &listener.route_source {
                 RouteSource::Rds(rds_name) => {
                     self.rds.as_ref().is_some_and(|rds| rds.name == *rds_name)
                 }
@@ -294,7 +328,7 @@ impl CascadeState {
     /// [`XdsConfig`] snapshot or a top-level [`XdsConfigError`], or holds
     /// publication if any required resource is still [`WatchState::Pending`].
     fn resolve(&mut self, xds_client: &XdsClient, cache: &XdsCache) {
-        let listener = match &self.lds.state {
+        let (listener, lds_note) = match &self.lds.state {
             WatchState::Pending => return,
             WatchState::Failed(reason) => {
                 let err = XdsConfigError(Arc::clone(reason));
@@ -303,13 +337,13 @@ impl CascadeState {
                 cache.publish_error(err);
                 return;
             }
-            WatchState::Ready(listener) => Arc::clone(listener),
+            WatchState::Ready { value, note } => (Arc::clone(value), note.clone()),
         };
 
-        let raw_rc = match &listener.route_source {
+        let (raw_rc, rds_note) = match &listener.route_source {
             RouteSource::Inline(rc) => {
                 self.rds = None;
-                Arc::clone(rc)
+                (Arc::clone(rc), None)
             }
             RouteSource::Rds(rds_name) => {
                 if self.rds.as_ref().is_none_or(|rds| rds.name != *rds_name) {
@@ -326,7 +360,7 @@ impl CascadeState {
                         cache.publish_error(err);
                         return;
                     }
-                    WatchState::Ready(rc) => Arc::clone(rc),
+                    WatchState::Ready { value, note } => (Arc::clone(value), note.clone()),
                 }
             }
         };
@@ -352,37 +386,42 @@ impl CascadeState {
             .clusters
             .values()
             .filter_map(|watch| match &watch.state {
-                WatchState::Ready(cluster) => Some(cluster.eds_service_name()),
+                WatchState::Ready { value: cluster, .. } => Some(cluster.eds_service_name()),
                 WatchState::Pending | WatchState::Failed(_) => None,
             })
             .collect();
         reconcile(xds_client, &mut self.endpoints, &required_eds);
 
+        // gRFC A88: LDS and RDS notes apply to every cluster.
+        let base_notes = [lds_note, rds_note];
         let mut clusters = HashMap::with_capacity(self.clusters.len());
         for (name, watch) in &self.clusters {
             let outcome = match &watch.state {
                 WatchState::Pending => return,
                 WatchState::Failed(reason) => Err(ClusterError(Arc::clone(reason))),
-                WatchState::Ready(cluster) => {
+                WatchState::Ready {
+                    value: cluster,
+                    note: cds_note,
+                } => {
                     let eds_name = cluster.eds_service_name();
-                    match &self
+                    let (endpoints, eds_note) = match &self
                         .endpoints
                         .get(eds_name)
                         .expect("reconciled from Ready clusters above")
                         .state
                     {
                         WatchState::Pending => return,
-                        WatchState::Failed(reason) => Ok(ClusterSnapshot {
-                            cluster: Arc::clone(cluster),
-                            endpoints: None,
-                            resolution_note: Some(Arc::clone(reason)),
-                        }),
-                        WatchState::Ready(endpoints) => Ok(ClusterSnapshot {
-                            cluster: Arc::clone(cluster),
-                            endpoints: Some(Arc::clone(endpoints)),
-                            resolution_note: None,
-                        }),
-                    }
+                        WatchState::Failed(reason) => (None, Some(reason)),
+                        WatchState::Ready { value, note } => {
+                            (Some(Arc::clone(value)), note.as_ref())
+                        }
+                    };
+                    let notes = base_notes.iter().flatten().chain(cds_note).chain(eds_note);
+                    Ok(ClusterSnapshot {
+                        cluster: Arc::clone(cluster),
+                        endpoints,
+                        resolution_note: join_notes(notes),
+                    })
                 }
             };
             clusters.insert(name.clone(), outcome);
@@ -621,11 +660,16 @@ mod tests {
         }
     }
 
-    fn ambient_event<T>() -> ResourceEvent<T> {
+    fn ambient_event<T>(reason: &str) -> ResourceEvent<T> {
         ResourceEvent::AmbientError {
-            error: xds_client::Error::Validation("post-ACK NACK".into()),
+            error: xds_client::Error::Validation(reason.into()),
             done: ProcessingDone::detached(),
         }
+    }
+
+    fn resolution_note(snap: &XdsConfig, cluster: &str) -> Option<String> {
+        let cluster = snap.clusters[cluster].as_ref().unwrap();
+        cluster.resolution_note.as_deref().map(str::to_owned)
     }
 
     fn resolve_cluster(state: &mut CascadeState, name: &str, client: &XdsClient, cache: &XdsCache) {
@@ -774,25 +818,69 @@ mod tests {
     }
 
     #[test]
-    fn ambient_errors_preserve_state() {
+    fn ambient_errors_annotate_affected_clusters_and_keep_state() {
         let cache = test_cache();
         let client = test_client();
         let mut state = new_state(&client);
 
         state.handle_lds(ok_event(make_listener_rds("rc")), &client, &cache);
-        state.handle_rds(ok_event(make_route_config("rc", &["c1"])), &client, &cache);
+        state.handle_rds(
+            ok_event(make_route_config("rc", &["c1", "c2"])),
+            &client,
+            &cache,
+        );
         resolve_cluster(&mut state, "c1", &client, &cache);
+        resolve_cluster(&mut state, "c2", &client, &cache);
         let initial = cache.current().unwrap();
+        assert_eq!(resolution_note(&initial, "c1"), None);
 
-        state.handle_lds(ambient_event(), &client, &cache);
-        state.handle_rds(ambient_event(), &client, &cache);
-        state.handle_cds("c1", ambient_event(), &client, &cache);
-        state.handle_eds("c1", ambient_event(), &client, &cache);
+        // LDS and RDS notes apply to every cluster; CDS and EDS notes only to
+        // their own.
+        state.handle_lds(ambient_event("lds"), &client, &cache);
+        state.handle_rds(ambient_event("rds"), &client, &cache);
+        state.handle_cds("c1", ambient_event("cds"), &client, &cache);
+        state.handle_eds("c2", ambient_event("eds"), &client, &cache);
 
-        assert!(Arc::ptr_eq(&cache.current().unwrap(), &initial));
+        let lds = "LDS resource 'listener': resource validation failed: lds";
+        let rds = "RDS resource 'rc': resource validation failed: rds";
+        let cds = "CDS resource 'c1': resource validation failed: cds";
+        let eds = "EDS resource 'c2': resource validation failed: eds";
+        let snap = cache.current().unwrap();
+        assert_eq!(
+            resolution_note(&snap, "c1"),
+            Some(format!("{lds}; {rds}; {cds}"))
+        );
+        assert_eq!(
+            resolution_note(&snap, "c2"),
+            Some(format!("{lds}; {rds}; {eds}"))
+        );
+
+        // The cached resources stay in use.
+        assert!(Arc::ptr_eq(&snap.route_config, &initial.route_config));
+        for name in ["c1", "c2"] {
+            let before = initial.clusters[name].as_ref().unwrap();
+            let after = snap.clusters[name].as_ref().unwrap();
+            assert!(Arc::ptr_eq(&before.cluster, &after.cluster));
+            assert!(Arc::ptr_eq(
+                before.endpoints.as_ref().unwrap(),
+                after.endpoints.as_ref().unwrap()
+            ));
+        }
         assert!(state.rds.is_some());
-        assert_eq!(state.clusters.len(), 1);
-        assert_eq!(state.endpoints.len(), 1);
+        assert_eq!(state.clusters.len(), 2);
+        assert_eq!(state.endpoints.len(), 2);
+
+        // A valid update clears its resource's note.
+        state.handle_lds(ok_event(make_listener_rds("rc")), &client, &cache);
+        state.handle_eds(
+            "c2",
+            ok_event(make_endpoints_resource("c2")),
+            &client,
+            &cache,
+        );
+        let snap = cache.current().unwrap();
+        assert_eq!(resolution_note(&snap, "c1"), Some(format!("{rds}; {cds}")));
+        assert_eq!(resolution_note(&snap, "c2"), Some(rds.to_owned()));
     }
 
     #[test]

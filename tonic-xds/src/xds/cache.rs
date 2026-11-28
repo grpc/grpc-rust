@@ -44,13 +44,14 @@ use crate::xds::resource::{ClusterResource, EndpointsResource, RouteConfigResour
 /// its EDS resource has resolved.
 ///
 /// Per gRFC A74, an EDS failure still resolves the cluster, with no endpoints
-/// and the reason in [`resolution_note`](Self::resolution_note).
+/// and the reason in [`resolution_note`](Self::resolution_note). RPCs routed
+/// to such a cluster fail with that note.
 #[derive(Clone, Debug)]
 pub struct ClusterSnapshot {
     pub(crate) cluster: Arc<ClusterResource>,
     /// `None` if the EDS resource failed.
     pub(crate) endpoints: Option<Arc<EndpointsResource>>,
-    /// Why `endpoints` is `None`.
+    /// The EDS failure and ambient errors affecting this cluster (gRFC A88).
     pub(crate) resolution_note: Option<Arc<str>>,
 }
 
@@ -59,17 +60,28 @@ impl ClusterSnapshot {
     /// per address, in EDS order.
     ///
     /// `None` if the EDS resource failed; see
-    /// [`resolution_note`](Self::resolution_note). If the channel already has
-    /// a load balancer for this cluster, that balancer keeps its last
-    /// endpoints, which this doesn't list.
+    /// [`resolution_note`](Self::resolution_note).
     pub fn endpoints(&self) -> Option<impl Iterator<Item = &XdsEndpoint>> {
         let endpoints = self.endpoints.as_ref()?;
         Some(endpoints.unique_healthy_endpoints().map(|ep| &**ep))
     }
 
-    /// Why [`endpoints`](Self::endpoints) is `None`.
+    /// Why [`endpoints`](Self::endpoints) is `None`, and any ambient errors
+    /// (such as a rejected update, which keeps the last valid resource) of
+    /// this cluster's xDS resources or the Listener and RouteConfiguration
+    /// above it, joined with `"; "` (gRFC A88).
     pub fn resolution_note(&self) -> Option<&str> {
         self.resolution_note.as_deref()
+    }
+
+    /// The error RPCs routed to this cluster fail with while it has no
+    /// endpoints: its resolution note.
+    pub(crate) fn no_endpoints_error(&self, name: &str) -> ClusterError {
+        ClusterError(
+            self.resolution_note
+                .clone()
+                .unwrap_or_else(|| format!("cluster '{name}' has no endpoints").into()),
+        )
     }
 
     fn ptr_eq(&self, other: &Self) -> bool {

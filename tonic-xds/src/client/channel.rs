@@ -1322,7 +1322,7 @@ mod tests {
                 let cluster = clusters
                     .entry(decision.cluster.clone())
                     .or_insert_with_key(|name| (self.provision)(name));
-                decision.cluster_ref = Some(cluster.clone());
+                decision.cluster_ref = Some(Ok(cluster.clone()));
             }
             Ok(decision)
         }
@@ -1921,7 +1921,8 @@ mod tests {
 
     /// Once activated by `connect()` or a first request, a channel's balancers
     /// connect every endpoint its config view lists, including ones published
-    /// later, without waiting for traffic.
+    /// later or for a cluster recovering from an EDS failure, without waiting
+    /// for traffic.
     #[tokio::test]
     async fn test_xds_channel_connects_ahead_of_traffic() {
         for by_request in [false, true] {
@@ -2006,18 +2007,20 @@ mod tests {
         );
 
         let mut connected = HashSet::new();
-        let mut expect_connected = async |expected: HashSet<EndpointAddress>| {
-            let all = async {
-                while connected != expected {
-                    connected.insert(connects.recv().await.unwrap());
-                }
+        let mut expect_connected =
+            async |connected: &mut HashSet<EndpointAddress>,
+                   expected: &HashSet<EndpointAddress>| {
+                let all = async {
+                    while connected != expected {
+                        connected.insert(connects.recv().await.unwrap());
+                    }
+                };
+                let waited = tokio::time::timeout(tokio::time::Duration::from_secs(5), all).await;
+                assert!(
+                    waited.is_ok(),
+                    "by_request={by_request}: connected {connected:?}"
+                );
             };
-            let waited = tokio::time::timeout(tokio::time::Duration::from_secs(5), all).await;
-            assert!(
-                waited.is_ok(),
-                "by_request={by_request}: connected {connected:?}"
-            );
-        };
         if by_request {
             let client = GreeterClient::new(channel.clone());
             let (successful, error_types, _) = send_grpc_requests(client, 1).await;
@@ -2025,12 +2028,47 @@ mod tests {
         } else {
             channel.connect();
         }
-        expect_connected(initial).await;
+        expect_connected(&mut connected, &initial).await;
 
         publish(&servers);
         let all = listed(&mut view).await;
         assert_eq!(all.len(), 3);
-        expect_connected(all).await;
+        expect_connected(&mut connected, &all).await;
+
+        // An EDS failure drops the cluster's balancer, so RPCs fail with the
+        // note. Once EDS recovers, the new balancer connects every endpoint
+        // again.
+        cache.publish(Arc::new(XdsConfig {
+            route_config: make_test_route_config(cluster_name),
+            virtual_host_index: 0,
+            clusters: HashMap::from([(
+                cluster_name.to_string(),
+                Ok(ClusterSnapshot {
+                    cluster: make_test_cluster(cluster_name),
+                    endpoints: None,
+                    resolution_note: Some("EDS resource 'test-cluster': does not exist".into()),
+                }),
+            )]),
+        }));
+        let config = view.next().await.unwrap().unwrap();
+        let (_, cluster) = config.clusters().next().unwrap();
+        assert!(cluster.unwrap().endpoints().is_none());
+        let mut client = GreeterClient::new(channel.clone());
+        let failed = async {
+            loop {
+                if let Err(status) = client.say_hello(HelloRequest::default()).await {
+                    break status;
+                }
+            }
+        };
+        let status = tokio::time::timeout(tokio::time::Duration::from_secs(5), failed)
+            .await
+            .expect("RPCs fail once the cluster has no endpoints");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("EDS resource 'test-cluster'"));
+        publish(&servers);
+        assert_eq!(listed(&mut view).await, all);
+        expect_connected(&mut HashSet::new(), &all).await;
 
         shutdown(servers).await;
     }

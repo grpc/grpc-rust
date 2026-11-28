@@ -34,7 +34,7 @@ use crate::client::transport::Transport;
 /// A registry to store and retrieve transports.  Transports are indexed by
 /// the address type they are intended to handle.
 #[derive(Default, Clone)]
-pub(crate) struct TransportRegistry {
+pub struct TransportRegistry {
     inner: Arc<Mutex<HashMap<String, ArcTransport>>>,
 }
 
@@ -54,7 +54,7 @@ impl TransportRegistry {
         Self::default()
     }
 
-    pub(crate) fn add_transport<T>(&self, address_type: &str, transport: T)
+    pub fn add_transport<T>(&self, address_type: &str, transport: T)
     where
         T: Transport + 'static,
     {
@@ -79,5 +79,8 @@ impl TransportRegistry {
 
 /// The registry used if a local registry is not provided to a channel or if it
 /// does not exist in the local registry.
-pub(crate) static GLOBAL_TRANSPORT_REGISTRY: LazyLock<TransportRegistry> =
-    LazyLock::new(TransportRegistry::new);
+pub static GLOBAL_TRANSPORT_REGISTRY: LazyLock<TransportRegistry> = LazyLock::new(|| {
+    let registry = TransportRegistry::new();
+    super::tonic::reg(&registry);
+    registry
+});

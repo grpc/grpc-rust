@@ -86,6 +86,24 @@ pub mod __unstable {
 
     pub mod rt {
         pub use crate::rt::unstable::*;
+
+        /// Establishes a TCP connection using the given runtime.
+        pub fn tcp_stream(
+            runtime: &crate::rt::GrpcRuntime,
+            target: std::net::SocketAddr,
+            opts: TcpOptions,
+        ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
+            runtime.tcp_stream(target, opts)
+        }
+
+        /// Establishes a Unix domain socket connection using the given runtime.
+        pub fn unix_stream(
+            runtime: &crate::rt::GrpcRuntime,
+            path: std::path::PathBuf,
+            opts: UnixSocketOptions,
+        ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
+            runtime.unix_stream(path, opts)
+        }
     }
     pub mod client {
         pub mod boxed {
@@ -99,6 +117,9 @@ pub mod __unstable {
         }
         pub mod service_config {
             pub use crate::client::service_config::*;
+        }
+        pub mod transport {
+            pub use crate::client::transport::*;
         }
     }
     pub mod credentials {
@@ -116,6 +137,19 @@ pub mod __unstable {
             security_protocol: &'static str,
         ) -> crate::credentials::ProtocolInfo {
             crate::credentials::ProtocolInfo::new(security_protocol)
+        }
+    }
+    pub mod metadata {
+        /// Converts an HTTP [`http::HeaderMap`] into a [`crate::metadata::MetadataMap`].
+        pub fn from_headers(
+            headers: &http::HeaderMap,
+        ) -> Result<crate::metadata::MetadataMap, String> {
+            crate::metadata::MetadataMap::from_headers(headers)
+        }
+
+        /// Converts a [`crate::metadata::MetadataMap`] into an HTTP [`http::HeaderMap`].
+        pub fn into_headers(map: crate::metadata::MetadataMap) -> http::HeaderMap {
+            map.into_headers()
         }
     }
 }

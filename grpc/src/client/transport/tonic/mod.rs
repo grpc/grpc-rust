@@ -71,7 +71,7 @@ use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
-use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::client::transport::TransportRegistry;
 use crate::codec::BufCodec;
 use crate::core::Address;
 use crate::core::ConnectionInfo;
@@ -95,14 +95,14 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, TonicStatus>> + Send>>;
 type BoxBuf = Box<dyn Buf + Send + Sync>;
 
-pub(crate) fn reg() {
-    GLOBAL_TRANSPORT_REGISTRY.add_transport(
+pub(crate) fn reg(registry: &TransportRegistry) {
+    registry.add_transport(
         TCP_IP_NETWORK_TYPE,
         TransportBuilder {
             network_type: NetworkType::Tcp,
         },
     );
-    GLOBAL_TRANSPORT_REGISTRY.add_transport(
+    registry.add_transport(
         UNIX_NETWORK_TYPE,
         TransportBuilder {
             network_type: NetworkType::Unix,

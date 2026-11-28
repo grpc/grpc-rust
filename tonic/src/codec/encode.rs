@@ -35,6 +35,7 @@ use http_body::{Body, Frame};
 use pin_project::pin_project;
 use std::{
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
 };
 use tokio_stream::{Stream, StreamExt, adapters::Fuse};
@@ -245,6 +246,7 @@ pub struct EncodeBody<T, U> {
     state: EncodeState,
     #[pin]
     cancellation_fut: Option<WaitForCancellationFutureOwned>,
+    send_error: Option<Arc<OnceLock<Status>>>,
 }
 
 #[derive(Debug)]
@@ -263,21 +265,23 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
     ) -> Self {
-        Self::new_client_with_cancellation(
+        Self::new_client_inner(
             encoder,
             source,
             compression_encoding,
             max_message_size,
             None,
+            None,
         )
     }
 
-    pub(crate) fn new_client_with_cancellation(
+    pub(crate) fn new_client_inner(
         encoder: T,
         source: U,
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
         cancellation_token: Option<CancellationToken>,
+        send_error: Option<Arc<OnceLock<Status>>>,
     ) -> Self {
         let cancellation_fut = cancellation_token.map(|c| c.cancelled_owned());
         Self {
@@ -294,6 +298,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 is_end_stream: false,
             },
             cancellation_fut,
+            send_error,
         }
     }
 
@@ -320,6 +325,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 is_end_stream: false,
             },
             cancellation_fut: None,
+            send_error: None,
         }
     }
 }
@@ -389,7 +395,14 @@ where
         match ready!(self_proj.inner.poll_next(cx)) {
             Some(Ok(d)) => Some(Ok(Frame::data(d))).into(),
             Some(Err(status)) => match self_proj.state.role {
-                Role::Client => Some(Err(status)).into(),
+                Role::Client => {
+                    // hyper discards request-body errors when resetting the
+                    // HTTP/2 stream, so stash the status for the client.
+                    if let Some(send_error) = self_proj.send_error.as_ref() {
+                        let _ = send_error.set(status.clone());
+                    }
+                    Some(Err(status)).into()
+                }
                 Role::Server => {
                     self_proj.state.is_end_stream = true;
                     Some(Ok(Frame::trailers(status.to_header_map()?))).into()

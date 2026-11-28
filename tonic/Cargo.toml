@@ -51,6 +51,9 @@ channel = [
 transport = ["server", "channel"]
 h2 = ["dep:h2"]
 
+# Adopt listening sockets passed in by systemd.
+socket-activation = []
+
 # [[bench]]
 # name = "bench_main"
 # harness = false

@@ -60,6 +60,12 @@ impl Certificate {
     }
 }
 
+impl From<Vec<u8>> for Certificate {
+    fn from(pem: Vec<u8>) -> Self {
+        Self { pem }
+    }
+}
+
 impl AsRef<[u8]> for Certificate {
     fn as_ref(&self) -> &[u8] {
         self.pem.as_ref()
@@ -80,5 +86,46 @@ impl Identity {
         let cert = Certificate::from_pem(cert);
         let key = key.as_ref().into();
         Self { cert, key }
+    }
+
+    /// Wrap a PEM-encoded certificate and private key without copying.
+    ///
+    /// The provided `cert` must contain at least one PEM-encoded certificate.
+    pub fn from_pem_vec(cert: Vec<u8>, key: Vec<u8>) -> Self {
+        Self {
+            cert: Certificate::from(cert),
+            key,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certificate_from_vec_takes_ownership_without_copying() {
+        let pem = b"cert-pem".to_vec();
+        let ptr = pem.as_ptr();
+
+        let cert = Certificate::from(pem);
+        assert_eq!(cert.get_ref(), b"cert-pem");
+        assert_eq!(cert.get_ref().as_ptr(), ptr);
+        let inner = cert.into_inner();
+        assert_eq!(inner.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn identity_from_pem_vec_takes_ownership_without_copying() {
+        let cert = b"cert-pem".to_vec();
+        let key = b"key-pem".to_vec();
+        let cert_ptr = cert.as_ptr();
+        let key_ptr = key.as_ptr();
+
+        let identity = Identity::from_pem_vec(cert, key);
+        assert_eq!(identity.cert.get_ref(), b"cert-pem");
+        assert_eq!(identity.key, b"key-pem");
+        assert_eq!(identity.cert.get_ref().as_ptr(), cert_ptr);
+        assert_eq!(identity.key.as_ptr(), key_ptr);
     }
 }
